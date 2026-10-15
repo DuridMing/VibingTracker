@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/coding-lab"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# 二進位瘦身（PLAN.md「二進位大小與拆分」）
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
