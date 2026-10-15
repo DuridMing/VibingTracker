@@ -1,0 +1,11 @@
+# 規劃文件與協作規範只留在本機（同步到 OpenProject），不進 git。
+# README.md 與使用者手冊等專案文件（docs/ 底下 plan/ 以外）照常進 git。
+/docs/plan/
+/CLAUDE.md
+/.opdocs.toml
+
+# Rust
+/target/
+
+# 本機開發資料（CODING_LAB_HOME 指到這裡）
+/.coding-lab/
