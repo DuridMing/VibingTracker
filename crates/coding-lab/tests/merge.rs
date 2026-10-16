@@ -161,9 +161,41 @@ fn transcript_result_first_then_hook_does_not_duplicate() {
     m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
     m.handle(line(1, tool_use("u1", "m1", "t1"), 1100));
     let a = m.handle(line(2, tool_result("u2", "t1"), 1200));
-    assert_eq!(types(&a), ["tool.result"]);
+    assert_eq!(types(&a), ["tool.updated", "tool.result"]);
+    assert_eq!(a[0].payload["status"], "done");
     let b = m.handle(post("t1", 1250));
-    assert_eq!(types(&b), ["tool.updated"]);
+    assert_eq!(
+        types(&b),
+        ["tool.updated"],
+        "duration 由 hook 補上，tool.result 不重送"
+    );
+}
+
+/// 執行中按 Esc：沒有任何 hook，只有 transcript 的 tool_result（樣本 5d21db12）。
+#[test]
+fn esc_during_tool_ends_the_card_from_transcript() {
+    let mut m = merger();
+    m.handle(pre("t1", "Bash", json!({"command": "sleep 60"}), 1000));
+    m.handle(line(1, tool_use("u1", "m1", "t1"), 1100));
+    let mut r = tool_result("u2", "t1");
+    r["message"]["content"][0]["is_error"] = json!(true);
+    r["toolUseResult"] = json!("User rejected tool use");
+    let a = m.handle(line(2, r, 14_000));
+    assert_eq!(types(&a), ["tool.updated", "tool.result"]);
+    assert_eq!(a[0].payload["status"], "failed");
+    assert_eq!(a[0].payload["interrupted"], true);
+    assert_eq!(a[1].payload["ok"], false);
+}
+
+/// 一般情況 hook 先給結束狀態，transcript 的 tool_result 不再送一次。
+#[test]
+fn transcript_result_after_hook_does_not_resend_status() {
+    let mut m = merger();
+    m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
+    m.handle(line(1, tool_use("u1", "m1", "t1"), 1100));
+    m.handle(post("t1", 1150));
+    let a = m.handle(line(2, tool_result("u2", "t1"), 1200));
+    assert!(a.is_empty(), "{a:?}");
 }
 
 #[test]
@@ -342,6 +374,134 @@ fn subagent_lines_carry_agent_id() {
         ts_seen: 1001,
     });
     assert_eq!(b[0].agent, "a123");
+}
+
+fn agent_hook(event: &str, agent_id: &str, agent_type: Option<&str>, extra: Value) -> Input {
+    let mut v = json!({ "session_id": S, "hook_event_name": event, "agent_id": agent_id });
+    if let Some(t) = agent_type {
+        v["agent_type"] = json!(t);
+    }
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    Input::Hook {
+        hook: hook(v),
+        ts_seen: 0,
+    }
+}
+
+fn at(input: Input, ts: u64) -> Input {
+    match input {
+        Input::Hook { hook, .. } => Input::Hook { hook, ts_seen: ts },
+        other => other,
+    }
+}
+
+fn bg_pre(id: &str, command: &str) -> Value {
+    json!({ "tool_name": "Bash", "tool_input": { "command": command }, "tool_use_id": id })
+}
+
+/// 「下一步建議」的背景 agent（樣本 64c1a1a7）：PreToolUse 沒有 agent_type、也沒有 SubagentStart，
+/// 工具實際上不會執行（PostToolBatch 回 "No tools needed for suggestion"）。
+#[test]
+fn suggestion_agent_tool_never_becomes_a_card() {
+    let mut m = Merger::new(Box::new(RmRf));
+    let a = m.handle(at(
+        agent_hook("PreToolUse", "bg1", None, bg_pre("t1", "rm -rf x")),
+        1000,
+    ));
+    assert!(a.is_empty(), "不建卡片、不判危險：{a:?}");
+    assert!(m.tick(1000 + FALLBACK_AFTER_MS).is_empty(), "不降級進串流");
+    let batch = json!({ "tool_calls": [{ "tool_use_id": "t1", "tool_name": "Bash",
+                                         "tool_response": "No tools needed for suggestion" }] });
+    assert!(
+        m.handle(at(agent_hook("PostToolBatch", "bg1", None, batch), 1300))
+            .is_empty()
+    );
+    let stop = m.handle(at(
+        agent_hook("SubagentStop", "bg1", Some(""), json!({})),
+        2000,
+    ));
+    assert_eq!(types(&stop), ["agent.finished"]);
+    assert_eq!(stop[0].agent, "bg");
+    assert!(m.tick(1000 + 10 * FALLBACK_AFTER_MS).is_empty());
+}
+
+/// 萬一背景 agent 的工具真的執行了（收到 PostToolUse），才補建卡片、判危險，直接放進串流末端。
+#[test]
+fn background_tool_that_really_ran_is_shown_late() {
+    let mut m = Merger::new(Box::new(RmRf));
+    assert!(
+        m.handle(at(
+            agent_hook("PreToolUse", "bg1", None, bg_pre("t1", "rm -rf x")),
+            1000
+        ))
+        .is_empty()
+    );
+    let post = json!({ "tool_name": "Bash", "tool_use_id": "t1", "duration_ms": 5,
+                       "tool_response": { "stdout": "", "stderr": "", "interrupted": false } });
+    let a = m.handle(at(agent_hook("PostToolUse", "bg1", None, post), 1200));
+    assert_eq!(
+        types(&a)[..4],
+        [
+            "tool.called",
+            "attention.raised",
+            "tool.placed",
+            "tool.updated"
+        ],
+        "{a:?}"
+    );
+    assert_eq!(a[0].agent, "bg");
+    assert_eq!(a[0].ts_exec, Some(1000));
+    assert_eq!(a[2].payload["placement"], "fallback");
+    assert!(m.tick(1000 + FALLBACK_AFTER_MS).is_empty(), "只放一次");
+
+    // 失敗也算執行過
+    m.handle(at(
+        agent_hook("PreToolUse", "bg1", None, bg_pre("t2", "ls")),
+        2000,
+    ));
+    let fail = json!({ "tool_name": "Bash", "tool_use_id": "t2", "error": "Exit code 1" });
+    let b = m.handle(at(
+        agent_hook("PostToolUseFailure", "bg1", None, fail),
+        2100,
+    ));
+    assert_eq!(
+        types(&b)[..3],
+        ["tool.called", "tool.placed", "tool.updated"]
+    );
+}
+
+/// 沒等到執行結果的背景工具 60 秒後丟掉；之後才到的 PostToolUse 也不補半張卡片。
+#[test]
+fn held_background_tool_is_forgotten_after_a_minute() {
+    let mut m = merger();
+    m.handle(at(
+        agent_hook("PreToolUse", "bg1", None, bg_pre("t1", "ls")),
+        1000,
+    ));
+    assert!(m.tick(1000 + 60_000).is_empty());
+    let post = json!({ "tool_name": "Bash", "tool_use_id": "t1",
+                       "tool_response": { "stdout": "", "stderr": "", "interrupted": false } });
+    let a = m.handle(at(agent_hook("PostToolUse", "bg1", None, post), 62_000));
+    assert!(a.is_empty(), "{a:?}");
+}
+
+/// 有 SubagentStart 的 agent 是真的 subagent：就算之後的工具事件沒有 agent_type 也照常建卡片。
+#[test]
+fn started_subagent_without_agent_type_still_gets_cards() {
+    let mut m = merger();
+    m.handle(at(
+        agent_hook("SubagentStart", "a1", Some("Explore"), json!({})),
+        900,
+    ));
+    let a = m.handle(at(
+        agent_hook("PreToolUse", "a1", None, bg_pre("t1", "ls")),
+        1000,
+    ));
+    assert_eq!(types(&a), ["tool.called"]);
+    assert_eq!(a[0].agent, "a1");
+    assert_eq!(a[0].payload["placement"], "staged");
 }
 
 #[test]
@@ -524,6 +684,31 @@ fn samples_replay_never_inserts_and_keeps_thinking_before_action() {
             count("tool.placed"),
         );
 
+        // 實測資料不該觸發降級
+        assert!(
+            !r.events
+                .iter()
+                .any(|e| e.payload["placement"] == "fallback"),
+            "{name}: 不該有降級卡片"
+        );
+
+        // 有結果的卡片一定有結束狀態（按 Esc 中斷時沒有任何 hook，只有 transcript 的 tool_result）
+        let mut last_status: HashMap<String, String> = HashMap::new();
+        for e in r.events.iter().filter(|e| e.type_name() == "tool.updated") {
+            last_status.insert(
+                e.payload["toolUseId"].as_str().unwrap().to_string(),
+                e.payload["status"].as_str().unwrap().to_string(),
+            );
+        }
+        for e in r.events.iter().filter(|e| e.type_name() == "tool.result") {
+            let id = e.payload["toolUseId"].as_str().unwrap();
+            let st = last_status.get(id).map(String::as_str);
+            assert!(
+                matches!(st, Some("done" | "failed")),
+                "{name}: {id} 有 tool.result 但狀態停在 {st:?}"
+            );
+        }
+
         // 串流位置只增不減（沒有往前插入）
         let positions: Vec<u64> = r.events.iter().filter_map(|e| e.pos()).collect();
         assert!(
@@ -551,13 +736,6 @@ fn samples_replay_never_inserts_and_keeps_thinking_before_action() {
                 }
             }
         }
-        // 實測資料不該觸發降級
-        assert!(
-            !r.events
-                .iter()
-                .any(|e| e.payload["placement"] == "fallback"),
-            "{name}: 不該有降級卡片"
-        );
     }
     let dirs = sample_sessions();
     if dirs.is_empty() {

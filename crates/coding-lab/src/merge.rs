@@ -21,10 +21,14 @@ use crate::prices::Prices;
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
+/// 背景 agent 的 PreToolUse 等執行結果的上限，過了就丟掉。
+pub const BG_HOLD_MS: u64 = 60_000;
 /// 工具輸出存前截斷的上限（contracts.md §4）。
 pub const OUTPUT_LIMIT: usize = 8 * 1024;
 const PROMPT_LIMIT: usize = 2 * 1024;
 const MESSAGE_LIMIT: usize = 500;
+/// transcript 的 `toolUseResult`：使用者按 Esc 中斷或拒絕（實測，樣本 a41c94d2、5d21db12）。
+const USER_REJECTED: &str = "User rejected tool use";
 
 /// 危險指令判斷（規則引擎在 #634）。
 pub trait DangerRules: Send {
@@ -62,6 +66,8 @@ struct Card {
     /// 還在暫存區時是 PreToolUse 的到達時間；進串流後為 None。
     staged_at: Option<u64>,
     result_sent: bool,
+    /// 已送出結束狀態（done／failed）的 tool.updated
+    finished: bool,
 }
 
 #[derive(Default)]
@@ -78,6 +84,16 @@ struct Session {
     last_model: HashMap<String, String>,
     seen_messages: HashSet<String>,
     pending_agents: Vec<PendingAgent>,
+    /// 有 SubagentStart 的 agent_id（真的 subagent）
+    started_agents: HashSet<String>,
+    /// 背景 agent 的 PreToolUse：工具通常不會執行，等到 PostToolUse／Failure 才建卡片
+    held_bg: HashMap<String, HeldTool>,
+}
+
+struct HeldTool {
+    hook: HookInput,
+    agent_id: String,
+    ts_seen: u64,
 }
 
 /// 已呼叫 Agent／Task 工具、還沒對到 SubagentStart 的 subagent。
@@ -184,6 +200,9 @@ impl Merger {
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         let mut out = Vec::new();
         for sid in sessions {
+            if let Some(s) = self.sessions.get_mut(&sid) {
+                s.held_bg.retain(|_, h| h.ts_seen + BG_HOLD_MS > now);
+            }
             out.extend(self.fall_back(&sid, |staged_at| staged_at + FALLBACK_AFTER_MS <= now, now));
         }
         out
@@ -278,7 +297,15 @@ impl Merger {
         if let Some(cwd) = h.str_field("cwd").filter(|c| !c.is_empty()) {
             self.sessions.entry(sid.clone()).or_default().cwd = Some(cwd.to_string());
         }
-        let agent = agent_of_hook(h);
+        let agent = self.agent_of_hook(&sid, h);
+        let mut out = Vec::new();
+        if agent == "bg" {
+            let (prefix, done) = self.on_background_tool(h, &sid, ts_seen);
+            if done {
+                return prefix;
+            }
+            out = prefix;
+        }
         let raw = Some(h.raw().clone());
         let meta = || Meta {
             agent: agent.clone(),
@@ -287,7 +314,6 @@ impl Merger {
             ..Meta::default()
         };
         let s = |k: &str| h.str_field(k).map(str::to_string);
-        let mut out = Vec::new();
         match h.event_name() {
             "SessionStart" => {
                 let p = SessionStarted {
@@ -319,6 +345,7 @@ impl Merger {
                     interrupted: None,
                     danger: None,
                 };
+                self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let output = response_text(h.field("tool_response"));
                 out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
@@ -337,6 +364,7 @@ impl Merger {
                     interrupted: h.field("is_interrupt").and_then(Value::as_bool),
                     danger: None,
                 };
+                self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let code = exit_code(&error);
                 out.extend(self.result_once(&sid, &id, false, code, &error, &agent, ts_seen));
@@ -346,6 +374,7 @@ impl Merger {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
                     return out;
                 };
+                self.mark_finished(&sid, &id, &agent);
                 let p = ToolUpdated {
                     tool_use_id: id,
                     status: ToolStatus::Failed,
@@ -396,6 +425,11 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
+                self.sessions
+                    .entry(sid.clone())
+                    .or_default()
+                    .started_agents
+                    .insert(agent_id.clone());
                 let agent_type = s("agent_type").filter(|t| !t.is_empty());
                 // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫
                 let pending = self.sessions.get_mut(&sid).and_then(|ss| {
@@ -423,6 +457,9 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
+                if let Some(ss) = self.sessions.get_mut(&sid) {
+                    ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+                }
                 let p = AgentFinished {
                     agent_id,
                     last_message: s("last_assistant_message")
@@ -435,6 +472,87 @@ impl Merger {
             _ => {}
         }
         out
+    }
+
+    /// 背景 agent（agent_type 沒有值、也沒有 SubagentStart）的工具事件。實測是「下一步建議」：
+    /// 只送 PreToolUse 與 PostToolBatch，工具不會執行、也不寫 transcript。所以 PreToolUse 先靜默記住，
+    /// 不建卡片、不判危險；真的收到 PostToolUse／Failure 才補建卡片並直接放進串流末端。
+    /// 回傳（要先送出的事件, 是否已處理完）；沒處理完就接著照一般流程處理這個 hook。
+    fn on_background_tool(&mut self, h: &HookInput, sid: &str, ts_seen: u64) -> (Vec<Event>, bool) {
+        let s = self.sessions.entry(sid.to_string()).or_default();
+        let id = h.tool_use_id().map(str::to_string);
+        let known = id.as_ref().is_some_and(|i| s.cards.contains_key(i));
+        match h.event_name() {
+            "PreToolUse" if !known => {
+                let Some(id) = id else {
+                    return (Vec::new(), true);
+                };
+                let agent_id = h.str_field("agent_id").unwrap_or_default().to_string();
+                s.held_bg.insert(
+                    id,
+                    HeldTool {
+                        hook: h.clone(),
+                        agent_id,
+                        ts_seen,
+                    },
+                );
+                (Vec::new(), true)
+            }
+            "PostToolUse" | "PostToolUseFailure" if !known => {
+                let held = id.and_then(|i| s.held_bg.remove(&i));
+                let Some(held) = held else {
+                    return (Vec::new(), true); // 已丟掉或從沒看過：不補半張卡片
+                };
+                let mut out = self.on_pre_tool_use(&held.hook, sid, "bg".into(), held.ts_seen);
+                let tool_id = held.hook.tool_use_id().unwrap_or_default().to_string();
+                let staged = self
+                    .sessions
+                    .get(sid)
+                    .and_then(|s| s.cards.get(&tool_id))
+                    .is_some_and(|c| c.staged_at.is_some());
+                if staged {
+                    out.push(self.place(sid, &tool_id, Placement::Fallback, None, None, ts_seen));
+                }
+                (out, false)
+            }
+            "PermissionDenied" if !known => {
+                if let Some(i) = id {
+                    s.held_bg.remove(&i);
+                }
+                (Vec::new(), true)
+            }
+            "PostToolBatch" => {
+                for c in h
+                    .field("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(i) = c["tool_use_id"].as_str() {
+                        s.held_bg.remove(i);
+                    }
+                }
+                (Vec::new(), true)
+            }
+            _ => (Vec::new(), false),
+        }
+    }
+
+    /// 背景 agent 記成 `"bg"`、不開 lane（contracts.md §2）：`agent_type` 是空字串，或沒有
+    /// `agent_type` 且這個 agent 沒有 SubagentStart（「下一步建議」的 PreToolUse 就沒有這個欄位）。
+    fn agent_of_hook(&self, sid: &str, h: &HookInput) -> String {
+        let Some(id) = h.str_field("agent_id").filter(|a| !a.is_empty()) else {
+            return "main".into();
+        };
+        let started = self
+            .sessions
+            .get(sid)
+            .is_some_and(|s| s.started_agents.contains(id));
+        match h.str_field("agent_type") {
+            Some("") => "bg".into(),
+            None if !started && h.event_name() != "SubagentStart" => "bg".into(),
+            _ => id.to_string(),
+        }
     }
 
     fn on_pre_tool_use(
@@ -480,6 +598,7 @@ impl Merger {
                     agent: agent.clone(),
                     staged_at: Some(ts_seen),
                     result_sent: false,
+                    finished: false,
                 },
             );
             let p = ToolCalled {
@@ -632,6 +751,18 @@ impl Merger {
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
+    /// 記下卡片已有結束狀態；回傳這次是不是第一次。
+    fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
+        let s = self.sessions.entry(sid.to_string()).or_default();
+        let card = s.cards.entry(id.to_string()).or_insert(Card {
+            agent: agent.to_string(),
+            staged_at: None,
+            result_sent: false,
+            finished: false,
+        });
+        !std::mem::replace(&mut card.finished, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn result_once(
         &mut self,
@@ -648,6 +779,7 @@ impl Merger {
             agent: agent.to_string(),
             staged_at: None,
             result_sent: false,
+            finished: false,
         });
         if card.result_sent {
             return None;
@@ -795,6 +927,7 @@ impl Merger {
                                 agent: agent.clone(),
                                 staged_at: None,
                                 result_sent: false,
+                                finished: false,
                             },
                         );
                         let p = ToolCalled {
@@ -815,22 +948,45 @@ impl Merger {
                 };
                 let ok = !block["is_error"].as_bool().unwrap_or(false);
                 let output = content_text(&block["content"]);
-                self.result_once(sid, id, ok, None, &output, &agent, ts_seen)
-                    .into_iter()
-                    .collect()
+                let mut evs = Vec::new();
+                // 執行中按 Esc（或在權限詢問按 Esc）沒有任何 hook，tool_result 是唯一的結束訊號
+                if self.mark_finished(sid, id, &agent) {
+                    let rejected = v["toolUseResult"].as_str() == Some(USER_REJECTED);
+                    let error = (!ok).then(|| {
+                        let why = v["toolUseResult"].as_str().unwrap_or(&output);
+                        truncate(why, MESSAGE_LIMIT).0
+                    });
+                    let p = ToolUpdated {
+                        tool_use_id: id.to_string(),
+                        status: if ok {
+                            ToolStatus::Done
+                        } else {
+                            ToolStatus::Failed
+                        },
+                        duration_ms: None,
+                        error,
+                        interrupted: rejected.then_some(true),
+                        danger: None,
+                    };
+                    let agent = self
+                        .sessions
+                        .get(sid)
+                        .and_then(|s| s.cards.get(id))
+                        .map_or(agent.clone(), |c| c.agent.clone());
+                    let m = Meta {
+                        agent,
+                        ts_seen,
+                        ..Meta::default()
+                    };
+                    evs.push(self.emit(sid, Payload::ToolUpdated(p), m));
+                }
+                evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
+                evs
             }
             _ => Vec::new(),
         };
         out.extend(main);
         out
-    }
-}
-
-fn agent_of_hook(h: &HookInput) -> String {
-    match (h.str_field("agent_id"), h.str_field("agent_type")) {
-        (Some(_), Some("")) => "bg".into(), // 背景 subagent 不開 lane（contracts.md §2）
-        (Some(id), _) if !id.is_empty() => id.to_string(),
-        _ => "main".into(),
     }
 }
 
