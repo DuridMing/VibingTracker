@@ -48,6 +48,7 @@ def main():
     probes = Counter()
     wait_lag = []
     wait_clear = []
+    decision = []
 
     for s in sessions:
         hooks = load(s / "hooks.jsonl")
@@ -82,6 +83,25 @@ def main():
                      and x["payload"].get("tool_input") == p.get("tool_input") and x["ts_seen_ms"] <= r["ts_seen_ms"]]
             if match:
                 wait_lag.append(r["ts_seen_ms"] - match[-1]["ts_seen_ms"])
+
+        # ── 放行前的決策耗時：(Post − Pre) − duration_ms，扣掉工具本身執行時間後剩下的就是權限判斷。
+        #    非自動模式只有 hook 來回（約 10–30 ms）；明顯更長代表跑了自動模式分類器或在等人。
+        #    PermissionDenied 沒有 duration_ms，記 Pre 到 Denied 的時間。
+        pre_rows_by_id = {r["payload"]["tool_use_id"]: r for r in pre_rows}
+        asked = {(r["payload"].get("tool_name"), json.dumps(r["payload"].get("tool_input"), sort_keys=True))
+                 for r in http if r["event"] == "PermissionRequest"}
+        for r in http:
+            if r["event"] not in WAIT_CLEAR_SAME_TOOL:
+                continue
+            p = r["payload"]
+            x = pre_rows_by_id.get(p.get("tool_use_id"))
+            if not x:
+                continue
+            xp = x["payload"]
+            gap = r["ts_seen_ms"] - x["ts_seen_ms"]
+            ms = gap - p["duration_ms"] if p.get("duration_ms") is not None else gap
+            was_asked = (xp.get("tool_name"), json.dumps(xp.get("tool_input"), sort_keys=True)) in asked
+            decision.append((xp.get("permission_mode"), r["event"], was_asked, ms, p.get("reason")))
 
         # ── 等你的解除：PermissionRequest 之後第一個能解除它的事件（P3 #645）
         for i, r in enumerate(http):
@@ -179,6 +199,15 @@ def main():
         groups.setdefault((mode or "-", tool, ev or "（找不到）"), []).append(ms)
     for (mode, tool, ev), xs in sorted(groups.items()):
         print(f"  {mode:12} {tool:16} → {ev:20} ms：{stats([x for x in xs if x is not None])}")
+    print("\n== 放行前的決策耗時（(Post − Pre) − duration_ms；有 PermissionRequest＝問了人）")
+    dgroups = {}
+    for mode, ev, was_asked, ms, _ in decision:
+        dgroups.setdefault((mode or "-", ev, "問了人" if was_asked else "沒問人"), []).append(ms)
+    for (mode, ev, a), xs in sorted(dgroups.items()):
+        print(f"  {mode:12} {ev:20} {a:4} ms：{stats(xs)}")
+    for mode, ev, was_asked, ms, reason in decision:
+        if ev == "PermissionDenied":
+            print(f"  駁回：{mode} {ms} ms {'問了人' if was_asked else '沒問人'} reason={reason!r}")
     check("每個 PermissionRequest 都找得到解除事件", all(ev for _, _, ev, _ in wait_clear))
 
     print("\n== Edit 讀檔（#626 未決 3）")
