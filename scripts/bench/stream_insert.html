@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>串流插入量測</title>
+<style>
+  body { margin: 0; font: 13px/1.45 system-ui, sans-serif; }
+  #box { height: 800px; width: 1100px; overflow-y: auto; position: relative; }
+  .row { display: flex; gap: 8px; padding: 4px 10px; border-bottom: 1px solid #eee; }
+  .row .sid { width: 64px; flex: none; color: #fff; background: #4a7; border-radius: 3px; text-align: center; }
+  .row .agent { width: 80px; flex: none; color: #666; }
+  .row .body { flex: 1; min-width: 0; }
+  .row pre { margin: 2px 0 0; padding: 4px; background: #f6f6f6; white-space: pre-wrap; font: 12px ui-monospace, monospace; }
+  .cv .row { content-visibility: auto; contain-intrinsic-size: auto 48px; }
+</style>
+</head>
+<body>
+<div id="box"></div>
+<script>
+// 一行的樣子貼近合流串流：session 標籤、agent、文字或工具卡片（約三分之一有 3–8 行輸出）
+const KEEP = 3000, PER_FRAME = 20, FRAMES = 150;
+let seq = 0;
+function rowHtml() {
+  const n = seq++;
+  const s = 'abcdefghijklmnop'[n % 16];
+  const tool = n % 3 === 0;
+  const out = tool ? '<pre>' + Array.from({ length: 3 + (n % 6) }, (_, i) => `line ${i} of output for call ${n}`).join('\n') + '</pre>' : '';
+  return `<div class="sid">s-${s}</div><div class="agent">${n % 5 ? 'main' : 'Explore'}</div>` +
+    `<div class="body">${tool ? 'Bash <b>cargo test -p coding-lab</b>' : '我先讀一下 merge.rs，看暫存區怎麼處理第 ' + n + ' 張卡片。'}${out}</div>`;
+}
+function makeRow() {
+  const d = document.createElement('div');
+  d.className = 'row';
+  d.innerHTML = rowHtml();
+  return d;
+}
+
+// A／B：真的 DOM，3000 行；每幀 append 20 行、刪掉最舊的 20 行，貼底捲動
+function domVariant(box) {
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < KEEP; i++) frag.append(makeRow());
+  box.append(frag);
+  box.scrollTop = box.scrollHeight;
+  return () => {
+    const f = document.createDocumentFragment();
+    for (let i = 0; i < PER_FRAME; i++) f.append(makeRow());
+    box.append(f);
+    for (let i = 0; i < PER_FRAME; i++) box.firstElementChild.remove();
+    box.scrollTop = box.scrollHeight;
+  };
+}
+
+// C：虛擬列表，資料 3000 筆，只渲染畫面內約 40 行（固定行高估計）
+function virtualVariant(box) {
+  const ROW_H = 48, data = [];
+  for (let i = 0; i < KEEP; i++) data.push(rowHtml());
+  const spacer = document.createElement('div');
+  const win = document.createElement('div');
+  win.style.position = 'absolute'; win.style.left = '0'; win.style.right = '0';
+  box.append(spacer, win);
+  const render = () => {
+    spacer.style.height = data.length * ROW_H + 'px';
+    box.scrollTop = box.scrollHeight;
+    const first = Math.max(0, Math.floor(box.scrollTop / ROW_H) - 5);
+    const last = Math.min(data.length, first + Math.ceil(800 / ROW_H) + 10);
+    win.style.top = first * ROW_H + 'px';
+    win.innerHTML = data.slice(first, last).map(h => `<div class="row">${h}</div>`).join('');
+  };
+  render();
+  return () => {
+    for (let i = 0; i < PER_FRAME; i++) data.push(rowHtml());
+    data.splice(0, PER_FRAME);
+    render();
+  };
+}
+
+function measure(name, setup) {
+  return new Promise(resolve => {
+    const box = document.getElementById('box');
+    box.className = name === 'content-visibility' ? 'cv' : '';
+    box.replaceChildren();
+    const step = setup(box);
+    box.offsetHeight;  // 起始版面先算完
+    const scripts = [], frames = [];
+    let last = performance.now(), i = 0;
+    const tick = () => {
+      const t = performance.now();
+      if (i > 0) frames.push(t - last);  // 上一幀從開始到這一幀開始（含版面與繪製）
+      last = t;
+      if (i++ >= FRAMES) return resolve({ name, scripts, frames });
+      const s = performance.now();
+      step();
+      box.offsetHeight;  // 強制同步版面，把版面計算算進插入耗時
+      scripts.push(performance.now() - s);
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+(async () => {
+  const results = [];
+  for (const [name, setup] of [['dom', domVariant], ['content-visibility', domVariant], ['virtual', virtualVariant]]) {
+    results.push(await measure(name, setup));
+  }
+  await fetch('/result', { method: 'POST', body: JSON.stringify({ ua: navigator.userAgent, results }) });
+  document.title = 'done';
+})();
+</script>
+</body>
+</html>
