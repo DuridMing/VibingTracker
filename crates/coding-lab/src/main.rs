@@ -82,7 +82,8 @@ fn main() -> ExitCode {
             }
         },
         Command::Healthz => healthz(),
-        Command::Prune | Command::Service => {
+        Command::Prune => prune(),
+        Command::Service => {
             eprintln!("coding-lab：此子命令尚未實作");
             ExitCode::FAILURE
         }
@@ -233,12 +234,47 @@ fn append_log(msg: &str) {
         .map(|c| c.home)
         .unwrap_or_else(|_| coding_lab::config::default_home());
     let _ = std::fs::create_dir_all(&home);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home.join("collector.log"))
-    {
-        let _ = writeln!(f, "[{}] coding-lab：{msg}", coding_lab::now_ms());
+    coding_lab::logging::append(&home.join("collector.log"), msg);
+}
+
+/// 清掉超過保留期限的 session。collector 在跑時不動（它啟動時與每天會自己清），避免兩個程序同時寫 store。
+fn prune() -> ExitCode {
+    let cfg = match Config::load(&Overrides::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let days = coding_lab::store::RETENTION_DAYS;
+    let _lock = match serve::try_lock_store(&cfg.home) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!(
+                "coding-lab：collector 正在執行，它啟動時與每天會自動清掉 {days} 天前的資料；要立刻清請先結束 collector"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let before = coding_lab::now_ms().saturating_sub(days * 24 * 60 * 60 * 1000);
+    let result = coding_lab::store::Store::open(&cfg.home).and_then(|mut s| s.prune(before));
+    match result {
+        Ok(r) => {
+            println!(
+                "清掉 {} 個超過 {days} 天的 session（{} KB）",
+                r.sessions.len(),
+                r.bytes / 1024
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

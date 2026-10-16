@@ -800,3 +800,132 @@ fn status_after_end_clears_the_end() {
         (None, None, "run")
     );
 }
+
+fn rows_of(h: &std::path::Path, session: &str) -> Vec<(String, i64)> {
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    ["sessions", "events", "file_touch", "changes", "attention"]
+        .iter()
+        .map(|t| {
+            let col = if *t == "sessions" { "id" } else { "session" };
+            let n: i64 = db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {t} WHERE {col} = ?1"),
+                    [session],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (t.to_string(), n)
+        })
+        .collect()
+}
+
+/// #655：最後活動早於界線的 session 整個清掉（JSONL 與所有索引列），剛好在界線上的留著；重開不會被 recover 補回來。
+#[test]
+fn prune_removes_sessions_whose_last_activity_is_before_the_cutoff() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("old", 1, "/p"));
+        s.append(ev(
+            "old",
+            2,
+            "assistant.text",
+            Some(1),
+            5000,
+            json!({"text": "a", "messageId": "m"}),
+        ));
+        s.append(started("edge", 1, "/p"));
+        s.append(ev(
+            "edge",
+            2,
+            "assistant.text",
+            Some(1),
+            5001,
+            json!({"text": "b", "messageId": "m"}),
+        ));
+        s.flush().unwrap();
+    }
+    {
+        // 其他表也放一列，確認一起清掉
+        let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+        for sid in ["old", "edge"] {
+            db.execute(
+                "INSERT INTO file_touch VALUES ('/p', 'a.rs', ?1, 'edit', 1, 5000)",
+                [sid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO changes VALUES (?1, 99, 't', '/p', 'a.rs', 'edit', 'main', 5000, 1, 0)",
+                [sid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO attention VALUES (?1, 'danger', 't', NULL, 5000, NULL, NULL)",
+                [sid],
+            )
+            .unwrap();
+        }
+    }
+    let mut s = Store::open(&h).unwrap();
+    let report = s.prune(5001).unwrap();
+    assert_eq!(
+        report.sessions,
+        ["old"],
+        "5000 早於 5001，5001 剛好在界線上不清"
+    );
+    assert!(report.bytes > 0);
+    assert!(!h.join("events/old.jsonl").exists());
+    assert!(h.join("events/edge.jsonl").exists());
+    assert!(
+        rows_of(&h, "old").iter().all(|(_, n)| *n == 0),
+        "{:?}",
+        rows_of(&h, "old")
+    );
+    assert!(
+        rows_of(&h, "edge").iter().all(|(_, n)| *n == 1 || *n == 2),
+        "{:?}",
+        rows_of(&h, "edge")
+    );
+    // 留下來的 session 照常寫入
+    s.append(text("edge", 3, 2));
+    s.flush().unwrap();
+    drop(s);
+
+    let s = Store::open(&h).unwrap();
+    assert!(s.session("old").unwrap().is_none(), "重開不會被補回來");
+    assert_eq!(s.session("edge").unwrap().unwrap().last_seq, 3);
+}
+
+/// 驗收：舊版（v1）資料目錄升級後照常查詢：session 列、事件、注意佇列都在。
+#[test]
+fn old_data_directory_is_queryable_after_upgrade() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.append(text("s1", 2, 1));
+        s.append(ev(
+            "s1",
+            3,
+            "attention.raised",
+            None,
+            1003,
+            json!({"kind": "danger", "ref": "t1", "reason": "rm -rf"}),
+        ));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX attention_open;
+         CREATE INDEX attention_open ON attention (raised_at) WHERE cleared_at IS NULL AND acked_at IS NULL;
+         UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(s.sessions(Some("/p"), 10).unwrap().len(), 1);
+    assert_eq!(s.events_by_seq("s1", 1, 3).unwrap().len(), 3);
+    assert_eq!(s.open_attention().unwrap().len(), 1);
+}

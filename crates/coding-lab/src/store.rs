@@ -15,6 +15,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use crate::event::{Event, Payload};
 
 pub const SCHEMA_VERSION: u32 = 2;
+/// 資料保留多久：最後活動早於這麼多天前的 session 由 [`Store::prune`] 清掉
+pub const RETENTION_DAYS: u64 = 30;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -70,6 +72,14 @@ pub struct SessionRow {
     pub cost_usd: f64,
     pub thinking_tokens: u64,
     pub last_seq: u64,
+}
+
+/// [`Store::prune`] 清掉了什麼。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    pub sessions: Vec<String>,
+    /// 刪掉的 JSONL 大小
+    pub bytes: u64,
 }
 
 /// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
@@ -344,7 +354,7 @@ impl Store {
                 .open(&path)
                 .and_then(|f| f.set_len(b.base))
             {
-                eprintln!("coding-lab store：截回 {} 失敗：{t}", b.name);
+                crate::logging::log(&format!("store：截回 {} 失敗：{t}", b.name));
             }
             return Err(e);
         }
@@ -757,6 +767,53 @@ impl Store {
     }
 
     /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
+    /// 清掉最後活動早於 `before`（epoch ms）的 session：先刪索引列，再刪 JSONL（#655）。
+    /// 中途當掉時 JSONL 還在、索引沒了，下次開啟會被 recover 補回，再清一次即可。
+    pub fn prune(&mut self, before: u64) -> Result<PruneReport, StoreError> {
+        let old: Vec<String> = {
+            let mut stmt = self.db.prepare(
+                "SELECT s.id FROM sessions s
+                 LEFT JOIN (SELECT session, MAX(ts_seen) AS t FROM events GROUP BY session) e
+                   ON e.session = s.id
+                 WHERE MAX(COALESCE(e.t, 0), s.started_at, COALESCE(s.ended_at, 0), s.status_since) < ?1
+                 ORDER BY s.id",
+            )?;
+            stmt.query_map(params![before as i64], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut report = PruneReport::default();
+        if old.is_empty() {
+            return Ok(report);
+        }
+        let tx = self.db.transaction()?;
+        for sid in &old {
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
+            for table in ["events", "file_touch", "changes", "attention"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session = ?1"),
+                    params![sid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        for sid in old {
+            let name = file_name(&sid);
+            let path = self.events_dir.join(&name);
+            if let Ok(meta) = fs::metadata(&path) {
+                report.bytes += meta.len();
+            }
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+            self.file_len.remove(&name);
+            self.cwd_of.remove(&sid);
+            self.path_of_tool.retain(|(s, _), _| *s != sid);
+            report.sessions.push(sid);
+        }
+        Ok(report)
+    }
+
     pub fn recover_bytes(&self) -> u64 {
         self.recover_bytes
     }

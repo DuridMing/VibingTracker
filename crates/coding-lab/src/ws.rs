@@ -208,7 +208,7 @@ pub async fn serve_web(
         .with_state(state);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
-            eprintln!("coding-lab web：{e}");
+            crate::logging::log(&format!("web：{e}"));
         }
     });
     Ok((local, task))
@@ -411,7 +411,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             if let Some(store) = &state.store {
                 let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = store.ack(s, k, r, crate::now_ms()) {
-                    eprintln!("coding-lab web：ack 寫入失敗：{e}");
+                    crate::logging::log(&format!("web：ack 寫入失敗：{e}"));
                 }
             }
             state.live().ack(s, k, r);
@@ -426,7 +426,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 Some(store) => {
                     let store = store.lock().unwrap_or_else(|e| e.into_inner());
                     more_events(&store, &session, before, limit).unwrap_or_else(|e| {
-                        eprintln!("coding-lab web：載入更多失敗：{e}");
+                        crate::logging::log(&format!("web：載入更多失敗：{e}"));
                         Vec::new()
                     })
                 }

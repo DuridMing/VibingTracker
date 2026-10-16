@@ -250,11 +250,11 @@ async fn run(
     let mut reader = match opened {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            eprintln!("coding-lab transcript：開不了 {}：{e}", path.display());
+            crate::logging::log(&format!("transcript：開不了 {}：{e}", path.display()));
             return;
         }
         Err(e) => {
-            eprintln!("coding-lab transcript：開 {} 失敗：{e}", path.display());
+            crate::logging::log(&format!("transcript：開 {} 失敗：{e}", path.display()));
             return;
         }
     };
@@ -316,7 +316,7 @@ impl Sender {
         let poll = match poll {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("coding-lab transcript：讀取失敗 {}：{e}", self.file);
+                crate::logging::log(&format!("transcript：讀取失敗 {}：{e}", self.file));
                 return;
             }
         };

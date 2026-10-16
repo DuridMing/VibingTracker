@@ -41,7 +41,7 @@ fn error(code: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 fn store_error(e: impl std::fmt::Display) -> Response {
-    eprintln!("coding-lab web：API 讀取 store 失敗：{e}");
+    crate::logging::log(&format!("web：API 讀取 store 失敗：{e}"));
     error(StatusCode::INTERNAL_SERVER_ERROR, "讀取資料失敗")
 }
 

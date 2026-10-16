@@ -89,7 +89,7 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
             .with_graceful_shutdown(stop)
             .await
         {
-            eprintln!("coding-lab hooks：{e}");
+            crate::logging::log(&format!("hooks：{e}"));
         }
     });
     Ok(HookServer {
@@ -141,17 +141,17 @@ async fn handle(
                 {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("coding-lab hooks：讀檔探針失敗：{e}");
+                        crate::logging::log(&format!("hooks：讀檔探針失敗：{e}"));
                         return StatusCode::OK;
                     }
                 };
             }
             if state.tx.try_send(Input::Hook { hook, ts_seen }).is_err() {
                 let n = state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-                eprintln!("coding-lab hooks：merge 忙碌，丟棄 hook（累計 {n}）");
+                crate::logging::log(&format!("hooks：merge 忙碌，丟棄 hook（累計 {n}）"));
             }
         }
-        Err(e) => eprintln!("coding-lab hooks：忽略無法解析的 hook：{e}"),
+        Err(e) => crate::logging::log(&format!("hooks：忽略無法解析的 hook：{e}")),
     }
     StatusCode::OK
 }

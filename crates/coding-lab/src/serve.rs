@@ -42,6 +42,9 @@ const AGENT_META_EVERY: Duration = Duration::from_millis(25);
 const AGENT_META_TRIES: u32 = 40;
 /// 等上一個 collector 放掉 store 鎖最多多久（它只剩停 tail 與 flush）
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
+pub const STORE_LOCK: &str = "collector.lock";
+/// 多久清一次超過保留期限的 session（啟動時先清一次）
+const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub enum Outcome {
     Stopped,
@@ -74,11 +77,17 @@ pub fn open_sessions(events: &[Event]) -> HashSet<String> {
 }
 
 pub fn log(msg: &str) {
-    eprintln!("[{}] coding-lab：{msg}", crate::now_ms());
+    crate::logging::log(msg);
 }
 
 pub async fn run(cfg: Config) -> io::Result<Outcome> {
     std::fs::create_dir_all(&cfg.home)?;
+    // 背景執行（ensure 拉起）時自己寫 collector.log 並輪替；前景跑時照舊印到終端機
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && let Err(e) = crate::logging::to_file(&cfg.home.join("collector.log"))
+    {
+        log(&format!("開不了 collector.log：{e}"));
+    }
     let (tx, mut rx) = mpsc::channel::<Input>(INPUT_QUEUE);
     let hooks = match serve_hooks(cfg.hook_bind, tx.clone()).await {
         Ok(h) => h,
@@ -177,6 +186,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut tick = tokio::time::interval(TICK);
     let mut flush = tokio::time::interval(STORE_FLUSH);
     let mut rescore = tokio::time::interval(SCORE_EVERY);
+    let mut prune = tokio::time::interval(PRUNE_EVERY);
     let mut rebase = tokio::time::interval(COST_BASELINE_EVERY);
     rebase.tick().await; // 第一次立即觸發，啟動時已經算過
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
@@ -256,6 +266,19 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 let now = crate::now_ms();
                 merger.set_cost_baseline(crate::status::cost_baseline(&cost_usage(&store, now), now));
             }
+            _ = prune.tick() => {
+                let before = crate::now_ms().saturating_sub(crate::store::RETENTION_DAYS * DAY_MS);
+                match store.lock().unwrap_or_else(|e| e.into_inner()).prune(before) {
+                    Ok(r) if !r.sessions.is_empty() => log(&format!(
+                        "清掉 {} 個超過 {} 天的 session（{} KB）",
+                        r.sessions.len(),
+                        crate::store::RETENTION_DAYS,
+                        r.bytes / 1024
+                    )),
+                    Ok(_) => {}
+                    Err(e) => log(&format!("清理舊資料失敗：{e}")),
+                }
+            }
             _ = rescore.tick() => {
                 // 只更新彙總列，不發 session.status（那是串流裡的狀態行，只在狀態改變時發）
                 web.set_scores(&merger.scores(crate::now_ms()));
@@ -291,32 +314,40 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     Ok(Outcome::Stopped)
 }
 
-/// 拿 `<home>/collector.lock` 的獨佔鎖；上一個 collector 還在結束時等它放掉。
-async fn lock_store(home: &Path) -> io::Result<std::fs::File> {
+/// 試拿 `<home>/collector.lock` 的獨佔鎖；別的程序拿著時回 `None`。`prune` 也用它避免和 collector 同時寫。
+pub fn try_lock_store(home: &Path) -> io::Result<Option<std::fs::File>> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(home.join("collector.lock"))?;
+        .open(home.join(STORE_LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// 拿 store 鎖；上一個 collector 還在結束時等它放掉。
+async fn lock_store(home: &Path) -> io::Result<std::fs::File> {
     let deadline = Instant::now() + STORE_LOCK_WAIT;
     let mut waited = false;
     loop {
-        match file.try_lock() {
-            Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+        match try_lock_store(home)? {
+            Some(file) => return Ok(file),
+            None if Instant::now() < deadline => {
                 if !waited {
                     log("上一個 collector 還在結束，等它寫完 store");
                     waited = true;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            Err(std::fs::TryLockError::WouldBlock) => {
+            None => {
                 return Err(io::Error::other(format!(
                     "store 被另一個程序鎖住超過 {} 秒",
                     STORE_LOCK_WAIT.as_secs()
                 )));
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }

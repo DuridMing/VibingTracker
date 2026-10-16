@@ -8,6 +8,7 @@ pub mod event;
 pub mod hook;
 pub mod hooks;
 pub mod live;
+pub mod logging;
 pub mod merge;
 pub mod prices;
 pub mod rules;

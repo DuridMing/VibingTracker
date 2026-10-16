@@ -529,23 +529,12 @@ fn prices_json_overrides_the_builtin_price() {
 fn broken_prices_json_warns_and_keeps_the_builtin_price() {
     let e = env(0);
     std::fs::write(e.home.join("prices.json"), "{ 壞掉").unwrap();
-    let mut child = cmd(&e, &["serve"]).stderr(Stdio::piped()).spawn().unwrap();
-    let pid = child.id();
-    wait_for("collector.json", || {
-        collector(&e).is_some_and(|c| c["pid"] == pid)
-    });
+    let _serve = start_serve(&e);
     let cost = cost_of_one_million_input(&e);
-    let _ = child.kill();
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    let _ = child.wait();
     assert_eq!(cost, 4.0, "照內建表");
-    assert!(err.contains("prices.json"), "log 要有警告：{err}");
+    // 背景執行時警告寫進 collector.log（#655）
+    let log = std::fs::read_to_string(e.home.join("collector.log")).unwrap_or_default();
+    assert!(log.contains("prices.json"), "log 要有警告：{log}");
 }
 
 // ── 重啟後的 sessions 列（#676）
@@ -788,4 +777,74 @@ fn ensure_retries_on_a_new_collector_when_the_old_one_is_exiting() {
     if let Some(c) = collector(&e) {
         kill_pid(c["pid"].as_u64().unwrap());
     }
+}
+
+fn old_event(session: &str, seq: u64, kind: &str, ts: u64) -> coding_lab::event::Event {
+    ev_with(
+        session,
+        seq,
+        kind,
+        None,
+        ts,
+        json!({"cwd": "/p", "source": "startup"}),
+    )
+}
+
+fn seed_old_and_recent(e: &Env) -> u64 {
+    let day = 24 * 60 * 60 * 1000;
+    let now = coding_lab::now_ms();
+    let mut s = coding_lab::store::Store::open(&e.home).unwrap();
+    s.append(old_event("old", 1, "session.started", now - 31 * day));
+    s.append(old_event("recent", 1, "session.started", now - day));
+    s.flush().unwrap();
+    now
+}
+
+/// #655：`coding-lab prune` 清掉 30 天前的 session，近期的留著。
+#[test]
+fn prune_command_removes_sessions_older_than_30_days() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let out = cmd(&e, &["prune"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!e.home.join("events/old.jsonl").exists());
+    assert!(e.home.join("events/recent.jsonl").exists());
+}
+
+/// #655：collector 在跑時 prune 不碰 store（兩個程序同時寫），說明 collector 自己會清。
+#[test]
+fn prune_command_refuses_while_the_collector_runs() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let _serve = start_serve(&e);
+    let out = cmd(&e, &["prune"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("collector"));
+}
+
+/// #655：collector 啟動時自己清一次 30 天前的資料。
+#[test]
+fn serve_prunes_old_sessions_on_start() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let _serve = start_serve(&e);
+    wait_for("啟動時清掉 old", || {
+        !e.home.join("events/old.jsonl").exists()
+    });
+    assert!(e.home.join("events/recent.jsonl").exists());
+}
+
+/// #655：背景執行（stderr 不是終端機）時 collector 自己寫 collector.log。
+#[test]
+fn detached_serve_writes_its_own_log() {
+    let e = env(0);
+    let _serve = start_serve(&e);
+    wait_for("collector.log 有啟動訊息", || {
+        std::fs::read_to_string(e.home.join("collector.log"))
+            .is_ok_and(|t| t.contains("hook 127.0.0.1"))
+    });
 }
