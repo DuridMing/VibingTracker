@@ -120,7 +120,16 @@ pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
     let live = state.live();
     let rows: Vec<Value> = stored
         .into_iter()
-        .map(|(r, v)| live.session_row(&r.id).unwrap_or(v))
+        .map(|(r, v)| match live.session_row(&r.id) {
+            // 重啟後 live 列還沒看到 assistant 行時，模型用 store 的（#673）
+            Some(mut row) => {
+                if row["model"].is_null() {
+                    row["model"] = v["model"].clone();
+                }
+                row
+            }
+            None => v,
+        })
         .collect();
     ok(&json!({ "sessions": rows }))
 }

@@ -694,3 +694,32 @@ async fn files_rejects_unknown_dirs_and_bad_bases() {
         "預設 main"
     );
 }
+
+/// #673：重啟後 live 列還沒看到 assistant 行，sessions.model 用 store 從 usage 補上的值。
+#[tokio::test]
+async fn sessions_api_takes_the_model_from_store_until_live_sees_it() {
+    let home = tmp("model");
+    let mut start_ev = started("s1", 1, 1_000, "/p");
+    start_ev.payload["model"] = Value::Null;
+    let usage = ev(
+        "s1",
+        2,
+        "usage",
+        None,
+        1_001,
+        json!({"messageId": "m", "model": "claude-opus-5-5", "input": 0, "output": 0, "thinking": 0,
+               "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": 0.0}),
+    );
+    let after_restart = prompt("s1", 3, 2_000, "重啟之後");
+    let store = store_with(&home, &[start_ev, usage, after_restart.clone()]);
+    let state = WebState::new(Some(store), None, 8);
+    state.apply(&[after_restart]); // 重啟後 live 只看到新的 hook
+    state.flush(3_000);
+    let addr = start(state.clone()).await;
+
+    let (code, body) = get(addr, "/api/sessions").await;
+    assert_eq!(code, 200, "{body}");
+    let row = &body["sessions"][0];
+    assert_eq!(row["lastPrompt"], "重啟之後", "用的是 live 列：{row}");
+    assert_eq!(row["model"], "opus 5.5", "{row}");
+}

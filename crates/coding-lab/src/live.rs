@@ -323,13 +323,21 @@ impl Live {
         if !ended {
             self.ensure_agent(&sid, "main", ts);
         }
+        // `<synthetic>` 這類 Claude Code 自己產生的訊息不算模型
         if MODEL_LINES.contains(&e.kind.as_str())
-            && let Some(m) = e.payload["model"].as_str()
-            && let Some(a) = self.agents.get_mut(&format!("{sid}/{}", e.agent))
+            && let Some(m) = e.payload["model"].as_str().filter(|m| !m.starts_with('<'))
         {
-            let m = Some(short_model(m));
-            if a.model != m {
-                a.model = m;
+            let m = short_model(m);
+            // VSCode 與 resume 的 SessionStart 不送 model：主模型取 main 第一行（#673）
+            if e.agent == "main"
+                && let Some(s) = self.sessions.get_mut(&sid)
+            {
+                s.model.get_or_insert_with(|| m.clone());
+            }
+            if let Some(a) = self.agents.get_mut(&format!("{sid}/{}", e.agent))
+                && a.model.as_ref() != Some(&m)
+            {
+                a.model = Some(m);
                 self.dirty_agents
                     .entry(format!("{sid}/{}", e.agent))
                     .or_insert(false);

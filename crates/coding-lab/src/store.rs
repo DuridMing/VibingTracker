@@ -789,9 +789,18 @@ fn index_event(
             )?;
         }
         Payload::Usage(p) => {
+            // SessionStart 沒送 model 時（VSCode、resume），主模型取 main 第一筆 usage（#673）
+            let model = (e.agent == "main").then_some(p.model.as_str());
             tx.execute(
-                "UPDATE sessions SET cost_usd = cost_usd + ?2, thinking_tokens = thinking_tokens + ?3 WHERE id = ?1",
-                params![sid, p.cost_usd, p.thinking as i64],
+                "UPDATE sessions SET cost_usd = cost_usd + ?2, thinking_tokens = thinking_tokens + ?3,
+                   model = COALESCE(model, ?4) WHERE id = ?1",
+                params![sid, p.cost_usd, p.thinking as i64, model],
+            )?;
+        }
+        Payload::ModelChanged(p) if e.agent == "main" => {
+            tx.execute(
+                "UPDATE sessions SET model = ?2 WHERE id = ?1",
+                params![sid, p.to],
             )?;
         }
         Payload::GitOp(p) if p.op == "commit" && p.ok => {
