@@ -1,0 +1,685 @@
+//! session.status 與注意佇列的狀態轉移（#645，docs/plan/PLAN.md「注意佇列」、contracts.md `attention.*`）。
+//!
+//! 全部透過 merge 的 `handle`／`tick` 驅動，時間由輸入帶入（假時鐘），不 sleep。
+
+use coding_lab::event::{AttentionKind, Danger, DangerLevel, Event};
+use coding_lab::hook::HookInput;
+use coding_lab::merge::{DangerRules, Input, Merger};
+use coding_lab::status::{ScoreConfig, Signal, score};
+use serde_json::{Value, json};
+
+const S: &str = "s1";
+
+fn hook(event: &str, extra: Value, ts: u64) -> Input {
+    let mut v = json!({ "session_id": S, "hook_event_name": event });
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    Input::Hook {
+        hook: HookInput::from_json(v.to_string().as_bytes()).unwrap(),
+        ts_seen: ts,
+    }
+}
+
+fn bash(cmd: &str) -> Value {
+    json!({ "command": cmd })
+}
+
+fn pre(id: &str, cmd: &str, ts: u64) -> Input {
+    hook(
+        "PreToolUse",
+        json!({ "tool_name": "Bash", "tool_input": bash(cmd), "tool_use_id": id }),
+        ts,
+    )
+}
+
+fn pre_agent(id: &str, cmd: &str, agent: &str, ts: u64) -> Input {
+    hook(
+        "PreToolUse",
+        json!({ "tool_name": "Bash", "tool_input": bash(cmd), "tool_use_id": id,
+                "agent_id": agent, "agent_type": "Explore" }),
+        ts,
+    )
+}
+
+fn ask(cmd: &str, ts: u64) -> Input {
+    hook(
+        "PermissionRequest",
+        json!({ "tool_name": "Bash", "tool_input": bash(cmd) }),
+        ts,
+    )
+}
+
+fn ok(id: &str, ts: u64) -> Input {
+    hook(
+        "PostToolUse",
+        json!({ "tool_name": "Bash", "tool_use_id": id, "duration_ms": 10,
+                "tool_response": { "stdout": "", "stderr": "" } }),
+        ts,
+    )
+}
+
+fn fail(id: &str, ts: u64) -> Input {
+    hook(
+        "PostToolUseFailure",
+        json!({ "tool_name": "Bash", "tool_use_id": id, "duration_ms": 10,
+                "error": "Exit code 1\nboom", "is_interrupt": false }),
+        ts,
+    )
+}
+
+fn fail_agent(id: &str, agent: &str, ts: u64) -> Input {
+    hook(
+        "PostToolUseFailure",
+        json!({ "tool_name": "Bash", "tool_use_id": id, "duration_ms": 10,
+                "error": "Exit code 1\nboom", "is_interrupt": false,
+                "agent_id": agent, "agent_type": "Explore" }),
+        ts,
+    )
+}
+
+fn prompt(text: &str, ts: u64) -> Input {
+    hook(
+        "UserPromptSubmit",
+        json!({ "prompt": text, "prompt_id": format!("p{ts}") }),
+        ts,
+    )
+}
+
+fn stop(ts: u64) -> Input {
+    hook("Stop", json!({ "last_assistant_message": "好了" }), ts)
+}
+
+fn line(no: u64, v: Value, ts: u64) -> Input {
+    Input::Line {
+        session: S.into(),
+        file: "main".into(),
+        no,
+        value: v,
+        ts_seen: ts,
+    }
+}
+
+/// 按 Esc 拒絕或中斷工具時 transcript 寫的 tool_result（實測，樣本 a41c94d2、5d21db12）。
+fn rejected(no: u64, id: &str, ts: u64) -> Input {
+    line(
+        no,
+        json!({ "type": "user", "uuid": format!("r{no}"), "toolUseResult": "User rejected tool use",
+                "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "is_error": true,
+                                           "content": "The user doesn't want to proceed with this tool use." }] } }),
+        ts,
+    )
+}
+
+fn interrupted(no: u64, text: &str, ts: u64) -> Input {
+    line(
+        no,
+        json!({ "type": "user", "uuid": format!("i{no}"),
+                "message": { "content": [{ "type": "text", "text": text }] } }),
+        ts,
+    )
+}
+
+struct NoDanger;
+impl DangerRules for NoDanger {
+    fn check(&self, _: &str, _: &Value) -> Option<Danger> {
+        None
+    }
+}
+
+/// `rm -rf` 是 danger、`sudo` 是 warn。
+struct Rules;
+impl DangerRules for Rules {
+    fn check(&self, _: &str, input: &Value) -> Option<Danger> {
+        let c = input["command"].as_str()?;
+        let level = if c.contains("rm -rf") {
+            DangerLevel::Danger
+        } else if c.contains("sudo") {
+            DangerLevel::Warn
+        } else {
+            return None;
+        };
+        Some(Danger {
+            rule: "r".into(),
+            level,
+            why: "測試".into(),
+        })
+    }
+}
+
+/// 收集所有事件，方便斷言「到目前為止」發生過什麼。
+struct Run {
+    m: Merger,
+    evs: Vec<Event>,
+}
+
+impl Run {
+    fn new() -> Run {
+        Run {
+            m: Merger::new(Box::new(NoDanger)),
+            evs: Vec::new(),
+        }
+    }
+    fn with_rules() -> Run {
+        Run {
+            m: Merger::new(Box::new(Rules)),
+            evs: Vec::new(),
+        }
+    }
+    fn feed(&mut self, i: Input) -> &mut Run {
+        let e = self.m.handle(i);
+        self.evs.extend(e);
+        self
+    }
+    fn tick(&mut self, now: u64) -> &mut Run {
+        let e = self.m.tick(now);
+        self.evs.extend(e);
+        self
+    }
+    /// 依序列出 attention 事件：("raised"|"cleared", kind, ref)
+    fn attention(&self) -> Vec<(String, String, String)> {
+        self.evs
+            .iter()
+            .filter_map(|e| {
+                let what = e.type_name().strip_prefix("attention.")?;
+                Some((
+                    what.to_string(),
+                    e.payload["kind"].as_str()?.to_string(),
+                    e.payload["ref"].as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+    /// 依序列出 session.status 的狀態
+    fn statuses(&self) -> Vec<String> {
+        self.evs
+            .iter()
+            .filter(|e| e.type_name() == "session.status")
+            .map(|e| e.payload["status"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+    fn last_status(&self) -> String {
+        self.statuses().pop().unwrap_or_else(|| "run".into())
+    }
+}
+
+fn a(what: &str, kind: &str, r: &str) -> (String, String, String) {
+    (what.into(), kind.into(), r.into())
+}
+
+// ── wait
+
+#[test]
+fn wait_is_raised_only_after_one_second() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .tick(2000);
+    assert!(r.attention().is_empty(), "1 秒內不發");
+    r.tick(2050);
+    assert_eq!(r.attention(), [a("raised", "wait", "t1")]);
+    assert_eq!(r.last_status(), "wait");
+}
+
+#[test]
+fn wait_resolved_within_one_second_is_never_raised() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .feed(ok("t1", 1500))
+        .tick(5000);
+    assert!(r.attention().is_empty());
+    assert!(r.statuses().iter().all(|s| s != "wait"));
+}
+
+#[test]
+fn wait_matches_the_latest_running_card_with_same_input() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ok("t1", 1100))
+        .feed(pre("t2", "ls", 1200))
+        .feed(ask("ls", 1250))
+        .tick(2300);
+    assert_eq!(r.attention(), [a("raised", "wait", "t2")]);
+}
+
+#[test]
+fn wait_is_cleared_by_post_tool_use() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .tick(2100)
+        .feed(ok("t1", 3000));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "wait", "t1"), a("cleared", "wait", "t1")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn wait_is_cleared_by_post_tool_batch_when_auto_denied() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .tick(2100)
+        .feed(hook("PostToolBatch", json!({}), 3000));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "wait", "t1")));
+}
+
+#[test]
+fn wait_is_cleared_by_transcript_tool_result_when_esc() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .tick(2100)
+        .feed(rejected(5, "t1", 4000));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "wait", "t1")));
+}
+
+#[test]
+fn wait_is_cleared_by_prompt_stop_and_session_end() {
+    for clear in [
+        prompt("下一步", 3000),
+        stop(3000),
+        hook("SessionEnd", json!({}), 3000),
+    ] {
+        let mut r = Run::new();
+        r.feed(pre("t1", "ls", 1000))
+            .feed(ask("ls", 1050))
+            .tick(2100)
+            .feed(clear);
+        assert_eq!(r.attention().last(), Some(&a("cleared", "wait", "t1")));
+    }
+}
+
+// ── done
+
+#[test]
+fn done_is_raised_five_seconds_after_stop() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0)).feed(stop(1000)).tick(5999);
+    assert!(r.attention().is_empty(), "靜默期內不發");
+    r.tick(6000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
+    assert_eq!(r.last_status(), "done");
+}
+
+#[test]
+fn prompt_within_silence_cancels_done() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .feed(prompt("再做", 3000))
+        .tick(10_000);
+    assert!(r.attention().is_empty());
+}
+
+#[test]
+fn prompt_after_done_withdraws_it() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .tick(6000)
+        .feed(prompt("再做", 9000));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "done", "p0"), a("cleared", "done", "p0")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn task_notification_withdraws_done_and_is_marked_as_task() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .tick(6000)
+        .feed(prompt("<task-notification>\n<task-id>b1</task-id>", 30_000));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "done", "p0")));
+    let task = r
+        .evs
+        .iter()
+        .rfind(|e| e.type_name() == "prompt.submitted")
+        .unwrap();
+    assert_eq!(task.payload["source"], "task");
+    let user = r
+        .evs
+        .iter()
+        .find(|e| e.type_name() == "prompt.submitted")
+        .unwrap();
+    assert!(
+        user.payload.get("source").is_none(),
+        "使用者輸入不帶 source"
+    );
+}
+
+#[test]
+fn subagent_stop_does_not_count_as_done() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(hook(
+            "SubagentStop",
+            json!({ "agent_id": "a1", "agent_type": "" }),
+            1000,
+        ))
+        .tick(10_000);
+    assert!(r.attention().is_empty());
+}
+
+// ── fail
+
+#[test]
+fn single_failure_is_not_raised() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000)).feed(fail("t1", 1100));
+    assert!(r.attention().is_empty());
+}
+
+#[test]
+fn two_consecutive_failures_raise_and_success_clears() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "y", 1200))
+        .feed(fail("t2", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
+    assert_eq!(r.last_status(), "fail");
+    r.feed(pre("t3", "z", 1400)).feed(ok("t3", 1500));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "fail", "t2")));
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn failures_of_parallel_agents_are_counted_separately() {
+    let mut r = Run::new();
+    r.feed(hook(
+        "SubagentStart",
+        json!({ "agent_id": "a1", "agent_type": "Explore" }),
+        900,
+    ))
+    .feed(pre("t1", "x", 1000))
+    .feed(fail("t1", 1100))
+    .feed(pre_agent("t2", "y", "a1", 1200))
+    .feed(fail_agent("t2", "a1", 1300));
+    assert!(
+        r.attention().is_empty(),
+        "main 一次、subagent 一次，不算連續"
+    );
+}
+
+#[test]
+fn interrupted_tool_is_not_a_failure() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "sleep", 1200))
+        .feed(rejected(9, "t2", 5000));
+    assert!(r.attention().is_empty(), "Esc 中斷不算第二次失敗");
+}
+
+// ── danger
+
+#[test]
+fn only_danger_level_enters_the_queue() {
+    let mut r = Run::with_rules();
+    r.feed(pre("t1", "sudo ls", 1000));
+    assert!(r.attention().is_empty(), "warn 只在串流標示");
+    r.feed(pre("t2", "rm -rf build", 1100));
+    assert_eq!(r.attention(), [a("raised", "danger", "t2")]);
+    assert_eq!(r.last_status(), "danger");
+}
+
+#[test]
+fn danger_is_cleared_when_the_tool_ends_and_status_falls_back() {
+    let mut r = Run::with_rules();
+    r.feed(pre("t1", "rm -rf build", 1000)).feed(ok("t1", 1500));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "danger", "t1"), a("cleared", "danger", "t1")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn status_is_the_highest_open_item() {
+    let mut r = Run::with_rules();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .tick(2100)
+        .feed(pre("t2", "rm -rf build", 2200));
+    assert_eq!(r.last_status(), "danger", "danger > wait");
+    r.feed(ok("t2", 2500));
+    assert_eq!(r.last_status(), "wait", "danger 解除後退回 wait");
+}
+
+// ── idle 與 ended
+
+#[test]
+fn interrupt_puts_session_into_idle_without_attention() {
+    for text in [
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+    ] {
+        let mut r = Run::new();
+        r.feed(prompt("寫短文", 0)).feed(interrupted(3, text, 2000));
+        assert_eq!(r.last_status(), "idle", "{text}");
+        assert!(r.attention().is_empty(), "idle 不進佇列");
+        r.feed(prompt("繼續", 5000));
+        assert_eq!(r.last_status(), "run");
+    }
+}
+
+#[test]
+fn session_end_is_ended_and_cancels_pending_done() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .feed(hook(
+            "SessionEnd",
+            json!({ "reason": "prompt_input_exit" }),
+            2000,
+        ))
+        .tick(10_000);
+    assert_eq!(r.last_status(), "ended");
+    assert!(r.attention().is_empty());
+}
+
+#[test]
+fn status_event_only_on_change() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000))
+        .feed(ok("t1", 1100))
+        .feed(pre("t2", "y", 1200))
+        .feed(ok("t2", 1300))
+        .tick(60_000);
+    assert!(r.statuses().is_empty(), "一直是 run 就不發");
+}
+
+// ── 分數（PLAN「session 分數」）
+
+const MIN: u64 = 60_000;
+
+#[test]
+fn pending_items_grow_with_waiting_time_up_to_the_cap() {
+    let c = ScoreConfig::default();
+    let w = |age: u64| score(&c, &[(AttentionKind::Wait, 0)], &[], age);
+    assert_eq!(w(0), 50.0);
+    assert_eq!(w(2 * MIN), 60.0);
+    assert_eq!(w(30 * MIN), 100.0, "上限 100");
+    let d = score(&c, &[(AttentionKind::Danger, 0)], &[], 30 * MIN);
+    assert_eq!(d, 100.0, "危險固定 100");
+}
+
+#[test]
+fn signals_decay_with_ten_minute_half_life() {
+    let c = ScoreConfig::default();
+    let s = |age: u64| score(&c, &[], &[(Signal::Conflict, 0)], age);
+    assert_eq!(s(0), 30.0);
+    assert!((s(10 * MIN) - 15.0).abs() < 1e-9);
+    assert!((s(20 * MIN) - 7.5).abs() < 1e-9);
+}
+
+#[test]
+fn longer_wait_ranks_first_unless_a_conflict_adds_more() {
+    let c = ScoreConfig::default();
+    let now = 10 * MIN;
+    // A 等了 2 分鐘；B 剛開始等，但 5 分鐘前碰了別人改的檔
+    let a = score(&c, &[(AttentionKind::Wait, now - 2 * MIN)], &[], now);
+    let b_plain = score(&c, &[(AttentionKind::Wait, now)], &[], now);
+    let b = score(
+        &c,
+        &[(AttentionKind::Wait, now)],
+        &[(Signal::Conflict, now - 5 * MIN)],
+        now,
+    );
+    assert!(a > b_plain, "等越久越前面");
+    assert!(b > a, "衝突讓分數反超");
+    // 再過 30 分鐘，衝突衰減，兩邊都封頂在 100，B 不再超過 A
+    let later = now + 30 * MIN;
+    let a2 = score(&c, &[(AttentionKind::Wait, now - 2 * MIN)], &[], later);
+    let b2 = score(
+        &c,
+        &[(AttentionKind::Wait, now)],
+        &[(Signal::Conflict, now - 5 * MIN)],
+        later,
+    );
+    assert!(b2 - a2 < 3.0, "衰減後差距只剩零頭");
+}
+
+#[test]
+fn every_signal_weight_can_change_the_order() {
+    let c = ScoreConfig::default();
+    let base = score(&c, &[(AttentionKind::Done, 0)], &[], 0);
+    for sig in [
+        Signal::Conflict,
+        Signal::SubagentFail,
+        Signal::CostSpike,
+        Signal::BigEdit,
+        Signal::NewFile,
+    ] {
+        let with = score(&c, &[(AttentionKind::Done, 0)], &[(sig, 0)], 0);
+        assert!(with > base, "{sig:?} 沒有作用");
+    }
+}
+
+#[test]
+fn empty_score_is_positive_zero() {
+    // f64 的空加總是 -0.0，序列化成 JSON 會變成 `-0.0`
+    let s = score(&ScoreConfig::default(), &[], &[], 0);
+    assert!(s == 0.0 && s.is_sign_positive(), "{s}");
+}
+
+// ── samples 回放（實測樣本，沒有 samples/ 時略過）
+
+/// 依到達時間把 hook 與 transcript 行餵進 merge；同一行號取最早的到達時間（resume 會重記 backfill）。
+fn replay_sample(name: &str) -> Option<Vec<Event>> {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../samples/sessions")
+        .join(name);
+    let read = |f: &str| -> Vec<Value> {
+        std::fs::read_to_string(dir.join(f))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let hooks = read("hooks.jsonl");
+    if hooks.is_empty() {
+        return None;
+    }
+    let session = hooks[0]["payload"]["session_id"].as_str()?.to_string();
+    let mut inputs: Vec<(u64, u8, Input)> = Vec::new();
+    for h in hooks.iter().filter(|h| h["via"] == "http") {
+        let ts = h["ts_seen_ms"].as_u64()?;
+        let hook = HookInput::from_json(h["payload"].to_string().as_bytes()).ok()?;
+        inputs.push((ts, 0, Input::Hook { hook, ts_seen: ts }));
+    }
+    let mut arrival: HashMap<u64, u64> = HashMap::new();
+    for a in read("transcript-arrivals.jsonl") {
+        if let (Some(no), Some(ts)) = (a["line_no"].as_u64(), a["ts_seen_ms"].as_u64()) {
+            let t = arrival.entry(no).or_insert(ts);
+            *t = (*t).min(ts);
+        }
+    }
+    for (i, v) in read("transcript.jsonl").into_iter().enumerate() {
+        let no = i as u64 + 1;
+        if let Some(&ts) = arrival.get(&no) {
+            let file = "main".to_string();
+            inputs.push((
+                ts,
+                1,
+                Input::Line {
+                    session: session.clone(),
+                    file,
+                    no,
+                    value: v,
+                    ts_seen: ts,
+                },
+            ));
+        }
+    }
+    inputs.sort_by_key(|(ts, k, _)| (*ts, *k));
+    let mut m = Merger::new(Box::new(NoDanger));
+    let mut evs = Vec::new();
+    let mut last = 0;
+    for (ts, _, input) in inputs {
+        evs.extend(m.tick(ts));
+        evs.extend(m.handle(input));
+        last = ts;
+    }
+    evs.extend(m.tick(last + 60_000));
+    Some(evs)
+}
+
+fn statuses_of(evs: &[Event]) -> Vec<String> {
+    evs.iter()
+        .filter(|e| e.type_name() == "session.status")
+        .map(|e| e.payload["status"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[test]
+fn samples_esc_goes_idle_and_is_never_a_failure() {
+    // 377fa132：權限詢問時按 Esc；5d21db12：工具執行中按 Esc
+    for name in ["377fa132", "5d21db12"] {
+        let Some(evs) = replay_sample(name) else {
+            eprintln!("略過：沒有 samples/sessions/{name}");
+            continue;
+        };
+        let st = statuses_of(&evs);
+        assert!(st.contains(&"idle".to_string()), "{name}: {st:?}");
+        assert!(
+            !evs.iter()
+                .any(|e| e.type_name() == "attention.raised" && e.payload["kind"] == "fail"),
+            "{name}: Esc 不算失敗"
+        );
+    }
+}
+
+#[test]
+fn samples_background_task_is_marked_and_withdraws_done() {
+    // 64c1a1a7：背景 sleep 在 Stop 後完成，以 <task-notification> 叫醒 Claude
+    let Some(evs) = replay_sample("64c1a1a7") else {
+        eprintln!("略過：沒有 samples/sessions/64c1a1a7");
+        return;
+    };
+    assert!(
+        evs.iter()
+            .any(|e| e.type_name() == "prompt.submitted" && e.payload["source"] == "task")
+    );
+    let raised = evs
+        .iter()
+        .filter(|e| e.type_name() == "attention.raised" && e.payload["kind"] == "done")
+        .count();
+    let cleared = evs
+        .iter()
+        .filter(|e| e.type_name() == "attention.cleared" && e.payload["kind"] == "done")
+        .count();
+    assert!(
+        raised >= 1 && cleared >= 1,
+        "done 有發也有被撤回：{raised}／{cleared}"
+    );
+}

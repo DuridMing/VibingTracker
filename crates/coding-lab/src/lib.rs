@@ -11,6 +11,7 @@ pub mod merge;
 pub mod prices;
 pub mod rules;
 pub mod serve;
+pub mod status;
 pub mod store;
 pub mod transcript;
 pub mod ws;

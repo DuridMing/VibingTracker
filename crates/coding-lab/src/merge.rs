@@ -10,14 +10,15 @@ use serde_json::{Map, Value};
 
 use crate::derive;
 use crate::event::{
-    AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, Attention,
-    AttentionKind, CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, Event, FileEdit,
+    AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking,
+    CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
     FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
     SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
     TranscriptHealth, TurnStopped, Usage,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
+use crate::status::{self, Change, Signal, Tracker};
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
@@ -107,6 +108,8 @@ struct Session {
     /// 最後一次收到這個 session 輸入的時間，與 SessionEnd 的時間：決定何時從記憶體移除
     last_seen: u64,
     ended_at: Option<u64>,
+    /// session.status 與注意佇列（#645）
+    status: Tracker,
 }
 
 struct HeldTool {
@@ -134,6 +137,8 @@ fn file_of(agent: &str) -> String {
 
 /// Write 的內容只留前 200 行（contracts.md §4）。
 const WRITE_PREVIEW_LINES: usize = 200;
+/// 單次 Edit 超過這麼多行算「大改動」（session 分數的訊號）。
+const BIG_EDIT_LINES: u32 = 200;
 
 /// 產生一筆 Event 需要的外層資訊。
 #[derive(Default)]
@@ -330,16 +335,21 @@ impl Merger {
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         let mut out = Vec::new();
         for sid in sessions {
-            if let Some(s) = self.sessions.get_mut(&sid) {
-                s.held_bg.retain(|_, h| h.ts_seen + BG_HOLD_MS > now);
-                s.fallback_waiting
-                    .retain(|_, (_, since)| *since + FALLBACK_WAIT_MS > now);
-            }
+            let changes = match self.sessions.get_mut(&sid) {
+                Some(s) => {
+                    s.held_bg.retain(|_, h| h.ts_seen + BG_HOLD_MS > now);
+                    s.fallback_waiting
+                        .retain(|_, (_, since)| *since + FALLBACK_WAIT_MS > now);
+                    s.status.tick(now)
+                }
+                None => Vec::new(),
+            };
             out.extend(self.fall_back(
                 &sid,
                 |c| c.staged_at.is_some_and(|t| t + FALLBACK_AFTER_MS <= now),
                 now,
             ));
+            out.extend(self.apply(&sid, changes, "main", now));
         }
         out
     }
@@ -436,6 +446,30 @@ impl Merger {
         }
     }
 
+    /// 狀態機的變化轉成 Event（不佔串流位置）。
+    fn apply(&mut self, sid: &str, changes: Vec<Change>, agent: &str, ts_seen: u64) -> Vec<Event> {
+        changes
+            .into_iter()
+            .map(|c| {
+                let payload = match c {
+                    Change::Raised(a) => Payload::AttentionRaised(a),
+                    Change::Cleared(a) => Payload::AttentionCleared(a),
+                    Change::Status(st) => Payload::SessionStatus(st),
+                };
+                let meta = Meta {
+                    agent: agent.to_string(),
+                    ts_seen,
+                    ..Meta::default()
+                };
+                self.emit(sid, payload, meta)
+            })
+            .collect()
+    }
+
+    fn tracker(&mut self, sid: &str) -> &mut Tracker {
+        &mut self.sessions.entry(sid.to_string()).or_default().status
+    }
+
     // ── hook
 
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
@@ -476,11 +510,15 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::SessionStarted(p), meta()));
             }
             "UserPromptSubmit" => {
+                let prompt = s("prompt").unwrap_or_default();
                 let p = PromptSubmitted {
-                    text: truncate(&s("prompt").unwrap_or_default(), PROMPT_LIMIT).0,
+                    text: truncate(&prompt, PROMPT_LIMIT).0,
                     prompt_id: s("prompt_id"),
+                    source: status::is_task_notification(&prompt).then(|| "task".into()),
                 };
                 out.push(self.emit(&sid, Payload::PromptSubmitted(p), meta()));
+                let changes = self.tracker(&sid).prompt(s("prompt_id"), ts_seen);
+                out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             "PreToolUse" => out.extend(self.on_pre_tool_use(h, &sid, agent.clone(), ts_seen)),
             "PostToolUse" => {
@@ -500,6 +538,7 @@ impl Merger {
                 let output = response_text(h.field("tool_response"));
                 out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
                 out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                out.extend(self.tool_ended(h, &sid, &id, &agent, Some(true), ts_seen));
             }
             "PostToolUseFailure" => {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
@@ -519,6 +558,9 @@ impl Merger {
                 let code = exit_code(&error);
                 out.extend(self.result_once(&sid, &id, false, code, &error, &agent, ts_seen));
                 out.extend(self.git_op(h, &sid, &id, None, false, meta()));
+                let interrupt = h.field("is_interrupt").and_then(Value::as_bool) == Some(true);
+                let ok = (!interrupt).then_some(false);
+                out.extend(self.tool_ended(h, &sid, &id, &agent, ok, ts_seen));
             }
             "PermissionDenied" => {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
@@ -526,7 +568,7 @@ impl Merger {
                 };
                 self.mark_finished(&sid, &id, &agent);
                 let p = ToolUpdated {
-                    tool_use_id: id,
+                    tool_use_id: id.clone(),
                     status: ToolStatus::Failed,
                     duration_ms: None,
                     error: s("reason"),
@@ -534,6 +576,7 @@ impl Merger {
                     danger: None,
                 };
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
+                out.extend(self.tool_ended(h, &sid, &id, &agent, None, ts_seen));
             }
             "Stop" => {
                 let p = TurnStopped {
@@ -541,6 +584,10 @@ impl Merger {
                         .map(|m| truncate(&m, MESSAGE_LIMIT).0),
                 };
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
+                if agent == "main" {
+                    let changes = self.tracker(&sid).stop(ts_seen);
+                    out.extend(self.apply(&sid, changes, &agent, ts_seen));
+                }
             }
             "SessionEnd" => {
                 self.sessions.entry(sid.clone()).or_default().ended_at = Some(ts_seen);
@@ -548,6 +595,8 @@ impl Merger {
                     reason: s("reason"),
                 };
                 out.push(self.emit(&sid, Payload::SessionEnded(p), meta()));
+                let changes = self.tracker(&sid).session_end(ts_seen);
+                out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             "PreCompact" => {
                 let p = CompactStarted {
@@ -619,10 +668,39 @@ impl Merger {
                 };
                 out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
             }
-            // Notification、PermissionRequest 在 P3（狀態與注意佇列）處理
+            "PermissionRequest" => {
+                let tool = h.str_field("tool_name").unwrap_or_default().to_string();
+                let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
+                self.tracker(&sid)
+                    .permission_request(&tool, &input, ts_seen);
+            }
+            "PostToolBatch" => {
+                let changes = self.tracker(&sid).batch_done(ts_seen);
+                out.extend(self.apply(&sid, changes, &agent, ts_seen));
+            }
+            // Notification（idle_prompt、permission_prompt）只當補強，P3 先不用（PLAN「注意佇列」）
             _ => {}
         }
         out
+    }
+
+    /// hook 回報工具結束：解除這張卡片的 wait／danger；Bash 的成敗算進該 agent 的連續失敗。
+    /// `ok` 為 None 表示不算（PermissionDenied、is_interrupt）。
+    fn tool_ended(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        id: &str,
+        agent: &str,
+        ok: Option<bool>,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let t = self.tracker(sid);
+        let mut changes = t.tool_finished(id, ts_seen);
+        if let (Some(ok), Some("Bash")) = (ok, h.str_field("tool_name")) {
+            changes.extend(t.bash_result(agent, id, ok, ts_seen));
+        }
+        self.apply(sid, changes, agent, ts_seen)
     }
 
     /// 背景 agent（agent_type 沒有值、也沒有 SubagentStart）的工具事件。實測是「下一步建議」：
@@ -722,6 +800,7 @@ impl Merger {
         let raw = Some(h.raw().clone());
         let session = self.sessions.entry(sid.to_string()).or_default();
         let degraded = session.degraded.contains(&file_of(&agent));
+        session.status.tool_started(&id, &tool, &input);
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {
@@ -774,22 +853,10 @@ impl Merger {
             }
         }
         out.extend(self.derive_from_pre(h, sid, &id, &agent, ts_seen));
-        // 危險不等 transcript：PreToolUse 一到就進注意佇列
-        if let Some(d) = danger {
-            let p = Attention {
-                kind: AttentionKind::Danger,
-                reference: id,
-                reason: Some(d.why),
-            };
-            out.push(self.emit(
-                sid,
-                Payload::AttentionRaised(p),
-                Meta {
-                    agent,
-                    ts_seen,
-                    ..Meta::default()
-                },
-            ));
+        // 危險不等 transcript：PreToolUse 一到就進注意佇列；warn 只在串流標示
+        if let Some(d) = danger.filter(|d| d.level == DangerLevel::Danger) {
+            let changes = self.tracker(sid).danger(&id, d.why, ts_seen);
+            out.extend(self.apply(sid, changes, &agent, ts_seen));
         }
         out
     }
@@ -873,6 +940,20 @@ impl Merger {
             }
             _ => None,
         };
+        let sig = match &payload {
+            Some(Payload::FileWrite(w)) if w.is_new => Some(Signal::NewFile),
+            Some(Payload::FileEdit(e))
+                if e.hunk
+                    .as_ref()
+                    .is_some_and(|k| k.old_lines.max(k.new_lines) > BIG_EDIT_LINES) =>
+            {
+                Some(Signal::BigEdit)
+            }
+            _ => None,
+        };
+        if let Some(sig) = sig {
+            self.tracker(sid).signal(sig, ts_seen);
+        }
         payload
             .map(|p| self.emit(sid, p, meta()))
             .into_iter()
@@ -1130,7 +1211,18 @@ impl Merger {
                     evs.push(self.emit(sid, Payload::ToolUpdated(p), m));
                 }
                 evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
+                // Esc 拒絕或中斷時這是唯一的結束訊號；只解除 wait／danger，不算失敗
+                let changes = self.tracker(sid).tool_finished(id, ts_seen);
+                evs.extend(self.apply(sid, changes, &agent, ts_seen));
                 evs
+            }
+            (Some("user"), Some("text"))
+                if block["text"]
+                    .as_str()
+                    .is_some_and(status::is_interrupt_text) =>
+            {
+                let changes = self.tracker(sid).interrupted(ts_seen);
+                self.apply(sid, changes, "main", ts_seen)
             }
             _ => Vec::new(),
         };
