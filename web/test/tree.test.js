@@ -237,3 +237,16 @@ test("filesUrl：四種基準的查詢參數；本次開啟以來也要抓樹（
   assert.equal(filesUrl("/repo", { kind: "commit", hash: "xyz" }), null, "hash 格式不對不送");
   assert.equal(filesUrl("/repo", { kind: "since" }), "/api/files?cwd=%2Frepo&base=main");
 });
+
+// ---------- 被拒或失敗的改動（#682，contracts §4） ----------
+
+test("被拒或失敗的 Edit／Write 不算改：改／新建的方塊收回、本次開啟以來不列；失敗照算，Esc 中斷不算失敗", () => {
+  const t = tree();
+  t.apply([edit(A, "src/a.rs", "e1"), failed(A, "e1"), write(A, "src/new.rs", true, "w1"), failed(A, "w1", { interrupted: true }), edit(B, "src/a.rs", "e2")]);
+  assert.deepEqual(t.counts("src/a.rs"), { r: 0, e: 1, w: 0, x: 1, isNew: false });
+  assert.deepEqual(t.counts("src/new.rs"), { r: 0, e: 0, w: 0, x: 0, isNew: false });
+  assert.deepEqual(sinceChanges(t), [{ path: "src/a.rs", conflict: false, by: [{ session: B, status: "M" }] }]);
+  // 失敗先到、file.* 後到
+  t.apply([failed(B, "e3"), edit(B, "src/b.rs", "e3")]);
+  assert.deepEqual(t.counts("src/b.rs"), { r: 0, e: 0, w: 0, x: 1, isNew: false });
+});

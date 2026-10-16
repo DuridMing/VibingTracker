@@ -1017,6 +1017,41 @@ fn index_event(
                 params![sid, kind, p.reference, ts],
             )?;
         }
+        Payload::ToolUpdated(p) if p.status == crate::event::ToolStatus::Failed => {
+            // 被拒或失敗的 Edit／Write 視為沒有發生（contracts §4，#682）：刪掉改動紀錄、碰檔計數減一並記 fail（Esc 中斷不記）。
+            // 之後同一張卡片的 tool.result（ok=false）不再記第二次 fail
+            let rows: Vec<(String, String)> = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT path, kind FROM changes WHERE session = ?1 AND tool_use_id = ?2",
+                )?;
+                stmt.query_map(params![sid, p.tool_use_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<Result<_, _>>()?
+            };
+            for (path, kind) in &rows {
+                exec(
+                    tx,
+                    "DELETE FROM changes WHERE session = ?1 AND tool_use_id = ?2",
+                    params![sid, p.tool_use_id],
+                )?;
+                exec(
+                    tx,
+                    "UPDATE file_touch SET count = count - 1 WHERE cwd = ?1 AND path = ?2 AND session = ?3 AND kind = ?4",
+                    params![cwd, path, sid, kind],
+                )?;
+                exec(
+                    tx,
+                    "DELETE FROM file_touch WHERE cwd = ?1 AND path = ?2 AND session = ?3 AND kind = ?4 AND count <= 0",
+                    params![cwd, path, sid, kind],
+                )?;
+                // Esc 中斷不算失敗（和前端的失敗計數一致）
+                if p.interrupted != Some(true) {
+                    touch("fail", path)?;
+                }
+            }
+            if !rows.is_empty() {
+                path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
+            }
+        }
         Payload::ToolResult(p) if !p.ok => {
             exec(
                 tx,
@@ -1049,7 +1084,8 @@ fn index_event(
                 &p.tool_use_id,
                 &p.path,
                 "write",
-                Some(p.content.lines().count() as u64),
+                // 全文行數；舊 Event 沒有 lines 時退回預覽的行數（#682）
+                Some(p.lines.unwrap_or(p.content.lines().count() as u64)),
                 Some(0),
             )?;
             path_of_tool.insert((sid.to_string(), p.tool_use_id), p.path);

@@ -265,3 +265,14 @@ test("載入更多：同 session 內照 server 給的順序（依 pos），不�
   st.prepend([[a1, a2, p], [b1]]);
   assert.deepEqual(st.rows.slice(0, 4).map((r) => r.text), ["b1", "a1", "a2", "下一個"]);
 });
+
+test("Write 卡片的行數用 file.write 的 lines（全文），沒有才數預覽（#682）", () => {
+  const st = createStream();
+  const w = (id, extra) => ({ v: 1, session: "s", seq: id.length, type: "file.write", agent: "main", line: null, pos: null, ts_model: null, ts_exec: null, ts_seen: 1, host: "local",
+    payload: { toolUseId: id, path: "big.txt", isNew: true, content: "a\nb\n", truncated: true, ...extra } });
+  st.apply([w("w1", { lines: 5000 })]);
+  const card = (id) => [...st.staged.values(), ...st.rows.map((r) => r.card)].find((c) => c?.toolUseId === id);
+  // file.write 先到時卡片還沒進暫存區，從內部的卡片表查：用 tool.called 建出來
+  st.apply([{ ...w("w1", {}), type: "tool.called", seq: 99, payload: { toolUseId: "w1", tool: "Write", input: {}, status: "running", placement: "staged", danger: null } }]);
+  assert.equal(card("w1").write.lines, 5000);
+});

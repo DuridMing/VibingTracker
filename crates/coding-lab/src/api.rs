@@ -1,7 +1,7 @@
 //! web 入口的 HTTP API（contracts.md §7、#671）：Sessions tab、回放／載入更多、檔案樹與改動基準。
 //!
 //! 路由與 Host／Origin 檢查在 [`crate::ws::serve_web`]。git 只對 store 裡有 session 的目錄跑，
-//! 而且一律關掉 fsmonitor：repo 設定裡的外部程式不能經由瀏覽器開的網頁被叫起來。
+//! 而且一律關掉 fsmonitor 與 repo 設定的 filter：repo 設定裡的外部程式不能經由瀏覽器開的網頁被叫起來（#682）。
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -324,7 +324,7 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
             let branch =
                 git(rp, &["symbolic-ref", "-q", "--short", "HEAD"]).map(|s| s.trim().to_string());
             let by = json!({ "worktree": r, "branch": branch });
-            let entries = git_changes(rp, &format!("{full}...HEAD"));
+            let entries = git_changes(rp, &[&format!("{full}...HEAD")]);
             (
                 format!("commit:{hash}"),
                 json!(full),
@@ -349,11 +349,14 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
                 }) else {
                     return error(StatusCode::CONFLICT, "repo 沒有 main 也沒有 master 分支");
                 };
+                // 比到工作目錄（PLAN「改動基準」，#682）：還沒 commit 的改動也算
                 let sources = wts
                     .iter()
                     .cloned()
                     .map(|(wt, branch)| Source {
-                        entries: git_changes(Path::new(&wt), &format!("{main}...HEAD")),
+                        entries: git(Path::new(&wt), &["merge-base", main, "HEAD"])
+                            .map(|base| git_changes(Path::new(&wt), &[base.trim()]))
+                            .unwrap_or_default(),
                         by: json!({ "worktree": wt, "branch": branch }),
                         head: git(Path::new(&wt), &["rev-parse", "HEAD"])
                             .map(|h| h.trim().to_string()),
@@ -448,7 +451,7 @@ struct Touched {
 }
 
 impl Touched {
-    /// 來源 `i` 從它與 `j` 的共同祖先之後是否改過 `path`；未追蹤檔一定算，資訊不足時保守算有。
+    /// 來源 `i` 從它與 `j` 的共同祖先之後（到工作目錄）是否改過 `path`；未追蹤檔一定算，資訊不足時保守算有。
     fn since_fork(&mut self, sources: &[Source], i: usize, j: usize, path: &str) -> bool {
         let (a, b) = (&sources[i], &sources[j]);
         if a.entries.get(path).is_some_and(|(st, _)| st == "?") {
@@ -470,64 +473,41 @@ impl Touched {
             })
             .clone();
         let Some(fork) = fork else { return true };
+        // 共同祖先到工作目錄（含還沒 commit 的改動，#682）
         self.names
-            .entry((fork.clone(), ha.clone()))
+            .entry((fork.clone(), dir.clone()))
             .or_insert_with(|| {
-                let out = git(Path::new(dir), &["diff", "--name-only", "-z", &fork, ha])
-                    .unwrap_or_default();
+                let out =
+                    git(Path::new(dir), &["diff", "--name-only", "-z", &fork]).unwrap_or_default();
                 nul_split(&out).into_iter().collect()
             })
             .contains(path)
     }
 }
 
-/// 這些檔在 worktree 裡的內容識別：已追蹤的用 HEAD 的 blob，未追蹤的用 `git hash-object`，刪除的是 `-`。
+/// 這些檔在 worktree 裡的內容識別：工作目錄的內容（`git hash-object --no-filters`，不套 repo 設定的 filter），
+/// 刪除的是 `-`。基準比到工作目錄（#682），所以比的也是工作目錄的內容，不是 HEAD 的 blob。
 fn content_ids<'a>(dir: &Path, entries: &Changes, paths: &[&'a str]) -> Vec<(&'a str, String)> {
-    let mut out = Vec::new();
-    let (untracked, tracked): (Vec<&str>, Vec<&str>) =
-        paths.iter().partition(|p| entries[**p].0 == "?");
-    let deleted: Vec<&str> = tracked
-        .iter()
-        .copied()
-        .filter(|p| entries[*p].0 == "D")
-        .collect();
-    out.extend(deleted.iter().map(|p| (*p, "-".to_string())));
-    let tracked: Vec<&str> = tracked
-        .into_iter()
-        .filter(|p| entries[*p].0 != "D")
-        .collect();
-    if !tracked.is_empty() {
-        let mut args = vec!["ls-tree", "-z", "HEAD", "--"];
-        args.extend(&tracked);
-        let listing = git(dir, &args).unwrap_or_default();
-        let blobs: HashMap<&str, &str> = listing
-            .split('\0')
-            .filter_map(|l| {
-                let (meta, path) = l.split_once('\t')?;
-                Some((path, meta.split(' ').nth(2)?))
-            })
-            .collect();
-        for p in tracked {
-            if let Some(b) = blobs.get(p) {
-                out.push((p, b.to_string()));
-            }
-        }
-    }
-    if !untracked.is_empty() {
-        let mut args = vec!["hash-object", "--"];
-        args.extend(&untracked);
+    let (deleted, present): (Vec<&str>, Vec<&str>) =
+        paths.iter().partition(|p| entries[**p].0 == "D");
+    let mut out: Vec<(&str, String)> = deleted.iter().map(|p| (*p, "-".to_string())).collect();
+    if !present.is_empty() {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(&present);
         let hashes = git(dir, &args).unwrap_or_default();
-        for (p, h) in untracked.into_iter().zip(hashes.lines()) {
+        for (p, h) in present.into_iter().zip(hashes.lines()) {
             out.push((p, h.to_string()));
         }
     }
     out
 }
 
-/// `git diff --name-status <range>` 加上未追蹤檔。
-fn git_changes(dir: &Path, range: &str) -> Changes {
+/// `git diff --name-status <range>` 加上未追蹤檔。`range` 只有一個 commit 時比到工作目錄。
+fn git_changes(dir: &Path, range: &[&str]) -> Changes {
     let mut out = BTreeMap::new();
-    let diff = git(dir, &["diff", "--name-status", "-z", range]).unwrap_or_default();
+    let mut args = vec!["diff", "--name-status", "-z"];
+    args.extend(range);
+    let diff = git(dir, &args).unwrap_or_default();
     let mut f = diff.split('\0').filter(|s| !s.is_empty());
     while let Some(st) = f.next() {
         let letter = st.chars().next().unwrap_or('M').to_string();
@@ -577,7 +557,20 @@ fn session_changes(store: &Store, id: &str) -> Result<Option<Changes>, crate::st
         return Ok(None);
     }
     let mut out: Changes = BTreeMap::new();
-    for e in store.events_of_types(id, &["file.edit", "file.write"])? {
+    let events = store.events_of_types(id, &["file.edit", "file.write", "tool.updated"])?;
+    // 被拒或失敗的 Edit／Write 不算改動（contracts §4，#682）
+    let failed: std::collections::HashSet<&str> = events
+        .iter()
+        .filter(|e| e.kind == "tool.updated" && e.payload["status"] == "failed")
+        .filter_map(|e| e.payload["toolUseId"].as_str())
+        .collect();
+    for e in &events {
+        if e.payload["toolUseId"]
+            .as_str()
+            .is_some_and(|t| failed.contains(t))
+        {
+            continue;
+        }
         let (path, new) = match e.payload_typed() {
             Ok(Some(Payload::FileEdit(p))) => (p.path, false),
             Ok(Some(Payload::FileWrite(p))) => (p.path, p.is_new),
@@ -591,25 +584,59 @@ fn session_changes(store: &Store, id: &str) -> Result<Option<Changes>, crate::st
     Ok(Some(out))
 }
 
-fn nul_split(s: &str) -> Vec<String> {
-    s.split('\0').filter(|p| !p.is_empty()).map(norm).collect()
-}
-
-/// 在 `dir` 跑 git；失敗回 None。清掉繼承的 GIT_*（collector 可能是從 git hook 裡被叫起來的）。
-fn git(dir: &Path, args: &[&str]) -> Option<String> {
+fn base_git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     for (k, _) in std::env::vars_os() {
         if k.to_string_lossy().starts_with("GIT_") {
             c.env_remove(k);
         }
     }
-    let out = c
-        .arg("-C")
+    c.arg("-C")
         .arg(dir)
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"])
-        .args(args)
+        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]);
+    c
+}
+
+/// repo 設定（含全域）裡定義的 filter driver 名稱；讀設定本身不會執行任何程式。
+fn filter_drivers(dir: &Path) -> Vec<String> {
+    let Ok(out) = base_git(dir)
+        .args([
+            "config",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process)$",
+        ])
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|k| {
+            let rest = k.strip_prefix("filter.")?;
+            Some(rest[..rest.rfind('.')?].to_string())
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn nul_split(s: &str) -> Vec<String> {
+    s.split('\0').filter(|p| !p.is_empty()).map(norm).collect()
+}
+
+/// 在 `dir` 跑 git；失敗回 None。清掉繼承的 GIT_*（collector 可能是從 git hook 裡被叫起來的）。
+/// repo 設定的 filter 一律停用：和工作目錄比較時 git 會對檔案跑 clean filter，那是 repo 設定裡的外部程式（#682）。
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let mut c = base_git(dir);
+    for driver in filter_drivers(dir) {
+        for key in ["clean", "smudge", "process"] {
+            c.arg("-c").arg(format!("filter.{driver}.{key}="));
+        }
+        c.arg("-c").arg(format!("filter.{driver}.required=false"));
+    }
+    let out = c.args(args).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())

@@ -1377,3 +1377,54 @@ fn later_tool_update_keeps_the_danger_from_an_earlier_one() {
     assert_eq!(u[0].payload["status"], "done");
     assert_eq!(u[0].payload["danger"], danger);
 }
+
+// ── 改動紀錄與分支（#682）
+
+/// 被拒的 Edit 不留在 snapshot 的改動紀錄（contracts §4「被拒或失敗的改動」）。
+#[test]
+fn failed_edit_leaves_the_changes_list() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let edit = |b: &mut B, id: &str, ts: u64| {
+        b.ev(
+            "s1",
+            "file.edit",
+            "main",
+            ts,
+            false,
+            json!({"toolUseId": id, "path": "a", "hunk": null, "hunkSource": "none"}),
+        )
+    };
+    let evs = [
+        b.started("s1", DAY),
+        edit(&mut b, "e1", DAY + 1),
+        b.ev("s1", "tool.updated", "main", DAY + 2, false, json!({"toolUseId": "e1", "status": "failed", "durationMs": null, "error": "denied", "interrupted": null})),
+        edit(&mut b, "e2", DAY + 3),
+    ];
+    apply_all(&mut l, &evs);
+    let snap = l.snapshot(&Channel::All, 0, DAY + 10);
+    let ids: Vec<&str> = rows(&snap, "changes")
+        .iter()
+        .map(|e| e["payload"]["toolUseId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["e2"]);
+}
+
+/// `git worktree add -b X` 是在另一個 worktree 建分支，目前 session 的分支不變；checkout／switch -b 照改。
+#[test]
+fn worktree_add_does_not_change_the_session_branch() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let op = |b: &mut B, op: &str, branch: &str, ts: u64| {
+        b.ev("s1", "git.op", "main", ts, false, json!({"toolUseId": "t", "op": op, "branch": branch, "hash": null, "message": null, "ok": true}))
+    };
+    let evs = [
+        b.started("s1", DAY),
+        op(&mut b, "worktree", "feature/x", DAY + 1),
+    ];
+    apply_all(&mut l, &evs);
+    assert_eq!(l.session_row("s1").unwrap()["branch"], "main");
+    let e = op(&mut b, "switch", "feature/y", DAY + 2);
+    l.apply(&e);
+    assert_eq!(l.session_row("s1").unwrap()["branch"], "feature/y");
+}

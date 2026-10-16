@@ -15,32 +15,47 @@ export function createSessionPane(session = null) {
   };
   const seen = new Set(); // 已算過的 git.op 與 file.*（同一筆可能在 snapshot 與 frame 都出現）
   const toolStatus = new Map(); // toolUseId → pending／running／done／failed
-  const fileMap = new Map(); // path → 碰過的檔案彙總（不受改動紀錄的筆數上限影響）
+  // 碰過的檔案（不受改動紀錄的筆數上限影響）：每筆 file.edit／file.write 一個紀錄，files() 時才彙總，
+  // 這樣之後以 failed 結束的卡片（被拒或失敗的改動，contracts §4，#682）可以排除
+  const touches = [];
 
   function touchFile(e) {
     const key = `${e.session}:${e.seq}`;
     if (seen.has(key)) return;
     seen.add(key);
     const pl = e.payload ?? {};
-    const f = fileMap.get(pl.path) ?? { path: pl.path ?? "", edits: 0, writes: 0, added: 0, removed: 0, isNew: false, agents: [], lastTs: 0, lastSeq: 0, toolUseIds: [] };
-    if (e.type === "file.edit") {
-      f.edits++;
-      for (const l of pl.hunk?.lines ?? []) {
-        if (l.startsWith("+")) f.added++;
-        else if (l.startsWith("-")) f.removed++;
+    let added = 0;
+    let removed = 0;
+    for (const l of pl.hunk?.lines ?? []) {
+      if (l.startsWith("+")) added++;
+      else if (l.startsWith("-")) removed++;
+    }
+    touches.push({ path: pl.path ?? "", edit: e.type === "file.edit", isNew: e.type === "file.write" && !!pl.isNew, added, removed, agent: e.agent, ts: e.ts_seen, seq: e.seq, toolUseId: pl.toolUseId ?? null });
+  }
+
+  function fileMap() {
+    const out = new Map();
+    for (const x of touches) {
+      if (x.toolUseId && toolStatus.get(x.toolUseId) === "failed") continue;
+      const f = out.get(x.path) ?? { path: x.path, edits: 0, writes: 0, added: 0, removed: 0, isNew: false, agents: [], lastTs: 0, lastSeq: 0, toolUseIds: [] };
+      if (x.edit) {
+        f.edits++;
+        f.added += x.added;
+        f.removed += x.removed;
+      } else {
+        f.writes++;
+        if (x.isNew) f.isNew = true;
       }
-    } else {
-      f.writes++;
-      if (pl.isNew) f.isNew = true;
+      if (!f.agents.includes(x.agent)) f.agents.push(x.agent);
+      if (x.toolUseId) f.toolUseIds.push(x.toolUseId);
+      if (x.ts > f.lastTs || (x.ts === f.lastTs && x.seq > f.lastSeq)) {
+        f.lastTs = x.ts;
+        f.lastSeq = x.seq;
+        f.lastToolUseId = x.toolUseId;
+      }
+      out.set(x.path, f);
     }
-    if (!f.agents.includes(e.agent)) f.agents.push(e.agent);
-    if (pl.toolUseId) f.toolUseIds.push(pl.toolUseId);
-    if (e.ts_seen > f.lastTs || (e.ts_seen === f.lastTs && e.seq > f.lastSeq)) {
-      f.lastTs = e.ts_seen;
-      f.lastSeq = e.seq;
-      f.lastToolUseId = pl.toolUseId ?? null;
-    }
-    fileMap.set(f.path, f);
+    return out;
   }
 
   function take(events) {
@@ -71,10 +86,10 @@ export function createSessionPane(session = null) {
     p.thinking = null;
     seen.clear();
     toolStatus.clear();
-    fileMap.clear();
+    touches.length = 0;
     const mine = (list) => list.filter((e) => e.session === p.session);
     const ops = p.stream.load({ staged: mine(staged), stream: mine(stream) });
-    p.changes.load(mine(stream).filter((e) => e.type === "file.edit" || e.type === "file.write"));
+    p.changes.load(mine(stream).filter((e) => e.type === "file.edit" || e.type === "file.write" || (e.type === "tool.updated" && e.payload?.status === "failed")));
     take(stream);
     return ops;
   };
@@ -91,7 +106,7 @@ export function createSessionPane(session = null) {
   // 這個 session 碰過的檔案：正在改（工具還沒結束）的在前，其餘依最近一次改動由新到舊
   p.files = () => {
     const live = (id) => ["pending", "running"].includes(toolStatus.get(id));
-    const list = [...fileMap.values()].map((f) => ({ ...f, running: f.toolUseIds.some(live) }));
+    const list = [...fileMap().values()].map((f) => ({ ...f, running: f.toolUseIds.some(live) }));
     return list.sort((a, b) => Number(b.running) - Number(a.running) || b.lastTs - a.lastTs || b.lastSeq - a.lastSeq);
   };
   p.open = (id) => {

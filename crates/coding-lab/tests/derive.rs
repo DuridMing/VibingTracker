@@ -599,3 +599,19 @@ fn evicted_session_keeps_its_path_base() {
     assert_eq!(edit_path(&e), "worktrees/x/README.md");
     assert_eq!(e[0].seq, last_seq + 1, "{e:?}");
 }
+
+/// file.write 帶全文行數 `lines`（#682）：content 只留 200 行，改動紀錄的 +N 用 lines。
+#[test]
+fn write_carries_the_full_line_count() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let content: String = (0..5000).map(|i| format!("l{i}\n")).collect();
+    let w = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Write",
+               "tool_input": {"file_path": "/r/big.txt", "content": content}, "tool_use_id": "w1"}),
+        1,
+    );
+    let p = &of(&w, "file.write")[0].payload;
+    assert_eq!(p["truncated"], true);
+    assert_eq!(p["lines"], 5000);
+}

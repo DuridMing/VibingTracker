@@ -706,3 +706,68 @@ fn reopen_reads_only_the_unindexed_tail() {
     );
     assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 49);
 }
+
+// ── 被拒或失敗的改動、Write 行數（#682）
+
+fn failed(session: &str, seq: u64, tool: &str, ts: u64) -> Event {
+    ev(
+        session,
+        seq,
+        "tool.updated",
+        None,
+        ts,
+        json!({
+            "toolUseId": tool, "status": "failed", "durationMs": null, "error": "denied", "interrupted": null,
+        }),
+    )
+}
+
+/// 卡片以 failed 結束：那筆改動視為沒發生——changes 刪掉、file_touch 的 edit／write 減一並記 fail（contracts §4）。
+#[test]
+fn failed_edit_and_write_are_not_changes() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(file_ev("s1", 2, "file.edit", "e1", "a.rs", 3000));
+    s.append(failed("s1", 3, "e1", 3010));
+    s.append(file_ev("s1", 4, "file.write", "w1", "b.rs", 3100));
+    s.append(failed("s1", 5, "w1", 3110));
+    s.append(file_ev("s1", 6, "file.edit", "e2", "a.rs", 3200));
+    s.flush().unwrap();
+    let paths: Vec<(String, String)> = s
+        .recent_changes("/p", 10)
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.path, c.tool_use_id))
+        .collect();
+    assert_eq!(paths, [("a.rs".to_string(), "e2".to_string())]);
+    let kinds = |p: &str| {
+        let mut t: Vec<(String, u64)> = s
+            .touches("/p", p)
+            .unwrap()
+            .into_iter()
+            .map(|t| (t.kind, t.count))
+            .collect();
+        t.sort();
+        t
+    };
+    assert_eq!(
+        kinds("a.rs"),
+        [("edit".to_string(), 1), ("fail".to_string(), 1)]
+    );
+    assert_eq!(kinds("b.rs"), [("fail".to_string(), 1)]);
+}
+
+/// file.write 帶全文行數 `lines` 時，改動紀錄用它而不是 200 行的預覽（contracts §4）。
+#[test]
+fn write_line_count_uses_full_length() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    let preview: String = (0..200).map(|i| format!("l{i}\n")).collect();
+    s.append(ev("s1", 2, "file.write", None, 3000, json!({
+        "toolUseId": "w1", "path": "big.txt", "isNew": true, "content": preview, "truncated": true, "lines": 5000,
+    })));
+    s.flush().unwrap();
+    assert_eq!(s.recent_changes("/p", 10).unwrap()[0].added, Some(5000));
+}

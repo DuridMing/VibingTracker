@@ -520,6 +520,25 @@ async fn files_server(r: &Repo) -> SocketAddr {
                 json!({"toolUseId": "w2", "path": "a.txt",
                 "isNew": false, "content": "x\n", "truncated": false}),
             ),
+            // 被拒的 Edit：卡片以 failed 結束，不算改動（#682）
+            ev(
+                "sx",
+                5,
+                "file.edit",
+                None,
+                1_004,
+                json!({"toolUseId": "e9", "path": "b.txt",
+                "hunk": null, "hunkSource": "none"}),
+            ),
+            ev(
+                "sx",
+                6,
+                "tool.updated",
+                None,
+                1_005,
+                json!({"toolUseId": "e9", "status": "failed", "durationMs": null,
+                "error": "denied", "interrupted": null}),
+            ),
         ],
     );
     start(WebState::new(Some(store), None, 8)).await
@@ -542,10 +561,11 @@ async fn files_relative_to_main_aggregates_every_worktree() {
     );
 
     for wt in [&r.root, &r.x, &r.y] {
+        let base = git(wt, &["merge-base", "main", "HEAD"]).trim().to_string();
         assert_eq!(
             by_source(&body, "worktree", &s(wt)),
-            manual(wt, "main...HEAD"),
-            "{} 與手動 git diff --name-status main...HEAD 一致",
+            manual(wt, &base),
+            "{} 與手動 git diff --name-status $(git merge-base main HEAD)（比到工作目錄）一致",
             wt.display()
         );
     }
@@ -690,7 +710,7 @@ async fn files_session_base_comes_from_events() {
             ("A".to_string(), "new.txt".to_string()),
             ("M".to_string(), "a.txt".to_string())
         ]),
-        "isNew 的 write 是 A；edit 與覆寫是 M"
+        "isNew 的 write 是 A；edit 與覆寫是 M；被拒的 edit 不算"
     );
 }
 
@@ -759,4 +779,62 @@ async fn sessions_api_takes_the_model_from_store_until_live_sees_it() {
     let row = &body["sessions"][0];
     assert_eq!(row["lastPrompt"], "重啟之後", "用的是 live 列：{row}");
     assert_eq!(row["model"], "opus 5.5", "{row}");
+}
+
+/// 「相對 main」比到工作目錄（#682，PLAN「改動基準」）：還沒 commit 的已追蹤檔也算，
+/// 兩個 worktree 都改了同一檔（一邊已 commit、一邊還沒）而且內容不同就是衝突候選。
+#[tokio::test]
+async fn files_relative_to_main_includes_uncommitted_changes() {
+    let r = repo();
+    write(&r.x, "b.txt", "x 還沒 commit\n");
+    let addr = files_server(&r).await;
+    let (code, body) = get(
+        addr,
+        &format!("/api/files?cwd={}&base=main", enc(&s(&r.root))),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        by_source(&body, "worktree", &s(&r.x)).contains(&("M".to_string(), "b.txt".to_string())),
+        "x 還沒 commit 的 b.txt：{body}"
+    );
+    assert_eq!(
+        change(&body, "b.txt")["conflict"],
+        true,
+        "y 已 commit、x 還沒 commit，內容不同"
+    );
+}
+
+/// repo 設定裡的 clean filter 是外部程式：經由網頁開的 /api/files 不能把它叫起來（#682）。
+#[tokio::test]
+async fn files_never_run_clean_filters() {
+    let r = repo();
+    let marker = r.root.join("filter-ran");
+    git(
+        &r.root,
+        &[
+            "config",
+            "filter.mark.clean",
+            &format!("sh -c 'touch {}; cat'", s(&marker)),
+        ],
+    );
+    let info = PathBuf::from(git(&r.root, &["rev-parse", "--git-common-dir"]).trim()).join("info");
+    let info = if info.is_absolute() {
+        info
+    } else {
+        r.root.join(info)
+    };
+    std::fs::create_dir_all(&info).unwrap();
+    std::fs::write(info.join("attributes"), "*.txt filter=mark\n").unwrap();
+    // 兩個 worktree 都有同名的未追蹤檔、也都動過已追蹤檔：比內容時會用到 hash-object 與工作目錄的 diff
+    write(&r.y, "new.txt", "other\n");
+    write(&r.x, "b.txt", "x 還沒 commit\n");
+    let addr = files_server(&r).await;
+    let (code, body) = get(
+        addr,
+        &format!("/api/files?cwd={}&base=main", enc(&s(&r.root))),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(!marker.exists(), "clean filter 被執行了");
 }

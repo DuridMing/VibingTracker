@@ -132,3 +132,15 @@ test("session 的滑過提示：完整 id、現在在做什麼、最近的 promp
   assert.equal(sessionTitle({ id: S, doing: null, lastPrompt: "修分頁" }), `${S}\n最近的 prompt：修分頁`);
   assert.equal(sessionTitle({ id: S, doing: "", lastPrompt: null }), S);
 });
+
+test("被拒或失敗的 Edit／Write 不算進碰過的檔案（#682）", () => {
+  const p = createSessionPane(S);
+  p.load({ staged: [], stream: [
+    called("e1", "Edit", "failed"), edit("e1", "src/a.ts", ["+x"]),
+    called("e2", "Edit", "done"), edit("e2", "src/b.ts", ["+y"]),
+  ] });
+  assert.deepEqual(p.files().map((x) => x.path), ["src/b.ts"]);
+  p.apply([called("e3", "Edit"), edit("e3", "src/b.ts", ["+z"]), updated("e3", "failed")]);
+  const b = p.files().find((x) => x.path === "src/b.ts");
+  assert.deepEqual([b.edits, b.added], [1, 1]);
+});
