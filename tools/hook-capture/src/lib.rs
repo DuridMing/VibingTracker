@@ -8,6 +8,7 @@
 //! 進 `samples/` 前要另外遮蔽。
 
 pub mod http;
+pub mod probe;
 pub mod settings;
 pub mod splitter;
 pub mod store;

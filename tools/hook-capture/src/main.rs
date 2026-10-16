@@ -9,9 +9,10 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use hook_capture::http::{OK_RESPONSE, read_request};
+use hook_capture::probe::edit_probe;
 use hook_capture::settings::settings_json;
 use hook_capture::store::{
-    Via, append_json, parse_payload, record_hook, record_hook_at, sanitize, session_dir,
+    Via, append_json, parse_payload, record_hook_with, sanitize, session_dir,
 };
 use hook_capture::tail::{Tail, snapshot};
 
@@ -65,7 +66,17 @@ fn main() -> ExitCode {
         Action::Cmd => {
             let mut body = Vec::new();
             let _ = std::io::stdin().read_to_end(&mut body);
-            if let Err(e) = record_hook(&default_out(), Via::Command, &body) {
+            let mut extra = serde_json::Map::new();
+            if let Some(probe) = parse_payload(&body).and_then(|p| edit_probe(&p)) {
+                extra.insert("probe_sync".into(), probe);
+            }
+            if let Err(e) = record_hook_with(
+                &default_out(),
+                Via::Command,
+                &body,
+                hook_capture::now_ms(),
+                extra,
+            ) {
                 eprintln!("hook-capture cmd: {e}");
             }
             ExitCode::SUCCESS
@@ -133,11 +144,20 @@ fn serve(port: u16, out: PathBuf) -> ExitCode {
 fn handle(mut stream: TcpStream, out: &Path, tails: &Tails) -> std::io::Result<()> {
     let req = read_request(&mut BufReader::new(&stream))?;
     let ts = hook_capture::now_ms();
+    let payload = parse_payload(&req.body);
+    // 回應前讀一次（Claude Code 還在等這個 hook）、回應後再讀一次（像先回 200 的非同步 collector）
+    let before = payload.as_ref().and_then(edit_probe);
     stream.write_all(OK_RESPONSE)?;
     drop(stream);
+    let after = payload.as_ref().and_then(edit_probe);
 
-    let sid = record_hook_at(out, Via::Http, &req.body, ts)?;
-    let Some(p) = parse_payload(&req.body) else {
+    let mut extra = serde_json::Map::new();
+    if let (Some(b), Some(a)) = (before, after) {
+        extra.insert("probe_before_reply".into(), b);
+        extra.insert("probe_after_reply".into(), a);
+    }
+    let sid = record_hook_with(out, Via::Http, &req.body, ts, extra)?;
+    let Some(p) = payload else {
         return Ok(());
     };
     let dir = session_dir(out, &sid);

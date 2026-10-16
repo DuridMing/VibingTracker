@@ -32,6 +32,17 @@ pub fn record_hook_at(
     body: &[u8],
     ts_seen_ms: u128,
 ) -> std::io::Result<String> {
+    record_hook_with(out, via, body, ts_seen_ms, serde_json::Map::new())
+}
+
+/// 同 `record_hook_at`，另外把 `extra` 的欄位併進這一筆（例如 Edit 探針結果）。
+pub fn record_hook_with(
+    out: &Path,
+    via: Via,
+    body: &[u8],
+    ts_seen_ms: u128,
+    extra: serde_json::Map<String, Value>,
+) -> std::io::Result<String> {
     let payload = parse_payload(body);
     let session_id = payload
         .as_ref()
@@ -52,6 +63,10 @@ pub fn record_hook_at(
             "raw": String::from_utf8_lossy(body),
         }),
     };
+    let mut row = row;
+    if let Some(obj) = row.as_object_mut() {
+        obj.extend(extra);
+    }
     append_json(&session_dir(out, &session_id).join("hooks.jsonl"), &row)?;
     Ok(session_id)
 }

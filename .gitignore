@@ -4,6 +4,12 @@
 /CLAUDE.md
 /.opdocs.toml
 
+# 遮蔽後的真實樣本：先只留在本機（使用者決定，2026-10-16）
+/samples/
+
+# hook-capture 的測試專案（自己是獨立 git repo，掛著收集用 hook）
+/capture-lab/
+
 # Rust
 /target/
 
