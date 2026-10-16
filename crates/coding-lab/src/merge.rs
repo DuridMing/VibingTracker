@@ -111,6 +111,8 @@ struct Card {
     finished: bool,
     /// 已送出 tool.called。PreToolUse 遺失時 PostToolUse／tool_result 會先建出沒有 tool.called 的卡片
     called: bool,
+    /// 命中敏感規則（#654）：tool.result 帶 sensitive，遠端送出時剝除
+    sensitive: bool,
 }
 
 #[derive(Default)]
@@ -1206,6 +1208,7 @@ impl Merger {
         let tool = h.str_field("tool_name").unwrap_or_default().to_string();
         let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
         let danger = self.danger.check(&tool, &input);
+        let sensitive = crate::sensitive::is_sensitive(&tool, &input);
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
@@ -1239,8 +1242,10 @@ impl Merger {
                     result_sent: false,
                     finished: false,
                     called: true,
+                    sensitive,
                 },
             );
+            let (input, input_truncated) = truncate_input(input);
             let p = ToolCalled {
                 tool_use_id: id.clone(),
                 tool,
@@ -1248,6 +1253,7 @@ impl Merger {
                 status: ToolStatus::Running,
                 placement: Placement::Staged,
                 danger: danger.clone(),
+                input_truncated,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1399,6 +1405,7 @@ impl Merger {
             result_sent: false,
             finished: false,
             called: false,
+            sensitive: false,
         });
         !std::mem::replace(&mut card.finished, true)
     }
@@ -1421,12 +1428,14 @@ impl Merger {
             result_sent: false,
             finished: false,
             called: false,
+            sensitive: false,
         });
         if card.result_sent {
             return None;
         }
         card.result_sent = true;
         let agent = card.agent.clone();
+        let sensitive = card.sensitive;
         let (output, truncated) = truncate(output, OUTPUT_LIMIT);
         let p = ToolResult {
             tool_use_id: id.to_string(),
@@ -1434,6 +1443,7 @@ impl Merger {
             exit_code,
             output,
             truncated,
+            sensitive,
         };
         Some(self.emit(
             sid,
@@ -1570,15 +1580,20 @@ impl Merger {
                             result_sent: false,
                             finished: false,
                             called: false,
+                            sensitive: false,
                         });
                         card.called = true;
+                        let tool = block["name"].as_str().unwrap_or_default().to_string();
+                        card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
+                        let (input, input_truncated) = truncate_input(block["input"].clone());
                         let p = ToolCalled {
                             tool_use_id: id,
-                            tool: block["name"].as_str().unwrap_or_default().to_string(),
-                            input: block["input"].clone(),
+                            tool,
+                            input,
                             status: ToolStatus::Pending,
                             placement: Placement::Stream,
                             danger: None,
+                            input_truncated,
                         };
                         vec![self.emit(sid, Payload::ToolCalled(p), meta(true))]
                     }
@@ -1661,6 +1676,41 @@ fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
 }
 
 /// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。
+/// tool.called 的 input：每個超過 [`OUTPUT_LIMIT`] 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）；
+/// 回傳有沒有截到。Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
+fn truncate_input(v: Value) -> (Value, bool) {
+    match v {
+        Value::String(s) if s.len() > OUTPUT_LIMIT => {
+            (Value::String(truncate(&s, OUTPUT_LIMIT).0), true)
+        }
+        Value::Array(items) => {
+            let mut cut = false;
+            let items = items
+                .into_iter()
+                .map(|x| {
+                    let (x, c) = truncate_input(x);
+                    cut |= c;
+                    x
+                })
+                .collect();
+            (Value::Array(items), cut)
+        }
+        Value::Object(map) => {
+            let mut cut = false;
+            let map = map
+                .into_iter()
+                .map(|(k, x)| {
+                    let (x, c) = truncate_input(x);
+                    cut |= c;
+                    (k, x)
+                })
+                .collect();
+            (Value::Object(map), cut)
+        }
+        other => (other, false),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);

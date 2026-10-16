@@ -1469,3 +1469,73 @@ fn transcript_paths_are_stored_with_forward_slashes() {
         "C:/Users/u/s1/subagents/agent-a1.jsonl"
     );
 }
+
+fn post_read(id: &str, output: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "PostToolUse", "tool_name": "Read",
+            "tool_use_id": id, "tool_response": output,
+        })),
+        ts_seen: ts,
+    }
+}
+
+/// #654：讀 `.env` 的 tool.result 標 sensitive（本機照存，遠端送出時剝除）；一般檔案不標。
+#[test]
+fn reading_secrets_marks_the_result_sensitive() {
+    let mut m = merger();
+    m.handle(pre("t1", "Read", json!({"file_path": "/p/.env"}), 1000));
+    let a = m.handle(post_read("t1", "TOKEN=abc", 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["sensitive"], true);
+    assert_eq!(r.payload["output"], "TOKEN=abc", "本機照存");
+
+    m.handle(pre(
+        "t2",
+        "Read",
+        json!({"file_path": "/p/src/main.rs"}),
+        1200,
+    ));
+    let b = m.handle(post_read("t2", "fn main() {}", 1300));
+    let r = b.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert!(
+        r.payload.get("sensitive").is_none(),
+        "沒命中時不輸出這個欄位"
+    );
+}
+
+/// #654（R22）：tool.called 的 input 裡過長的字串截到 8 KB，標 inputTruncated；短的不動。
+#[test]
+fn long_tool_input_strings_are_truncated() {
+    let mut m = merger();
+    let big = "a".repeat(20 * 1024);
+    let a = m.handle(pre(
+        "t1",
+        "Write",
+        json!({"file_path": "/p/a.txt", "content": big}),
+        1000,
+    ));
+    let c = a.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert!(c.payload["input"]["content"].as_str().unwrap().len() <= 8 * 1024);
+    assert_eq!(c.payload["input"]["file_path"], "/p/a.txt");
+    assert_eq!(c.payload["inputTruncated"], true);
+
+    let b = m.handle(pre("t2", "Bash", json!({"command": "ls"}), 1100));
+    let c = b.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert!(c.payload.get("inputTruncated").is_none());
+}
+
+/// #654：output 截在 8 KB 時不把多位元組字切壞。
+#[test]
+fn output_truncation_keeps_utf8_intact() {
+    let mut m = merger();
+    m.handle(pre("t1", "Read", json!({"file_path": "/p/a.md"}), 1000));
+    // 8 KB 的位置落在三位元組字的中間
+    let text = format!("{}{}", "a".repeat(8 * 1024 - 1), "中".repeat(10));
+    let a = m.handle(post_read("t1", &text, 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    let out = r.payload["output"].as_str().unwrap();
+    assert!(out.len() <= 8 * 1024);
+    assert!(out.ends_with('a'), "不留下半個字");
+    assert_eq!(r.payload["truncated"], true);
+}

@@ -12,6 +12,7 @@ pub mod logging;
 pub mod merge;
 pub mod prices;
 pub mod rules;
+pub mod sensitive;
 pub mod serve;
 pub mod status;
 pub mod store;

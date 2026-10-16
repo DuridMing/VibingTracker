@@ -72,12 +72,24 @@ function toolBody(c) {
   }
 }
 
+// 工具輸出只顯示前幾行（PLAN「風險」：tool_response 很大），collector 存的是前 8 KB
+const OUTPUT_LINES = 20;
+
+function outputText(r) {
+  const lines = r.output.split("\n");
+  if (lines.length > OUTPUT_LINES) {
+    return `${lines.slice(0, OUTPUT_LINES).join("\n")}\n…（共 ${lines.length}${r.truncated ? "+" : ""} 行，只顯示前 ${OUTPUT_LINES} 行）`;
+  }
+  return r.output + (r.truncated ? "\n…（已截斷，全文在 transcript）" : "");
+}
+
 function toolDetail(c) {
   const cmd = c.tool === "Bash" ? String(c.input?.command ?? "") : "";
   const out = c.result?.output ?? "";
   const parts = [];
   if (cmd && (cmd.includes("\n") || cmd.length > LONG || out || c.error)) parts.push(`$ ${cmd}`);
-  if (out) parts.push(out + (c.result.truncated ? "\n…（已截斷，全文在 transcript）" : ""));
+  if (c.result?.redacted) parts.push("（敏感輸出，例如 .env：遠端連線不顯示，請在本機看）");
+  else if (out) parts.push(outputText(c.result));
   if (c.error && !out) parts.push(c.error);
   return parts.length ? parts.join("\n") : null;
 }

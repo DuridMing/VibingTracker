@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -207,6 +207,8 @@ pub async fn serve_web(
         .layer(middleware::from_fn(loopback_host))
         .with_state(state);
     let task = tokio::spawn(async move {
+        // 連線來源位址：遠端連線送出前剝除敏感輸出（#654）
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
         if let Err(e) = axum::serve(listener, app).await {
             crate::logging::log(&format!("web：{e}"));
         }
@@ -261,15 +263,23 @@ fn same_origin(headers: &HeaderMap) -> bool {
     !host.is_empty() && authority.trim_end_matches('/') == host
 }
 
+/// 連線是不是從別台來的。P6 之前 web 只綁 loopback，SSH 通道進來的也是本機位址，所以目前一律是本機；
+/// P6 開放非 loopback 綁定後，遠端連線送出前剝除敏感輸出（不變式 6）。
+pub fn is_remote(peer: SocketAddr) -> bool {
+    !peer.ip().is_loopback()
+}
+
 async fn ws_handler(
     State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !same_origin(&headers) {
         return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
     }
-    ws.on_upgrade(move |socket| connection(socket, state))
+    let remote = is_remote(peer);
+    ws.on_upgrade(move |socket| connection(socket, state, remote))
 }
 
 struct Conn {
@@ -278,21 +288,28 @@ struct Conn {
     offset: i32,
     /// hello 帶的 frame 編號與收到 hello 的時間
     resume: Option<(u64, Instant)>,
+    /// 從別台連進來（[`is_remote`]）
+    remote: bool,
 }
 
-async fn send(socket: &mut WebSocket, v: &Value) -> bool {
-    socket
-        .send(Message::Text(v.to_string().into()))
-        .await
-        .is_ok()
+async fn send(socket: &mut WebSocket, remote: bool, v: &Value) -> bool {
+    let text = if remote {
+        let mut v = v.clone();
+        crate::sensitive::redact_remote(&mut v);
+        v.to_string()
+    } else {
+        v.to_string()
+    };
+    socket.send(Message::Text(text.into())).await.is_ok()
 }
 
-async fn connection(mut socket: WebSocket, state: Arc<WebState>) {
+async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool) {
     let mut rx = state.frames.subscribe();
     let mut conn = Conn {
         subs: BTreeMap::new(),
         offset: 0,
         resume: None,
+        remote,
     };
     loop {
         tokio::select! {
@@ -313,7 +330,7 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>) {
                         }
                         *since = f.no;
                         if let Some(j) = f.to_json(ch, conn.offset)
-                            && !send(&mut socket, &j).await
+                            && !send(&mut socket, conn.remote, &j).await
                         {
                             return;
                         }
@@ -342,13 +359,18 @@ async fn send_snapshot(
     let snap = state.live().snapshot(ch, conn.offset, crate::now_ms());
     conn.subs
         .insert(ch.clone(), snap["frame"].as_u64().unwrap_or(0));
-    send(socket, &snap).await
+    send(socket, conn.remote, &snap).await
 }
 
 /// 處理一則 client 訊息；回傳 false 表示連線該結束。
 async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, text: &str) -> bool {
     let Ok(msg) = serde_json::from_str::<Value>(text) else {
-        return send(socket, &json!({ "t": "error", "message": "不是 JSON" })).await;
+        return send(
+            socket,
+            conn.remote,
+            &json!({ "t": "error", "message": "不是 JSON" }),
+        )
+        .await;
     };
     match msg["op"].as_str().unwrap_or_default() {
         "hello" => {
@@ -364,13 +386,18 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             state.live().register_offset(conn.offset);
             let welcome = json!({
                 "t": "welcome", "protocol": PROTOCOL, "instance": state.instance, "host": "local",
-                "version": env!("CARGO_PKG_VERSION"), "remote": false, "thinking": "full", "scope": "local",
+                "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote, "thinking": "full", "scope": "local",
             });
-            send(socket, &welcome).await
+            send(socket, conn.remote, &welcome).await
         }
         "subscribe" => {
             let Some(ch) = msg["channel"].as_str().and_then(Channel::parse) else {
-                return send(socket, &json!({ "t": "error", "message": "不認得的頻道" })).await;
+                return send(
+                    socket,
+                    conn.remote,
+                    &json!({ "t": "error", "message": "不認得的頻道" }),
+                )
+                .await;
             };
             // 帶 resume 而且接得上：補送漏掉的 frame；否則送 snapshot
             let window = Duration::from_millis(state.resume_window_ms.load(Ordering::Relaxed));
@@ -386,7 +413,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                     conn.subs.insert(ch.clone(), now_no);
                     for f in frames {
                         if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(socket, &j).await
+                            && !send(socket, conn.remote, &j).await
                         {
                             return false;
                         }
@@ -434,11 +461,12 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             };
             let reply =
                 json!({ "t": "more", "session": session, "beforePos": before, "events": events });
-            send(socket, &reply).await
+            send(socket, conn.remote, &reply).await
         }
         other => {
             send(
                 socket,
+                conn.remote,
                 &json!({ "t": "error", "message": format!("不認得的 op：{other}") }),
             )
             .await

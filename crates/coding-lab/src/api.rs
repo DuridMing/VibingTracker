@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -173,6 +173,7 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
 
 pub async fn events(
     State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     UrlPath(id): UrlPath<String>,
     uri: Uri,
 ) -> Response {
@@ -193,7 +194,14 @@ pub async fn events(
         before,
         limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize),
     ) {
-        Ok(events) => ok(&json!({ "session": id, "beforePos": before, "events": events })),
+        Ok(events) => {
+            let mut body = json!({ "session": id, "beforePos": before, "events": events });
+            // 遠端連線剝除敏感輸出（#654，不變式 6）
+            if crate::ws::is_remote(peer) {
+                crate::sensitive::redact_remote(&mut body);
+            }
+            ok(&body)
+        }
         Err(e) => store_error(e),
     }
 }
