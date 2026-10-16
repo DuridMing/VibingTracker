@@ -30,6 +30,7 @@ const ui = { tab: "all", conn: "connecting", welcome: null };
 // 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
 const lastSig = new Map();
 function changed(name, sig) {
+  if (lastSig.has(name) && bench.freeze.has(name)) return false; // 量測用：凍結指定面板
   if (lastSig.get(name) === sig) return false;
   lastSig.set(name, sig);
   return true;
@@ -108,9 +109,10 @@ function renderKindFilters() {
 
 // 暫存區：hook 已到、transcript 還沒到的卡片（PLAN「方案 C」），不進串流，只在這裡看
 function renderLive() {
+  if (!changed("liveN", String(stream.staged.size))) return;
   $("#liveN").textContent = String(stream.staged.size);
   const list = $("#liveList");
-  if (list.hidden || !changed("live", [...stream.staged.values()].slice(-30).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
+  if (list.hidden || !changed("liveList", [...stream.staged.values()].slice(-30).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
   const cards = [...stream.staged.values()].slice(-30);
   list.replaceChildren(
     ...(cards.length
@@ -149,6 +151,9 @@ function agentChip(a) {
     !isBg && a.current ? h("span", { class: "cur" }, a.current) : null);
 }
 
+// 每個 session 一列，只重建內容有變的那一列（Agents 的「目前動作」幾乎每幀都在變）
+const agentRows = new Map(); // session id → { el, sig }
+
 function renderAgents() {
   const bySession = new Map();
   for (const a of store.agents.values()) {
@@ -156,27 +161,65 @@ function renderAgents() {
     bySession.get(a.session).push(a);
   }
   const live = liveSessions();
-  if (!changed("agents", live.map((s) => s.id).join("|") + "#" + [...store.agents.values()].map((a) => `${a.id}:${a.status}:${a.name}:${a.current ?? ""}`).join("|"))) return;
-  $("#agall").replaceChildren(
-    ...(live.length
-      ? live.map((s) => {
-          const list = bySession.get(s.id) ?? [];
-          const rank = (a) => (a.agentId === "main" ? 0 : a.agentId === "bg" ? 1 : 2);
-          list.sort((x, y) => rank(x) - rank(y) || (x.spawnedAt ?? 0) - (y.spawnedAt ?? 0));
-          return h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(list.length ? list.map(agentChip) : [h("span", { class: "none" }, "—")])));
-        })
-      : [h("div", { class: "none" }, "尚無 session")]),
-  );
+  if (bench.freeze.has("agents") && agentRows.size) return;
+  const box = $("#agall");
+  if (!live.length) {
+    agentRows.clear();
+    if (!changed("agentsEmpty", "1")) return;
+    box.replaceChildren(h("div", { class: "none" }, "尚無 session"));
+    return;
+  }
+  lastSig.delete("agentsEmpty");
+  const rank = (a) => (a.agentId === "main" ? 0 : a.agentId === "bg" ? 1 : 2);
+  const keep = new Set();
+  let prev = null;
+  for (const s of live) {
+    keep.add(s.id);
+    const list = (bySession.get(s.id) ?? []).sort((x, y) => rank(x) - rank(y) || (x.spawnedAt ?? 0) - (y.spawnedAt ?? 0));
+    const sig = list.map((a) => `${a.id}:${a.status}:${a.name}:${a.current ?? ""}`).join("|");
+    let row = agentRows.get(s.id);
+    if (!row || row.sig !== sig) {
+      const el = h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(list.length ? list.map(agentChip) : [h("span", { class: "none" }, "—")])));
+      if (row) row.el.replaceWith(el);
+      row = { el, sig };
+      agentRows.set(s.id, row);
+    }
+    // 順序跟 session 列表一致；已在正確位置就不動 DOM
+    const want = prev ? prev.nextSibling : box.firstChild;
+    if (want !== row.el) box.insertBefore(row.el, want);
+    prev = row.el;
+  }
+  for (const [id, row] of agentRows) {
+    if (!keep.has(id)) {
+      row.el.remove();
+      agentRows.delete(id);
+    }
+  }
+  // 清掉「尚無 session」之類的殘留
+  while (prev && prev.nextSibling) prev.nextSibling.remove();
 }
 
+// 串流以外的面板（KPI、tab、篩選、Sessions、Agents、即時計數）不需要每幀更新：
+// 資料進來時最多每 PANEL_MS 畫一次；使用者操作與連線狀態改變（urgent）下一幀就畫。
+const PANEL_MS = 250;
 let rafPending = false;
+let throttleTimer = 0;
+let lastPanelRender = 0;
 let renderOnce = false;
-function render() {
+function render(urgent = false) {
   if (bench.isolate && renderOnce) return; // 量測用：只畫第一次，之後其他面板不動
   if (rafPending) return;
+  const wait = urgent ? 0 : lastPanelRender + PANEL_MS - performance.now();
+  if (wait > 0) {
+    if (!throttleTimer) throttleTimer = setTimeout(() => { throttleTimer = 0; render(true); }, wait);
+    return;
+  }
+  clearTimeout(throttleTimer);
+  throttleTimer = 0;
   rafPending = true;
   requestAnimationFrame(() => {
     rafPending = false;
+    lastPanelRender = performance.now();
     renderOnce = stream.rows.length >= 3000;
     renderConn();
     renderKpis();
@@ -212,13 +255,13 @@ function updateHasMore() {
 function toggleSession(id) {
   stream.setSessionHidden(id, !stream.hiddenSessions.has(id));
   view.filterChanged();
-  render();
+  render(true);
 }
 
 function toggleKind(k) {
   stream.setKindHidden(k, !stream.hiddenKinds.has(k));
   view.filterChanged();
-  render();
+  render(true);
 }
 
 $("#liveToggle").addEventListener("click", () => {
@@ -271,7 +314,8 @@ function onStreamFrame(m) {
 }
 
 // ---------- 效能量測（?mock=16&bench）：串流 ≥ 3000 行時，每幀套用 Event＋渲染＋排版的耗時 ----------
-const bench = { on: false, samples: [], apply: [], js: [], events: 0, need: 120 };
+// &freeze=agents,kpi,…：第一次之後不再更新那些面板，用來找出是誰拖慢整頁
+const bench = { on: false, samples: [], apply: [], js: [], events: 0, need: 120, freeze: new Set((new URLSearchParams(location.search).get("freeze") ?? "").split(",").filter(Boolean)) };
 
 function benchFrame(m) {
   const t0 = performance.now();
@@ -308,7 +352,7 @@ function selectTab(id) {
   if (ui.tab !== "all") client.unsubscribe(`session:${ui.tab}`);
   ui.tab = id;
   if (id !== "all") client.subscribe(`session:${id}`);
-  render();
+  render(true);
 }
 
 for (const t of document.querySelectorAll(".tab")) {
@@ -338,26 +382,26 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; render(); },
+    welcome: (m) => { ui.welcome = m; render(true); },
     snapshot: (m) => {
       if (m.ch === "*") {
         applySnapshot(store, m);
         onStreamSnapshot(m);
       }
-      render();
+      render(true);
     },
     frame: (m) => {
       applyFrame(store, m);
       // session:<id> 頻道的 Event 與 `*` 重複，只有 `*` 進合流串流
       if (m.ch === "*") {
-        const ops = bench.on ? benchFrame(m) : onStreamFrame(m);
-        if (ops?.stagedChanged) render();
+        if (bench.on) benchFrame(m);
+        else onStreamFrame(m);
       }
       render();
     },
     more: onMore,
-    onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(); },
-    onIncompatible: () => { ui.conn = "incompatible"; render(); },
+    onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(true); },
+    onIncompatible: () => { ui.conn = "incompatible"; render(true); },
     onError: (e) => console.warn("ws message", e),
   },
 });

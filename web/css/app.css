@@ -63,7 +63,7 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-r
 .conn.closed,.conn.incompatible{color:var(--rose);border-color:var(--rose-soft);background:var(--rose-soft)}
 .conn.closed i,.conn.incompatible i{background:var(--rose)}
 .conn b{font-weight:500;color:var(--ink);font-family:var(--mono);font-size:11px}
-.kpis{display:flex;flex-wrap:wrap;gap:4px 20px;justify-content:flex-end}
+.kpis{display:flex;flex-wrap:wrap;gap:4px 14px;justify-content:flex-end}
 .kpi span{display:block;color:var(--muted);font-size:11px}
 .kpi b{font-weight:600;font-size:16px;font-variant-numeric:tabular-nums}
 .kpi b.t,.kpi b.live{color:var(--teal)}.kpi b.r{color:var(--rose)}.kpi b.v{color:var(--violet)}
@@ -188,3 +188,8 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 /* 其他每幀會變的面板也限制排版範圍，避免它們的變動拖累串流（同上，不支援就忽略） */
 .agall,.chg,.att{contain:strict}
 .kpis,.stabs{contain:layout paint style}
+/* 每幀會變的小地方給固定大小＋contain:strict，變動只在框內重排，不會引發整頁排版 */
+.stabs{height:34px;contain:strict}
+.kpi b{display:block;width:3.6em;height:22px;line-height:22px;contain:strict;white-space:nowrap}
+#liveN{display:inline-block;width:3ch;height:1.4em;text-align:right;contain:strict;vertical-align:bottom}
+.agrow{contain:layout paint style}
