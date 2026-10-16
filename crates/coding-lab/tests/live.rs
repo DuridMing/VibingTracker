@@ -263,9 +263,9 @@ fn kpi_models_split_cost_and_thinking_by_model() {
     assert_eq!(
         k["models"],
         json!({
-            "opus 5.5": {"costUsd": 1.5, "thinkingTokens": 8},
-            "sonnet 5.5": {"costUsd": 0.5, "thinkingTokens": 3},
-            "foo 9": {"costUsd": 0.0, "thinkingTokens": 2},
+            "opus 5.5": {"costUsd": 1.5, "thinkingTokens": 8, "ids": ["claude-opus-5-5", "claude-opus-5-5[1m]"]},
+            "sonnet 5.5": {"costUsd": 0.5, "thinkingTokens": 3, "ids": ["claude-sonnet-5-5"]},
+            "foo 9": {"costUsd": 0.0, "thinkingTokens": 2, "ids": ["claude-foo-9"]},
         }),
         "{k}"
     );
@@ -298,7 +298,7 @@ fn kpi_models_split_cost_and_thinking_by_model() {
     assert_eq!(models.as_object().unwrap().len(), 3, "{models}");
     assert_eq!(
         models["sonnet 5.5"],
-        json!({"costUsd": 0.75, "thinkingTokens": 4})
+        json!({"costUsd": 0.75, "thinkingTokens": 4, "ids": ["claude-sonnet-5-5"]})
     );
 }
 
@@ -1047,11 +1047,16 @@ fn agent_rows_carry_their_own_model() {
             .any(|a| a["id"] == "s1/main" && a["model"] == "sonnet 5.5"),
         "中途切換要送更新：{agents:?}"
     );
-    l.apply(&line(&mut b, "main", "assistant.text", "claude-sonnet-5-5"));
+    l.apply(&line(
+        &mut b,
+        "main",
+        "assistant.text",
+        "claude-sonnet-5-5[1m]",
+    ));
     let f = l.flush(DAY);
     assert!(
         f.is_none_or(|f| f.rows_for(&Channel::All).get("agents").is_none()),
-        "模型沒變不送 agents 列"
+        "模型沒變不送 agents 列（列帶完整 id，比的是完整 id，#643）"
     );
 }
 
@@ -1132,4 +1137,66 @@ fn session_start_model_wins_and_synthetic_is_ignored() {
         }
     }
     assert_eq!(l.session_row("s1").unwrap()["model"], "opus 5.5");
+}
+
+/// #643：短名顯示、完整 id 放 tooltip。sessions 與 agents 列帶 `modelId`，跟著 `model` 一起換。
+#[test]
+fn rows_carry_the_full_model_id_next_to_the_short_name() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let line = |b: &mut B, agent: &str, model: &str| {
+        b.ev(
+            "s1",
+            "assistant.text",
+            agent,
+            DAY,
+            false,
+            json!({"text": "x", "messageId": "m", "model": model}),
+        )
+    };
+    apply_all(&mut l, &[
+        b.started("s1", DAY),
+        b.ev("s1", "agent.spawned", "main", DAY, false, json!({"agentId": "a1", "agentType": "Explore", "name": "找檔案", "task": "t", "parentToolUseId": "t0"})),
+        line(&mut b, "main", "claude-opus-5-5"),
+        line(&mut b, "a1", "claude-haiku-5-5"),
+    ]);
+    let ids = |l: &Live| {
+        let snap = l.snapshot(&Channel::All, 0, DAY);
+        let agent = |id: &str| {
+            rows(&snap, "agents")
+                .iter()
+                .find(|a| a["id"] == id)
+                .map(|a| (a["model"].clone(), a["modelId"].clone()))
+                .unwrap()
+        };
+        let s = &rows(&snap, "sessions")[0];
+        (
+            (s["model"].clone(), s["modelId"].clone()),
+            agent("s1/main"),
+            agent("s1/a1"),
+        )
+    };
+    assert_eq!(
+        ids(&l),
+        (
+            (json!("opus 5.5"), json!("claude-opus-5-5")),
+            (json!("opus 5.5"), json!("claude-opus-5-5")),
+            (json!("haiku 5.5"), json!("claude-haiku-5-5")),
+        )
+    );
+
+    l.apply(&b.ev(
+        "s1",
+        "model.changed",
+        "main",
+        DAY,
+        true,
+        json!({"from": "claude-opus-5-5", "to": "claude-sonnet-5-5[1m]"}),
+    ));
+    l.apply(&line(&mut b, "main", "claude-sonnet-5-5[1m]"));
+    assert_eq!(
+        ids(&l).0,
+        (json!("sonnet 5.5"), json!("claude-sonnet-5-5[1m]")),
+        "切換模型後兩個一起換"
+    );
 }

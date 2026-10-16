@@ -77,7 +77,7 @@ function fillKpop(key) {
     ...(rows.length === 0
       ? [h("div", { class: "none" }, "collector 尚未提供依模型分列")]
       : rows.map((r) => h("div", { class: "kpop-r" },
-          h("span", { class: "m" }, r.model),
+          h("span", { class: "m", title: r.title }, r.model),
           h("i", { class: "bar" }, h("i", { style: `width:${(r.share * 100).toFixed(1)}%` })),
           h("b", {}, fmtKpi(key, r.value)),
           h("small", {}, `${Math.round(r.share * 100)}%`)))),
@@ -192,7 +192,7 @@ function renderSessions() {
             sessTag(s),
             h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
               s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
-              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl" }, s.model) : null)),
+              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
             h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")))
       : [h("div", { class: "none" }, "尚無 session")]),
     ...(all.length > SESS_SHOWN ? [h("div", { class: "more" }, `只列最近 ${SESS_SHOWN} 個（共 ${all.length}）`)] : []),
@@ -204,10 +204,10 @@ const AGENT_STATUS_TEXT = { run: "執行中", idle: "閒置", done: "完成", fa
 // 每個 session 一列：main、背景、執行中與出事的 subagent 各一個 chip；已完成的收成「✓ n」（contracts.md §6）。
 function agentChip(a) {
   const isBg = a.agentId === "bg";
-  const title = [a.label, a.agentType, a.model, a.task, AGENT_STATUS_TEXT[a.status], a.current].filter(Boolean).join("\n");
+  const title = [a.label, a.agentType, a.model && (a.modelId ?? a.model), a.task, AGENT_STATUS_TEXT[a.status], a.current].filter(Boolean).join("\n");
   return h("span", { class: `agc ${a.status}${isBg ? " bg" : ""}`, title },
     h("i"), h("b", {}, a.label),
-    a.model ? h("small", { class: "mdl" }, a.model) : null,
+    a.model ? h("small", { class: "mdl", title: a.modelId ?? a.model }, a.model) : null,
     !isBg && a.current ? h("span", { class: "cur" }, a.current) : null);
 }
 
@@ -913,8 +913,8 @@ function paneHasMore() {
 
 function lane(a) {
   const isBg = a.agentId === "bg";
-  return h("div", { class: `lane ${a.status}${isBg ? " bg" : ""}`, title: [a.label, a.agentType, a.model, a.task].filter(Boolean).join("\n") },
-    h("span", { class: "nm" }, h("span", {}, a.label), a.model ? h("small", {}, a.model) : null),
+  return h("div", { class: `lane ${a.status}${isBg ? " bg" : ""}`, title: [a.label, a.agentType, a.model && (a.modelId ?? a.model), a.task].filter(Boolean).join("\n") },
+    h("span", { class: "nm" }, h("span", {}, a.label), a.model ? h("small", { title: a.modelId ?? a.model }, a.model) : null),
     h("span", { class: `stt ${a.status}` }, LANE_TEXT[a.status] ?? a.status, a.toolCount ? ` · ${a.toolCount} 個工具` : ""),
     h("span", { class: "cur" }, a.current ?? "—"),
     a.task ? h("span", { class: "tsk" }, a.task.replace(/\s+/g, " ")) : null);
@@ -928,11 +928,13 @@ function renderPane() {
   const id = pane.session;
   const s = store.sessions.get(id);
   const v = agentView([...store.agents.values()], id, { sessionModel: s?.model ?? null });
-  const model = s?.model ?? store.agents.get(`${id}/main`)?.model ?? null; // sessions.model 還沒有值時先用 main agent 的
+  const main = store.agents.get(`${id}/main`);
+  const model = s?.model ?? main?.model ?? null; // sessions.model 還沒有值時先用 main agent 的
+  const modelId = s?.model ? s.modelId : main?.modelId; // 完整 id 放滑過提示（#643）
   const g = pane.git;
   const now = nowOf(v, s);
 
-  if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, s?.doing, model, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
+  if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, s?.doing, model, modelId, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
     $("#spDoing").hidden = !s?.doing;
     $("#spDoing").textContent = s?.doing ? `▸ ${s.doing}` : "";
     $("#spSid").textContent = shortId(id);
@@ -941,6 +943,7 @@ function renderPane() {
     $("#spPrompt").textContent = s?.lastPrompt ?? s?.firstPrompt ?? "";
     $("#spPrompt").title = s?.firstPrompt ? `第一個 prompt：${s.firstPrompt}` : "";
     $("#spModel").textContent = model ?? "";
+    $("#spModel").title = modelId ?? model ?? "";
     $("#spBranch").textContent = g.last?.branch ?? s?.branch ?? "—";
     $("#spCwd").textContent = s?.cwd ?? "—";
     $("#spCommits").textContent = String(Math.max(s?.commits ?? 0, g.commits.length)); // collector 的計數為準，看到的 commit 比它多時不倒退

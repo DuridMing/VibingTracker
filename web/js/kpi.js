@@ -8,10 +8,11 @@ export function fmtKpi(k, v) {
   return String(v);
 }
 
-// models：{ 短名: { costUsd, thinkingTokens } }；回傳依 key 由大到小、附占比的列
+// models：{ 短名: { costUsd, thinkingTokens, ids } }；回傳依 key 由大到小、附占比的列。
+// title 是滑過提示：這個短名底下的完整模型 id（#643），collector 沒給就用短名
 export function modelBreakdown(models, key) {
   if (models == null) return [];
-  const rows = Object.entries(models).map(([model, m]) => ({ model, value: m?.[key] ?? 0 }));
+  const rows = Object.entries(models).map(([model, m]) => ({ model, value: m?.[key] ?? 0, title: m?.ids?.length ? m.ids.join("\n") : model }));
   const total = rows.reduce((a, r) => a + r.value, 0);
   for (const r of rows) r.share = total > 0 ? r.value / total : 0;
   return rows.sort((a, b) => b.value - a.value || a.model.localeCompare(b.model));

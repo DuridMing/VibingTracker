@@ -29,3 +29,11 @@ test("frame 的 kpi.models 整個取代，消失的模型不留下", () => {
   assert.deepEqual(Object.keys(st.kpi.models), ["opus"]);
   assert.equal(st.kpi.costUsd, 2);
 });
+
+test("依模型分列的每列帶完整模型 id（滑過提示用，#643）；collector 沒給 ids 時退回短名", () => {
+  const rows = modelBreakdown({
+    "opus 5.5": { costUsd: 3, thinkingTokens: 0, ids: ["claude-opus-5-5", "claude-opus-5-5[1m]"] },
+    "foo 9": { costUsd: 1, thinkingTokens: 0 },
+  }, "costUsd");
+  assert.deepEqual(rows.map((r) => [r.model, r.title]), [["opus 5.5", "claude-opus-5-5\nclaude-opus-5-5[1m]"], ["foo 9", "foo 9"]]);
+});

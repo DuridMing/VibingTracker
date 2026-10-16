@@ -125,6 +125,7 @@ pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
             Some(mut row) => {
                 if row["model"].is_null() {
                     row["model"] = v["model"].clone();
+                    row["modelId"] = v["modelId"].clone();
                 }
                 row
             }
@@ -141,7 +142,7 @@ fn stored_row(store: &Store, r: &SessionRow) -> Result<Value, crate::store::Stor
         .and_then(|e| e.payload["text"].as_str().map(clip));
     Ok(json!({
         "id": r.id, "host": r.host, "cwd": r.cwd.replace('\\', "/"), "branch": r.branch,
-        "model": r.model.as_deref().map(short_model),
+        "model": r.model.as_deref().map(short_model), "modelId": r.model,
         "firstPrompt": r.first_prompt.as_deref().map(clip), "lastPrompt": last_prompt,
         "startedAt": r.started_at, "endedAt": r.ended_at,
         "status": r.status, "statusSince": r.status_since, "doing": Value::Null, "score": 0,

@@ -206,8 +206,8 @@ struct Counts {
     commits: u64,
     thinking: u64,
     cost: f64,
-    /// 短名 → (costUsd, thinking)
-    models: BTreeMap<String, (f64, u64)>,
+    /// 短名 → (costUsd, thinking, 完整 id)
+    models: BTreeMap<String, (f64, u64, BTreeSet<String>)>,
 }
 
 #[derive(Clone, Default)]
@@ -215,6 +215,7 @@ struct SessionLive {
     host: String,
     cwd: String,
     branch: Option<String>,
+    /// 完整模型 id；列裡的 `model` 是它的短名（#643）
     model: Option<String>,
     first_prompt: Option<String>,
     last_prompt: Option<String>,
@@ -239,7 +240,7 @@ struct AgentLive {
     session: String,
     agent_id: String,
     agent_type: Option<String>,
-    /// 這個 agent 最近一行 assistant／usage 的模型短名
+    /// 這個 agent 最近一行 assistant／usage 的完整模型 id
     model: Option<String>,
     name: String,
     task: Option<String>,
@@ -336,7 +337,7 @@ impl Live {
         if MODEL_LINES.contains(&e.kind.as_str())
             && let Some(m) = e.payload["model"].as_str().filter(|m| !m.starts_with('<'))
         {
-            let m = short_model(m);
+            let m = m.to_string();
             // VSCode 與 resume 的 SessionStart 不送 model：主模型取 main 第一行（#673）
             if e.agent == "main"
                 && let Some(s) = self.sessions.get_mut(&sid)
@@ -423,6 +424,7 @@ impl Live {
                 let m = counts.models.entry(short_model(&u.model)).or_default();
                 m.0 += u.cost_usd;
                 m.1 += u.thinking;
+                m.2.insert(u.model.clone());
             }
             _ => {}
         }
@@ -436,7 +438,7 @@ impl Live {
                 if s.cwd.is_empty() {
                     s.cwd = p.cwd.replace('\\', "/");
                 }
-                s.model = p.model.as_deref().map(short_model).or(s.model.take());
+                s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
                 s.status = "run".into();
@@ -479,7 +481,7 @@ impl Live {
                 s.cost += u.cost_usd;
                 s.thinking += u.thinking;
             }
-            Payload::ModelChanged(m) if e.agent == "main" => s.model = Some(short_model(&m.to)),
+            Payload::ModelChanged(m) if e.agent == "main" => s.model = Some(m.to),
             Payload::GitOp(g) => {
                 if g.op == "commit" && g.ok {
                     s.commits += 1;
@@ -653,7 +655,7 @@ impl Live {
             s.first_prompt = Some(clip(p));
         }
         if let Some(m) = &r.model {
-            s.model = Some(short_model(m));
+            s.model = Some(m.clone());
         }
         if s.branch.is_none() {
             s.branch = r.branch.clone();
@@ -956,19 +958,20 @@ impl Live {
             total.commits += c.commits;
             total.thinking += c.thinking;
             total.cost += c.cost;
-            for (name, (cost, thinking)) in &c.models {
+            for (name, (cost, thinking, ids)) in &c.models {
                 let m = total.models.entry(name.clone()).or_default();
                 m.0 += cost;
                 m.1 += thinking;
+                m.2.extend(ids.iter().cloned());
             }
         }
         let models: Map<String, Value> = total
             .models
             .iter()
-            .map(|(name, (cost, thinking))| {
+            .map(|(name, (cost, thinking, ids))| {
                 (
                     name.clone(),
-                    json!({ "costUsd": cost, "thinkingTokens": thinking }),
+                    json!({ "costUsd": cost, "thinkingTokens": thinking, "ids": ids }),
                 )
             })
             .collect();
@@ -999,7 +1002,7 @@ impl Live {
             .filter(|a| a.status != "done" && a.status != "fail")
             .count();
         Some(json!({
-            "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model,
+            "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model.as_deref().map(short_model), "modelId": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
             "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
@@ -1011,7 +1014,7 @@ impl Live {
 
 fn agent_row(id: &str, a: &AgentLive) -> Value {
     json!({
-        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "model": a.model, "name": a.name,
+        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "model": a.model.as_deref().map(short_model), "modelId": a.model, "name": a.name,
         "task": a.task, "status": a.status, "current": a.current, "toolCount": a.tool_count,
         "parentToolUseId": a.parent, "spawnedAt": a.spawned_at, "finishedAt": a.finished_at,
     })

@@ -461,6 +461,13 @@ fn usage_once_per_message_and_model_change_line() {
         (Some("claude-opus-5-5"), Some("claude-sonnet-5-5"))
     );
     assert!(mc.pos.is_some(), "模型切換是串流裡的一行狀態");
+    let u = of(&c, "usage")[0];
+    assert_eq!(u.payload["model"], "claude-sonnet-5-5");
+    assert!(
+        (u.payload["costUsd"].as_f64().unwrap() - 2.0).abs() < 1e-9,
+        "切換後改用 sonnet 的單價（輸入 $2／百萬）：{}",
+        u.payload
+    );
     let text_ev = of(&c, "assistant.text")[0];
     assert!(mc.pos < text_ev.pos, "狀態行在該行之前");
 }
