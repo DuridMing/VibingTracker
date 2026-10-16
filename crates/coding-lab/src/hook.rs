@@ -70,12 +70,20 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// PreToolUse 時（回應 hook 之前）對 Edit／Write 目標檔的探測結果，見 `derive::attach_probe`。
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileProbe {
+    pub exists: bool,
+    pub hunk: Option<crate::event::Hunk>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HookInput {
     event: String,
     session_id: String,
     fields: Map<String, Value>,
     raw: Map<String, Value>,
+    probe: Option<FileProbe>,
 }
 
 impl HookInput {
@@ -100,6 +108,7 @@ impl HookInput {
             session_id: text("session_id")?,
             fields,
             raw,
+            probe: None,
         })
     }
 
@@ -124,6 +133,14 @@ impl HookInput {
     /// 契約用到的欄位（原始 JSON 值）。
     pub fn field(&self, key: &str) -> Option<&Value> {
         self.fields.get(key)
+    }
+
+    pub fn set_probe(&mut self, probe: FileProbe) {
+        self.probe = Some(probe);
+    }
+
+    pub fn probe(&self) -> Option<&FileProbe> {
+        self.probe.as_ref()
     }
 
     /// payload 裡契約沒有用到的欄位。

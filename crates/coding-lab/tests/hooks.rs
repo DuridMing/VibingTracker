@@ -251,3 +251,30 @@ fn subagent_files_are_tailed_and_stopped() {
     let a = p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "resume", "transcript_path": T})));
     assert_eq!(a.len(), 1);
 }
+
+/// #626 的結論：Edit 的 hunk 在回應 hook **之前**讀檔計算；回應之後檔案被改掉也不影響。
+#[tokio::test]
+async fn edit_hunk_is_read_before_the_response() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hooks-edit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("calc.py");
+    std::fs::write(&file, "def sub(a, b):\n    return a + b\n").unwrap();
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                      "tool_input": {"file_path": file, "old_string": "a + b", "new_string": "a - b"},
+                      "tool_use_id": "e1"});
+    post(addr, body.to_string().as_bytes()).await;
+    std::fs::write(&file, "def sub(a, b):\n    return a - b\n").unwrap(); // Claude Code 執行 Edit
+    let Ok(Input::Hook { hook, .. }) = rx.try_recv() else {
+        panic!()
+    };
+    let probe = hook.probe().expect("PreToolUse 的 Edit 要有探測結果");
+    assert!(probe.exists);
+    let hunk = probe.hunk.as_ref().expect("old_string 找得到");
+    assert!(
+        hunk.lines.contains(&"-    return a + b".to_string()),
+        "{:?}",
+        hunk.lines
+    );
+}

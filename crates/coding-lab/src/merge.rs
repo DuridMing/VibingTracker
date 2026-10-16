@@ -8,13 +8,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
+use crate::derive;
 use crate::event::{
-    AssistantDisplay, AssistantText, AssistantThinking, Attention, AttentionKind, CONTRACT_VERSION,
-    CompactFinished, CompactStarted, Danger, Event, LineRef, Payload, Placement, PromptSubmitted,
+    AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, Attention,
+    AttentionKind, CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, Event, FileEdit,
+    FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
     SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped,
+    TranscriptHealth, TurnStopped, Usage,
 };
 use crate::hook::HookInput;
+use crate::prices::Prices;
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
@@ -70,7 +73,23 @@ struct Session {
     degraded: HashSet<String>,
     /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片
     fallback_waiting: HashSet<String>,
+    /// 衍生事件用（#633）
+    cwd: Option<String>,
+    last_model: HashMap<String, String>,
+    seen_messages: HashSet<String>,
+    pending_agents: Vec<PendingAgent>,
 }
+
+/// 已呼叫 Agent／Task 工具、還沒對到 SubagentStart 的 subagent。
+struct PendingAgent {
+    tool_use_id: String,
+    subagent_type: Option<String>,
+    description: Option<String>,
+    prompt: Option<String>,
+}
+
+/// Write 的內容只留前 200 行（contracts.md §4）。
+const WRITE_PREVIEW_LINES: usize = 200;
 
 /// 產生一筆 Event 需要的外層資訊。
 #[derive(Default)]
@@ -86,6 +105,7 @@ struct Meta {
 
 pub struct Merger {
     danger: Box<dyn DangerRules>,
+    prices: Prices,
     host: String,
     sessions: BTreeMap<String, Session>,
 }
@@ -94,6 +114,7 @@ impl Merger {
     pub fn new(danger: Box<dyn DangerRules>) -> Merger {
         Merger {
             danger,
+            prices: Prices::builtin(),
             host: "local".into(),
             sessions: BTreeMap::new(),
         }
@@ -254,6 +275,9 @@ impl Merger {
 
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
+        if let Some(cwd) = h.str_field("cwd").filter(|c| !c.is_empty()) {
+            self.sessions.entry(sid.clone()).or_default().cwd = Some(cwd.to_string());
+        }
         let agent = agent_of_hook(h);
         let raw = Some(h.raw().clone());
         let meta = || Meta {
@@ -298,6 +322,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let output = response_text(h.field("tool_response"));
                 out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
             }
             "PostToolUseFailure" => {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
@@ -315,6 +340,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let code = exit_code(&error);
                 out.extend(self.result_once(&sid, &id, false, code, &error, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, None, false, meta()));
             }
             "PermissionDenied" => {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
@@ -366,7 +392,46 @@ impl Merger {
                 };
                 out.push(self.emit(&sid, Payload::AssistantDisplay(p), meta()));
             }
-            // Notification、PermissionRequest、SubagentStart／Stop 在 P3（狀態）與 #633（agent）處理
+            "SubagentStart" => {
+                let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
+                    return out;
+                };
+                let agent_type = s("agent_type").filter(|t| !t.is_empty());
+                // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫
+                let pending = self.sessions.get_mut(&sid).and_then(|ss| {
+                    let i = ss.pending_agents.iter().rposition(|p| {
+                        p.subagent_type.is_none() || p.subagent_type == agent_type
+                    })?;
+                    Some(ss.pending_agents.remove(i))
+                });
+                let p = AgentSpawned {
+                    agent_id,
+                    agent_type,
+                    name: pending.as_ref().and_then(|p| p.description.clone()),
+                    task: pending
+                        .as_ref()
+                        .and_then(|p| p.prompt.as_ref().map(|t| truncate(t, MESSAGE_LIMIT).0)),
+                    parent_tool_use_id: pending.map(|p| p.tool_use_id),
+                };
+                let m = Meta {
+                    agent: "main".into(),
+                    ..meta()
+                };
+                out.push(self.emit(&sid, Payload::AgentSpawned(p), m));
+            }
+            "SubagentStop" => {
+                let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
+                    return out;
+                };
+                let p = AgentFinished {
+                    agent_id,
+                    last_message: s("last_assistant_message")
+                        .map(|m| truncate(&m, MESSAGE_LIMIT).0),
+                    transcript_path: s("agent_transcript_path"),
+                };
+                out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+            }
+            // Notification、PermissionRequest 在 P3（狀態與注意佇列）處理
             _ => {}
         }
         out
@@ -437,6 +502,7 @@ impl Merger {
                 out.push(self.place(sid, &id, Placement::Fallback, None, None, ts_seen));
             }
         }
+        out.extend(self.derive_from_pre(h, sid, &id, &agent, ts_seen));
         // 危險不等 transcript：PreToolUse 一到就進注意佇列
         if let Some(d) = danger {
             let p = Attention {
@@ -455,6 +521,114 @@ impl Merger {
             ));
         }
         out
+    }
+
+    /// PreToolUse 衍生的 file.* 事件（不佔串流位置），以及記下 Agent／Task 呼叫供 SubagentStart 對應。
+    fn derive_from_pre(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        id: &str,
+        agent: &str,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let tool = h.str_field("tool_name").unwrap_or_default();
+        let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
+        let meta = || Meta {
+            agent: agent.to_string(),
+            ts_seen,
+            ..Meta::default()
+        };
+        let cwd = self
+            .sessions
+            .get(sid)
+            .and_then(|s| s.cwd.clone())
+            .unwrap_or_default();
+        let path = || {
+            input["file_path"]
+                .as_str()
+                .map(|p| derive::relative_path(&cwd, p))
+        };
+        let tool_use_id = id.to_string();
+        let payload = match tool {
+            "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
+            "Edit" => path().map(|path| {
+                let hunk = h.probe().and_then(|p| p.hunk.clone());
+                let hunk_source = if hunk.is_some() {
+                    HunkSource::Pre
+                } else {
+                    HunkSource::None
+                };
+                Payload::FileEdit(FileEdit {
+                    tool_use_id,
+                    path,
+                    hunk,
+                    hunk_source,
+                })
+            }),
+            "Write" => path().map(|path| {
+                let content = input["content"].as_str().unwrap_or_default();
+                let total = content.lines().count();
+                let preview: Vec<&str> = content.lines().take(WRITE_PREVIEW_LINES).collect();
+                let mut content = preview.join("\n");
+                if total <= WRITE_PREVIEW_LINES
+                    && input["content"].as_str().is_some_and(|c| c.ends_with('\n'))
+                {
+                    content.push('\n');
+                }
+                Payload::FileWrite(FileWrite {
+                    tool_use_id,
+                    path,
+                    is_new: !h.probe().is_some_and(|p| p.exists),
+                    content,
+                    truncated: total > WRITE_PREVIEW_LINES,
+                })
+            }),
+            "Agent" | "Task" => {
+                let s = |k: &str| {
+                    input[k]
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                };
+                let pending = PendingAgent {
+                    tool_use_id,
+                    subagent_type: s("subagent_type"),
+                    description: s("description"),
+                    prompt: s("prompt"),
+                };
+                self.sessions
+                    .entry(sid.to_string())
+                    .or_default()
+                    .pending_agents
+                    .push(pending);
+                None
+            }
+            _ => None,
+        };
+        payload
+            .map(|p| self.emit(sid, p, meta()))
+            .into_iter()
+            .collect()
+    }
+
+    /// Bash 結束時判斷 git 操作（PostToolUse 帶 `tool_response`；失敗時只看指令）。
+    fn git_op(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        id: &str,
+        response: Option<&Value>,
+        ok: bool,
+        meta: Meta,
+    ) -> Option<Event> {
+        if h.str_field("tool_name") != Some("Bash") {
+            return None;
+        }
+        let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
+        let mut op = derive::git_op_from(command, response, ok)?;
+        op.tool_use_id = id.to_string();
+        Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
@@ -529,7 +703,59 @@ impl Merger {
         let model = v["message"]["model"].as_str().map(str::to_string);
         let delayed = !s.fallback_waiting.is_empty();
 
-        match (v["type"].as_str(), block["type"].as_str()) {
+        // 模型切換（每個 agent 各自追蹤；`<synthetic>` 這類 Claude Code 自己產生的訊息不算）
+        let real_model = model.clone().filter(|m| !m.starts_with('<'));
+        let mut out = Vec::new();
+        let mut changed = None;
+        let mut first_line_of_message = false;
+        if v["type"] == "assistant"
+            && let Some(m) = &real_model
+        {
+            match s.last_model.insert(agent.clone(), m.clone()) {
+                Some(prev) if prev != *m => changed = Some(prev),
+                _ => {}
+            }
+            first_line_of_message =
+                !message_id.is_empty() && s.seen_messages.insert(message_id.clone());
+        }
+        if let (Some(from), Some(to)) = (changed, &real_model) {
+            let p = ModelChanged {
+                from: Some(from),
+                to: to.clone(),
+            };
+            out.push(self.emit(sid, Payload::ModelChanged(p), meta(true)));
+        }
+        // 同一個 message.id 拆成多行時每行的 usage 都一樣（實測），只在第一行算一次
+        if first_line_of_message
+            && let (Some(m), Some(u)) = (&real_model, v["message"]["usage"].as_object())
+        {
+            let u = Value::Object(u.clone());
+            let n = |v: &Value| v.as_u64().unwrap_or(0);
+            let cc = &u["cache_creation"];
+            let (w5, w1) = if cc.is_object() {
+                (
+                    n(&cc["ephemeral_5m_input_tokens"]),
+                    n(&cc["ephemeral_1h_input_tokens"]),
+                )
+            } else {
+                (n(&u["cache_creation_input_tokens"]), 0)
+            };
+            let p = Usage {
+                message_id: message_id.clone(),
+                model: m.clone(),
+                input: n(&u["input_tokens"]),
+                output: n(&u["output_tokens"]),
+                thinking: n(&u["output_tokens_details"]["thinking_tokens"]),
+                cache_read: n(&u["cache_read_input_tokens"]),
+                cache_write_1h: w1,
+                cache_write_5m: w5,
+                cost_usd: self.prices.cost(m, &u),
+            };
+            out.push(self.emit(sid, Payload::Usage(p), meta(false)));
+        }
+        let s = self.sessions.entry(sid.to_string()).or_default();
+
+        let main = match (v["type"].as_str(), block["type"].as_str()) {
             (Some("assistant"), Some("thinking")) => {
                 let signed = block["signature"].as_str().is_some_and(|x| !x.is_empty());
                 let p = AssistantThinking {
@@ -552,10 +778,10 @@ impl Merger {
             }
             (Some("assistant"), Some("tool_use")) => {
                 let Some(id) = block["id"].as_str().map(str::to_string) else {
-                    return Vec::new();
+                    return out;
                 };
                 if s.fallback_waiting.remove(&id) {
-                    return Vec::new(); // 已降級進串流，不搬位置
+                    return out; // 已降級進串流，不搬位置
                 }
                 match s.cards.get(&id) {
                     Some(card) if card.staged_at.is_some() => {
@@ -585,7 +811,7 @@ impl Merger {
             }
             (Some("user"), Some("tool_result")) => {
                 let Some(id) = block["tool_use_id"].as_str() else {
-                    return Vec::new();
+                    return out;
                 };
                 let ok = !block["is_error"].as_bool().unwrap_or(false);
                 let output = content_text(&block["content"]);
@@ -594,7 +820,9 @@ impl Merger {
                     .collect()
             }
             _ => Vec::new(),
-        }
+        };
+        out.extend(main);
+        out
     }
 }
 

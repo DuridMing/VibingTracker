@@ -63,7 +63,9 @@ pub fn router(tx: mpsc::Sender<Input>) -> Router {
 async fn handle(State(state): State<Arc<HookState>>, body: Bytes) -> StatusCode {
     let ts_seen = crate::now_ms();
     match HookInput::from_json(&body) {
-        Ok(hook) => {
+        Ok(mut hook) => {
+            // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）
+            crate::derive::attach_probe(&mut hook);
             if state.tx.try_send(Input::Hook { hook, ts_seen }).is_err() {
                 let n = state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!("coding-lab hooks：merge 忙碌，丟棄 hook（累計 {n}）");

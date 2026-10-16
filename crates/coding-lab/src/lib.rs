@@ -1,9 +1,11 @@
 //! coding-lab collector。資料契約見 docs/plan/contracts.md。
 
+pub mod derive;
 pub mod event;
 pub mod hook;
 pub mod hooks;
 pub mod merge;
+pub mod prices;
 pub mod store;
 pub mod transcript;
 
