@@ -742,7 +742,8 @@ impl Merger {
                 };
                 self.session(&sid).started_agents.insert(agent_id.clone());
                 let agent_type = s("agent_type").filter(|t| !t.is_empty());
-                // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫
+                // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫：實測（#680）每個呼叫的
+                // SubagentStart 緊接在它的 PreToolUse 之後、下一個呼叫之前，所以取最近的；結束的呼叫已從清單移除
                 let pending = self.sessions.get_mut(&sid).and_then(|ss| {
                     let i = ss.pending_agents.iter().rposition(|p| {
                         p.subagent_type.is_none() || p.subagent_type == agent_type
@@ -809,6 +810,7 @@ impl Merger {
         ok: Option<bool>,
         ts_seen: u64,
     ) -> Vec<Event> {
+        self.drop_pending_agent(sid, id);
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
         match (ok, h.str_field("tool_name")) {
@@ -818,6 +820,14 @@ impl Merger {
             _ => {}
         }
         self.apply(sid, changes, agent, ts_seen)
+    }
+
+    /// Agent／Task 呼叫結束了還沒配到 SubagentStart（失敗、被拒、不存在的 subagent_type）：從待配對清單移除，
+    /// 免得之後的 subagent 配到它（#680）。實測 SubagentStart 緊接在自己的 PreToolUse 之後，配對看最近一個呼叫。
+    fn drop_pending_agent(&mut self, sid: &str, id: &str) {
+        self.session(sid)
+            .pending_agents
+            .retain(|p| p.tool_use_id != id);
     }
 
     /// 背景 agent（agent_type 沒有值、也沒有 SubagentStart）的工具事件。實測是「下一步建議」：
@@ -1327,6 +1337,7 @@ impl Merger {
                 }
                 evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
                 // Esc 拒絕或中斷時這是唯一的結束訊號；只解除 wait／danger，不算失敗
+                self.drop_pending_agent(sid, id);
                 let changes = self.tracker(sid).tool_finished(id, ts_seen);
                 evs.extend(self.apply(sid, changes, &agent, ts_seen));
                 evs

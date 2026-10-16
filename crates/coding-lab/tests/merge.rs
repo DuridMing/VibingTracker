@@ -956,3 +956,85 @@ fn resumed_sessions_stay_and_abandoned_ones_are_evicted() {
         "沒有 SessionEnd（終端機被關掉）也不能永遠留著"
     );
 }
+
+// ── subagent 與 Agent 呼叫的配對（#680）
+
+fn agent_call(id: &str, desc: &str, ts: u64) -> Input {
+    pre(
+        id,
+        "Agent",
+        json!({"subagent_type": "Explore", "description": desc, "prompt": desc}),
+        ts,
+    )
+}
+
+fn subagent_start(agent: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStart",
+                          "agent_id": agent, "agent_type": "Explore"})),
+        ts_seen: ts,
+    }
+}
+
+fn spawned(evs: &[Event]) -> Vec<(String, Value, Value)> {
+    evs.iter()
+        .filter(|e| e.kind == "agent.spawned")
+        .map(|e| {
+            (
+                e.payload["agentId"].as_str().unwrap().to_string(),
+                e.payload["name"].clone(),
+                e.payload["parentToolUseId"].clone(),
+            )
+        })
+        .collect()
+}
+
+/// 實測（2026-10-17，一則回覆平行呼叫三次 Agent，兩次都一樣）：每個呼叫的 PreToolUse 之後約 20 ms 就是
+/// 它自己的 SubagentStart，下一個 PreToolUse 再隔約 800 ms；配對時待配對的只有最近一個呼叫。
+#[test]
+fn parallel_agent_calls_pair_in_the_measured_hook_order() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    for (i, (id, desc, agent)) in [
+        ("ta", "alpha", "x"),
+        ("tb", "beta", "y"),
+        ("tc", "gamma", "z"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let t = 1_000 + i as u64 * 800;
+        evs.extend(m.handle(agent_call(id, desc, t)));
+        evs.extend(m.handle(subagent_start(agent, t + 20)));
+    }
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("x".into(), json!("alpha"), json!("ta")),
+            ("y".into(), json!("beta"), json!("tb")),
+            ("z".into(), json!("gamma"), json!("tc")),
+        ]
+    );
+}
+
+/// 失敗、沒有啟動 subagent 的 Agent 呼叫（例如不存在的 subagent_type）不能留在待配對清單裡被之後的 subagent 配到。
+#[test]
+fn failed_agent_call_is_not_paired_later() {
+    let mut m = merger();
+    m.handle(pre(
+        "t1",
+        "Agent",
+        json!({"description": "lost", "prompt": "lost"}),
+        1_000,
+    ));
+    m.handle(Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": "PostToolUseFailure",
+                          "tool_name": "Agent", "tool_use_id": "t1",
+                          "error": "Agent type 'nope' not found", "is_interrupt": false}),
+        ),
+        ts_seen: 1_100,
+    });
+    let evs = m.handle(subagent_start("x", 5_000));
+    assert_eq!(spawned(&evs), [("x".into(), Value::Null, Value::Null)]);
+}
