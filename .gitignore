@@ -1,6 +1,6 @@
 # 規劃文件與協作規範只留在本機（同步到 OpenProject），不進 git。
 # README.md 與使用者手冊等專案文件（docs/ 底下 plan/ 以外）照常進 git。
-/docs/plan/
+/docs/plan
 /CLAUDE.md
 /.opdocs.toml
 
@@ -9,6 +9,9 @@
 
 # hook-capture 的測試專案（自己是獨立 git repo，掛著收集用 hook）
 /capture-lab/
+
+# git worktree：依 git-flow 分支類型分資料夾（worktrees/feature/<名稱>、release/<版號>、hotfix/<版號>）
+/worktrees/
 
 # Rust
 /target/

@@ -10,9 +10,9 @@ use serde_json::{Value, json};
 
 static N: AtomicU32 = AtomicU32::new(0);
 
-/// 每個測試一個獨立的資料目錄（不碰真正的 ~/.coding-lab）。
+/// 每個測試一個獨立的資料目錄，放在這個 worktree 的 target/tmp/（不碰真正的 ~/.coding-lab，也不寫到專案外）。
 fn home() -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "coding-lab-store-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::SeqCst)

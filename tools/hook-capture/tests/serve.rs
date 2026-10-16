@@ -51,7 +51,8 @@ impl Drop for Kill {
 
 #[test]
 fn serve_records_hooks_and_transcript_arrivals() {
-    let root = std::env::temp_dir().join(format!("hook-capture-serve-{}", std::process::id()));
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hook-capture-serve-{}", std::process::id()));
     let out = root.join("out");
     let transcript = root.join("s1.jsonl");
     std::fs::create_dir_all(&root).unwrap();
@@ -144,7 +145,8 @@ fn serve_records_hooks_and_transcript_arrivals() {
 
 #[test]
 fn cmd_reads_stdin_and_always_exits_zero() {
-    let out = std::env::temp_dir().join(format!("hook-capture-cmd-{}", std::process::id()));
+    let out = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hook-capture-cmd-{}", std::process::id()));
     for input in [r#"{"session_id":"c1","hook_event_name":"Stop"}"#, "garbage"] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_hook-capture"))
             .arg("cmd")

@@ -2,7 +2,8 @@ use hook_capture::probe::edit_probe;
 use serde_json::json;
 
 fn tmpfile(name: &str, content: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("hook-capture-probe-{}", std::process::id()));
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hook-capture-probe-{}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     let p = d.join(name);
     std::fs::write(&p, content).unwrap();
@@ -39,7 +40,8 @@ fn post_tool_use_also_probed() {
 
 #[test]
 fn missing_file() {
-    let p = std::env::temp_dir().join("hook-capture-probe-does-not-exist.py");
+    let p = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("hook-capture-probe-does-not-exist.py");
     let r = edit_probe(&edit("PreToolUse", &p, "a", "b")).unwrap();
     assert_eq!(r["exists"], false);
 }

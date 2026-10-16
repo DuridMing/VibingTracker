@@ -92,7 +92,7 @@ fn record_hook_keeps_unparseable_body() {
 }
 
 pub fn tempdir() -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "hook-capture-test-{}-{}",
         std::process::id(),
         hook_capture::now_ms()

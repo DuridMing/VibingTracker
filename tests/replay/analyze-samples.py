@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """重算階段 0 的量測結果（#624、#625、#626），確認 PLAN 依據的事實在目前的 Claude Code 版本仍成立。
 
-用法：python3 -I scripts/analyze-samples.py [samples 目錄，預設 samples]
+用法：python3 -I tests/replay/analyze-samples.py [samples 目錄，預設 samples]
 
 讀 scripts/redact-samples.py 產生的 samples/sessions/*/，每一節對應 PLAN 的一個結論；
 最後一節列出「檢查項目」，任何一項不成立就以非 0 結束，表示 PLAN 要重新檢討。
