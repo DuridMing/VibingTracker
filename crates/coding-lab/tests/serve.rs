@@ -965,3 +965,46 @@ fn lines_written_while_the_collector_was_down_are_read_after_restart() {
     std::thread::sleep(Duration::from_millis(600));
     assert_eq!(texts(), ["一", "二", "三", "四"], "不漏、不重複");
 }
+
+/// #652 驗收：transcript 被弄壞後，hook 的工具事件照樣進串流（降級放置），恢復後回到正常。
+#[test]
+fn broken_transcript_still_shows_tool_events() {
+    let e = env(0);
+    let _serve = start_serve(&e);
+    let transcript = e.home.join("t6.jsonl");
+    std::fs::write(&transcript, "{壞掉的一行\n").unwrap();
+    let start = json!({"session_id": "s6", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    let jsonl = e.home.join("events/s6.jsonl");
+    let types = || -> Vec<Value> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    };
+    wait_for("transcript.degraded", || {
+        types().iter().any(|v| v["type"] == "transcript.degraded")
+    });
+    let pre = json!({"session_id": "s6", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                     "tool_input": {"command": "ls"}, "tool_use_id": "t1", "transcript_path": transcript});
+    http(e.hook, "POST", "/hook", &pre.to_string());
+    wait_for("工具卡片直接進串流", || {
+        types()
+            .iter()
+            .any(|v| v["type"] == "tool.placed" && v["payload"]["placement"] == "fallback")
+    });
+    // 之後寫進好的行：恢復
+    let good = json!({"type": "assistant", "uuid": "u1", "timestamp": "2026-10-17T00:00:00Z",
+                      "message": {"id": "m1", "model": "claude-opus-5-5",
+                                  "content": [{"type": "text", "text": "好了"}]}});
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(f, "{good}").unwrap();
+    wait_for("transcript.recovered", || {
+        types().iter().any(|v| v["type"] == "transcript.recovered")
+    });
+}

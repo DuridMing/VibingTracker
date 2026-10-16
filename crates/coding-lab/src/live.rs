@@ -319,6 +319,8 @@ struct SessionLive {
     score: i64,
     /// 「現在在做什麼」一句話的這一輪來源（#648）
     doing: Doing,
+    /// transcript 解析失敗、還沒恢復的檔（main、agent-<id>）；前端依它標「文字與思考不可用」（#652）
+    degraded: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -554,6 +556,12 @@ impl Live {
                     self.dirty_agents.insert(id, true);
                 }
                 self.bg_running.remove(&sid);
+            }
+            Payload::TranscriptDegraded(h) => {
+                s.degraded.insert(h.file);
+            }
+            Payload::TranscriptRecovered(h) => {
+                s.degraded.remove(&h.file);
             }
             Payload::SessionStatus(p) => {
                 s.status = serde_json::to_value(p.status)
@@ -1171,6 +1179,7 @@ impl Live {
             "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
+            "degraded": s.degraded,
         }))
     }
 }

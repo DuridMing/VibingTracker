@@ -164,6 +164,8 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
         "commits": r.commits, "dangers": r.dangers, "failures": r.failures,
         "agentsLive": 0, "costUsd": r.cost_usd, "thinkingTokens": r.thinking_tokens,
         "lastPos": last_pos,
+        // 降級只在 live 裡追蹤（#652）；store 的列（多半是已結束的）沒有進行中的降級
+        "degraded": [],
     })
 }
 

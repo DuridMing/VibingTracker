@@ -1569,3 +1569,52 @@ fn seeded_row_keeps_the_stored_status_and_end() {
         (json!("run"), Value::Null)
     );
 }
+
+/// #652：transcript 解析失敗時 sessions 列帶 `degraded`（哪些檔降級），恢復後清掉；前端依它顯示標語。
+#[test]
+fn session_row_lists_degraded_transcript_files_until_recovered() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY + H),
+            b.ev(
+                "s1",
+                "transcript.degraded",
+                "main",
+                DAY + H,
+                false,
+                json!({"file": "main", "error": "第 3 行：invalid JSON"}),
+            ),
+            b.ev(
+                "s1",
+                "transcript.degraded",
+                "main",
+                DAY + H,
+                false,
+                json!({"file": "agent-a1", "error": "第 1 行：invalid JSON"}),
+            ),
+        ],
+    );
+    let degraded = |l: &Live| l.session_row("s1").unwrap()["degraded"].clone();
+    assert_eq!(degraded(&l), json!(["agent-a1", "main"]));
+    l.apply(&b.ev(
+        "s1",
+        "transcript.recovered",
+        "main",
+        DAY + H,
+        false,
+        json!({"file": "main"}),
+    ));
+    assert_eq!(degraded(&l), json!(["agent-a1"]));
+    l.apply(&b.ev(
+        "s1",
+        "transcript.recovered",
+        "main",
+        DAY + H,
+        false,
+        json!({"file": "agent-a1"}),
+    ));
+    assert_eq!(degraded(&l), json!([]));
+}
