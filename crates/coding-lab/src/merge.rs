@@ -329,6 +329,14 @@ impl Merger {
         )
     }
 
+    /// 各 session 目前的分數，四捨五入成整數（契約 §6 `sessions.score`）。
+    pub fn scores(&self, now: u64) -> Vec<(String, i64)> {
+        self.sessions
+            .iter()
+            .map(|(id, s)| (id.clone(), s.status.score(now).round() as i64))
+            .collect()
+    }
+
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
         self.evict(now);

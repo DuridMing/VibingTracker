@@ -365,6 +365,34 @@ fn agent_rows_lifecycle() {
     );
 }
 
+/// 分數由 merge 每 10 秒交來；變了才送該 session 列（契約 §6）。
+#[test]
+fn session_score_is_sent_only_when_changed() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(&mut l, &[b.started("s1", DAY), b.started("s2", DAY)]);
+    l.flush(DAY);
+
+    l.set_scores(&[("s1".to_string(), 56), ("s2".to_string(), 0)]);
+    let f = l.flush(DAY + 1).expect("s1 分數變了要送");
+    let sent = f.rows_for(&Channel::All)["sessions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(sent.len(), 1, "s2 沒變，不送");
+    assert_eq!(
+        (sent[0]["id"].as_str(), sent[0]["score"].as_i64()),
+        (Some("s1"), Some(56))
+    );
+    assert_eq!(l.session_row("s1").unwrap()["score"], 56);
+
+    l.set_scores(&[("s1".to_string(), 56), ("s2".to_string(), 0)]);
+    assert!(l.flush(DAY + 2).is_none(), "都沒變就沒有 frame");
+
+    l.set_scores(&[("nope".to_string(), 9)]);
+    assert!(l.flush(DAY + 3).is_none(), "不認得的 session 略過");
+}
+
 // ── attention 列
 
 #[test]

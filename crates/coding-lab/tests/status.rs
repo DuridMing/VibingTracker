@@ -683,3 +683,40 @@ fn samples_background_task_is_marked_and_withdraws_done() {
         "done 有發也有被撤回：{raised}／{cleared}"
     );
 }
+
+// ── sessions 列的分數（契約 §6：整數、每 10 秒重算）
+
+#[test]
+fn scores_lists_each_session_rounded() {
+    let mut r = Run::with_rules();
+    r.feed(pre("t1", "rm -rf build", 1000));
+    assert_eq!(
+        r.m.scores(1000),
+        [(S.to_string(), 100)],
+        "未解除的 danger 100 分"
+    );
+    r.feed(ok("t1", 1500));
+    assert_eq!(
+        r.m.scores(1500),
+        [(S.to_string(), 0)],
+        "解除後留在佇列等 ack 的 danger 不算分（使用者決定）"
+    );
+    // wait 在 tick 3000 發出，50 分起每分鐘 +5：再過 1 分 6 秒 → 55.5 → 四捨五入 56
+    r.feed(pre("t2", "ls", 2000))
+        .feed(ask("ls", 2000))
+        .tick(3000);
+    assert_eq!(r.attention().last(), Some(&a("raised", "wait", "t2")));
+    assert_eq!(r.m.scores(3000 + 66_000), [(S.to_string(), 56)]);
+}
+
+#[test]
+fn score_changes_do_not_emit_status_events() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1000))
+        .tick(2000);
+    assert_eq!(r.last_status(), "wait");
+    let n = r.statuses().len();
+    r.tick(2000 + 5 * MIN);
+    assert_eq!(r.statuses().len(), n, "分數變了不發 session.status");
+}

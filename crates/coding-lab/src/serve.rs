@@ -26,6 +26,8 @@ use crate::ws::{WebState, serve_web};
 const REBUILD_WINDOW_MS: u64 = 36 * 60 * 60 * 1000;
 const TICK: Duration = Duration::from_millis(500);
 const STORE_FLUSH: Duration = Duration::from_millis(100);
+/// sessions 列的分數多久重算一次（契約 §6）
+const SCORE_EVERY: Duration = Duration::from_secs(10);
 const INPUT_QUEUE: usize = 8192;
 /// 進行中的 session 沒送 SessionEnd（終端機被直接關掉）時，最多再撐這麼久沒有 hook 才結束。
 const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -141,6 +143,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
     let mut tick = tokio::time::interval(TICK);
     let mut flush = tokio::time::interval(STORE_FLUSH);
+    let mut rescore = tokio::time::interval(SCORE_EVERY);
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
     let mut last_hook = Instant::now();
     let shutdown = shutdown_signal();
@@ -192,6 +195,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     log("閒置，自動結束");
                     break;
                 }
+            }
+            _ = rescore.tick() => {
+                // 只更新彙總列，不發 session.status（那是串流裡的狀態行，只在狀態改變時發）
+                web.set_scores(&merger.scores(crate::now_ms()));
             }
             _ = flush.tick() => {
                 if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {

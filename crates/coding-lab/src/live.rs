@@ -225,6 +225,8 @@ struct SessionLive {
     cost: f64,
     thinking: u64,
     last_pos: Option<u64>,
+    /// merge 定期重算的 session 分數（契約 §6）
+    score: i64,
 }
 
 #[derive(Clone)]
@@ -607,6 +609,18 @@ impl Live {
         }
     }
 
+    /// merge 定期重算的分數（契約 §6 `sessions.score`）；變了才標記該列要送。
+    pub fn set_scores(&mut self, scores: &[(String, i64)]) {
+        for (sid, v) in scores {
+            if let Some(s) = self.sessions.get_mut(sid)
+                && s.score != *v
+            {
+                s.score = *v;
+                self.dirty_sessions.insert(sid.clone());
+            }
+        }
+    }
+
     /// 重啟重建後對齊 store 的佇列：ack 不是 Event，重放會讓已確認的列跑回來。
     pub fn keep_attention(&mut self, open: &std::collections::HashSet<String>) {
         let gone: Vec<String> = self
@@ -930,7 +944,7 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": Value::Null, "score": 0,
+            "status": s.status, "statusSince": s.status_since, "doing": Value::Null, "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
         }))
