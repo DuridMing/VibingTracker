@@ -432,3 +432,23 @@ fn unsafe_session_ids_do_not_escape_the_events_dir() {
     assert!(!h.parent().unwrap().join("evil.jsonl").exists());
     assert_eq!(std::fs::read_dir(h.join("events")).unwrap().count(), 1);
 }
+
+/// #670-1：重啟時 merge 要從這裡接著編 seq／pos。
+#[test]
+fn counters_are_the_highest_seq_and_pos_per_session() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    for e in [
+        started("a", 1, "/p"),
+        text("a", 2, 1),
+        text("a", 3, 2),
+        started("b", 1, "/q"),
+    ] {
+        s.append(e);
+    }
+    s.flush().unwrap();
+    drop(s);
+    let c = Store::open(&h).unwrap().counters().unwrap();
+    assert_eq!(c.get("a"), Some(&(3, 2)));
+    assert_eq!(c.get("b"), Some(&(1, 0)), "沒進過串流的 pos 是 0");
+}

@@ -443,3 +443,61 @@ async fn non_loopback_bind_is_refused_until_keys_exist() {
         "金鑰驗證（P6）之前不開放遠端"
     );
 }
+
+async fn http_get_host(addr: SocketAddr, path: &str, host: &str) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    out
+}
+
+/// #670-6：DNS rebinding。攻擊者把自己的網域解析到 127.0.0.1，瀏覽器送出的 Origin 和 Host 都是那個網域、
+/// 彼此相同，所以只比 Origin == Host 擋不住；Host 必須是 loopback 名稱。
+#[tokio::test]
+async fn non_loopback_host_is_rejected_even_when_origin_matches() {
+    let state = WebState::new(None, None, 8);
+    let addr = start(state).await;
+    let port = addr.port();
+    let evil = format!("evil.example:{port}");
+
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Host", evil.parse().unwrap());
+    req.headers_mut()
+        .insert("Origin", format!("http://{evil}").parse().unwrap());
+    assert!(
+        tokio_tungstenite::connect_async(req).await.is_err(),
+        "rebinding 的網頁不能開 WS"
+    );
+    assert!(
+        http_get_host(addr, "/healthz", &evil)
+            .await
+            .starts_with("HTTP/1.1 403"),
+        "HTTP 也要擋"
+    );
+
+    for host in [
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+        format!("[::1]:{port}"),
+    ] {
+        let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+        req.headers_mut().insert("Host", host.parse().unwrap());
+        req.headers_mut()
+            .insert("Origin", format!("http://{host}").parse().unwrap());
+        assert!(
+            tokio_tungstenite::connect_async(req).await.is_ok(),
+            "{host} 可以（含 SSH 通道的 localhost）"
+        );
+        assert!(
+            http_get_host(addr, "/healthz", &host)
+                .await
+                .starts_with("HTTP/1.1 200"),
+            "{host}"
+        );
+    }
+}

@@ -402,6 +402,20 @@ impl Store {
             .optional()?)
     }
 
+    /// 每個 session 已用到的最大 (seq, pos)；沒進過串流的 pos 是 0。
+    pub fn counters(&self) -> Result<HashMap<String, (u64, u64)>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT session, MAX(seq), COALESCE(MAX(pos), 0) FROM events GROUP BY session",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// `ts_seen` ≥ `since` 的所有 Event，依 (ts_seen, session, seq)：collector 重啟時重建 live 狀態用。
     pub fn recent_events(&self, since: u64) -> Result<Vec<Event>, StoreError> {
         let mut stmt = self.db.prepare(

@@ -93,6 +93,16 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     ));
 
     let mut merger = Merger::new(Box::new(rules));
+    {
+        let counters = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .counters()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        for (sid, (seq, pos)) in counters {
+            merger.resume(&sid, seq, pos);
+        }
+    }
     let mut planner = TailPlanner::default();
     let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
     let mut tick = tokio::time::interval(TICK);

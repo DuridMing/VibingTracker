@@ -240,6 +240,50 @@ fn sessions_open_before_a_restart_still_keep_the_collector_alive() {
     );
 }
 
+/// #670-1：重啟後續跑的 session，seq 與 pos 接著上一輪編號，新事件也進得了索引。
+#[test]
+fn seq_and_pos_continue_after_a_restart() {
+    let e = env(1);
+    let jsonl = e.home.join("events/s3.jsonl");
+    let events = || -> Vec<Value> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let prompt = |text: &str| {
+        json!({"session_id": "s3", "hook_event_name": "UserPromptSubmit", "prompt": text, "cwd": "/p"})
+            .to_string()
+    };
+    {
+        let _first = start_serve(&e);
+        let start = json!({"session_id": "s3", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": e.home.join("t3.jsonl"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &start.to_string());
+        http(e.hook, "POST", "/hook", &prompt("一"));
+        wait_for("第一輪的 prompt 進 store", || {
+            events().iter().any(|v| v["type"] == "prompt.submitted")
+        });
+    } // Kill：模擬 collector 當掉
+    let before = events().len();
+    let _second = start_serve(&e);
+    http(e.hook, "POST", "/hook", &prompt("二"));
+    wait_for("第二輪的 prompt 進 store", || events().len() > before);
+
+    let all = events();
+    let seqs: Vec<u64> = all.iter().map(|v| v["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seq 要嚴格遞增：{seqs:?}"
+    );
+    let pos: Vec<u64> = all.iter().filter_map(|v| v["pos"].as_u64()).collect();
+    assert!(
+        pos.windows(2).all(|w| w[0] < w[1]),
+        "pos 要嚴格遞增：{pos:?}"
+    );
+}
+
 fn ensure(e: &Env, stdin: &str) -> std::process::Output {
     let mut c = cmd(e, &["ensure"]).stdin(Stdio::piped()).spawn().unwrap();
     c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();

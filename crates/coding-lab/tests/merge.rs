@@ -744,3 +744,24 @@ fn samples_replay_never_inserts_and_keeps_thinking_before_action() {
         assert!(replayed > 0, "有 samples/ 卻沒有任何 session 可回放");
     }
 }
+
+/// #670-1：collector 重啟後，續跑的 session 接著 store 裡最後的 seq／pos 編號，不從 1 重來。
+#[test]
+fn resumed_session_continues_seq_and_pos() {
+    let mut m = merger();
+    m.resume(S, 500, 200);
+    let a = m.handle(line(1, thinking("u1", "m1"), 1000));
+    assert_eq!((a[0].seq, a[0].pos()), (501, Some(201)));
+    let b = m.handle(Input::Line {
+        session: "s2".into(),
+        file: "main".into(),
+        no: 1,
+        value: thinking("v1", "n1"),
+        ts_seen: 1001,
+    });
+    assert_eq!(
+        (b[0].seq, b[0].pos()),
+        (1, Some(1)),
+        "沒記錄的 session 照常從 1 開始"
+    );
+}

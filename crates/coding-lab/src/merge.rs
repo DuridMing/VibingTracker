@@ -124,6 +124,8 @@ pub struct Merger {
     prices: Prices,
     host: String,
     sessions: BTreeMap<String, Session>,
+    /// 上一輪 collector 留下的 (seq, pos)，見 [`Merger::resume`]
+    resumed: HashMap<String, (u64, u64)>,
 }
 
 impl Merger {
@@ -133,7 +135,14 @@ impl Merger {
             prices: Prices::builtin(),
             host: "local".into(),
             sessions: BTreeMap::new(),
+            resumed: HashMap::new(),
         }
+    }
+
+    /// collector 重啟時，把 store 裡各 session 已用到的 seq／pos 交給 merge，續跑的 session 接著編號
+    /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
+    pub fn resume(&mut self, sid: &str, seq: u64, pos: u64) {
+        self.resumed.insert(sid.to_string(), (seq, pos));
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Event> {
@@ -266,6 +275,11 @@ impl Merger {
 
     fn emit(&mut self, sid: &str, payload: Payload, meta: Meta) -> Event {
         let s = self.sessions.entry(sid.to_string()).or_default();
+        if s.seq == 0
+            && let Some((seq, pos)) = self.resumed.remove(sid)
+        {
+            (s.seq, s.pos) = (seq, pos);
+        }
         s.seq += 1;
         let pos = meta.in_stream.then(|| {
             s.pos += 1;

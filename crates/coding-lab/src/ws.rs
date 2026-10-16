@@ -8,15 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
@@ -116,6 +117,7 @@ pub async fn serve_web(
         .route("/ws", get(ws_handler))
         .route("/healthz", get(healthz))
         .fallback(get(static_file))
+        .layer(middleware::from_fn(loopback_host))
         .with_state(state);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -123,6 +125,28 @@ pub async fn serve_web(
         }
     });
     Ok((local, task))
+}
+
+/// 只接受 loopback 名稱的 `Host`。DNS rebinding 時攻擊者的網域解析到 127.0.0.1，瀏覽器送出的
+/// `Origin` 與 `Host` 都是攻擊者網域、彼此相同，[`same_origin`] 擋不住；P6 開放遠端時改由金鑰驗證把關。
+async fn loopback_host(req: Request, next: Next) -> Response {
+    if host_is_loopback(req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Host 不是本機").into_response()
+    }
+}
+
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
