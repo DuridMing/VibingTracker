@@ -449,6 +449,33 @@ fn counters_are_the_highest_seq_and_pos_per_session() {
     s.flush().unwrap();
     drop(s);
     let c = Store::open(&h).unwrap().counters().unwrap();
-    assert_eq!(c.get("a"), Some(&(3, 2)));
-    assert_eq!(c.get("b"), Some(&(1, 0)), "沒進過串流的 pos 是 0");
+    let got = |id: &str| c.get(id).map(|c| (c.seq, c.pos, c.cwd.as_str()));
+    assert_eq!(got("a"), Some((3, 2, "/p")));
+    assert_eq!(got("b"), Some((1, 0, "/q")), "沒進過串流的 pos 是 0");
+}
+
+/// #672：之後的 session.started（compact／clear／resume）不換路徑基準，舊的與新的 file.* 都歸在同一個 cwd。
+#[test]
+fn later_session_started_keeps_the_first_cwd() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/r"));
+    let mut compact = started("s1", 2, "/r/worktrees/x");
+    compact.payload["source"] = json!("compact");
+    s.append(compact);
+    s.append(file_ev(
+        "s1",
+        3,
+        "file.edit",
+        "e1",
+        "worktrees/x/README.md",
+        3000,
+    ));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/r");
+    assert_eq!(s.touches("/r", "worktrees/x/README.md").unwrap().len(), 1);
+    assert_eq!(s.recent_changes("/r", 10).unwrap().len(), 1);
+    drop(s);
+    let c = Store::open(&h).unwrap().counters().unwrap();
+    assert_eq!(c["s1"].cwd, "/r", "重啟後交給 merge 的也是第一次的 cwd");
 }

@@ -72,6 +72,15 @@ pub struct SessionRow {
     pub last_seq: u64,
 }
 
+/// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Counters {
+    pub seq: u64,
+    pub pos: u64,
+    /// 路徑基準（session 第一次 `session.started` 的 cwd）；不知道時是空字串
+    pub cwd: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Touch {
     pub session: String,
@@ -402,15 +411,20 @@ impl Store {
             .optional()?)
     }
 
-    /// 每個 session 已用到的最大 (seq, pos)；沒進過串流的 pos 是 0。
-    pub fn counters(&self) -> Result<HashMap<String, (u64, u64)>, StoreError> {
+    /// 每個 session 已用到的最大 seq、pos（沒進過串流的是 0）與路徑基準 cwd。
+    pub fn counters(&self) -> Result<HashMap<String, Counters>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT session, MAX(seq), COALESCE(MAX(pos), 0) FROM events GROUP BY session",
+            "SELECT e.session, MAX(e.seq), COALESCE(MAX(e.pos), 0), COALESCE(s.cwd, '')
+             FROM events e LEFT JOIN sessions s ON s.id = e.session GROUP BY e.session",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
+                Counters {
+                    seq: r.get::<_, i64>(1)? as u64,
+                    pos: r.get::<_, i64>(2)? as u64,
+                    cwd: r.get(3)?,
+                },
             ))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -741,9 +755,13 @@ fn index_event(
 
     match payload {
         Payload::SessionStarted(p) => {
-            cwd_of.insert(sid.to_string(), p.cwd.clone());
+            // 路徑基準只取第一次的 cwd（#672）；之後的 compact／clear／resume 不換
+            let cwd = cwd_of.entry(sid.to_string()).or_default();
+            if cwd.is_empty() {
+                *cwd = p.cwd.clone();
+            }
             tx.execute(
-                "UPDATE sessions SET cwd = ?2, transcript_path = COALESCE(?3, transcript_path),
+                "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
                    ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
                 params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],

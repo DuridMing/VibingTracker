@@ -664,3 +664,21 @@ fn status_lines_outside_the_window_are_dropped() {
         2
     );
 }
+
+/// #672：之後的 session.started（compact 等）不換 sessions 列的 cwd（路徑基準）。
+#[test]
+fn later_session_started_keeps_the_first_cwd() {
+    let mut b = B::new();
+    let mut live = Live::new();
+    live.apply(&b.started("s1", DAY));
+    live.apply(&b.ev(
+        "s1",
+        "session.started",
+        "main",
+        DAY + 1,
+        false,
+        json!({"cwd": "/p/worktrees/x", "source": "compact",
+               "model": "claude-opus-5-5", "transcriptPath": "/t", "branch": "main"}),
+    ));
+    assert_eq!(live.session_row("s1").unwrap()["cwd"], "/p");
+}

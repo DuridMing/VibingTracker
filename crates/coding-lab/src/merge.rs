@@ -95,7 +95,7 @@ struct Session {
     /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片：id → (transcript 檔, 開始等的時間)。
     /// 背景 agent 的卡片沒有 transcript 行，不記。
     fallback_waiting: HashMap<String, (String, u64)>,
-    /// 衍生事件用（#633）
+    /// file.* 的路徑基準：第一次 SessionStart 的 cwd（#672）；之後的 hook 與 SessionStart 都不改
     cwd: Option<String>,
     last_model: HashMap<String, String>,
     seen_messages: HashSet<String>,
@@ -152,8 +152,14 @@ pub struct Merger {
     prices: Prices,
     host: String,
     sessions: BTreeMap<String, Session>,
-    /// 上一輪 collector 留下的 (seq, pos)，見 [`Merger::resume`]
-    resumed: HashMap<String, (u64, u64)>,
+    /// 上一輪 collector（或 evict）留下的編號與路徑基準，見 [`Merger::resume`]
+    resumed: HashMap<String, Resumed>,
+}
+
+struct Resumed {
+    seq: u64,
+    pos: u64,
+    cwd: Option<String>,
 }
 
 impl Merger {
@@ -169,8 +175,19 @@ impl Merger {
 
     /// collector 重啟時，把 store 裡各 session 已用到的 seq／pos 交給 merge，續跑的 session 接著編號
     /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
-    pub fn resume(&mut self, sid: &str, seq: u64, pos: u64) {
-        self.resumed.insert(sid.to_string(), (seq, pos));
+    /// `cwd` 是 file.* 的路徑基準（store 的 sessions.cwd），空字串表示不知道。
+    pub fn resume(&mut self, sid: &str, seq: u64, pos: u64, cwd: &str) {
+        let cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+        self.resumed
+            .insert(sid.to_string(), Resumed { seq, pos, cwd });
+    }
+
+    /// file.* 的路徑基準；還沒套用的 resume 也算（第一個 file.* 在 emit 之前就要用到）。
+    fn path_base(&self, sid: &str) -> Option<&str> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| s.cwd.as_deref())
+            .or_else(|| self.resumed.get(sid).and_then(|r| r.cwd.as_deref()))
     }
 
     /// 記憶體裡的 session 數。
@@ -268,7 +285,7 @@ impl Merger {
     }
 
     /// 結束超過 [`SESSION_EVICT_AFTER_MS`]、或 [`SESSION_IDLE_EVICT_MS`] 沒有任何輸入的 session 移出記憶體；
-    /// seq／pos 留在 `resumed`，resume 回來時接著編號。
+    /// seq／pos 與路徑基準留在 `resumed`，resume 回來時接著用。
     fn evict(&mut self, now: u64) {
         let gone: Vec<String> = self
             .sessions
@@ -284,7 +301,12 @@ impl Merger {
             if let Some(s) = self.sessions.remove(&id)
                 && s.seq > 0
             {
-                self.resumed.insert(id, (s.seq, s.pos));
+                let r = Resumed {
+                    seq: s.seq,
+                    pos: s.pos,
+                    cwd: s.cwd,
+                };
+                self.resumed.insert(id, r);
             }
         }
     }
@@ -383,9 +405,12 @@ impl Merger {
     fn emit(&mut self, sid: &str, payload: Payload, meta: Meta) -> Event {
         let s = self.sessions.entry(sid.to_string()).or_default();
         if s.seq == 0
-            && let Some((seq, pos)) = self.resumed.remove(sid)
+            && let Some(r) = self.resumed.remove(sid)
         {
-            (s.seq, s.pos) = (seq, pos);
+            (s.seq, s.pos) = (r.seq, r.pos);
+            if s.cwd.is_none() {
+                s.cwd = r.cwd;
+            }
         }
         s.seq += 1;
         let pos = meta.in_stream.then(|| {
@@ -415,9 +440,6 @@ impl Merger {
 
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
-        if let Some(cwd) = h.str_field("cwd").filter(|c| !c.is_empty()) {
-            self.sessions.entry(sid.clone()).or_default().cwd = Some(cwd.to_string());
-        }
         let agent = self.agent_of_hook(&sid, h);
         let mut out = Vec::new();
         if agent == "bg" {
@@ -437,9 +459,15 @@ impl Merger {
         let s = |k: &str| h.str_field(k).map(str::to_string);
         match h.event_name() {
             "SessionStart" => {
-                self.sessions.entry(sid.clone()).or_default().ended_at = None;
+                let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
+                let base = (self.path_base(&sid).is_none() && !cwd.is_empty()).then(|| cwd.clone());
+                let session = self.sessions.entry(sid.clone()).or_default();
+                session.ended_at = None;
+                if base.is_some() {
+                    session.cwd = base;
+                }
                 let p = SessionStarted {
-                    cwd: s("cwd").unwrap_or_default(),
+                    cwd,
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
                     transcript_path: s("transcript_path"),
@@ -782,11 +810,7 @@ impl Merger {
             ts_seen,
             ..Meta::default()
         };
-        let cwd = self
-            .sessions
-            .get(sid)
-            .and_then(|s| s.cwd.clone())
-            .unwrap_or_default();
+        let cwd = self.path_base(sid).unwrap_or_default().to_string();
         let path = || {
             input["file_path"]
                 .as_str()

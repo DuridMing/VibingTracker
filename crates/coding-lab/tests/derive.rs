@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use coding_lab::derive::{edit_hunk, git_op_from, relative_path};
 use coding_lab::event::{Event, HunkSource};
 use coding_lab::hook::HookInput;
-use coding_lab::merge::{DangerRules, Input, Merger};
+use coding_lab::merge::{DangerRules, Input, Merger, SESSION_IDLE_EVICT_MS};
 use coding_lab::prices::Prices;
+use coding_lab::store::Store;
 use serde_json::{Value, json};
 
 static N: AtomicU32 = AtomicU32::new(0);
@@ -266,12 +267,32 @@ fn of<'a>(evs: &'a [Event], t: &str) -> Vec<&'a Event> {
     evs.iter().filter(|e| e.type_name() == t).collect()
 }
 
+fn session_start(sid: &str, cwd: &str, source: &str) -> Value {
+    json!({"session_id": sid, "hook_event_name": "SessionStart", "cwd": cwd, "source": source})
+}
+
+/// hook 的 cwd 是「當下」的（session 裡 `cd` 過就會變），file_path 是絕對路徑。
+fn edit_at(sid: &str, hook_cwd: &str, file_path: &str, id: &str) -> Value {
+    json!({
+        "session_id": sid, "hook_event_name": "PreToolUse", "cwd": hook_cwd, "tool_name": "Edit",
+        "tool_input": {"file_path": file_path, "old_string": "a", "new_string": "b"}, "tool_use_id": id,
+    })
+}
+
+fn edit_path(evs: &[Event]) -> String {
+    of(evs, "file.edit")[0].payload["path"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn file_events_from_pre_tool_use() {
     let dir = tmpdir();
     std::fs::write(dir.join("calc.py"), "def sub(a, b):\n    return a + b\n").unwrap();
     let cwd = dir.to_str().unwrap();
     let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", cwd, "startup"), 0);
     let pre = |tool: &str, input: Value, id: &str| {
         json!({
             "session_id": "s1", "hook_event_name": "PreToolUse", "cwd": cwd,
@@ -456,4 +477,117 @@ fn synthetic_model_is_ignored() {
     let a = line(&mut m, 2, assistant("u2", "m2", "<synthetic>", text));
     assert!(of(&a, "model.changed").is_empty());
     assert!(of(&a, "usage").is_empty());
+}
+
+// ── #672：file.* 的 path 相對 session 第一次 session.started 的 cwd
+
+/// 1. session 中途 `cd` 進 worktree：path 仍相對開始時的 cwd，不是 hook 當下的 cwd。
+#[test]
+fn file_path_is_relative_to_the_session_start_cwd_not_the_current_one() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", "/r", "startup"), 1);
+    let e = handle(
+        &mut m,
+        edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
+        2,
+    );
+    assert_eq!(edit_path(&e), "worktrees/x/README.md");
+}
+
+/// 2. session cwd 以外的檔：絕對路徑。
+#[test]
+fn file_outside_the_session_cwd_keeps_its_absolute_path() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", "/r", "startup"), 1);
+    let e = handle(&mut m, edit_at("s1", "/r", "/tmp/a.txt", "e1"), 2);
+    assert_eq!(edit_path(&e), "/tmp/a.txt");
+}
+
+/// 3. 沒收到 session.started（session 比 collector 早開）：基準未知，存絕對路徑，不拿 hook 的 cwd 當基準。
+#[test]
+fn without_session_started_paths_are_absolute() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let e = handle(&mut m, edit_at("s1", "/r", "/r/a.rs", "e1"), 1);
+    assert_eq!(edit_path(&e), "/r/a.rs");
+}
+
+/// 4. merge → store：changes／file_touch 的 (cwd, path) 拼回來就是工具碰的那個檔。
+#[test]
+fn store_cwd_and_path_point_at_the_file_the_tool_touched() {
+    let home = tmpdir();
+    let mut st = Store::open(&home).unwrap();
+    let mut m = Merger::new(Box::new(NoDanger));
+    for e in handle(&mut m, session_start("s1", "/r", "startup"), 1) {
+        st.append(e);
+    }
+    for e in handle(
+        &mut m,
+        edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
+        2,
+    ) {
+        st.append(e);
+    }
+    st.flush().unwrap();
+    let cwd = st.session("s1").unwrap().unwrap().cwd;
+    let c = st.recent_changes(&cwd, 10).unwrap();
+    assert_eq!(c.len(), 1, "{c:?}");
+    assert_eq!(format!("{cwd}/{}", c[0].path), "/r/worktrees/x/README.md");
+    assert_eq!(st.touches(&cwd, &c[0].path).unwrap().len(), 1);
+}
+
+/// 5. collector 重啟：基準從 store 交回來；store 也不知道（空字串）就用絕對路徑。
+#[test]
+fn resumed_session_keeps_its_path_base() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    m.resume("s1", 10, 5, "/r");
+    m.resume("s2", 10, 5, "");
+    let e = handle(
+        &mut m,
+        edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
+        1,
+    );
+    assert_eq!(edit_path(&e), "worktrees/x/README.md");
+    let e = handle(&mut m, edit_at("s2", "/r", "/r/a.rs", "e2"), 2);
+    assert_eq!(edit_path(&e), "/r/a.rs");
+}
+
+/// 6. 之後的 session.started（例如在 worktree 裡 /compact）不換基準。
+#[test]
+fn later_session_start_does_not_change_the_path_base() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", "/r", "startup"), 1);
+    handle(&mut m, session_start("s1", "/r/worktrees/x", "compact"), 2);
+    let e = handle(
+        &mut m,
+        edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
+        3,
+    );
+    assert_eq!(edit_path(&e), "worktrees/x/README.md");
+}
+
+/// 7. Windows 路徑：session.started 的 cwd 在入口就正規化成 `/`，store／live／WS 拿到同一個值。
+#[test]
+fn session_started_cwd_is_normalized_to_forward_slashes() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let s = handle(&mut m, session_start("s1", "C:\\r", "startup"), 1);
+    assert_eq!(of(&s, "session.started")[0].payload["cwd"], "C:/r");
+    let e = handle(&mut m, edit_at("s1", "C:\\r", "C:\\r\\src\\a.rs", "e1"), 2);
+    assert_eq!(edit_path(&e), "src/a.rs");
+}
+
+/// 8. session 被移出記憶體（evict）後，回來的第一個事件就是 file.*：基準與 seq 都要接續。
+#[test]
+fn evicted_session_keeps_its_path_base() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let s = handle(&mut m, session_start("s1", "/r", "startup"), 1);
+    let last_seq = s.last().unwrap().seq;
+    m.tick(1 + SESSION_IDLE_EVICT_MS);
+    assert_eq!(m.session_count(), 0);
+    let e = handle(
+        &mut m,
+        edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
+        2 + SESSION_IDLE_EVICT_MS,
+    );
+    assert_eq!(edit_path(&e), "worktrees/x/README.md");
+    assert_eq!(e[0].seq, last_seq + 1, "{e:?}");
 }

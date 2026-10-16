@@ -119,8 +119,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             .unwrap_or_else(|e| e.into_inner())
             .counters()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        for (sid, (seq, pos)) in counters {
-            merger.resume(&sid, seq, pos);
+        for (sid, c) in counters {
+            merger.resume(&sid, c.seq, c.pos, &c.cwd);
         }
     }
     let mut planner = TailPlanner::default();

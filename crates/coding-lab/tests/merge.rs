@@ -752,7 +752,7 @@ fn samples_replay_never_inserts_and_keeps_thinking_before_action() {
 #[test]
 fn resumed_session_continues_seq_and_pos() {
     let mut m = merger();
-    m.resume(S, 500, 200);
+    m.resume(S, 500, 200, "");
     let a = m.handle(line(1, thinking("u1", "m1"), 1000));
     assert_eq!((a[0].seq, a[0].pos()), (501, Some(201)));
     let b = m.handle(Input::Line {

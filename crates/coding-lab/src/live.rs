@@ -399,7 +399,10 @@ impl Live {
         };
         match payload {
             Payload::SessionStarted(p) => {
-                s.cwd = p.cwd.replace('\\', "/");
+                // 第一次的 cwd 是路徑基準（#672），之後的 session.started 不換
+                if s.cwd.is_empty() {
+                    s.cwd = p.cwd.replace('\\', "/");
+                }
                 s.model = p.model.as_deref().map(short_model).or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
