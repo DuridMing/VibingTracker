@@ -491,7 +491,7 @@ export function installMock(n, { bench = false, prefill = false, bigtree = false
     }
     send(text) {
       const msg = JSON.parse(text);
-      if (msg.op === "hello") this.#emit({ t: "welcome", protocol: 1, host: "local", version: "0.0.0-mock", remote: false, thinking: "full", scope: "operate" });
+      if (msg.op === "hello") this.#emit({ t: "welcome", protocol: 1, instance: "mock", host: "local", version: "0.0.0-mock", remote: false, thinking: "full", scope: "operate" });
       if (msg.op === "subscribe" && msg.channel === "*") {
         this.all = true;
         this.#emit(world.snapshot());

@@ -177,7 +177,8 @@ async fn resume_sends_missed_frames_instead_of_snapshot() {
     let state = WebState::new(None, None, 64);
     let addr = start(state.clone()).await;
     let mut ws = connect(addr, None).await.unwrap();
-    hello(&mut ws, json!({})).await;
+    let instance = hello(&mut ws, json!({})).await["instance"].clone();
+    assert!(instance.is_string(), "welcome 帶 instance");
     send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
     let last = recv(&mut ws).await["frame"].as_u64().unwrap();
     drop(ws);
@@ -188,7 +189,11 @@ async fn resume_sends_missed_frames_instead_of_snapshot() {
     state.flush(3_000);
 
     let mut ws = connect(addr, None).await.unwrap();
-    hello(&mut ws, json!({"resume": last})).await;
+    hello(
+        &mut ws,
+        json!({"resume": {"instance": instance, "frame": last}}),
+    )
+    .await;
     send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
     let a = recv(&mut ws).await;
     let b = recv(&mut ws).await;
@@ -203,9 +208,47 @@ async fn resume_sends_missed_frames_instead_of_snapshot() {
 
     // 接不上（編號不合理）就送 snapshot
     let mut ws = connect(addr, None).await.unwrap();
-    hello(&mut ws, json!({"resume": 999_999})).await;
+    hello(
+        &mut ws,
+        json!({"resume": {"instance": instance, "frame": 999_999}}),
+    )
+    .await;
     send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
     assert_eq!(recv(&mut ws).await["t"], "snapshot");
+
+    // 舊格式（resume 只是數字）分不出是不是同一個 collector，當成接不上
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({"resume": last})).await;
+    send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
+    assert_eq!(recv(&mut ws).await["t"], "snapshot");
+}
+
+/// R5：collector 重啟後 frame 編號從頭算；舊頁面帶的 frame 編號剛好在新的範圍內，
+/// 也不能當成接得上（會漏掉新 collector 的前段 frame），要送 snapshot。
+#[tokio::test]
+async fn resume_from_another_collector_instance_gets_snapshot() {
+    let old = WebState::new(None, None, 64);
+    let old_addr = start(old.clone()).await;
+    let mut ws = connect(old_addr, None).await.unwrap();
+    let old_instance = hello(&mut ws, json!({})).await["instance"].clone();
+    drop(ws);
+
+    let state = WebState::new(None, None, 64); // 重啟
+    for i in 1..=80 {
+        state.apply(&[text("s1", i, i)]);
+        state.flush(2_000 + i);
+    }
+    let addr = start(state.clone()).await;
+    let mut ws = connect(addr, None).await.unwrap();
+    let w = hello(
+        &mut ws,
+        json!({"resume": {"instance": old_instance, "frame": 30}}),
+    )
+    .await;
+    assert_ne!(w["instance"], old_instance, "重啟後 instance 不同");
+    send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
+    let m = recv(&mut ws).await;
+    assert_eq!(m["t"], "snapshot", "舊 collector 的 frame 30 被當成接得上");
 }
 
 #[tokio::test]
@@ -502,6 +545,96 @@ async fn non_loopback_host_is_rejected_even_when_origin_matches() {
     }
 }
 
+/// R7：平行工具 A、B 的結果在 B 進串流之後才到；「載入更多」窗口最後一張卡片 A
+/// 也要帶上它的 tool.updated 與 tool.result，不能停在「…」。
+#[tokio::test]
+async fn more_keeps_late_companions_of_the_last_card() {
+    let home = tmp("more-late");
+    let store = Arc::new(std::sync::Mutex::new(Store::open(&home).unwrap()));
+    let called = |seq, id: &str| {
+        ev(
+            "s1",
+            seq,
+            "tool.called",
+            None,
+            json!({"toolUseId": id, "tool": "Bash", "input": {"command": "ls"},
+            "status": "running", "placement": "staged", "danger": null}),
+        )
+    };
+    let placed = |seq, id: &str, pos| {
+        ev(
+            "s1",
+            seq,
+            "tool.placed",
+            Some(pos),
+            json!({"toolUseId": id, "placement": "stream"}),
+        )
+    };
+    let done = |seq, id: &str| {
+        ev(
+            "s1",
+            seq,
+            "tool.updated",
+            None,
+            json!({"toolUseId": id, "status": "done", "durationMs": 1, "error": null, "interrupted": false}),
+        )
+    };
+    let result = |seq, id: &str| {
+        ev(
+            "s1",
+            seq,
+            "tool.result",
+            None,
+            json!({"toolUseId": id, "ok": true, "exitCode": 0, "output": "a\n", "truncated": false}),
+        )
+    };
+    {
+        let mut s = store.lock().unwrap();
+        for e in [
+            called(1, "A"),
+            called(2, "B"),
+            placed(3, "A", 1),
+            placed(4, "B", 2),
+            done(5, "A"),
+            result(6, "A"),
+            done(7, "B"),
+            result(8, "B"),
+        ] {
+            s.append(e);
+        }
+        s.flush().unwrap();
+    }
+    let state = WebState::new(Some(store), None, 8);
+    let addr = start(state).await;
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({})).await;
+    send(
+        &mut ws,
+        json!({"op": "more", "session": "s1", "beforePos": 2, "limit": 10}),
+    )
+    .await;
+    let m = recv(&mut ws).await;
+    let a: Vec<&str> = m["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["payload"]["toolUseId"] == "A")
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        a,
+        ["tool.called", "tool.placed", "tool.updated", "tool.result"]
+    );
+    assert!(
+        m["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["payload"]["toolUseId"] != "B"),
+        "窗口外的卡片 B 不帶"
+    );
+}
+
 /// #670-5：hello 的 resume 只給重連時一起送出的那批 subscribe；之後才新開的頻道
 /// （例如重連後幾秒才打開的 session tab）客戶端沒有它的狀態，要給 snapshot。
 #[tokio::test]
@@ -509,7 +642,7 @@ async fn resume_only_covers_the_resubscribe_burst() {
     let state = WebState::new(None, None, 64);
     let addr = start(state.clone()).await;
     let mut ws = connect(addr, None).await.unwrap();
-    hello(&mut ws, json!({})).await;
+    let instance = hello(&mut ws, json!({})).await["instance"].clone();
     send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
     let last = recv(&mut ws).await["frame"].as_u64().unwrap();
     drop(ws);
@@ -518,7 +651,11 @@ async fn resume_only_covers_the_resubscribe_burst() {
 
     state.set_resume_window(Duration::ZERO); // 模擬「過了重連那一刻」
     let mut ws = connect(addr, None).await.unwrap();
-    hello(&mut ws, json!({"resume": last})).await;
+    hello(
+        &mut ws,
+        json!({"resume": {"instance": instance, "frame": last}}),
+    )
+    .await;
     send(&mut ws, json!({"op": "subscribe", "channel": "session:s1"})).await;
     assert_eq!(recv(&mut ws).await["t"], "snapshot");
 }

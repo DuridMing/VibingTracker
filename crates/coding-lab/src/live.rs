@@ -65,11 +65,14 @@ fn card_key(e: &Event) -> Option<String> {
     e.payload[key].as_str().map(str::to_string)
 }
 
-/// 組串流：`window` 是依 pos 排好的帶 pos Event，`pool` 是候選的伴隨 Event 與狀態行。
-/// 附上窗口內卡片的伴隨 Event（同卡只留最新的 tool.updated）；狀態行只取窗口範圍內的——
-/// 窗口從 pos 1 開始時沒有下限，否則從窗口第一個 Event 的時間起，`until`（不含）為上限。
-/// 結果依 (ts_seen, session, pos) 排序；伴隨 Event 沒有 pos，前端依 toolUseId 併進卡片。
-pub fn assemble_stream(window: Vec<Event>, pool: Vec<Event>, until: Option<u64>) -> Vec<Event> {
+/// 組一個 session 的串流（contracts.md §6「同一 session 內永遠只看 pos」）：`window` 是帶 pos 的 Event，
+/// `pool` 是候選的伴隨 Event 與狀態行。
+/// - 帶 pos 的 Event 依 pos 排；窗口內卡片的伴隨 Event 跟在卡片旁（卡片與伴隨合起來依 seq），
+///   同卡只留最新的 tool.updated，較早一筆帶的 danger 併進它。
+/// - 狀態行只取窗口範圍內的（窗口從 pos 1 開始時沒有下限，否則從窗口第一個 Event 的時間起，
+///   `until`（不含）為上限），插在 ts_seen 不晚於它的最後一個帶 pos Event 之後，同位置依 seq。
+pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u64>) -> Vec<Event> {
+    window.sort_by_key(|e| (e.pos, e.seq));
     let lower = match window.first() {
         Some(first) if first.pos == Some(1) => 0,
         Some(first) => first.ts_seen,
@@ -80,36 +83,105 @@ pub fn assemble_stream(window: Vec<Event>, pool: Vec<Event>, until: Option<u64>)
         .filter(|e| e.kind == "tool.placed" || e.kind == "tool.called")
         .filter_map(card_key)
         .collect();
-    let mut latest_update: HashMap<String, u64> = HashMap::new();
-    for e in pool.iter().filter(|e| e.kind == "tool.updated") {
-        if let Some(id) = card_key(e) {
-            let seq = latest_update.entry(id).or_insert(e.seq);
-            *seq = (*seq).max(e.seq);
-        }
-    }
     let mut seen = HashSet::new();
-    let mut out = window;
+    let mut companions: HashMap<String, Vec<Event>> = HashMap::new();
+    let mut lines: Vec<Event> = Vec::new();
     for e in pool {
         if e.pos.is_some() || !seen.insert((e.session.clone(), e.seq)) {
             continue;
         }
-        let keep = if is_status_line(&e) {
-            e.ts_seen >= lower && until.is_none_or(|u| e.ts_seen < u)
-        } else if COMPANIONS.contains(&e.kind.as_str()) {
-            card_key(&e).is_some_and(|id| {
-                cards.contains(&id)
-                    && (e.kind != "tool.updated" || latest_update.get(&id) == Some(&e.seq))
-            })
-        } else {
-            false
-        };
-        if keep {
+        if is_status_line(&e) {
+            if e.ts_seen >= lower && until.is_none_or(|u| e.ts_seen < u) {
+                lines.push(e);
+            }
+        } else if COMPANIONS.contains(&e.kind.as_str())
+            && let Some(id) = card_key(&e).filter(|id| cards.contains(id))
+        {
+            companions.entry(id).or_default().push(e);
+        }
+    }
+    for list in companions.values_mut() {
+        list.sort_by_key(|e| e.seq);
+        keep_latest_update(list);
+    }
+    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）
+    lines.sort_by_key(|e| e.seq);
+    let mut after: Vec<Vec<Event>> = vec![Vec::new(); window.len() + 1];
+    for l in lines {
+        let at = window
+            .iter()
+            .rposition(|e| e.ts_seen <= l.ts_seen)
+            .map_or(0, |i| i + 1);
+        after[at].push(l);
+    }
+    let mut after = after.into_iter();
+    let mut out: Vec<Event> = after.next().unwrap_or_default();
+    for (e, tail) in window.into_iter().zip(after) {
+        let mut unit = card_key(&e)
+            .and_then(|id| companions.remove(&id))
+            .unwrap_or_default();
+        unit.push(e);
+        unit.sort_by_key(|e| e.seq);
+        out.extend(unit);
+        out.extend(tail);
+    }
+    out
+}
+
+/// 同卡只留最新的 tool.updated（`list` 依 seq 排好）；較早一筆帶的 danger 併進它，
+/// 否則 transcript 先到時危險標示會被之後的狀態更新蓋掉。
+fn keep_latest_update(list: &mut Vec<Event>) {
+    let danger = list
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "tool.updated")
+        .find_map(|e| e.payload.get("danger").filter(|d| !d.is_null()).cloned());
+    let Some(last) = list.iter().rposition(|e| e.kind == "tool.updated") else {
+        return;
+    };
+    if let Some(d) = danger
+        && list[last].payload.get("danger").is_none_or(Value::is_null)
+    {
+        list[last].payload["danger"] = d;
+    }
+    let mut i = 0;
+    list.retain(|e| {
+        i += 1;
+        e.kind != "tool.updated" || i - 1 == last
+    });
+}
+
+/// 各 session 的串流（[`assemble_stream`] 的結果）依開頭那筆的順序鍵 `(ts_seen, session, pos)` 逐筆合併，
+/// 不打亂任何一個 session 內的順序（contracts.md §6）。伴隨 Event 沿用它前一筆的鍵，跟著卡片走。
+pub fn merge_streams(lists: Vec<Vec<Event>>) -> Vec<Event> {
+    type Key = (u64, String, Option<u64>, u64);
+    let mut queues: Vec<VecDeque<(Key, Event)>> = lists
+        .into_iter()
+        .map(|list| {
+            let mut prev: Option<Key> = None;
+            list.into_iter()
+                .map(|e| {
+                    let own = (e.ts_seen, e.session.clone(), e.pos, e.seq);
+                    let key = match &prev {
+                        Some(p) if e.pos.is_none() && !is_status_line(&e) => p.clone(),
+                        _ => own,
+                    };
+                    prev = Some(key.clone());
+                    (key, e)
+                })
+                .collect()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(queues.iter().map(VecDeque::len).sum());
+    while let Some(q) = queues
+        .iter_mut()
+        .filter(|q| !q.is_empty())
+        .min_by(|a, b| a[0].0.cmp(&b[0].0))
+    {
+        if let Some((_, e)) = q.pop_front() {
             out.push(e);
         }
     }
-    out.sort_by(|a, b| {
-        (a.ts_seen, &a.session, a.pos, a.seq).cmp(&(b.ts_seen, &b.session, b.pos, b.seq))
-    });
     out
 }
 
@@ -319,6 +391,8 @@ impl Live {
     }
 
     pub fn apply(&mut self, e: &Event) {
+        let carried = self.carry_danger(e);
+        let e = carried.as_ref().unwrap_or(e);
         self.pending.push(e.clone());
         let sid = e.session.clone();
         let ts = e.ts_seen;
@@ -870,7 +944,7 @@ impl Live {
         } else {
             STREAM_PER_SESSION
         };
-        let mut stream: Vec<Event> = Vec::new();
+        let mut lists: Vec<Vec<Event>> = Vec::new();
         for (sid, q) in self.streams.iter().filter(|(s, _)| ch.wants(s)) {
             let window: Vec<Event> = q
                 .iter()
@@ -889,20 +963,17 @@ impl Live {
                     pool.extend(list.iter().cloned());
                 }
             }
-            stream.extend(assemble_stream(window, pool, None));
+            lists.push(assemble_stream(window, pool, None));
         }
         // 還沒有任何 pos 的 session：只有狀態行
-        for (sid, lines) in self
+        for (_, lines) in self
             .status_lines
             .iter()
             .filter(|(s, _)| ch.wants(s) && !self.streams.contains_key(*s))
         {
-            let _ = sid;
-            stream.extend(lines.iter().cloned());
+            lists.push(lines.iter().cloned().collect());
         }
-        stream.sort_by(|a, b| {
-            (a.ts_seen, &a.session, a.pos, a.seq).cmp(&(b.ts_seen, &b.session, b.pos, b.seq))
-        });
+        let stream = merge_streams(lists);
 
         let mut snap = json!({
             "t": "snapshot", "ch": ch.name(), "frame": self.frame_no,
@@ -945,6 +1016,25 @@ impl Live {
             self.dirty_agents.insert(id.clone(), false);
         }
         id
+    }
+
+    /// 沒帶 danger 的 tool.updated 接手同卡較早一筆帶的 danger：live、frame 與 snapshot 都只留同卡
+    /// 最新的 tool.updated，transcript 先到時的危險標示（PreToolUse 後到才判斷）不能因此不見（R15）。
+    fn carry_danger(&self, e: &Event) -> Option<Event> {
+        if e.kind != "tool.updated" || e.payload.get("danger").is_some_and(|d| !d.is_null()) {
+            return None;
+        }
+        let key = (e.session.clone(), card_key(e)?);
+        let danger = [self.card_events.get(&key), self.staged.get(&key)]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|x| x.kind == "tool.updated")
+            .find_map(|x| x.payload.get("danger").filter(|d| !d.is_null()))?
+            .clone();
+        let mut e = e.clone();
+        e.payload["danger"] = danger;
+        Some(e)
     }
 
     fn stage_update(&mut self, sid: &str, tool_use_id: &str, e: &Event) {

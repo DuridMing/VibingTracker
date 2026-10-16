@@ -27,7 +27,7 @@ export function kindOf(row) {
   return "cmd";
 }
 
-// 跨 session 的順序鍵（contracts.md §6）：(ts_seen, session, pos)
+// 跨 session 的順序鍵（contracts.md §6）：(ts_seen, session, pos)；同 session 內只看 server 給的順序（依 pos）
 function compareRows(a, b) {
   return a.ts - b.ts || (a.session < b.session ? -1 : a.session > b.session ? 1 : 0) || (a.pos ?? -1) - (b.pos ?? -1) || a.seq - b.seq;
 }
@@ -99,7 +99,8 @@ export function createStream({ cap = CAP } = {}) {
     switch (ev.type) {
       case "tool.called": {
         const c = card(id, ev);
-        Object.assign(c, { tool: p.tool, input: p.input ?? {}, danger: p.danger ?? null, agent: ev.agent });
+        // danger 也可能由先套用的 tool.updated 帶來（transcript 先到時），沒有就不蓋掉
+        Object.assign(c, { tool: p.tool, input: p.input ?? {}, danger: p.danger ?? c.danger, agent: ev.agent });
         // tool.updated 可能先被套用（例如載入更多的批次），已有更新的狀態就不蓋回去
         if (c.status === "pending") c.status = p.status ?? "pending";
         if (ev.pos != null) placeCard(ev, c, out);
@@ -119,6 +120,8 @@ export function createStream({ cap = CAP } = {}) {
       case "tool.updated": {
         const c = card(id, ev);
         Object.assign(c, { status: p.status ?? c.status, durationMs: p.durationMs, error: p.error, interrupted: p.interrupted });
+        // transcript 先建卡、PreToolUse 後到才判斷出的危險（contracts.md §4）；之後沒帶 danger 的更新不清掉
+        if (p.danger != null) c.danger = p.danger;
         touch(id, ops);
         break;
       }
@@ -235,12 +238,28 @@ export function createStream({ cap = CAP } = {}) {
     return st.apply([...staged, ...stream]);
   };
 
-  // 載入更多：每個 session 一段 Event，合併排序後放在最上面
+  // 載入更多：每個 session 一段 Event（server 已依 pos 排好、狀態行插在該在的位置），
+  // 各 session 依開頭那行的順序鍵逐行合併，不打亂同 session 內的順序（contracts.md §6），放在最上面
   st.prepend = (batches) => {
     const ops = newOps();
+    const made = [];
+    for (const events of batches ?? []) for (const ev of events ?? []) handle(ev, made, ops);
+    const bySession = new Map();
+    for (const r of made) {
+      if (!bySession.has(r.session)) bySession.set(r.session, []);
+      bySession.get(r.session).push(r);
+    }
+    const queues = [...bySession.values()];
+    const heads = queues.map(() => 0);
     const out = [];
-    for (const events of batches ?? []) for (const ev of events ?? []) handle(ev, out, ops);
-    out.sort(compareRows);
+    for (;;) {
+      let best = -1;
+      for (let i = 0; i < queues.length; i++) {
+        if (heads[i] < queues[i].length && (best < 0 || compareRows(queues[i][heads[i]], queues[best][heads[best]]) < 0)) best = i;
+      }
+      if (best < 0) break;
+      out.push(queues[best][heads[best]++]);
+    }
     st.rows = out.concat(st.rows);
     if (out.length) st.holding = true;
     return { prepended: out.length, rows: out, updated: ops.updated };

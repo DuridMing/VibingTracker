@@ -862,11 +862,11 @@ fn stream_carries_card_companions_and_status_lines() {
             .collect();
         assert_eq!(updates.len(), 1, "只附最新一筆 tool.updated");
         assert_eq!(updates[0]["payload"]["status"], "done");
-        let ts: Vec<u64> = stream
-            .iter()
-            .map(|e| e["ts_seen"].as_u64().unwrap())
-            .collect();
-        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "依 ts_seen 排");
+        // 伴隨 Event 跟著卡片（依 seq），狀態行排在 ts_seen 不晚於它的卡片之後（contracts §6）
+        let at = |t: &str| types.iter().position(|x| *x == t).unwrap();
+        assert!(at("prompt.submitted") < at("tool.called"));
+        assert!(at("tool.called") < at("tool.placed"));
+        assert!(at("agent.spawned") < at("session.status"), "{types:?}");
     }
 }
 
@@ -1221,4 +1221,159 @@ fn clear_is_not_a_resume_status_line() {
         .map(|e| e["payload"]["source"].as_str().unwrap())
         .collect();
     assert_eq!(sources, ["resume"]);
+}
+
+// ── 同 session 內只依 pos（不變式 1、R14、#681）
+
+fn pos_of(stream: &[&Value], s: &str) -> Vec<u64> {
+    stream
+        .iter()
+        .filter(|e| e["session"] == s)
+        .filter_map(|e| e["pos"].as_u64())
+        .collect()
+}
+
+/// ts_seen 在同 session 內可能倒退（main 與 subagent 兩個 tail 搶 channel、逾時降級用當下時間）。
+#[test]
+fn assemble_stream_keeps_pos_order_when_ts_seen_goes_back() {
+    let mut b = B::new();
+    let p5 = b.text("s1", DAY + 1_001);
+    let p6 = b.text("s1", DAY + 1_000);
+    let out = coding_lab::live::assemble_stream(vec![p5, p6], vec![], None);
+    let pos: Vec<u64> = out.iter().filter_map(|e| e.pos).collect();
+    assert_eq!(pos, [1, 2]);
+}
+
+#[test]
+fn snapshot_merges_sessions_without_reordering_within_one() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.text("s1", DAY + 10),
+            b.text("s2", DAY + 11),
+            b.text("s1", DAY + 5), // 倒退
+            b.ev(
+                "s1",
+                "prompt.submitted",
+                "main",
+                DAY + 12,
+                false,
+                json!({"text": "下一個", "promptId": "p2"}),
+            ),
+            b.text("s2", DAY + 13),
+            b.text("s1", DAY + 14),
+        ],
+    );
+    for ch in [Channel::All, Channel::Session("s1".into())] {
+        let snap = l.snapshot(&ch, 0, DAY + 100);
+        let stream = rows(&snap, "stream");
+        assert_eq!(pos_of(&stream, "s1"), [1, 2, 3], "{ch:?}");
+        let s1: Vec<&str> = stream
+            .iter()
+            .filter(|e| e["session"] == "s1")
+            .map(|e| e["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            s1,
+            [
+                "assistant.text",
+                "assistant.text",
+                "prompt.submitted",
+                "assistant.text"
+            ],
+            "狀態行排在 ts_seen 不晚於它的最後一個 pos 之後"
+        );
+    }
+    let all = l.snapshot(&Channel::All, 0, DAY + 100);
+    let order: Vec<(String, u64)> = rows(&all, "stream")
+        .iter()
+        .filter_map(|e| Some((e["session"].as_str()?.to_string(), e["pos"].as_u64()?)))
+        .collect();
+    // s1 的 pos 2（ts 5）倒退：開頭換成它之後比 s2 的 pos 1（ts 11）早，先出
+    let want: Vec<(String, u64)> = [("s1", 1), ("s1", 2), ("s2", 1), ("s2", 2), ("s1", 3)]
+        .iter()
+        .map(|(s, p)| (s.to_string(), *p))
+        .collect();
+    assert_eq!(
+        order, want,
+        "跨 session 依各列開頭的 (ts_seen, session, pos) 合併"
+    );
+}
+
+// ── tool.updated 的 danger 不能被之後的 tool.updated 蓋掉（R15）
+
+#[test]
+fn later_tool_update_keeps_the_danger_from_an_earlier_one() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let danger = json!({"rule": "rm-rf", "level": "danger", "why": "刪除"});
+    let up = |b: &mut B, ts, status: &str, danger: Option<&Value>| {
+        let mut p = json!({"toolUseId": "t1", "status": status, "durationMs": null, "error": null, "interrupted": null});
+        if let Some(d) = danger {
+            p["danger"] = d.clone();
+        }
+        b.ev("s1", "tool.updated", "main", ts, false, p)
+    };
+    // transcript 先到：tool.called 直接帶 pos、沒有 danger；PreToolUse 後到才判斷出危險
+    let called = b.ev(
+        "s1",
+        "tool.called",
+        "main",
+        DAY,
+        true,
+        json!({"toolUseId": "t1", "tool": "Bash", "input": {"command": "rm -rf x"},
+               "status": "pending", "placement": "stream", "danger": null}),
+    );
+    apply_all(
+        &mut l,
+        &[called, up(&mut b, DAY + 1, "running", Some(&danger))],
+    );
+    l.flush(DAY + 1);
+    // 同一個 frame 裡先後兩筆：只送最後一筆，danger 要留著
+    apply_all(
+        &mut l,
+        &[
+            up(&mut b, DAY + 2, "running", None),
+            up(&mut b, DAY + 3, "done", None),
+        ],
+    );
+    let f = l.flush(DAY + 3).unwrap();
+    let ups = f.events_for(&Channel::All);
+    assert_eq!(ups.len(), 1);
+    assert_eq!(ups[0].payload["status"], "done");
+    assert_eq!(
+        ups[0].payload["danger"], danger,
+        "frame 只留最後一筆時 danger 不見"
+    );
+
+    let snap = l.snapshot(&Channel::All, 0, DAY + 10);
+    let u: Vec<&Value> = rows(&snap, "stream")
+        .into_iter()
+        .filter(|e| e["type"] == "tool.updated")
+        .collect();
+    assert_eq!(u.len(), 1);
+    assert_eq!(u[0]["payload"]["danger"], danger, "snapshot 後危險標示不見");
+
+    // 「載入更多」從 store 組：pool 裡有兩筆 tool.updated，只留最新的那筆也要帶 danger
+    let mut b = B::new();
+    let called = b.ev(
+        "s1",
+        "tool.called",
+        "main",
+        DAY,
+        true,
+        json!({"toolUseId": "t1", "tool": "Bash", "input": {"command": "rm -rf x"},
+               "status": "pending", "placement": "stream", "danger": null}),
+    );
+    let pool = vec![
+        up(&mut b, DAY + 1, "running", Some(&danger)),
+        up(&mut b, DAY + 2, "done", None),
+    ];
+    let out = coding_lab::live::assemble_stream(vec![called], pool, None);
+    let u: Vec<&Event> = out.iter().filter(|e| e.kind == "tool.updated").collect();
+    assert_eq!(u.len(), 1);
+    assert_eq!(u[0].payload["status"], "done");
+    assert_eq!(u[0].payload["danger"], danger);
 }

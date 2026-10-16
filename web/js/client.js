@@ -11,6 +11,7 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
   const channels = new Set();
   let ws = null;
   let lastFrame = null;
+  let instance = null; // 上次 welcome 的 instance：collector 重啟後 frame 編號從頭算，resume 要帶它（#681）
   let backoff = BACKOFF_START_MS;
   let timer = null;
   let stopped = false;
@@ -32,7 +33,7 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
     ws = sock;
     sock.onopen = () => {
       const hello = { op: "hello", protocol: PROTOCOL };
-      if (lastFrame !== null) hello.resume = lastFrame;
+      if (lastFrame !== null && instance !== null) hello.resume = { instance, frame: lastFrame };
       if (typeof utcOffsetMin === "number") hello.utcOffsetMin = utcOffsetMin;
       send(hello);
       for (const channel of channels) send({ op: "subscribe", channel });
@@ -71,6 +72,7 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
         return;
       }
       backoff = BACKOFF_START_MS;
+      instance = msg.instance ?? null;
       status("open");
     }
     if (typeof msg.frame === "number") lastFrame = msg.frame;
