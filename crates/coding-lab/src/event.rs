@@ -258,6 +258,9 @@ pub struct AssistantThinking {
     pub summarized: bool,
     pub message_id: String,
     pub model: Option<String>,
+    /// 降級卡片之後才補上的行（PLAN 方案 C 規則 5）；false 時不輸出。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delayed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -266,6 +269,8 @@ pub struct AssistantText {
     pub text: String,
     pub message_id: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub delayed: bool,
 }
 
 /// MessageDisplay hook 的顯示片段；`display_id` 與 transcript 的 `message.id` 不同套。
@@ -314,6 +319,9 @@ pub struct ToolUpdated {
     pub duration_ms: Option<u64>,
     pub error: Option<String>,
     pub interrupted: Option<bool>,
+    /// transcript 先建卡、PreToolUse 後到時才判斷出的危險；沒有時不輸出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger: Option<Danger>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
