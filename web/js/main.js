@@ -20,7 +20,7 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
-const STATUS_TEXT = { run: "執行中", wait: "等你", done: "待確認", fail: "失敗", danger: "危險", ended: "結束" };
+const STATUS_TEXT = { run: "執行中", idle: "已中斷", wait: "等你", done: "待確認", fail: "失敗", danger: "危險", ended: "結束" };
 const CONN_TEXT = { connecting: "連線中…", open: "已連線", closed: "已斷線，重新連線中…", incompatible: "collector 版本不相容，請重新整理或更新" };
 
 const store = createStore();

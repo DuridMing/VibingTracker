@@ -198,3 +198,15 @@ test("session 結束時清掉它還在暫存區的卡片，其他 session 的不
   st.apply([placed(A, "t1", 5)]);
   assert.equal(row(st, st.rows.length - 1).card.toolUseId, "t1");
 });
+
+test("按 Esc 中斷（session.status idle）在串流出現狀態行；背景工作完成的 prompt 帶 source", () => {
+  const st = createStream();
+  st.apply([
+    ev(A, "session.status", { status: "idle", since: 1, score: 0 }),
+    ev(A, "prompt.submitted", { text: "<task-notification>build done</task-notification>", promptId: "p2", source: "task" }),
+    ev(A, "prompt.submitted", { text: "繼續", promptId: "p3" }),
+  ]);
+  assert.deepEqual(st.rows.map((r) => r.status), ["idle", "prompt", "prompt"]);
+  assert.equal(row(st, 1).source, "task");
+  assert.equal(row(st, 2).source, "user");
+});

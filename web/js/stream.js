@@ -6,8 +6,8 @@
 
 export const CAP = 3000;
 
-// 串流裡的狀態行：prompt 與 session.status（run 不出現，避免太吵）
-const STATUS_ROWS = new Set(["wait", "done", "fail", "danger", "ended"]);
+// 串流裡的狀態行：prompt 與 session.status（run 不出現，避免太吵；idle＝使用者按 Esc 中斷，只標示、不通知）
+const STATUS_ROWS = new Set(["idle", "wait", "done", "fail", "danger", "ended"]);
 
 const READ_TOOLS = new Set(["Read", "Grep", "Glob", "LS", "NotebookRead", "WebFetch", "WebSearch"]);
 const EDIT_TOOLS = new Set(["Edit", "MultiEdit", "NotebookEdit"]);
@@ -155,7 +155,8 @@ export function createStream({ cap = CAP } = {}) {
         }
         break;
       case "prompt.submitted":
-        newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: "prompt", text: p.text ?? "" }, out);
+        // source: "task" 是背景工作完成叫醒 Claude，不是使用者輸入（contracts.md §4）
+        newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: "prompt", source: p.source === "task" ? "task" : "user", text: p.text ?? "" }, out);
         break;
       case "session.status":
         if (STATUS_ROWS.has(p.status)) newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: p.status, text: "" }, out);

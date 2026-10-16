@@ -148,7 +148,7 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .ln .rd{color:var(--teal)}.ln .ed{color:var(--amber)}.ln .wr{color:var(--violet)}.ln .wr+b,.ln b{font-weight:500}
 .ln.th{color:var(--muted)}.ln.th .hd{font-style:italic}.ln .ss,.ln .tg{font-style:normal}.ln .lbl{color:var(--violet);font-style:normal}
 .ln .tx{color:var(--term-ink)}
-.ln .st{color:var(--accent);font-weight:500}.ln .st.wait{color:var(--amber)}.ln .st.bad{color:var(--rose)}
+.ln .st{color:var(--accent);font-weight:500}.ln .st.wait{color:var(--amber)}.ln .st.bad{color:var(--rose)}.ln .st.idle,.ln .st.task{color:var(--term-dim);font-weight:400}
 .ln .pr{color:var(--ink);font-weight:500}
 .ln.dz{background:var(--rose-soft)}.ln.dz:hover{background:var(--rose-soft)}
 .ln .warn{color:var(--rose);font-weight:500;margin-left:6px}

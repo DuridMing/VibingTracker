@@ -77,3 +77,12 @@ test("背景 agent 的工具一律 fallback 進串流（contracts.md §2），�
   // main 的降級卡片照常標示
   assert.match(formatRow(tool({ tool: "Bash", input: { command: "ls" }, fallback: true })).html, /無 transcript/);
 });
+
+test("狀態行：已中斷；背景工作完成不當成使用者的 prompt", () => {
+  assert.match(formatRow({ ...base, type: "status", status: "idle", text: "" }).html, /⏹ 已中斷/);
+  const task = formatRow({ ...base, type: "status", status: "prompt", source: "task", text: "<task-notification>build done</task-notification>" });
+  assert.match(task.html, /背景工作完成/);
+  assert.doesNotMatch(task.html, /▶/);
+  assert.equal(task.detail, "<task-notification>build done</task-notification>");
+  assert.match(formatRow({ ...base, type: "status", status: "prompt", source: "user", text: "修 bug" }).html, /▶.*修 bug/);
+});

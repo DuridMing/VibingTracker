@@ -83,6 +83,7 @@ function toolDetail(c) {
 }
 
 const STATUS_TEXT = {
+  idle: '<span class="st idle">⏹ 已中斷</span>',
   wait: '<span class="st wait">⏸ 等你回答</span>',
   done: '<span class="st done">✔ 完成，等你確認</span>',
   fail: '<span class="st bad">✗ 失敗</span>',
@@ -105,8 +106,16 @@ export function formatRow(row, { agentName } = {}) {
     body = `<span class="tx">${esc(firstLine(row.text))}</span>`;
     detail = row.text.includes("\n") || row.text.length > LONG ? row.text : null;
   } else if (row.type === "status") {
-    body = row.status === "prompt" ? `<span class="p">▶</span> <span class="pr">${esc(firstLine(row.text))}</span>` : STATUS_TEXT[row.status] ?? esc(row.status);
-    detail = row.status === "prompt" && (row.text.includes("\n") || row.text.length > LONG) ? row.text : null;
+    if (row.status === "prompt" && row.source === "task") {
+      // 背景工作完成叫醒 Claude：不是使用者的 prompt，內容放進展開
+      body = '<span class="st task">⟲ 背景工作完成</span>';
+      detail = row.text || null;
+    } else if (row.status === "prompt") {
+      body = `<span class="p">▶</span> <span class="pr">${esc(firstLine(row.text))}</span>`;
+      detail = row.text.includes("\n") || row.text.length > LONG ? row.text : null;
+    } else {
+      body = STATUS_TEXT[row.status] ?? esc(row.status);
+    }
   } else {
     const c = row.card;
     body = toolBody(c) + statusSuffix(c);
