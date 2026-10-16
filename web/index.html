@@ -45,7 +45,7 @@
 
   <section class="col col-work">
     <nav class="stabs" id="stabs"></nav>
-    <div class="blk">
+    <div class="blk" id="allblk">
       <div class="ovh"><h2>專案即時串流<small>所有 session 合在一起，每行標示 [session id] [agent]</small></h2><span class="hint">點 session 標籤只看它；⧉ 開成監視器視窗</span></div>
       <div class="filters"><span class="lab">session：</span><span id="fSess"><span class="none">無</span></span></div>
       <div class="filters"><span class="lab">類型：</span><span id="fKind"></span></div>
@@ -78,6 +78,29 @@
           </div>
         </div>
       </div>
+    </div>
+    <div class="blk spane" id="spane" hidden>
+      <div class="ph">
+        <span class="sid" id="spSid"></span><span class="pr" id="spPrompt"></span><span class="mdl" id="spModel"></span>
+        <span class="meta">
+          <span>⎇ <b id="spBranch">—</b></span>
+          <span title="session 的 cwd（第一次 SessionStart）">📁 <b id="spCwd">—</b></span>
+          <span>commits <b id="spCommits">0</b></span>
+          <span class="glast" id="spLast">尚無 commit</span>
+          <span class="gd" id="spDanger" hidden>⚠ 危險 <b id="spDangerN">0</b></span>
+          <span>費用 <b id="spCost">—</b></span>
+        </span>
+      </div>
+      <div class="now" id="spNow"><span class="st" id="spNowSt">—</span><span class="what" id="spNowWhat"></span><span class="tag" id="spNowAg"></span></div>
+      <div class="thinkbox" id="spThink" hidden><b>思考</b><span id="spThinkText"></span><small id="spThinkTag"></small></div>
+      <div class="spgrid">
+        <div class="streamwrap"><div class="stream" id="spStream"></div></div>
+        <div class="sblk"><h2>檔案變更<small>這個 session 最近的改動</small></h2>
+          <div class="chg spchg" id="spChg"><div class="none">尚無改動</div></div>
+          <div class="fb" id="spFb" hidden><div class="h"><span id="spFbKind"></span><b id="spFbPath"></b></div><div class="diff" id="spFbBody"></div></div>
+        </div>
+      </div>
+      <div class="lanes" id="spLanes"></div>
     </div>
   </section>
 </div>

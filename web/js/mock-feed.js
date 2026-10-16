@@ -290,6 +290,21 @@ function createWorld(n) {
   }
 
   return {
+    // session:<id> 頻道（§6）：該 session 的一列、agents、attention、staged、最後 3000 個 pos
+    sessionSnapshot(id) {
+      const mine = glog.filter((e) => e.session === id);
+      let n = 0;
+      let from = mine.length;
+      while (from > 0 && n < 3000) if (mine[--from].pos != null) n++;
+      return {
+        t: "snapshot", ch: `session:${id}`, frame,
+        sessions: sessions.filter((s) => s.id === id).map((s) => ({ ...s })),
+        agents: [...agents.values()].filter((a) => a.session === id).map((a) => ({ ...a })),
+        attention: [...attention.values()].filter((a) => a.session === id).map((a) => ({ ...a })),
+        staged: [...staged.values()].filter((e) => e.session === id),
+        stream: mine.slice(from).flatMap(expand),
+      };
+    },
     snapshot() {
       // 每個 session 最後 200 個 pos（contracts.md §6），依進串流順序，連同卡片內容
       const counted = new Map();
@@ -382,6 +397,7 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
     constructor() {
       this.readyState = 0;
       this.timer = null;
+      this.subs = new Set();
       live.add(this);
       setTimeout(() => {
         if (Date.now() < downUntil) return this.#end(); // collector「還沒起來」
@@ -395,13 +411,29 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
       if (msg.op === "subscribe" && msg.channel === "*") {
         this.#emit(world.snapshot());
         this.timer = bench
-          ? setInterval(() => this.#emit(world.step({ minEvents: 20 })), 50)
-          : setInterval(() => this.#emit(world.step()), 400);
+          ? setInterval(() => this.#frame(world.step({ minEvents: 20 })), 50)
+          : setInterval(() => this.#frame(world.step()), 400);
       }
+      if (msg.op === "subscribe" && msg.channel.startsWith("session:")) {
+        const id = msg.channel.slice(8);
+        this.subs.add(id);
+        setTimeout(() => this.#emit(world.sessionSnapshot(id)), 40);
+      }
+      if (msg.op === "unsubscribe" && msg.channel.startsWith("session:")) this.subs.delete(msg.channel.slice(8));
       if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#emit(f); }, 80);
       if (msg.op === "more") setTimeout(() => this.#emit(world.more(msg.session, msg.beforePos, msg.limit)), 60);
     }
     close() { this.#end(); }
+    // `*` 的 frame，再為每個訂閱中的 session 頻道各送一份只含它的
+    #frame(f) {
+      this.#emit(f);
+      for (const id of this.subs) {
+        const pick = (list) => (list ?? []).filter((x) => (x.session ?? x.id) === id || String(x.id).startsWith(`${id}/`));
+        const events = f.events.filter((e) => e.session === id);
+        const rows = { sessions: (f.rows.sessions ?? []).filter((x) => x.id === id), agents: pick(f.rows.agents), attention: pick(f.rows.attention) };
+        if (events.length || rows.sessions.length || rows.agents.length || rows.attention.length) this.#emit({ t: "frame", frame: f.frame, ch: `session:${id}`, events, rows });
+      }
+    }
     #emit(obj) { if (this.readyState === 1) this.onmessage?.({ data: JSON.stringify(obj) }); }
     #end() {
       if (this.readyState === 3) return;

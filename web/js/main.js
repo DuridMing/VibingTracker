@@ -10,6 +10,7 @@ import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel } from "./agents.js";
+import { createSessionPane, nowOf, switchTab } from "./session-pane.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -284,6 +285,7 @@ function render(urgent = false) {
     renderDiff();
     renderAttention();
     renderNotifySwitches();
+    renderPane();
   });
 }
 
@@ -470,6 +472,108 @@ $("#nBrowser").addEventListener("change", async (e) => {
 $("#nHint").addEventListener("click", unlockAudio);
 setInterval(() => render(), 30_000); // 佇列的「幾分前」
 
+// ---------- 單 session 畫面（#649）：tab 切到某個 session 時取代全部串流那一塊 ----------
+// 資料只來自 `session:<id>` 頻道（session-pane.js）；NOW 與 lanes 用 collector 的 agents 列，跟 Agents 面板同一份。
+const pane = createSessionPane();
+let paneMoreReq = null;
+const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
+const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
+
+function paneMore() {
+  if (paneMoreReq || ui.tab === "all") return;
+  const beforePos = pane.stream.minPos().get(pane.session);
+  if (!(beforePos > 1)) return;
+  paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
+  client.more({ session: pane.session, beforePos, limit: 200 });
+}
+function onPaneMore(m) {
+  clearTimeout(paneMoreReq.timer);
+  paneMoreReq = null;
+  paneView.prepended(pane.stream.prepend([m.events ?? []]));
+  paneHasMore();
+}
+function paneHasMore() {
+  paneView.setHasMore((pane.stream.minPos().get(pane.session) ?? 1) > 1);
+}
+
+function lane(a) {
+  const isBg = a.agentId === "bg";
+  return h("div", { class: `lane ${a.status}${isBg ? " bg" : ""}`, title: [a.label, a.agentType, a.model, a.task].filter(Boolean).join("\n") },
+    h("span", { class: "nm" }, h("span", {}, a.label), a.model ? h("small", {}, a.model) : null),
+    h("span", { class: `stt ${a.status}` }, LANE_TEXT[a.status] ?? a.status, a.toolCount ? ` · ${a.toolCount} 個工具` : ""),
+    h("span", { class: "cur" }, a.current ?? "—"),
+    a.task ? h("span", { class: "tsk" }, a.task.replace(/\s+/g, " ")) : null);
+}
+
+function renderPane() {
+  const on = ui.tab !== "all";
+  $("#allblk").hidden = on;
+  $("#spane").hidden = !on;
+  if (!on) return;
+  const id = pane.session;
+  const s = store.sessions.get(id);
+  const v = agentView([...store.agents.values()], id, { sessionModel: s?.model ?? null });
+  const model = s?.model ?? store.agents.get(`${id}/main`)?.model ?? null; // sessions.model 還沒有值時先用 main agent 的
+  const g = pane.git;
+  const now = nowOf(v, s);
+
+  if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, model, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
+    $("#spSid").textContent = shortId(id);
+    $("#spSid").style.color = sessionColor(id);
+    $("#spSid").title = id;
+    $("#spPrompt").textContent = s?.lastPrompt ?? s?.firstPrompt ?? "";
+    $("#spPrompt").title = s?.firstPrompt ? `第一個 prompt：${s.firstPrompt}` : "";
+    $("#spModel").textContent = model ?? "";
+    $("#spBranch").textContent = g.last?.branch ?? s?.branch ?? "—";
+    $("#spCwd").textContent = s?.cwd ?? "—";
+    $("#spCommits").textContent = String(Math.max(s?.commits ?? 0, g.commits.length)); // collector 的計數為準，看到的 commit 比它多時不倒退
+    $("#spLast").textContent = g.last
+      ? `最後 ${String(g.last.hash ?? "").slice(0, 7)} ${g.last.message ?? ""}（${g.last.agent === "main" ? "main" : agentName(id, g.last.agent) ?? shortId(g.last.agent)}）`
+      : s?.commits ? "commit 在目前載入的範圍之前" : "尚無 commit";
+    $("#spDanger").hidden = !s?.dangers;
+    $("#spDangerN").textContent = String(s?.dangers ?? 0);
+    $("#spCost").textContent = s?.costUsd != null ? fmtKpi("costUsd", s.costUsd) : "—";
+  }
+  if (changed("spNow", JSON.stringify(now))) {
+    $("#spNow").className = `now ${now.state}`;
+    $("#spNowSt").textContent = NOW_TEXT[now.state] ?? now.state;
+    $("#spNowWhat").textContent = now.what;
+    $("#spNowWhat").title = now.what;
+    $("#spNowAg").textContent = now.agent;
+  }
+  const th = pane.thinking;
+  if (changed("spThink", JSON.stringify(th))) {
+    $("#spThink").hidden = !th;
+    if (th) {
+      $("#spThinkText").textContent = th.text.replace(/\s+/g, " ");
+      $("#spThinkText").title = th.text;
+      $("#spThinkTag").textContent = `${th.agent === "main" ? "main" : agentName(id, th.agent) ?? shortId(th.agent)}${th.summarized ? " · 摘要" : ""}`;
+    }
+  }
+  const ch = pane.changes;
+  if (changed("spChg", `${id}|${ch.selectedKey}|${ch.list.map((c) => c.key).join(",")}`)) {
+    const box = $("#spChg");
+    box.replaceChildren(...(ch.list.length ? ch.list.slice(0, 20).map((c) => h("button", {
+      class: c.key === ch.selectedKey ? "sel" : "", title: c.path, "aria-pressed": String(c.key === ch.selectedKey),
+      onclick: () => { ch.select(c.key); render(true); },
+    },
+    h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
+    h("span", { class: "pth" }, c.path),
+    c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫"))) : [h("div", { class: "none" }, "尚無改動")]));
+    const c = ch.selected();
+    $("#spFb").hidden = !c;
+    if (c) {
+      $("#spFbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added}` : `WRITE${c.isNew ? "（新檔案）" : ""}`;
+      $("#spFbPath").textContent = c.path;
+      $("#spFbBody").innerHTML = diffHtml(c);
+    }
+  }
+  const lanes = [v.main, v.bg, ...v.active, ...v.done.slice(0, 4)].filter(Boolean);
+  if (changed("spLanes", JSON.stringify(lanes.map((a) => [a.id, a.status, a.label, a.model, a.current, a.toolCount])))) {
+    $("#spLanes").replaceChildren(...(lanes.length ? lanes.map(lane) : [h("div", { class: "none" }, "尚無 agent")]));
+  }
+}
+
 // ---------- 改動紀錄（中欄）與修改情形（右欄） ----------
 const changes = createChanges();
 
@@ -505,16 +609,21 @@ function renderDiff() {
   $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
   $("#fbPath").textContent = c.path;
   $("#fbPath").title = c.path;
+  $("#fbBody").innerHTML = diffHtml(c);
+  $("#gfb").scrollTop = 0;
+}
+
+// 修改情形的內容（全部串流的右欄與單 session 的檔案變更共用）
+function diffHtml(c) {
   const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource) : writeRows(c.content, c.truncated);
   const no = (v) => (v == null ? "" : String(v));
-  $("#fbBody").innerHTML = rows.map((r) => {
+  return rows.map((r) => {
     if (r.type === "hunk") return `<div class="hunk">${esc(r.text)}</div>`;
     if (r.type === "note") return `<div class="note">${esc(r.text)}</div>`;
     if (r.type === "line") return `<div class="dl w"><span class="no">${r.new}</span><span class="tx">${esc(r.text)}</span></div>`;
     const mk = r.type === "add" ? "+" : r.type === "del" ? "−" : " ";
     return `<div class="dl ${r.type}"><span class="no">${no(r.old)}</span><span class="no">${no(r.new)}</span><span class="mk">${mk}</span><span class="tx">${esc(r.text)}</span></div>`;
   }).join("");
-  $("#gfb").scrollTop = 0;
 }
 
 function selectChange(key) {
@@ -536,6 +645,16 @@ const view = createStreamView({
   onFollow: (on) => {
     // 回到底部恢復跟隨：載入更多時暫時保留的舊行修剪回上限
     if (on && stream.holding) view.update({ ...stream.trim(), appended: 0, updated: new Set() });
+  },
+});
+
+const paneView = createStreamView({
+  scroller: $("#spStream"),
+  model: pane.stream,
+  agentName,
+  onNeedMore: paneMore,
+  onFollow: (on) => {
+    if (on && pane.stream.holding) paneView.update({ ...pane.stream.trim(), appended: 0, updated: new Set() });
   },
 });
 
@@ -652,9 +771,16 @@ function benchFrame(m) {
 
 // ---------- 互動 ----------
 function selectTab(id) {
-  if (ui.tab !== "all") client.unsubscribe(`session:${ui.tab}`);
+  if (id === ui.tab) return;
+  switchTab(client, ui.tab, id);
   ui.tab = id;
-  if (id !== "all") client.subscribe(`session:${id}`);
+  if (id !== "all") {
+    // 先清空，等 session 頻道的 snapshot 進來再畫（subscribe 一定會回 snapshot，contracts §6）
+    pane.open(id);
+    paneMoreReq = null;
+    paneView.reset();
+    paneView.setHasMore(false);
+  }
   render(true);
 }
 
@@ -688,6 +814,12 @@ const client = createClient({
   handlers: {
     welcome: (m) => { ui.welcome = m; notifier.connected(); render(true); },
     snapshot: (m) => {
+      if (ui.tab !== "all" && m.ch === `session:${pane.session}`) {
+        pane.load({ staged: m.staged, stream: m.stream });
+        paneMoreReq = null;
+        paneView.reset();
+        paneHasMore();
+      }
       if (m.ch === "*") {
         applySnapshot(store, m);
         notifier.snapshot(m.attention);
@@ -699,6 +831,8 @@ const client = createClient({
     frame: (m) => {
       applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
+      // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
+      if (ui.tab !== "all" && m.ch === `session:${pane.session}`) paneView.update(pane.apply(m.events));
       // session:<id> 頻道的 Event 與 `*` 重複，只有 `*` 進合流串流
       if (m.ch === "*") {
         if (bench.on) benchFrame(m);
@@ -707,7 +841,7 @@ const client = createClient({
       }
       render();
     },
-    more: onMore,
+    more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
     onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(true); },
     onIncompatible: () => { ui.conn = "incompatible"; render(true); },
     onError: (e) => console.warn("ws message", e),
