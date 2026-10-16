@@ -42,7 +42,7 @@ function harness(opts = {}) {
   return { sockets, at, timers, clock, got, client };
 }
 
-const welcome = { t: "welcome", protocol: PROTOCOL, host: "local", version: "0.1.0", remote: false, thinking: "full", scope: "operate" };
+const welcome = { t: "welcome", protocol: PROTOCOL, instance: "i1", host: "local", version: "0.1.0", remote: false, thinking: "full", scope: "operate" };
 
 test("連上後先送 hello，再補送已訂閱的頻道", () => {
   const { sockets, at, client } = harness();
@@ -101,7 +101,35 @@ test("斷線後重連，hello 帶上次收到的 frame 編號", () => {
   at(0).drop();
   clock.fire();
   at(1).open();
-  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: 42 });
+  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: { instance: "i1", frame: 42 } });
+});
+
+test("resume 帶上次 welcome 的 instance；重連到重啟過的 collector 後改用新的 instance（#681）", () => {
+  const { at, clock, client } = harness();
+  client.connect();
+  at(0).open();
+  at(0).recv(welcome);
+  at(0).recv({ t: "frame", frame: 7, ch: "*", events: [], rows: {} });
+  at(0).drop();
+  clock.fire();
+  at(1).open();
+  assert.deepEqual(at(1).sent[0].resume, { instance: "i1", frame: 7 });
+  at(1).recv({ ...welcome, instance: "i2" });
+  at(1).recv({ t: "snapshot", frame: 3, ch: "*" });
+  at(1).drop();
+  clock.fire();
+  at(2).open();
+  assert.deepEqual(at(2).sent[0].resume, { instance: "i2", frame: 3 });
+});
+
+test("還沒收到 welcome（不知道 instance）就斷線：重連不帶 resume", () => {
+  const { at, clock, client } = harness();
+  client.connect();
+  at(0).open();
+  at(0).drop();
+  clock.fire();
+  at(1).open();
+  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL });
 });
 
 test("重連間隔指數退避到上限，收到 welcome 後歸零", () => {
@@ -166,11 +194,12 @@ test("hello 帶 utcOffsetMin（算「今天」的 KPI），重連時也帶", () 
   client.connect();
   at(0).open();
   assert.deepEqual(at(0).sent[0], { op: "hello", protocol: PROTOCOL, utcOffsetMin: 480 });
+  at(0).recv(welcome);
   at(0).recv({ t: "frame", frame: 5, ch: "*", events: [], rows: {} });
   at(0).drop();
   clock.fire();
   at(1).open();
-  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: 5, utcOffsetMin: 480 });
+  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: { instance: "i1", frame: 5 }, utcOffsetMin: 480 });
 });
 
 test("連線失敗只有 error、沒有 close（Node 的 WebSocket）也會排下一次重連；之後補來的 close 不重複排", () => {

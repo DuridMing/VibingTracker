@@ -233,3 +233,35 @@ test("resume／compact 在串流出現一行狀態（#651）；startup 與 clear
   assert.deepEqual(rows.map((r) => [r.status, r.source]), [["session", "resume"], ["session", "compact"]]);
   assert.equal(kindOf(rows[0]), "st");
 });
+
+test("transcript 先到時危險標示走 tool.updated：卡片要帶上 danger，之後的更新不清掉（#681）", () => {
+  const st = createStream();
+  const danger = { rule: "rm-rf", level: "danger", why: "刪除" };
+  st.apply([ev(A, "tool.called", { toolUseId: "t1", tool: "Bash", input: { command: "rm -rf x" }, status: "pending", placement: "stream", danger: null }, { pos: 1 })]);
+  st.apply([ev(A, "tool.updated", { toolUseId: "t1", status: "running", durationMs: null, error: null, interrupted: null, danger })]);
+  assert.deepEqual(row(st, 0).card.danger, danger);
+  st.apply([updated(A, "t1", "done")]);
+  assert.deepEqual(row(st, 0).card.danger, danger);
+  assert.equal(row(st, 0).card.status, "done");
+  // snapshot 的伴隨 Event 順序不保證：tool.updated 先於 tool.called 也不能被蓋回 null
+  const st2 = createStream();
+  st2.load({ stream: [
+    ev(A, "tool.updated", { toolUseId: "t2", status: "done", durationMs: 1, error: null, interrupted: null, danger }),
+    ev(A, "tool.called", { toolUseId: "t2", tool: "Bash", input: { command: "rm -rf x" }, status: "pending", placement: "stream", danger: null }, { pos: 1 }),
+  ] });
+  assert.deepEqual(row(st2, 0).card.danger, danger);
+});
+
+test("載入更多：同 session 內照 server 給的順序（依 pos），不因 ts_seen 倒退而重排（#681）", () => {
+  const st = createStream();
+  st.apply([think(A, 10, "a10")]);
+  const a1 = think(A, 1, "a1");
+  const a2 = think(A, 2, "a2");
+  a2.ts_seen = a1.ts_seen - 5; // 同 session 內 ts_seen 倒退
+  const b1 = think(B, 1, "b1");
+  b1.ts_seen = a1.ts_seen - 1;
+  const p = ev(A, "prompt.submitted", { text: "下一個", promptId: "p" });
+  p.ts_seen = a1.ts_seen + 1;
+  st.prepend([[a1, a2, p], [b1]]);
+  assert.deepEqual(st.rows.slice(0, 4).map((r) => r.text), ["b1", "a1", "a2", "下一個"]);
+});

@@ -45,7 +45,12 @@ pub struct WebState {
     /// collector 主迴圈回報的健康資訊（tail 數、排程延遲…），併進 /healthz
     health: Mutex<Value>,
     resume_window_ms: AtomicU64,
+    /// 這次啟動的識別（`welcome.instance`）：frame 編號每次啟動從頭算，resume 要同一個 instance 才接得上
+    instance: String,
 }
+
+/// 同一毫秒建立兩個 [`WebState`]（測試）也要不同
+static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
 impl WebState {
     /// `capacity`：每個連線最多落後幾個 frame，超過就改送 snapshot。
@@ -62,6 +67,11 @@ impl WebState {
             frames,
             health: Mutex::new(json!({})),
             resume_window_ms: AtomicU64::new(RESUME_WINDOW.as_millis() as u64),
+            instance: format!(
+                "{}-{}",
+                crate::now_ms(),
+                INSTANCES.fetch_add(1, Ordering::Relaxed)
+            ),
         })
     }
 
@@ -346,10 +356,14 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 .as_i64()
                 .unwrap_or(0)
                 .clamp(-14 * 60, 14 * 60) as i32;
-            conn.resume = msg["resume"].as_u64().map(|n| (n, Instant::now()));
+            // 只接受同一個 instance 的 `{instance, frame}`；舊格式（只有數字）分不出是不是重啟前的編號
+            conn.resume = (msg["resume"]["instance"].as_str() == Some(state.instance.as_str()))
+                .then(|| msg["resume"]["frame"].as_u64())
+                .flatten()
+                .map(|n| (n, Instant::now()));
             state.live().register_offset(conn.offset);
             let welcome = json!({
-                "t": "welcome", "protocol": PROTOCOL, "host": "local",
+                "t": "welcome", "protocol": PROTOCOL, "instance": state.instance, "host": "local",
                 "version": env!("CARGO_PKG_VERSION"), "remote": false, "thinking": "full", "scope": "local",
             });
             send(socket, &welcome).await
@@ -433,7 +447,9 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 }
 
 /// 「載入更多」：窗口內的帶 pos Event，加上卡片的伴隨 Event 與窗口範圍內的狀態行（contracts.md §6）。
-/// 伴隨 Event 從窗口第一個 seq 往前 [`COMPANION_LOOKBACK`] 個、往後到下一個帶 pos 的 Event 為止找。
+/// 伴隨 Event 從窗口第一個 seq 往前、最後一個 seq 往後各 [`COMPANION_LOOKBACK`] 個找：平行工具的結果
+/// 常在下一張卡片進串流之後才到；伴隨 Event 依 toolUseId 過濾，不會混進窗口外的卡片。
+/// 狀態行仍以下一個帶 pos 的 Event 的時間為上限。
 pub(crate) fn more_events(
     store: &Store,
     session: &str,
@@ -446,10 +462,7 @@ pub(crate) fn more_events(
     };
     let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
     let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
-    let to = next.map_or(last.seq + COMPANION_LOOKBACK, |(seq, _)| {
-        seq.saturating_sub(1)
-    });
-    let pool = store.events_by_seq(session, from, to)?;
+    let pool = store.events_by_seq(session, from, last.seq + COMPANION_LOOKBACK)?;
     Ok(crate::live::assemble_stream(
         window,
         pool,
