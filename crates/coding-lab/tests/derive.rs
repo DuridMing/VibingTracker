@@ -111,8 +111,16 @@ fn hunk_matches_git_diff_for_20_edits() {
     for (n, (before, old, new)) in cases.iter().enumerate() {
         let dir = tmpdir();
         let git = |args: &[&str]| {
+            // pre-commit hook 裡跑時會繼承 GIT_DIR／GIT_INDEX_FILE 等，不清掉的話 tmpdir 的
+            // git init／add 會寫進正在 commit 的 repo（worktree 的 index 是絕對路徑）
             let o = Command::new("git")
                 .current_dir(&dir)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_OBJECT_DIRECTORY")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_PREFIX")
                 .args(args)
                 .output()
                 .unwrap();
