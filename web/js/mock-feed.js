@@ -17,6 +17,7 @@ const THOUGHTS = [
   "git status 乾淨，可以 commit。",
 ];
 const TEXTS = ["我先讀相關的檔案。", "改好了，接著跑測試。", "測試全過，準備 commit。", "這裡需要你確認要不要同時更新 README。"];
+const ROOT = "/home/me/my-api";
 const FILES = ["src/api/users.ts", "src/repo/users.ts", "src/middleware/auth.ts", "tests/users.test.ts", "src/web/useKeyboardInset.ts", "README.md", "src/config.ts"];
 const BASH = [
   { command: "npm test", out: "✓ users list (12 ms)\n✓ users paging (8 ms)\n\nTests: 2 passed", ok: true },
@@ -44,14 +45,15 @@ function uuid(r) {
 }
 
 // collector 端的狀態在所有連線之間共用，斷線重連後還是同一批 session。
-function createWorld(n) {
+function createWorld(n, { bigtree = false } = {}) {
   const r = rng(20261016);
   const pick = (a) => a[Math.floor(r() * a.length)];
   const now = Date.now();
   const sessions = Array.from({ length: n }, (_, i) => ({
     id: uuid(r),
     host: "local",
-    cwd: "/home/me/my-api",
+    // develop 的在 repo 根，其他各開一個 worktree（左欄「相對 main」逐 worktree 合併，#644）
+    cwd: i % 3 === 0 ? ROOT : `${ROOT}/.claude/wt/t${i}`,
     branch: i % 3 === 0 ? "develop" : `feature/t${i}`,
     model: i % 4 === 0 ? "opus" : "sonnet",
     firstPrompt: PROMPTS[i % PROMPTS.length],
@@ -87,6 +89,7 @@ function createWorld(n) {
   const cardEv = new Map(); // toolUseId → { called, updated, result, extra: [] }
   const staged = new Map(); // toolUseId → tool.called
   const changeLog = []; // file.edit／file.write，snapshot 的 changes 用
+  const edited = new Map(); // session → Map(path → "A" | "M")，/api/files 用（不受 60 筆限制）
   const GLOG_MAX = 60_000;
 
   function ev(s, type, payload, { pos = null, agent = "main" } = {}) {
@@ -139,6 +142,9 @@ function createWorld(n) {
           if (d.type === "file.edit" || d.type === "file.write") {
             changeLog.push(d);
             if (changeLog.length > 60) changeLog.shift();
+            const m = edited.get(s.id) ?? new Map();
+            if (m.get(d.payload.path) !== "A") m.set(d.payload.path, d.type === "file.write" && d.payload.isNew ? "A" : "M");
+            edited.set(s.id, m);
           }
         }
         const a = agents.get(`${s.id}/${t.agent}`);
@@ -175,6 +181,8 @@ function createWorld(n) {
     } else if (y < 0.33) {
       tool = "Grep"; input = { pattern: "listUsers", path: "src" };
     } else if (y < 0.5) {
+      t.ok = r() > 0.08;
+      t.out = t.ok ? "" : "String to replace not found in file.";
       tool = "Edit"; input = { file_path: pick(FILES), old_string: "const page = 1;", new_string: "const page = Number(req.query.page ?? 1);" };
       t.derived.push({ type: "file.edit", payload: { path: input.file_path, hunk: { start: 41, oldLines: 3, newLines: 4, lines: [" export async function listUsers(req, res) {", "-  const page = 1;", "+  const page = Number(req.query.page ?? 1);", "+  const size = Math.min(100, Number(req.query.size ?? 20));", "   const rows = await repo.list({ page, size });"] }, hunkSource: "pre" } });
       kpi.edits++;
@@ -308,7 +316,49 @@ function createWorld(n) {
     s.agentsLive = [...agents.values()].filter((a) => a.session === s.id && a.agentId !== "main" && a.agentId !== "bg" && a.status === "run").length;
   }
 
+  // GET /api/files 的 tree：FILES 加一些不會被碰到的檔；bigtree 時超過懶載入門檻
+  const tree = [...FILES, "package.json", "tsconfig.json", "src/api/health.ts", "src/repo/index.ts", "docs/guide.md", ".gitignore"];
+  if (bigtree) for (let d = 0; d < 80; d++) for (let f = 0; f < 100; f++) tree.push(`packages/p${d}/src/m${f}.ts`);
+  const ended = Array.from({ length: 3 }, (_, i) => ({ ...sessions[0], id: uuid(r), cwd: ROOT, branch: "develop", status: "ended", firstPrompt: `（昨天）${PROMPTS[(i + 5) % PROMPTS.length]}`, lastPrompt: null, startedAt: now - (i + 1) * 86_400_000, endedAt: now - (i + 1) * 86_400_000 + 3_600_000, model: i === 1 ? "opus" : "sonnet", commits: i, dangers: 0, doing: null, agentsLive: 0, score: 0 }));
+  const err = (status, error) => ({ status, body: { error } });
+
+  // contracts §7（#671）的 /api/files：worktree 的改動從各 session 的 file.edit／write 算（同一個 worktree 合併）
+  function files(q) {
+    const cwd = q.get("cwd");
+    if (!cwd || !(cwd === ROOT || cwd.startsWith(`${ROOT}/`))) return err(404, "沒有 session 在這個目錄");
+    const base = q.get("base") ?? "main";
+    const sources = new Map(); // key → { by, paths: Map }
+    const add = (key, by, sess) => {
+      const src = sources.get(key) ?? { by, paths: new Map() };
+      for (const [p, st] of edited.get(sess.id) ?? []) if (src.paths.get(p) !== "A") src.paths.set(p, st === "A" ? "?" : st);
+      sources.set(key, src);
+    };
+    if (base === "main") for (const s of sessions) add(s.cwd, { worktree: s.cwd, branch: s.branch }, s);
+    else if (base.startsWith("session:")) {
+      const s = sessions.find((x) => x.id === base.slice(8));
+      if (!s) return err(404, "沒有這個 session");
+      add(s.id, { session: s.id }, s);
+      for (const [, src] of sources) for (const [p, st] of src.paths) src.paths.set(p, st === "?" ? "A" : st);
+    } else if (/^commit:[0-9a-f]{4,64}$/.test(base)) {
+      for (const s of sessions.filter((x) => x.cwd === cwd)) add(cwd, { worktree: cwd, branch: s.branch }, s);
+    } else return err(400, "base 只能是 main、commit:<hash>（4–64 位十六進位）或 session:<id>");
+    const byPath = new Map();
+    for (const src of sources.values()) for (const [p, status] of src.paths) {
+      if (!byPath.has(p)) byPath.set(p, []);
+      byPath.get(p).push({ ...src.by, status });
+    }
+    const changes = [...byPath].sort(([a], [b]) => (a < b ? -1 : 1)).map(([path, by]) => ({ path, conflict: by.length > 1 && by.some((b) => b.status !== "?"), by }));
+    return { status: 200, body: { root: cwd === ROOT || base === "main" ? ROOT : cwd, base, baseRef: base === "main" ? "main" : base.startsWith("commit:") ? base.slice(7).padEnd(40, "0") : null, tree: [...tree].sort(), treeTruncated: false, changes, worktrees: [...new Map(sessions.map((s) => [s.cwd, { path: s.cwd, branch: s.branch }])).values()] } };
+  }
+
   return {
+    // GET /api/*：{ status, body }
+    api(url) {
+      const u = new URL(url, "http://mock");
+      if (u.pathname === "/api/files") return files(u.searchParams);
+      if (u.pathname === "/api/sessions") return { status: 200, body: { sessions: [...sessions.map((s) => ({ ...s })), ...ended.map((s) => ({ ...s, model: s.model }))] } };
+      return err(404, "not found");
+    },
     // session:<id> 頻道（§6）：該 session 的一列、agents、attention、staged、最後 3000 個 pos
     sessionSnapshot(id) {
       const mine = glog.filter((e) => e.session === id);
@@ -420,8 +470,8 @@ function createWorld(n) {
   };
 }
 
-export function installMock(n, { bench = false, prefill = false } = {}) {
-  const world = createWorld(n);
+export function installMock(n, { bench = false, prefill = false, bigtree = false } = {}) {
+  const world = createWorld(n, { bigtree });
   if (bench || prefill) world.prefill(220);
   const live = new Set();
   let downUntil = 0;
@@ -484,6 +534,12 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
 
   return {
     WebSocket: MockSocket,
+    // 取代 window.fetch，只認 /api/*
+    async fetch(url) {
+      await new Promise((ok) => setTimeout(ok, 50));
+      const { status, body } = world.api(url);
+      return { ok: status < 400, status, json: async () => JSON.parse(JSON.stringify(body)) };
+    },
     // 模擬 collector 重啟：所有連線斷掉，之後 ms 毫秒內連不上
     restart(ms = 3000) {
       downUntil = Date.now() + ms;

@@ -86,7 +86,43 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .tab small{font-weight:400;margin-left:6px;color:var(--dim)}
 .tab.on{background:var(--panel);color:var(--ink);box-shadow:var(--shadow)}
 .pane[hidden],.blk[hidden],.thinkbox[hidden]{display:none!important}
-.tree{overflow:auto;flex:1;font-family:var(--mono);font-size:12px;line-height:1.8;min-height:0}
+.tree{overflow:auto;flex:1;font-family:var(--mono);font-size:12px;line-height:22px;min-height:0;position:relative}
+/* 檔案樹（#642）：固定列高 22px，只畫看得到的列（tree.js 給列、main.js 虛擬化） */
+.tree .tin{position:relative}
+.node{position:absolute;left:0;right:0;height:22px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;white-space:nowrap;padding:0 6px;border-radius:6px;text-align:left;width:100%}
+.node .lbl{overflow:hidden;text-overflow:ellipsis}
+.node .pre{color:var(--dim)}
+.node.dir{cursor:pointer}
+.node.dir .lbl{color:var(--muted)}
+.node.dir:hover,.node.file:hover{background:var(--panel-2)}
+.node.file .lbl{color:var(--ink)}
+.node.g-mod .nm{color:var(--amber)}
+.node.g-new .nm{color:var(--violet)}
+.node.g-del .nm{color:var(--dim);text-decoration:line-through}
+.node.isnew .nm:after{content:" +";color:var(--violet)}
+.node .cf{color:var(--amber);margin-left:4px}
+.node.cflt{box-shadow:inset 0 0 0 1px var(--amber)}
+.node .mk{display:flex;gap:2px;margin-left:8px;align-items:center}
+.node .mk i{width:5px;height:9px;display:block;border-radius:1px}
+.node .mk i.r{background:var(--teal)}.node .mk i.e{background:var(--amber)}.node .mk i.w{background:var(--violet)}.node .mk i.x{background:var(--rose)}
+.node .mk small{color:var(--dim);font-size:10px;margin-left:1px}
+.node .sb{display:flex;gap:2px;margin-left:4px}
+.node .sb i{width:7px;height:7px;border-radius:50%}
+.node.lit .pre{animation:lit 1.2s ease-out}@keyframes lit{0%{color:var(--accent)}100%{color:var(--dim)}}
+.node.flash{animation:fl .9s ease-out}@keyframes fl{0%{background:var(--teal-soft)}100%{background:transparent}}
+.node.flash-e{animation:fle .9s ease-out}@keyframes fle{0%{background:var(--amber-soft)}100%{background:transparent}}
+.node.flash-w{animation:flw 1.1s ease-out}@keyframes flw{0%{background:var(--violet-soft)}100%{background:transparent}}
+.node.flash-x{animation:flx 1.2s ease-out}@keyframes flx{0%{background:var(--rose-soft)}100%{background:transparent}}
+@media (prefers-reduced-motion: reduce){.node[class*="flash"],.node.lit .pre{animation:none}}
+.tbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px}
+.tbar select,.tbar input{border:1px solid var(--line);border-radius:7px;background:var(--panel);padding:3px 6px;font-size:12px;max-width:100%;min-width:0;color:var(--ink)}
+.tbar select#tProj{max-width:100%}
+.tbar input.hash{font-family:var(--mono);width:11em}
+.tbar input.hash.bad{border-color:var(--rose)}
+.tbar .tinfo{color:var(--muted);flex-basis:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tbar .tinfo.err{color:var(--rose)}
+.leg .lg-git b{font-weight:600;margin-right:4px}
+.leg .g-mod{color:var(--amber)}.leg .g-new{color:var(--violet)}.leg .g-cf{color:var(--amber)}
 .leg{display:flex;gap:12px;color:var(--muted);font-size:11px;border-top:1px solid var(--line-soft);padding-top:8px;flex-wrap:wrap}
 .leg i{display:inline-block;width:5px;height:9px;vertical-align:-1px;margin-right:4px;border-radius:1px}
 .sess{overflow:auto;flex:1;display:flex;flex-direction:column;gap:4px;font-size:12px;min-height:0}
@@ -96,6 +132,9 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .sess button .pr{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sess button small{display:block;color:var(--muted);font-size:11px}
 .sess button .r{text-align:right;color:var(--muted);font-weight:500;font-size:11px}
+.sess button .mdl{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-left:4px}
+.sess button.ended{opacity:.75}
+.sess .more{font-size:11px;color:var(--dim);text-align:center;padding:4px}
 .sess button .r.run{color:var(--teal)}.sess button .r.danger,.sess button .r.fail{color:var(--rose)}.sess button .r.wait{color:var(--amber)}.sess button .r.done{color:var(--accent)}
 
 /* session tab 列 */
@@ -348,3 +387,5 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .spane .ph .doing[hidden]{display:none}
 .sess button > span:nth-child(2){min-width:0;overflow:hidden}
 .sess button .r{white-space:nowrap}
+.glast.pick{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
+.glast.pick:hover{color:var(--accent)}

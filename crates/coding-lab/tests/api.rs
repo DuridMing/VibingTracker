@@ -588,6 +588,43 @@ async fn files_relative_to_main_aggregates_every_worktree() {
     assert_eq!(paths, sorted, "依 path 排序");
 }
 
+/// 前端要知道哪些目錄是 worktree，才能把 session 的 file.* 路徑對到樹上（被 ignore 的目錄不是）。
+/// 每種基準都帶，從哪個 worktree 問都是同一份清單。
+#[tokio::test]
+async fn files_lists_every_worktree_for_any_base() {
+    let r = repo();
+    let addr = files_server(&r).await;
+    let want = BTreeSet::from([
+        (s(&r.root), "develop".to_string()),
+        (s(&r.x), "feature/x".to_string()),
+        (s(&r.y), "feature/y".to_string()),
+    ]);
+    for (cwd, base) in [
+        (&r.root, "main".to_string()),
+        (&r.x, format!("commit:{}", r.develop_tip)),
+        (&r.x, "session:sx".to_string()),
+    ] {
+        let (code, body) = get(
+            addr,
+            &format!("/api/files?cwd={}&base={}", enc(&s(cwd)), enc(&base)),
+        )
+        .await;
+        assert_eq!(code, 200, "{base}：{body}");
+        let got: BTreeSet<(String, String)> = body["worktrees"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{base}：沒有 worktrees：{body}"))
+            .iter()
+            .map(|w| {
+                (
+                    w["path"].as_str().unwrap_or_default().to_string(),
+                    w["branch"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "{base}");
+    }
+}
+
 #[tokio::test]
 async fn files_tree_and_commit_base_use_the_cwd_worktree() {
     let r = repo();

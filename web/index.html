@@ -38,9 +38,21 @@
       <button class="tab on" role="tab" data-t="tree">專案檔案</button>
       <button class="tab" role="tab" data-t="sess">Sessions<small id="sessCount"></small></button>
     </div>
-    <div class="tree pane" id="tree"><div class="none">檔案樹（#642）</div></div>
+    <div class="tbar" id="tbar">
+      <select id="tProj" title="專案（session 的 cwd；worktree 與子目錄歸到上層）" hidden></select>
+      <select id="tBase" title="檔名顏色依這個基準的 git 狀態">
+        <option value="main">相對 main</option>
+        <option value="since">本次開啟以來</option>
+        <option value="session">單一 session</option>
+        <option value="commit">相對某個 commit</option>
+      </select>
+      <select id="tBaseSess" title="只看這個 session 的改動" hidden></select>
+      <input id="tBaseHash" class="hash" placeholder="commit hash" spellcheck="false" autocomplete="off" maxlength="64" hidden>
+      <small class="tinfo" id="tInfo"></small>
+    </div>
+    <div class="tree pane" id="tree"><div class="none">尚無 session</div></div>
     <div class="sess pane" id="sess" hidden><div class="none">尚無 session</div></div>
-    <div class="leg"><span><i style="background:var(--teal)"></i>讀</span><span><i style="background:var(--amber)"></i>改</span><span><i style="background:var(--violet)"></i>新建</span><span><i style="background:var(--rose)"></i>失敗</span><span>● 正在碰它的 session</span></div>
+    <div class="leg" id="treeLeg"><span><i style="background:var(--teal)"></i>讀</span><span><i style="background:var(--amber)"></i>改</span><span><i style="background:var(--violet)"></i>新建</span><span><i style="background:var(--rose)"></i>失敗</span><span>● 正在碰它的 session</span><span class="lg-git"><b class="g-mod">檔名</b>未合併</span><span class="lg-git"><b class="g-new">檔名</b>新檔</span><span class="lg-git"><b class="g-cf">⚠</b>衝突候選</span></div>
   </section>
 
   <section class="col col-work">

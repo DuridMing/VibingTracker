@@ -13,6 +13,8 @@ import { agentView, agentLabel } from "./agents.js";
 import { createSessionPane, nowOf, switchTab, sessionTitle } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
+import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
+import { mergeSessions, projectRoots, pickProject } from "./sessions.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -177,20 +179,23 @@ function renderLive() {
   );
 }
 
+// Sessions tab：WS 的列加上 /api/sessions 補的已結束 session（mergeSessions，新到舊）
+const SESS_SHOWN = 200;
 function renderSessions() {
-  const all = [...store.sessions.values()];
-  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.doing ?? ""}`).join("|"))) return;
+  const all = allSessions();
+  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
   $("#sess").replaceChildren(
     ...(all.length
-      ? all.map((s) =>
-          h("button", { class: ui.tab === s.id ? "sel" : "", title: sessionTitle(s), onclick: () => selectTab(s.id) },
+      ? all.slice(0, SESS_SHOWN).map((s) =>
+          h("button", { class: `${ui.tab === s.id ? "sel" : ""}${s.status === "ended" ? " ended" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
             sessTag(s),
             h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
               s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
-              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`)),
+              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl" }, s.model) : null)),
             h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")))
       : [h("div", { class: "none" }, "尚無 session")]),
+    ...(all.length > SESS_SHOWN ? [h("div", { class: "more" }, `只列最近 ${SESS_SHOWN} 個（共 ${all.length}）`)] : []),
   );
 }
 
@@ -300,6 +305,7 @@ function render(urgent = false) {
     renderSessFilters();
     renderKindFilters();
     renderSessions();
+    renderTree();
     renderAgents();
     renderLive();
     renderChanges();
@@ -494,6 +500,393 @@ $("#nHint").addEventListener("click", unlockAudio);
 $("#spPop").addEventListener("click", () => openMonitor(pane.session));
 setInterval(() => render(), 30_000); // 佇列的「幾分前」
 
+// ---------- 左欄：專案檔案（#642）與改動基準（#644） ----------
+// 樹與 git 狀態來自 GET /api/files（tree.js 的 filesUrl）；方塊來自 `*` 頻道的 file.* Event（tree.js 累積）。
+// 「本次開啟以來」不問 collector：用這個頁面收到的 Event 累積（sinceChanges）。
+// 專案：session 的 cwd 歸組（sessions.js），一次看一個；每個專案一棵樹，Event 先收在 fileEvents，開新樹時重放。
+const ROW_H = 22;
+const FILE_EVENTS_MAX = 50_000;
+const BASE_TEXT = { main: "相對 main", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
+const pref = {
+  get: (k) => { try { return storage?.getItem(`coding-lab.tree.${k}`) ?? null; } catch { return null; } },
+  set: (k, v) => { try { storage?.setItem(`coding-lab.tree.${k}`, v); } catch { /* 無痕模式等 */ } },
+};
+const left = {
+  tab: "tree",
+  fetched: [], // GET /api/sessions 的列
+  project: pref.get("project"),
+  base: BASE_TEXT[pref.get("base")] ? pref.get("base") : "main",
+  baseSess: null,
+  hash: "",
+  hashCwd: null, // 從單 session 的 git 列點 commit 時，用那個 session 的 worktree
+  trees: new Map(), // 專案 cwd → { tree, loading, error, info }
+  fileEvents: [],
+  req: 0,
+  dirty: true,
+  rows: [],
+  els: new Map(), // path → { el, sig }
+  flash: new Map(), // path → 閃爍的 class（下次畫時套上）
+  lit: new Set(), // 被點亮的父目錄
+  refetch: 0,
+};
+const fetchedById = () => new Map(left.fetched.map((s) => [s.id, s]));
+let fetchedIndex = new Map();
+const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?? null;
+const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }));
+const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+
+function allSessions() {
+  return mergeSessions([...store.sessions.values()], left.fetched);
+}
+
+function treeFor(cwd) {
+  let ent = left.trees.get(cwd);
+  if (!ent) {
+    const tree = createFileTree();
+    tree.cwdOf = cwdOf;
+    tree.apply(left.fileEvents); // 樹還沒載入：先收著，setFiles 時才算
+    ent = { tree, loading: false, error: null, info: "" };
+    left.trees.set(cwd, ent);
+  }
+  return ent;
+}
+
+// 專案清單變了（新 session、Sessions 補進來的）：選一個，換了就重抓
+function syncProjects() {
+  const roots = projectRoots(allSessions());
+  const pick = pickProject(roots, left.project);
+  if (pick && pick !== left.project) {
+    left.project = pick;
+    left.dirty = true;
+    loadFiles();
+  } else if (pick && !left.trees.has(pick)) loadFiles();
+}
+
+const FLASH = { r: "flash", e: "flash-e", w: "flash-w", x: "flash-x" };
+// `*` 的 Event（snapshot 的 stream／changes、frame 的 events）：只留 file.* 與失敗，餵給每一棵樹
+function feedFiles(events) {
+  if (isMonitor) return;
+  const mine = (events ?? []).filter((e) => e.type?.startsWith("file.") || (e.type === "tool.updated" && e.payload?.status === "failed"));
+  const gitOp = (events ?? []).some((e) => e.type === "git.op");
+  if (!mine.length && !gitOp) return;
+  left.fileEvents.push(...mine);
+  if (left.fileEvents.length > FILE_EVENTS_MAX) left.fileEvents.splice(0, left.fileEvents.length - FILE_EVENTS_MAX);
+  let changedFiles = gitOp;
+  for (const [cwd, ent] of left.trees) {
+    const hits = ent.tree.apply(mine);
+    if (cwd !== left.project || !hits.length) continue;
+    left.dirty = true;
+    for (const hit of hits) {
+      left.flash.set(hit.path, FLASH[hit.kind]);
+      const parts = hit.path.split("/");
+      for (let i = 1; i < parts.length; i++) left.lit.add(parts.slice(0, i).join("/"));
+      if (hit.kind === "e" || hit.kind === "w") changedFiles = true;
+    }
+  }
+  if (!changedFiles) return;
+  if (left.base === "since") {
+    const ent = left.trees.get(left.project);
+    if (ent?.tree.root != null) setSince(ent);
+  } else scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）
+}
+
+function setSince(ent) {
+  const ch = sinceChanges(ent.tree);
+  ent.tree.setGit(ch);
+  ent.info = `本次開啟以來 · ${ch.length} 個檔有改動`;
+  left.dirty = true;
+}
+
+function scheduleFiles(ms) {
+  clearTimeout(left.refetch);
+  left.refetch = setTimeout(loadFiles, ms);
+}
+
+function currentBase() {
+  if (left.base === "session") {
+    const id = left.baseSess ?? (ui.tab !== "all" ? ui.tab : projectSessions()[0]?.id);
+    return id ? { kind: "session", id } : null;
+  }
+  if (left.base === "commit") return { kind: "commit", hash: left.hash, cwd: left.hashCwd ?? undefined };
+  return { kind: left.base };
+}
+
+function projectSessions() {
+  const root = left.project;
+  if (!root) return [];
+  return allSessions().filter((s) => s.cwd && (s.cwd === root || s.cwd.startsWith(`${root}/`)));
+}
+
+async function loadFiles() {
+  clearTimeout(left.refetch);
+  const cwd = left.project;
+  if (!cwd) return;
+  const ent = treeFor(cwd);
+  const base = currentBase();
+  // 樹還沒載入時，commit 基準先用專案的 cwd（另一個 worktree 的根不同，樹要以專案為準）
+  const url = base && filesUrl(cwd, ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  if (!url) {
+    ent.error = base ? "commit hash 要 4–64 位十六進位" : "這個專案沒有 session";
+    render(true);
+    return;
+  }
+  const req = ++left.req;
+  ent.loading = true;
+  render(true);
+  try {
+    const res = await apiFetch(url);
+    const body = await res.json().catch(() => ({}));
+    if (req !== left.req) return;
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
+    if (ent.tree.root == null || normRoot(body.root) === ent.tree.root) ent.tree.setFiles(body);
+    const n = body.changes?.length ?? 0;
+    const cf = (body.changes ?? []).filter((c) => c.conflict).length;
+    const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";
+    if (base.kind === "since") setSince(ent);
+    else if (base.kind === "session") {
+      ent.tree.setGit(body.changes, (p) => ent.tree.pathOf(cwdOf(base.id), p));
+      ent.info = `session ${shortId(base.id)} · ${n} 個檔有改動`;
+    } else {
+      ent.tree.setGit(body.changes);
+      const wts = new Set((body.changes ?? []).flatMap((c) => c.by.map((b) => b.worktree)));
+      ent.info = base.kind === "commit"
+        ? `相對 ${String(body.baseRef ?? base.hash).slice(0, 7)} · ${n} 個檔有改動`
+        : `相對 ${body.baseRef ?? "main"} · ${n} 個檔有改動${wts.size > 1 ? `（${wts.size} 個 worktree）` : ""}${cf ? ` · ⚠ ${cf} 個衝突候選` : ""}`;
+    }
+    ent.info += trunc;
+    ent.error = null;
+    left.dirty = true;
+  } catch (e) {
+    if (req !== left.req) return;
+    ent.error = `檔案樹載入失敗：${e.message}`;
+  } finally {
+    if (req === left.req) {
+      ent.loading = false;
+      render(true);
+    }
+  }
+}
+setInterval(() => { if (left.tab === "tree" && !document.hidden && left.base !== "since") loadFiles(); }, 60_000);
+
+async function loadSessions() {
+  if (isMonitor) return;
+  try {
+    const res = await apiFetch("/api/sessions?limit=500");
+    if (!res.ok) return;
+    const body = await res.json();
+    left.fetched = Array.isArray(body.sessions) ? body.sessions : [];
+    fetchedIndex = fetchedById();
+    syncProjects();
+    render(true);
+  } catch {
+    // collector 太舊或斷線：只顯示 WS 的列
+  }
+}
+setInterval(() => { if (!document.hidden) loadSessions(); }, 60_000);
+
+function renderTreeBar() {
+  const roots = projectRoots(allSessions());
+  const ent = left.project ? left.trees.get(left.project) : null;
+  const sess = left.base === "session" ? projectSessions() : [];
+  const base = currentBase();
+  const sig = JSON.stringify([roots.map((r) => [r.cwd, r.live]), left.project, left.base, base?.id, sess.map((s) => s.id), left.hash, ent?.info, ent?.error, ent?.loading]);
+  if (!changed("tbar", sig)) return;
+  const proj = $("#tProj");
+  proj.hidden = roots.length < 2;
+  proj.replaceChildren(...roots.map((r) => {
+    const o = h("option", { value: r.cwd, title: r.cwd }, `${r.cwd.split("/").pop() || r.cwd}（${r.live}/${r.sessions.length}）`);
+    if (r.cwd === left.project) o.selected = true;
+    return o;
+  }));
+  $("#tBase").value = left.base;
+  const bs = $("#tBaseSess");
+  bs.hidden = left.base !== "session";
+  bs.replaceChildren(...sess.map((s) => {
+    const o = h("option", { value: s.id }, `${shortId(s.id)} ${s.firstPrompt ?? ""}`.slice(0, 40));
+    if (s.id === base?.id) o.selected = true;
+    return o;
+  }));
+  const hash = $("#tBaseHash");
+  hash.hidden = left.base !== "commit";
+  if (document.activeElement !== hash) hash.value = left.hash;
+  hash.classList.toggle("bad", left.base === "commit" && !!left.hash && !/^[0-9a-f]{4,64}$/i.test(left.hash));
+  const info = $("#tInfo");
+  info.classList.toggle("err", !!ent?.error);
+  info.textContent = ent?.error ?? (ent?.loading && !ent.info ? "載入中…" : left.base === "commit" && !left.hash ? "輸入 commit hash，或在單一 session 的 git 列點最後的 commit" : ent?.info ?? "");
+  info.title = info.textContent;
+}
+
+function setBase(kind) {
+  left.base = kind;
+  pref.set("base", kind);
+  if (kind !== "commit") left.hashCwd = null;
+  const ent = left.trees.get(left.project);
+  if (kind === "since" && ent?.tree.root != null) {
+    setSince(ent);
+    render(true);
+  } else if (kind !== "commit" || /^[0-9a-f]{4,64}$/i.test(left.hash)) loadFiles();
+  else render(true);
+}
+$("#tProj").addEventListener("change", (e) => {
+  left.project = e.target.value;
+  pref.set("project", left.project);
+  left.dirty = true;
+  left.els.clear();
+  $("#tree").replaceChildren();
+  loadFiles();
+});
+$("#tBase").addEventListener("change", (e) => setBase(e.target.value));
+$("#tBaseSess").addEventListener("change", (e) => { left.baseSess = e.target.value; loadFiles(); });
+$("#tBaseHash").addEventListener("change", (e) => {
+  left.hash = e.target.value.trim();
+  left.hashCwd = null;
+  setBase("commit");
+});
+
+// 單 session 的 git 列：點最後的 commit，左欄改成「相對這個 commit」
+$("#spLast").addEventListener("click", () => {
+  const c = pane.git.last;
+  if (!c?.hash) return;
+  left.hash = String(c.hash);
+  left.hashCwd = cwdOf(pane.session);
+  showLeftTab("tree");
+  setBase("commit");
+});
+
+function showLeftTab(name) {
+  left.tab = name;
+  for (const x of document.querySelectorAll(".tab")) x.classList.toggle("on", x.dataset.t === name);
+  $("#tree").hidden = name !== "tree";
+  $("#tbar").hidden = name !== "tree";
+  $("#treeLeg").hidden = name !== "tree";
+  $("#sess").hidden = name !== "sess";
+  if (name === "sess") loadSessions();
+  else left.dirty = true;
+  render(true);
+}
+
+function treePlaceholder(text) {
+  left.els.clear();
+  if (changed("treeNone", text)) $("#tree").replaceChildren(h("div", { class: "none" }, text));
+}
+
+// 只畫看得到的列（固定列高）；列的內容沒變就不重建，閃爍與點亮在下一次畫時套上
+function renderTree() {
+  if (left.tab !== "tree" || isMonitor) return;
+  renderTreeBar();
+  const ent = left.project ? left.trees.get(left.project) : null;
+  if (!ent || ent.tree.root == null) {
+    treePlaceholder(ent?.error ?? (left.project ? "載入檔案樹…" : "尚無 session"));
+    return;
+  }
+  lastSig.delete("treeNone");
+  const t = ent.tree;
+  const box = $("#tree");
+  if (left.dirty) {
+    left.rows = t.visible();
+    left.dirty = false;
+  }
+  const rows = left.rows;
+  let inner = box.firstElementChild;
+  if (!inner || inner.className !== "tin") {
+    inner = h("div", { class: "tin" });
+    box.replaceChildren(inner);
+    left.els.clear();
+  }
+  if (!rows.length) {
+    inner.style.height = "";
+    inner.replaceChildren(h("div", { class: "none" }, "這個專案沒有檔案（不是 git repo？）"));
+    left.els.clear();
+    return;
+  }
+  inner.style.height = `${rows.length * ROW_H}px`;
+  const top = box.scrollTop;
+  const height = box.clientHeight || 600;
+  const from = Math.max(0, Math.floor(top / ROW_H) - 10);
+  const to = Math.min(rows.length, Math.ceil((top + height) / ROW_H) + 10);
+  const running = new Set([...store.sessions.values()].filter((s) => s.status === "run").map((s) => s.id));
+  const keep = new Set();
+  for (let i = from; i < to; i++) {
+    const r = rows[i];
+    keep.add(r.path);
+    const c = r.dir ? null : t.counts(r.path);
+    const dots = r.dir ? [] : t.touching(r.path, running);
+    const sig = `${i}|${r.pre}|${r.open}|${r.git}|${r.conflict}|${c ? `${c.r},${c.e},${c.w},${c.x},${c.isNew}` : ""}|${dots.join(",")}`;
+    let row = left.els.get(r.path);
+    if (!row || row.sig !== sig) {
+      const el = treeRow(r, c, dots, t, i);
+      if (row) row.el.replaceWith(el);
+      else inner.append(el);
+      row = { el, sig };
+      left.els.set(r.path, row);
+    }
+    const fl = left.flash.get(r.path);
+    if (fl || left.lit.has(r.path)) {
+      const el = row.el;
+      el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
+      void el.offsetWidth; // 重新觸發動畫
+      if (fl) el.classList.add(fl);
+      if (left.lit.has(r.path)) el.classList.add("lit");
+    }
+  }
+  for (const [p, row] of left.els) {
+    if (!keep.has(p)) {
+      row.el.remove();
+      left.els.delete(p);
+    }
+  }
+  left.flash.clear();
+  left.lit.clear();
+}
+
+function treeRow(r, c, dots, t, i) {
+  const cls = `node ${r.dir ? "dir" : "file"}${r.git ? ` g-${r.git}` : ""}${c?.isNew ? " isnew" : ""}${r.conflict && !r.dir ? " cflt" : ""}`;
+  const lbl = h("span", { class: "lbl" }, h("span", { class: "pre" }, r.pre), h("span", { class: "nm" }, r.dir ? `${r.name}/` : r.name), r.conflict ? h("span", { class: "cf" }, "⚠") : null);
+  const mk = h("span", { class: "mk" });
+  if (c) {
+    const cap = (n) => Math.min(n, 6);
+    for (const [k, n] of [["r", c.r], ["e", c.e], ["w", c.w], ["x", c.x]]) for (let j = 0; j < cap(n); j++) mk.append(h("i", { class: k }));
+    const total = c.r + c.e + c.w + c.x;
+    if ([c.r, c.e, c.w, c.x].some((n) => n > 6)) mk.append(h("small", {}, String(total)));
+  }
+  if (dots.length) mk.append(h("span", { class: "sb" }, ...dots.map((s) => h("i", { style: `background:${sessionColor(s)}`, title: s }))));
+  const attrs = { class: cls, style: `top:${i * ROW_H}px`, title: treeTitle(r, c, dots, t) };
+  if (r.dir) {
+    attrs["aria-expanded"] = String(r.open);
+    attrs.onclick = () => {
+      t.toggle(r.path);
+      left.dirty = true;
+      render(true);
+    };
+    return h("button", attrs, lbl, mk);
+  }
+  return h("div", attrs, lbl, mk);
+}
+
+const GIT_TEXT = { M: "修改", A: "新增", "?": "未追蹤", D: "刪除", R: "改名", C: "複製", T: "類型改變" };
+function treeTitle(r, c, dots, t) {
+  const lines = [r.path];
+  if (c && c.r + c.e + c.w + c.x) lines.push(`讀 ${c.r} · 改 ${c.e} · 新建 ${c.w} · 失敗 ${c.x}`);
+  const m = r.dir ? null : t.mark(r.path);
+  for (const b of m?.by ?? []) {
+    const who = b.session ? shortId(b.session) : b.branch ?? b.worktree ?? "";
+    lines.push(`${who}：${GIT_TEXT[b.status] ?? b.status}${b.from ? `（從 ${b.from}）` : ""}`);
+  }
+  if (r.conflict) lines.push(r.dir ? "⚠ 底下有衝突候選" : "⚠ 衝突候選：兩個 worktree 都改了這個檔，內容不同");
+  if (dots.length) lines.push(`正在碰：${dots.map(shortId).join("、")}`);
+  return lines.join("\n");
+}
+
+let treeScrollRaf = 0;
+$("#tree").addEventListener("scroll", () => {
+  if (treeScrollRaf) return;
+  treeScrollRaf = requestAnimationFrame(() => {
+    treeScrollRaf = 0;
+    renderTree();
+  });
+}, { passive: true });
+
 // ---------- 單 session 畫面（#649）：tab 切到某個 session 時取代全部串流那一塊 ----------
 // 資料只來自 `session:<id>` 頻道（session-pane.js）；NOW 與 lanes 用 collector 的 agents 列，跟 Agents 面板同一份。
 const pane = createSessionPane();
@@ -554,6 +947,8 @@ function renderPane() {
     $("#spLast").textContent = g.last
       ? `最後 ${String(g.last.hash ?? "").slice(0, 7)} ${g.last.message ?? ""}（${g.last.agent === "main" ? "main" : agentName(id, g.last.agent) ?? shortId(g.last.agent)}）`
       : s?.commits ? "commit 在目前載入的範圍之前" : "尚無 commit";
+    $("#spLast").classList.toggle("pick", !!g.last?.hash);
+    $("#spLast").title = g.last?.hash ? "點一下：左欄的改動改成相對這個 commit" : "";
     $("#spDanger").hidden = !s?.dangers;
     $("#spDangerN").textContent = String(s?.dangers ?? 0);
     $("#spCost").textContent = s?.costUsd != null ? fmtKpi("costUsd", s.costUsd) : "—";
@@ -846,13 +1241,7 @@ function selectTab(id) {
   render(true);
 }
 
-for (const t of document.querySelectorAll(".tab")) {
-  t.addEventListener("click", () => {
-    for (const x of document.querySelectorAll(".tab")) x.classList.toggle("on", x === t);
-    $("#tree").hidden = t.dataset.t !== "tree";
-    $("#sess").hidden = t.dataset.t !== "sess";
-  });
-}
+for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => showLeftTab(t.dataset.t));
 
 // ---------- 連線 ----------
 const params = new URLSearchParams(location.search);
@@ -860,7 +1249,8 @@ const mockN = params.has("mock") ? Math.max(1, Math.min(32, Number(params.get("m
 bench.on = mockN > 0 && params.has("bench");
 bench.isolate = bench.on && params.has("isolate");
 // &prefill：mock 先產生一段歷史（每個 session 約 220 個 pos），用來試「載入更多」與 3000 行上限
-const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill") }) : null;
+// &bigtree：檔案樹超過懶載入門檻（#642）
+const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));
@@ -874,7 +1264,7 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; notifier.connected(); render(true); },
+    welcome: (m) => { ui.welcome = m; notifier.connected(); loadSessions(); render(true); },
     snapshot: (m) => {
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
@@ -889,6 +1279,8 @@ const client = createClient({
         notifier.snapshot(m.attention);
         onStreamSnapshot(m);
         changes.load(m.changes);
+        syncProjects();
+        feedFiles([...(m.stream ?? []), ...(m.changes ?? []), ...(m.staged ?? [])]);
       }
       render(true);
     },
@@ -902,6 +1294,8 @@ const client = createClient({
         if (bench.on) benchFrame(m);
         else onStreamFrame(m);
         changes.apply(m.events);
+        if (m.rows?.sessions?.length) syncProjects();
+        feedFiles(m.events);
       }
       render();
     },

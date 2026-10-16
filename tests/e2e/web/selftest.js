@@ -200,6 +200,53 @@
     await sleep(150);
     check("點「回到最新」恢復自動", chgBtns()[0]?.classList.contains("sel") && !$("#chg .hint"));
 
+    // ---- 左欄：檔案樹（#642）與改動基準（#644） ----
+    const nodes = () => $$("#tree .node");
+    const nodeOf = (path) => nodes().find((n) => n.title.split("\n")[0] === path);
+    check("檔案樹有節點、目錄在前", nodes().length > 3 && nodes()[0].classList.contains("dir"), `${nodes().length} 列`);
+    const touched = nodes().filter((n) => n.querySelector(".mk i"));
+    check("碰過的檔有方塊、所在目錄已展開", touched.length > 0, touched.slice(0, 3).map((n) => n.title.split("\n")[0]).join("、"));
+    const docs = nodeOf("docs");
+    if (docs) {
+      // 樹是虛擬化的（只畫看得到的列），所以看子節點出不出現，不數列數
+      click(docs);
+      await sleep(400);
+      const opened = nodeOf("docs")?.getAttribute("aria-expanded") === "true" && !!nodeOf("docs/guide.md");
+      click(nodeOf("docs"));
+      await sleep(400);
+      check("點目錄展開、再點收起", opened && nodeOf("docs")?.getAttribute("aria-expanded") === "false" && !nodeOf("docs/guide.md"));
+    } else check("點目錄展開、再點收起", false, "找不到 docs/");
+    await sleep(3500); // 等改動後的重抓
+    check("相對 main：有改動的檔名上色、說明列有數字", $$("#tree .node.g-mod, #tree .node.g-new").length > 0 && /\d+ 個檔有改動/.test($("#tInfo").textContent), $("#tInfo").textContent);
+    const base = $("#tBase");
+    base.value = "since";
+    base.dispatchEvent(new Event("change"));
+    await sleep(400);
+    check("切到「本次開啟以來」：不問 collector，用收到的改動", /^本次開啟以來 · \d+ 個檔有改動/.test($("#tInfo").textContent), $("#tInfo").textContent);
+    base.value = "session";
+    base.dispatchEvent(new Event("change"));
+    await sleep(600);
+    check("切到「單一 session」：出現 session 選單", !$("#tBaseSess").hidden && $("#tBaseSess").options.length > 0 && /^session \w{8} · \d+ 個檔有改動/.test($("#tInfo").textContent), $("#tInfo").textContent);
+    base.value = "commit";
+    base.dispatchEvent(new Event("change"));
+    const hash = $("#tBaseHash");
+    hash.value = "zz";
+    hash.dispatchEvent(new Event("change"));
+    await sleep(300);
+    const bad = hash.classList.contains("bad");
+    hash.value = "abc1234";
+    hash.dispatchEvent(new Event("change"));
+    await sleep(600);
+    check("相對 commit：hash 格式不對標紅、對的就抓", bad && /^相對 abc1234/.test($("#tInfo").textContent), $("#tInfo").textContent);
+    base.value = "main";
+    base.dispatchEvent(new Event("change"));
+    click($(".tab[data-t=sess]"));
+    await sleep(600);
+    const sess = $$("#sess button");
+    check("Sessions tab：含已結束（API 補的）與模型", sess.some((b) => b.classList.contains("ended")) && sess.some((b) => b.querySelector(".mdl")), `${sess.length} 列`);
+    click($(".tab[data-t=tree]"));
+    await sleep(200);
+
     out.push("DONE");
     show();
     report();

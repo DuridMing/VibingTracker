@@ -15,6 +15,7 @@ query=$2
 [ -f "$web/index.html" ] || { echo "找不到前端：$web/index.html（用 WEB_DIR 指定）" >&2; exit 2; }
 tmp=$root/target/tmp/web-e2e
 mkdir -p "$tmp" "$(dirname "$out")"
+out=$(cd "$(dirname "$out")" && pwd)/$(basename "$out") # Firefox 的 --screenshot 不認相對路徑（不報錯、也不產生檔案）
 profile=$tmp/ffprofile.$$
 python3 -I "$root/tests/e2e/web/shotserver.py" "$web" "$port" "${RESULT_FILE:-$tmp/result.txt}" &
 pid=$!
