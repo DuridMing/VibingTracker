@@ -7,6 +7,7 @@ import { createStreamView } from "./stream-view.js";
 import { formatRow, esc } from "./format.js";
 import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
+import { fmtKpi, modelBreakdown } from "./kpi.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -38,13 +39,6 @@ function changed(name, sig) {
   return true;
 }
 
-function fmtKpi(k, v) {
-  if (v == null) return "—";
-  if (k === "costUsd") return `$${v.toFixed(2)}`;
-  if (k === "thinkingTokens") return v >= 1000 ? `${(v / 1000).toFixed(1)}k` : String(v);
-  return String(v);
-}
-
 function renderConn() {
   const el = $("#conn");
   el.className = `conn ${ui.conn}`;
@@ -59,6 +53,48 @@ function renderConn() {
 function renderKpis() {
   if (!changed("kpi", JSON.stringify(store.kpi))) return;
   for (const b of document.querySelectorAll("#kpis b[data-k]")) b.textContent = fmtKpi(b.dataset.k, store.kpi[b.dataset.k]);
+  const many = Object.keys(store.kpi.models ?? {}).length > 0;
+  for (const el of document.querySelectorAll("#kpis .km")) el.classList.toggle("has", many);
+  if (kpop.key) fillKpop(kpop.key);
+}
+
+// 費用與思考 tokens 依模型分列（§6 kpi.models）：滑過或聚焦時顯示
+const kpop = { key: null, anchor: null };
+function fillKpop(key) {
+  const el = $("#kpop");
+  const rows = modelBreakdown(store.kpi.models, key);
+  el.replaceChildren(
+    h("div", { class: "kpop-h" }, key === "costUsd" ? "費用（今天）依模型" : "思考 tokens（今天）依模型"),
+    ...(rows.length === 0
+      ? [h("div", { class: "none" }, "collector 尚未提供依模型分列")]
+      : rows.map((r) => h("div", { class: "kpop-r" },
+          h("span", { class: "m" }, r.model),
+          h("i", { class: "bar" }, h("i", { style: `width:${(r.share * 100).toFixed(1)}%` })),
+          h("b", {}, fmtKpi(key, r.value)),
+          h("small", {}, `${Math.round(r.share * 100)}%`)))),
+  );
+}
+function openKpop(anchor) {
+  const el = $("#kpop");
+  kpop.key = anchor.dataset.m;
+  kpop.anchor = anchor;
+  fillKpop(kpop.key);
+  el.hidden = false;
+  const a = anchor.getBoundingClientRect();
+  const w = el.offsetWidth;
+  el.style.left = `${Math.max(8, Math.min(a.right - w, innerWidth - w - 8))}px`;
+  el.style.top = `${a.bottom + 6}px`;
+}
+function closeKpop(anchor) {
+  if (kpop.anchor !== anchor) return;
+  kpop.key = kpop.anchor = null;
+  $("#kpop").hidden = true;
+}
+for (const el of document.querySelectorAll("#kpis .km")) {
+  el.addEventListener("mouseenter", () => openKpop(el));
+  el.addEventListener("focus", () => openKpop(el));
+  el.addEventListener("mouseleave", () => closeKpop(el));
+  el.addEventListener("blur", () => closeKpop(el));
 }
 
 function liveSessions() {

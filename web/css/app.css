@@ -231,3 +231,17 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 .fw-x{font-size:16px;line-height:1;padding:2px 8px;border-radius:6px;color:var(--muted);cursor:pointer}
 .fw-x:hover{background:var(--rose-soft);color:var(--rose)}
 .fw-b{flex:1;overflow:auto;padding:6px 8px;min-height:0}
+
+/* KPI 依模型分列（#643） */
+.km{cursor:default;outline:none}
+.km .km-i{display:none;font-style:normal;font-size:9px;margin-left:2px;color:var(--dim)}
+.km.has .km-i{display:inline}
+.km:focus-visible span{text-decoration:underline}
+.kpop{position:fixed;z-index:50;min-width:240px;max-width:340px;padding:8px 10px;background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,.18);font-size:12px}
+.kpop-h{color:var(--muted);font-size:11px;margin-bottom:4px}
+.kpop-r{display:grid;grid-template-columns:7em 1fr 4.2em 2.6em;align-items:center;gap:6px;padding:2px 0}
+.kpop-r .m{font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kpop-r .bar{display:block;height:6px;background:var(--line-soft);border-radius:3px;overflow:hidden}
+.kpop-r .bar i{display:block;height:100%;background:var(--violet)}
+.kpop-r b{font-weight:600;text-align:right;font-variant-numeric:tabular-nums}
+.kpop-r small{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums}

@@ -75,7 +75,7 @@ function createWorld(n) {
   for (const s of sessions) {
     agents.set(`${s.id}/main`, { id: `${s.id}/main`, session: s.id, agentId: "main", agentType: null, name: "main", task: null, status: "run", current: null, toolCount: 0, parentToolUseId: null, spawnedAt: s.startedAt, finishedAt: null });
   }
-  const kpi = { live: n, attention: 0, sessions: n, agents: 0, edits: 0, writes: 0, commands: 0, failures: 0, dangers: 0, commits: 0, thinkingTokens: 0, costUsd: 0 };
+  const kpi = { live: n, attention: 0, sessions: n, agents: 0, edits: 0, writes: 0, commands: 0, failures: 0, dangers: 0, commits: 0, thinkingTokens: 0, costUsd: 0, models: {} };
   let frame = 0;
   let toolSeq = 0;
   let agentSeq = 0;
@@ -333,6 +333,10 @@ function createWorld(n) {
         s.thinkingTokens += think;
         kpi.costUsd = +(kpi.costUsd + cost).toFixed(4);
         kpi.thinkingTokens += think;
+        // §6 kpi.models：subagent 常用較小的模型，這裡讓一部分花費記在 haiku
+        const m = r() < 0.25 ? "haiku" : s.model;
+        const km = kpi.models[m] ?? { costUsd: 0, thinkingTokens: 0 };
+        kpi.models = { ...kpi.models, [m]: { costUsd: +(km.costUsd + cost).toFixed(4), thinkingTokens: km.thinkingTokens + think } };
         rows.sessions.push({ id: s.id, costUsd: s.costUsd, thinkingTokens: s.thinkingTokens, agentsLive: s.agentsLive, lastPos: s.lastPos });
       }
       recount();
