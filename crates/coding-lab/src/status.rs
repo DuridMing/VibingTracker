@@ -96,6 +96,16 @@ struct Open {
     raised_at: u64,
 }
 
+/// 還開著的注意項目：session 移出記憶體或 collector 重啟時留下，回來時種回 [`Tracker`]（#679）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenItem {
+    pub kind: AttentionKind,
+    pub reference: String,
+    /// fail 屬於哪個 agent 的連續失敗（其他種類不用）
+    pub agent: String,
+    pub raised_at: u64,
+}
+
 struct Running {
     id: String,
     tool: String,
@@ -247,6 +257,48 @@ impl Tracker {
         self.idle = true;
         out.extend(self.recompute(now));
         out
+    }
+
+    /// SessionStart：resume／compact／clear 接回同一個 session 時，結束、中斷與 Stop 的狀態都不再成立。
+    pub fn started(&mut self, now: u64) -> Vec<Change> {
+        self.ended = false;
+        self.idle = false;
+        self.stop_at = None;
+        self.recompute(now).into_iter().collect()
+    }
+
+    /// 種回還開著的注意項目（不發 Event：live 與 store 已經有這些列與狀態）。
+    pub fn seed_open(&mut self, item: OpenItem) {
+        if item.kind == AttentionKind::Fail {
+            self.fail_streak.insert(item.agent.clone(), FAIL_STREAK);
+            self.fail_open
+                .insert(item.agent.clone(), item.reference.clone());
+        }
+        if !self.is_open(item.kind, &item.reference) {
+            self.open.push(Open {
+                kind: item.kind,
+                reference: item.reference,
+                raised_at: item.raised_at,
+            });
+        }
+        let _ = self.recompute(item.raised_at);
+    }
+
+    /// 還開著的注意項目，交給下一次 [`Tracker::seed_open`]。
+    pub fn open_items(&self) -> Vec<OpenItem> {
+        self.open
+            .iter()
+            .map(|o| OpenItem {
+                kind: o.kind,
+                reference: o.reference.clone(),
+                agent: self
+                    .fail_open
+                    .iter()
+                    .find(|(_, r)| o.kind == AttentionKind::Fail && **r == o.reference)
+                    .map_or_else(|| "main".to_string(), |(a, _)| a.clone()),
+                raised_at: o.raised_at,
+            })
+            .collect()
     }
 
     pub fn session_end(&mut self, now: u64) -> Vec<Change> {

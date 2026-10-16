@@ -109,6 +109,8 @@ pub struct AttentionRow {
     pub reference: String,
     pub reason: Option<String>,
     pub raised_at: u64,
+    /// danger 解除後仍留在佇列（等 ack），這時有值
+    pub cleared_at: Option<u64>,
 }
 
 const SCHEMA_V1: &str = "
@@ -615,7 +617,7 @@ impl Store {
     /// 注意佇列：還沒被使用者確認，且還沒自動解除或是 danger（danger 解除後留到 ack）。
     pub fn open_attention(&self) -> Result<Vec<AttentionRow>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT session, kind, ref, reason, raised_at FROM attention
+            "SELECT session, kind, ref, reason, raised_at, cleared_at FROM attention
              WHERE acked_at IS NULL AND (cleared_at IS NULL OR kind = 'danger') ORDER BY raised_at",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -625,6 +627,7 @@ impl Store {
                 reference: r.get(2)?,
                 reason: r.get(3)?,
                 raised_at: r.get::<_, i64>(4)? as u64,
+                cleared_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)

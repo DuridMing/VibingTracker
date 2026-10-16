@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::derive;
 use crate::event::{
-    AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking,
+    AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
     FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
     SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
@@ -18,7 +18,7 @@ use crate::event::{
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
-use crate::status::{self, Change, Signal, Tracker};
+use crate::status::{self, Change, OpenItem, Signal, Tracker};
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
@@ -165,10 +165,13 @@ pub struct Merger {
     cost_baseline: Option<f64>,
 }
 
+#[derive(Default)]
 struct Resumed {
     seq: u64,
     pos: u64,
     cwd: Option<String>,
+    /// 還開著的注意項目（#679）
+    open: Vec<OpenItem>,
 }
 
 impl Merger {
@@ -187,9 +190,48 @@ impl Merger {
     /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
     /// `cwd` 是 file.* 的路徑基準（store 的 sessions.cwd），空字串表示不知道。
     pub fn resume(&mut self, sid: &str, seq: u64, pos: u64, cwd: &str) {
-        let cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+        let r = self.resumed.entry(sid.to_string()).or_default();
+        (r.seq, r.pos) = (seq, pos);
+        r.cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+    }
+
+    /// collector 重啟時，把 store 裡還開著（未解除、未確認）的注意項目交給 merge，session 回到記憶體時
+    /// 種回 Tracker，之後的 prompt、工具結束才解得掉它們。`agent` 是 fail 的連續失敗所屬的 agent。
+    pub fn resume_attention(
+        &mut self,
+        sid: &str,
+        kind: AttentionKind,
+        reference: &str,
+        agent: &str,
+        raised_at: u64,
+    ) {
+        let item = OpenItem {
+            kind,
+            reference: reference.to_string(),
+            agent: agent.to_string(),
+            raised_at,
+        };
         self.resumed
-            .insert(sid.to_string(), Resumed { seq, pos, cwd });
+            .entry(sid.to_string())
+            .or_default()
+            .open
+            .push(item);
+    }
+
+    /// 取得（必要時建立）session；新建時套用上一輪留下的編號、路徑基準與注意項目，
+    /// 之後 Tracker 一被用到就已經是接續的狀態。
+    fn session(&mut self, sid: &str) -> &mut Session {
+        let resumed = &mut self.resumed;
+        self.sessions.entry(sid.to_string()).or_insert_with(|| {
+            let mut s = Session::default();
+            if let Some(r) = resumed.remove(sid) {
+                (s.seq, s.pos, s.cwd) = (r.seq, r.pos, r.cwd);
+                for item in r.open {
+                    s.status.seed_open(item);
+                }
+            }
+            s
+        })
     }
 
     /// file.* 的路徑基準；還沒套用的 resume 也算（第一個 file.* 在 emit 之前就要用到）。
@@ -220,7 +262,7 @@ impl Merger {
             Input::TailReset { .. } => None,
         };
         if let Some((sid, ts)) = seen {
-            let s = self.sessions.entry(sid.to_string()).or_default();
+            let s = self.session(sid);
             s.last_seen = s.last_seen.max(ts);
         }
         match input {
@@ -239,7 +281,7 @@ impl Merger {
                 ts_seen,
             } => {
                 let mut out = Vec::new();
-                let s = self.sessions.entry(session.clone()).or_default();
+                let s = self.session(&session);
                 s.degraded.insert(file.clone());
                 let file_name = file.clone();
                 let payload = Payload::TranscriptDegraded(TranscriptHealth {
@@ -263,11 +305,7 @@ impl Merger {
                 file,
                 ts_seen,
             } => {
-                self.sessions
-                    .entry(session.clone())
-                    .or_default()
-                    .degraded
-                    .remove(&file);
+                self.session(&session).degraded.remove(&file);
                 vec![self.recovered(&session, file, ts_seen)]
             }
             Input::TailReset {
@@ -295,8 +333,9 @@ impl Merger {
     }
 
     /// 結束超過 [`SESSION_EVICT_AFTER_MS`]、或 [`SESSION_IDLE_EVICT_MS`] 沒有任何輸入的 session 移出記憶體；
-    /// seq／pos 與路徑基準留在 `resumed`，resume 回來時接著用。
-    fn evict(&mut self, now: u64) {
+    /// seq／pos、路徑基準與還開著的注意項目留在 `resumed`，resume 回來時接著用。
+    /// 沒有 SessionEnd 就被丟棄的 session 先結束它（`reason: "abandoned"`），否則 live 與 store 永遠是 run。
+    fn evict(&mut self, now: u64) -> Vec<Event> {
         let gone: Vec<String> = self
             .sessions
             .iter()
@@ -307,18 +346,49 @@ impl Merger {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        let mut out = Vec::new();
         for id in gone {
+            let abandoned = self
+                .sessions
+                .get(&id)
+                .is_some_and(|s| s.ended_at.is_none() && s.seq > 0);
+            if abandoned {
+                out.extend(self.end_session(&id, Some("abandoned".into()), now, None));
+            }
             if let Some(s) = self.sessions.remove(&id)
-                && s.seq > 0
+                && (s.seq > 0 || !s.status.open_items().is_empty())
             {
                 let r = Resumed {
                     seq: s.seq,
                     pos: s.pos,
+                    open: s.status.open_items(),
                     cwd: s.cwd,
                 };
                 self.resumed.insert(id, r);
             }
         }
+        out
+    }
+
+    /// 結束 session：session.ended 加上狀態機的變化。`raw` 是 SessionEnd hook 的原始內容（merge 自己結束時沒有）。
+    fn end_session(
+        &mut self,
+        sid: &str,
+        reason: Option<String>,
+        ts_seen: u64,
+        raw: Option<Map<String, Value>>,
+    ) -> Vec<Event> {
+        self.session(sid).ended_at = Some(ts_seen);
+        let meta = Meta {
+            agent: "main".into(),
+            ts_seen,
+            raw,
+            ..Meta::default()
+        };
+        let mut out = vec![self.emit(sid, Payload::SessionEnded(SessionEnded { reason }), meta)];
+        let changes = self.tracker(sid).session_end(ts_seen);
+        out.extend(self.apply(sid, changes, "main", ts_seen));
+        out
     }
 
     fn recovered(&mut self, sid: &str, file: String, ts_seen: u64) -> Event {
@@ -346,7 +416,7 @@ impl Merger {
 
     /// 重啟時補回 session 最近 24 小時的花費（只進滾動區間，不觸發）。
     pub fn seed_cost(&mut self, sid: &str, at: u64, usd: f64) {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         // 新建的 session last_seen 是 0，不更新的話下一次 tick 就被 evict
         s.last_seen = s.last_seen.max(at);
         s.status.seed_cost(at, usd);
@@ -362,9 +432,8 @@ impl Merger {
 
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
-        self.evict(now);
+        let mut out = self.evict(now);
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
-        let mut out = Vec::new();
         for sid in sessions {
             let changes = match self.sessions.get_mut(&sid) {
                 Some(s) => {
@@ -413,7 +482,7 @@ impl Merger {
         ts_model: Option<String>,
         ts_seen: u64,
     ) -> Event {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         let agent = match s.cards.get_mut(id) {
             Some(card) => {
                 card.staged_at = None;
@@ -444,15 +513,7 @@ impl Merger {
     }
 
     fn emit(&mut self, sid: &str, payload: Payload, meta: Meta) -> Event {
-        let s = self.sessions.entry(sid.to_string()).or_default();
-        if s.seq == 0
-            && let Some(r) = self.resumed.remove(sid)
-        {
-            (s.seq, s.pos) = (r.seq, r.pos);
-            if s.cwd.is_none() {
-                s.cwd = r.cwd;
-            }
-        }
+        let s = self.session(sid);
         s.seq += 1;
         let pos = meta.in_stream.then(|| {
             s.pos += 1;
@@ -498,7 +559,7 @@ impl Merger {
     }
 
     fn tracker(&mut self, sid: &str) -> &mut Tracker {
-        &mut self.sessions.entry(sid.to_string()).or_default().status
+        &mut self.session(sid).status
     }
 
     // ── hook
@@ -526,7 +587,7 @@ impl Merger {
             "SessionStart" => {
                 let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
                 let base = (self.path_base(&sid).is_none() && !cwd.is_empty()).then(|| cwd.clone());
-                let session = self.sessions.entry(sid.clone()).or_default();
+                let session = self.session(&sid);
                 session.ended_at = None;
                 if base.is_some() {
                     session.cwd = base;
@@ -539,6 +600,9 @@ impl Merger {
                     branch: None,
                 };
                 out.push(self.emit(&sid, Payload::SessionStarted(p), meta()));
+                // resume 回來：結束、中斷與 Stop 不再成立；還開著的注意項目決定新的 status（#679）
+                let changes = self.tracker(&sid).started(ts_seen);
+                out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             "UserPromptSubmit" => {
                 let prompt = s("prompt").unwrap_or_default();
@@ -647,13 +711,7 @@ impl Merger {
                 }
             }
             "SessionEnd" => {
-                self.sessions.entry(sid.clone()).or_default().ended_at = Some(ts_seen);
-                let p = SessionEnded {
-                    reason: s("reason"),
-                };
-                out.push(self.emit(&sid, Payload::SessionEnded(p), meta()));
-                let changes = self.tracker(&sid).session_end(ts_seen);
-                out.extend(self.apply(&sid, changes, &agent, ts_seen));
+                out.extend(self.end_session(&sid, s("reason"), ts_seen, raw.clone()));
             }
             "PreCompact" => {
                 let p = CompactStarted {
@@ -682,11 +740,7 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                self.sessions
-                    .entry(sid.clone())
-                    .or_default()
-                    .started_agents
-                    .insert(agent_id.clone());
+                self.session(&sid).started_agents.insert(agent_id.clone());
                 let agent_type = s("agent_type").filter(|t| !t.is_empty());
                 // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫
                 let pending = self.sessions.get_mut(&sid).and_then(|ss| {
@@ -714,7 +768,7 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                let ss = self.sessions.entry(sid.clone()).or_default();
+                let ss = self.session(&sid);
                 ss.held_bg.retain(|_, h| h.agent_id != agent_id);
                 if !ss.finished_agents.insert(agent_id.clone()) {
                     return out;
@@ -771,7 +825,7 @@ impl Merger {
     /// 不建卡片、不判危險；真的收到 PostToolUse／Failure 才補建卡片並直接放進串流末端。
     /// 回傳（要先送出的事件, 是否已處理完）；沒處理完就接著照一般流程處理這個 hook。
     fn on_background_tool(&mut self, h: &HookInput, sid: &str, ts_seen: u64) -> (Vec<Event>, bool) {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         let id = h.tool_use_id().map(str::to_string);
         let known = id.as_ref().is_some_and(|i| s.cards.contains_key(i));
         match h.event_name() {
@@ -861,7 +915,7 @@ impl Merger {
         let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
         let danger = self.danger.check(&tool, &input);
         let raw = Some(h.raw().clone());
-        let session = self.sessions.entry(sid.to_string()).or_default();
+        let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
         session.status.tool_started(&id, &tool, &input);
         let mut out = Vec::new();
@@ -994,11 +1048,7 @@ impl Merger {
                     description: s("description"),
                     prompt: s("prompt"),
                 };
-                self.sessions
-                    .entry(sid.to_string())
-                    .or_default()
-                    .pending_agents
-                    .push(pending);
+                self.session(sid).pending_agents.push(pending);
                 None
             }
             _ => None,
@@ -1045,7 +1095,7 @@ impl Merger {
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         let card = s.cards.entry(id.to_string()).or_insert(Card {
             agent: agent.to_string(),
             staged_at: None,
@@ -1067,7 +1117,7 @@ impl Merger {
         agent: &str,
         ts_seen: u64,
     ) -> Option<Event> {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         let card = s.cards.entry(id.to_string()).or_insert(Card {
             agent: agent.to_string(),
             staged_at: None,
@@ -1102,7 +1152,7 @@ impl Merger {
     // ── transcript
 
     fn on_line(&mut self, sid: &str, file: &str, no: u64, v: &Value, ts_seen: u64) -> Vec<Event> {
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
         if let Some(uuid) = v["uuid"].as_str()
             && !s.seen_uuids.insert(uuid.to_string())
         {
@@ -1181,7 +1231,7 @@ impl Merger {
             self.tracker(sid).cost(ts_seen, usd, base);
             out.push(self.emit(sid, Payload::Usage(p), meta(false)));
         }
-        let s = self.sessions.entry(sid.to_string()).or_default();
+        let s = self.session(sid);
 
         let main = match (v["type"].as_str(), block["type"].as_str()) {
             (Some("assistant"), Some("thinking")) => {

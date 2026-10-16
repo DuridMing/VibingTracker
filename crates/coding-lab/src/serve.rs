@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::config::Config;
-use crate::event::Event;
+use crate::event::{AttentionKind, Event};
 use crate::hooks::serve_hooks;
 use crate::merge::{Input, Merger};
 use crate::prices::Prices;
@@ -100,19 +100,23 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
     web.rebuild(&recent);
     // ack 不是 Event，重放會讓已確認的注意列跑回來：依 store 的佇列對齊
-    match store
+    let open_attention = match store
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .open_attention()
     {
-        Ok(rows) => web.keep_attention(
-            &rows
-                .iter()
-                .map(|a| format!("{}/{}/{}", a.session, a.kind, a.reference))
-                .collect(),
-        ),
-        Err(e) => log(&format!("讀取注意佇列失敗：{e}")),
-    }
+        Ok(rows) => rows,
+        Err(e) => {
+            log(&format!("讀取注意佇列失敗：{e}"));
+            Vec::new()
+        }
+    };
+    web.keep_attention(
+        &open_attention
+            .iter()
+            .map(|a| format!("{}/{}/{}", a.session, a.kind, a.reference))
+            .collect(),
+    );
     web.flush(crate::now_ms());
     let (web_addr, _web_task) = serve_web(cfg.web_bind, web.clone()).await?;
     let _flusher = web.spawn_flusher();
@@ -148,6 +152,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             merger.resume(&sid, c.seq, c.pos, &c.cwd);
         }
     }
+    // 還沒解除的注意項目種回 merge（#679）：否則之後的 prompt、工具結束解不掉重啟前的列
+    resume_attention(&mut merger, &open_attention, &recent);
     // 費用暴增（#675）：基準＋補回各 session 最近 24 小時的花費
     let now = crate::now_ms();
     let usage = cost_usage(&store, now);
@@ -203,7 +209,12 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             }
             scheduled = tick.tick() => {
                 let lag = Instant::now().saturating_duration_since(scheduled.into_std());
-                sink(merger.tick(crate::now_ms()));
+                let events = merger.tick(crate::now_ms());
+                // merge 結束了被丟棄的 session（#679）：閒置結束不必再等它
+                for e in events.iter().filter(|e| e.kind == "session.ended") {
+                    open_sessions.remove(&e.session);
+                }
+                sink(events);
                 web.set_health(json!({ "tails": tails.len(), "schedLagMs": lag.as_millis() as u64 }));
                 let quiet = last_hook.elapsed();
                 if !idle.is_zero()
@@ -243,6 +254,29 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     }
     remove_info_if_mine(&info, me);
     Ok(Outcome::Stopped)
+}
+
+/// 把 store 裡還沒解除的注意列交給 merge；fail 要知道是哪個 agent 的連續失敗，從重放的 Event 找，找不到當 main。
+fn resume_attention(merger: &mut Merger, rows: &[crate::store::AttentionRow], recent: &[Event]) {
+    let agent_of: HashMap<(&str, &str, &str), &str> = recent
+        .iter()
+        .filter(|e| e.kind == "attention.raised")
+        .filter_map(|e| {
+            let kind = e.payload["kind"].as_str()?;
+            let r = e.payload["ref"].as_str()?;
+            Some(((e.session.as_str(), kind, r), e.agent.as_str()))
+        })
+        .collect();
+    for a in rows.iter().filter(|a| a.cleared_at.is_none()) {
+        let Ok(kind) = serde_json::from_value::<AttentionKind>(json!(a.kind)) else {
+            continue;
+        };
+        let agent = agent_of
+            .get(&(a.session.as_str(), a.kind.as_str(), a.reference.as_str()))
+            .copied()
+            .unwrap_or("main");
+        merger.resume_attention(&a.session, kind, &a.reference, agent, a.raised_at);
+    }
 }
 
 fn apply_tail(

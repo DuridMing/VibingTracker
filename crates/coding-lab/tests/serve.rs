@@ -612,3 +612,50 @@ fn sessions_row_survives_a_restart() {
         assert_eq!(after[k], before[k], "{k}：重啟前 {before}\n重啟後 {after}");
     }
 }
+
+// ── 重啟後的注意佇列（#679）
+
+/// 真的重啟 collector：重啟前「完成待確認」的 session 收到新 prompt 後，done 解除、狀態回到 run。
+#[test]
+fn done_from_before_a_restart_is_cleared_by_the_next_prompt() {
+    let e = env(30);
+    let hook = |name: &str, extra: Value| {
+        let mut body = json!({"session_id": "sd", "hook_event_name": name,
+                              "transcript_path": e.home.join("td.jsonl"), "cwd": "/p"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        http(e.hook, "POST", "/hook", &body.to_string());
+    };
+    let status = || {
+        json_body(&http(e.web, "GET", "/api/sessions", ""))["sessions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["id"] == "sd").cloned())
+            .map_or(Value::Null, |r| r["status"].clone())
+    };
+    {
+        let _first = start_serve(&e);
+        hook("SessionStart", json!({"source": "startup"}));
+        hook(
+            "UserPromptSubmit",
+            json!({"prompt": "一", "prompt_id": "p1"}),
+        );
+        hook("Stop", json!({}));
+        wait_for("Stop 5 秒後標完成待確認", || status() == "done");
+        // live 先更新、store 每 100 ms 才 flush：等 done 寫進 JSONL 才殺
+        wait_for("done 寫進 store", || {
+            std::fs::read_to_string(e.home.join("events/sd.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .any(|v| v["type"] == "session.status" && v["payload"]["status"] == "done")
+        });
+    } // Kill：模擬 collector 當掉
+    let _second = start_serve(&e);
+    assert_eq!(status(), "done", "前提：重啟後重放出 done");
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt": "二", "prompt_id": "p2"}),
+    );
+    wait_for("新的 prompt 撤回 done", || status() == "run");
+}
