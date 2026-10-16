@@ -334,6 +334,11 @@ impl Merger {
         )
     }
 
+    /// 換成 `prices.json` 覆寫過的單價表（#678）；serve 啟動時讀一次，已算過的費用不重算。
+    pub fn set_prices(&mut self, prices: Prices) {
+        self.prices = prices;
+    }
+
     /// 費用暴增的基準（#675）：serve 啟動時與每小時由 store 算好交進來。
     pub fn set_cost_baseline(&mut self, baseline: Option<f64>) {
         self.cost_baseline = baseline;

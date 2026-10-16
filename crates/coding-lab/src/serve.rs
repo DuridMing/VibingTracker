@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::event::Event;
 use crate::hooks::serve_hooks;
 use crate::merge::{Input, Merger};
+use crate::prices::Prices;
 use crate::rules::RuleSet;
 use crate::store::Store;
 use crate::transcript::{TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail, stop_all};
@@ -132,6 +133,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     ));
 
     let mut merger = Merger::new(Box::new(rules));
+    let (prices, warning) = Prices::load(&cfg.home.join("prices.json"));
+    if let Some(w) = warning {
+        log(&w);
+    }
+    merger.set_prices(prices);
     {
         let counters = store
             .lock()

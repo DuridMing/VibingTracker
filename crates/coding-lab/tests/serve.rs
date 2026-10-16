@@ -473,3 +473,77 @@ fn http_api_serves_stored_sessions() {
     );
     assert_eq!(json_body(&r)["changes"][0]["path"], "n.txt", "{r}");
 }
+
+// ── prices.json 覆寫（#678）
+
+/// 送一個 session 與一行 100 萬輸入 tokens 的 assistant 行，回傳寫進 store 的 usage.costUsd。
+fn cost_of_one_million_input(e: &Env) -> f64 {
+    let transcript = e.home.join("tp.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let start = json!({"session_id": "sp", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": transcript, "cwd": "/p", "model": "claude-opus-5-5"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    let prompt = json!({"session_id": "sp", "hook_event_name": "UserPromptSubmit", "prompt": "hi",
+                        "transcript_path": transcript});
+    http(e.hook, "POST", "/hook", &prompt.to_string());
+    let line = json!({"type": "assistant", "uuid": "u1", "timestamp": "2026-10-16T00:00:00Z",
+                      "message": {"id": "m1", "model": "claude-opus-5-5",
+                                  "content": [{"type": "text", "text": "好。"}],
+                                  "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(format!("{line}\n").as_bytes())
+        .unwrap();
+    let jsonl = e.home.join("events/sp.jsonl");
+    wait_for("usage 進 store", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("\"usage\""))
+    });
+    std::fs::read_to_string(&jsonl)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["type"] == "usage")
+        .and_then(|v| v["payload"]["costUsd"].as_f64())
+        .unwrap()
+}
+
+#[test]
+fn prices_json_overrides_the_builtin_price() {
+    let e = env(0);
+    std::fs::write(
+        e.home.join("prices.json"),
+        r#"{"claude-opus-5-5": {"input": 10.0, "output": 50.0, "cacheRead": 1.0}}"#,
+    )
+    .unwrap();
+    let _serve = start_serve(&e);
+    assert_eq!(
+        cost_of_one_million_input(&e),
+        10.0,
+        "內建是 4.0，覆寫成 10.0"
+    );
+}
+
+#[test]
+fn broken_prices_json_warns_and_keeps_the_builtin_price() {
+    let e = env(0);
+    std::fs::write(e.home.join("prices.json"), "{ 壞掉").unwrap();
+    let mut child = cmd(&e, &["serve"]).stderr(Stdio::piped()).spawn().unwrap();
+    let pid = child.id();
+    wait_for("collector.json", || {
+        collector(&e).is_some_and(|c| c["pid"] == pid)
+    });
+    let cost = cost_of_one_million_input(&e);
+    let _ = child.kill();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    let _ = child.wait();
+    assert_eq!(cost, 4.0, "照內建表");
+    assert!(err.contains("prices.json"), "log 要有警告：{err}");
+}

@@ -1,9 +1,11 @@
 //! 模型單價（#633）：USD／每百萬 tokens。
 //!
 //! 內建表來自 Anthropic 第一方 API 價目（2026-10-06）；cache 寫入固定是輸入價的 1.25 倍（5 分鐘 TTL）
-//! 與 2 倍（1 小時 TTL）。使用者可用 `~/.coding-lab/prices.json` 覆寫（#643）。不認得的模型費用記 0，不猜。
+//! 與 2 倍（1 小時 TTL）。使用者可用 `~/.coding-lab/prices.json` 覆寫（#678，見 [`Prices::load`]）。
+//! 不認得的模型費用記 0，不猜。
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -54,10 +56,35 @@ impl Prices {
         Prices { table }
     }
 
+    /// `<home>/prices.json` 覆寫（#678）：`{ "<模型>": { "input", "output", "cacheRead" } }`，USD／每百萬 tokens。
+    /// 有列的模型蓋過內建、沒列的照用內建、可新增；`_` 開頭的鍵是註解。檔案不存在不算錯；
+    /// 壞掉或數字不合理就整個退回內建表，第二個值是要寫進 log 的警告（不讓 collector 起不來，不變式 4）。
+    pub fn load(path: &Path) -> (Prices, Option<String>) {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Prices::builtin(), None),
+            Err(e) => {
+                return (
+                    Prices::builtin(),
+                    Some(format!("讀不到 {}：{e}，改用內建單價", path.display())),
+                );
+            }
+        };
+        match parse_overrides(&text) {
+            Ok(overrides) => {
+                let mut prices = Prices::builtin();
+                prices.table.extend(overrides);
+                (prices, None)
+            }
+            Err(e) => (
+                Prices::builtin(),
+                Some(format!("{} 有錯（{e}），改用內建單價", path.display())),
+            ),
+        }
+    }
+
     pub fn get(&self, model: &str) -> Option<Price> {
-        // transcript 的模型名稱可能帶 `[1m]` 之類的後綴
-        let base = model.split('[').next().unwrap_or(model);
-        self.table.get(base).copied()
+        self.table.get(base_model(model)).copied()
     }
 
     /// transcript `message.usage` 的費用（USD）。
@@ -80,4 +107,33 @@ impl Prices {
             + w1 * p.input * 2.0)
             / 1_000_000.0
     }
+}
+
+/// transcript 的模型名稱可能帶 `[1m]` 之類的後綴；比對時去掉（prices.json 的鍵也一樣）。
+fn base_model(model: &str) -> &str {
+    model.split('[').next().unwrap_or(model)
+}
+
+fn parse_overrides(text: &str) -> Result<Vec<(String, Price)>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let models = v.as_object().ok_or("最外層要是物件")?;
+    let mut out = Vec::new();
+    for (model, row) in models {
+        if model.starts_with('_') {
+            continue;
+        }
+        let field = |name: &str| {
+            row.get(name)
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite() && *n >= 0.0)
+                .ok_or_else(|| format!("{model}.{name} 要是不小於 0 的數字"))
+        };
+        let price = Price {
+            input: field("input")?,
+            output: field("output")?,
+            cache_read: field("cacheRead")?,
+        };
+        out.push((base_model(model).to_string(), price));
+    }
+    Ok(out)
 }
