@@ -6,6 +6,7 @@ import { createStream } from "./stream.js";
 import { createStreamView } from "./stream-view.js";
 import { formatRow, esc } from "./format.js";
 import { createChanges, diffRows, writeRows } from "./changes.js";
+import { makeFloating } from "./floatwin.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -113,8 +114,9 @@ function renderKindFilters() {
 function renderLive() {
   if (changed("liveN", String(stream.staged.size))) $("#liveN").textContent = String(stream.staged.size);
   const list = $("#liveList");
-  if (list.hidden || !changed("liveList", [...stream.staged.values()].slice(-30).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
-  const cards = [...stream.staged.values()].slice(-30);
+  if (!liveWin.isOpen || !changed("liveList", [...stream.staged.values()].slice(-100).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
+  $("#liveWinTitle").textContent = `進行中的動作（${stream.staged.size}）`;
+  const cards = [...stream.staged.values()].slice(-100);
   list.replaceChildren(
     ...(cards.length
       ? cards.map((c) => {
@@ -320,13 +322,24 @@ function toggleKind(k) {
   render(true);
 }
 
-$("#liveToggle").addEventListener("click", () => {
-  const list = $("#liveList");
-  list.hidden = !list.hidden;
-  $("#liveToggle").setAttribute("aria-expanded", String(!list.hidden));
-  lastSig.delete("liveList"); // 剛打開：不管簽章，重畫一次
-  renderLive();
+// 「即時：N 個動作進行中」點開成浮動視窗（不擋頁面、可拖動縮放）
+const liveWin = makeFloating($("#liveWin"), {
+  handle: $("#liveWinHandle"),
+  key: "coding-lab.liveWin",
+  initial: () => {
+    const b = $("#liveToggle").getBoundingClientRect();
+    return { x: b.left, y: Math.max(0, b.top - 340), w: 560, h: 320 };
+  },
+  onToggle: (open) => {
+    $("#liveToggle").setAttribute("aria-expanded", String(open));
+    if (open) {
+      lastSig.delete("liveList"); // 剛打開：不管簽章，重畫一次
+      renderLive();
+    }
+  },
 });
+$("#liveToggle").addEventListener("click", () => liveWin.toggle());
+$("#liveWinClose").addEventListener("click", () => liveWin.close());
 
 // 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
 const MORE_LIMIT = 200;

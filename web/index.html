@@ -52,8 +52,7 @@
           <div class="streamwrap">
             <div class="stream" id="stream"></div>
             <div class="livebar">
-              <button id="liveToggle" aria-expanded="false">即時：<b id="liveN">0</b> 個動作進行中<small>（hook 已到、transcript 未到）</small></button>
-              <div class="livelist" id="liveList" hidden></div>
+              <button id="liveToggle" aria-expanded="false" aria-controls="liveWin">即時：<b id="liveN">0</b> 個動作進行中<small>（hook 已到、transcript 未到）</small></button>
             </div>
           </div>
           <div class="att-blk">
@@ -79,6 +78,14 @@
     </div>
   </section>
 </div>
+<dialog class="floatwin" id="liveWin" aria-labelledby="liveWinTitle">
+  <div class="fw-h" id="liveWinHandle">
+    <b id="liveWinTitle">進行中的動作</b>
+    <small>hook 已到、transcript 未到・拖標題列移動、右下角縮放</small>
+    <button class="fw-x" id="liveWinClose" aria-label="關閉">×</button>
+  </div>
+  <div class="fw-b livelist" id="liveList"></div>
+</dialog>
 <pre id="benchOut" hidden></pre>
 </body>
 </html>
