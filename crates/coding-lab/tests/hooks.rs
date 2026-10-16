@@ -14,9 +14,13 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 async fn post(addr: SocketAddr, body: &[u8]) -> String {
+    post_with(addr, "", body).await
+}
+
+async fn post_with(addr: SocketAddr, extra_headers: &str, body: &[u8]) -> String {
     let mut s = TcpStream::connect(addr).await.unwrap();
     let head = format!(
-        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     s.write_all(head.as_bytes()).await.unwrap();
@@ -32,10 +36,10 @@ fn body_of(resp: &str) -> &str {
 
 async fn server(cap: usize) -> (SocketAddr, mpsc::Receiver<Input>) {
     let (tx, rx) = mpsc::channel(cap);
-    let (addr, _task) = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
         .await
         .unwrap();
-    (addr, rx)
+    (server.addr, rx)
 }
 
 #[tokio::test]
@@ -378,5 +382,58 @@ fn clear_starts_a_new_session_read_from_the_top() {
             path: PathBuf::from(T),
             start: Start::Beginning
         }]
+    );
+}
+
+/// #685：決定閒置結束後，ensure 轉送的 SessionStart 回 503 讓 ensure 改拉新的 collector；
+/// 已經在跑的 session 的 hook 照收（之後 stop_all 會處理掉，不會被吞掉）。
+#[tokio::test]
+async fn closing_hook_server_refuses_ensure_forwards_but_keeps_other_hooks() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    server.set_closing(true);
+    let start = json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup"});
+    let resp = post_with(
+        addr,
+        "X-Coding-Lab-Via: ensure\r\n",
+        start.to_string().as_bytes(),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+    assert!(rx.try_recv().is_err(), "503 的 SessionStart 不能交給 merge");
+
+    let stop = json!({"session_id": "s2", "hook_event_name": "Stop"});
+    let resp = post(addr, stop.to_string().as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(rx.try_recv().is_ok(), "一般 hook 照收");
+
+    server.set_closing(false);
+    let resp = post_with(
+        addr,
+        "X-Coding-Lab-Via: ensure\r\n",
+        start.to_string().as_bytes(),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "取消結束後照常收：{resp}");
+}
+
+/// #685：close() 回來時埠已經放掉，ensure 的 probe 會失敗而重新拉起 collector。
+#[tokio::test]
+async fn closed_hook_server_releases_the_port() {
+    let (tx, _rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    assert!(TcpStream::connect(addr).await.is_ok());
+    tokio::time::timeout(Duration::from_secs(5), server.close())
+        .await
+        .expect("close 不能卡住");
+    assert!(
+        TcpStream::connect(addr).await.is_err(),
+        "close 之後 hook 埠要放掉"
     );
 }

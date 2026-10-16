@@ -1,7 +1,8 @@
 //! `coding-lab serve`：把 hooks、transcript tail、merge、store、ws 組成一個 collector（#629）。
 //!
-//! 先綁 hook 埠——這同時是單例鎖：綁不到就表示已有 collector 在跑，直接結束；綁到了才開 store，
-//! 避免兩個程序同時寫 SQLite。主迴圈是 merge 的唯一消費者（PLAN「collector 設計」）：
+//! 先綁 hook 埠——這同時是單例鎖：綁不到就表示已有 collector 在跑，直接結束；綁到了再拿 store 鎖
+//! （`collector.lock`）才開 store，避免兩個程序同時寫 SQLite。閒置結束時 hook 埠先放掉（#685），
+//! 新的 collector 可能在舊的還在 flush 時就綁到埠，store 鎖讓它等舊的寫完。主迴圈是 merge 的唯一消費者（PLAN「collector 設計」）：
 //! hook 與 transcript 的輸入都經同一個 channel 進來，同一個 session 內的順序因此固定。
 
 use std::collections::{HashMap, HashSet};
@@ -39,6 +40,8 @@ const FRAME_QUEUE: usize = 256;
 /// SubagentStart 後讀 meta.json 的重試間隔與次數（實測晚 40–60 ms 寫好；merge 最多等 1.5 秒）
 const AGENT_META_EVERY: Duration = Duration::from_millis(25);
 const AGENT_META_TRIES: u32 = 40;
+/// 等上一個 collector 放掉 store 鎖最多多久（它只剩停 tail 與 flush）
+const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 
 pub enum Outcome {
     Stopped,
@@ -77,11 +80,13 @@ pub fn log(msg: &str) {
 pub async fn run(cfg: Config) -> io::Result<Outcome> {
     std::fs::create_dir_all(&cfg.home)?;
     let (tx, mut rx) = mpsc::channel::<Input>(INPUT_QUEUE);
-    let hook_addr = match serve_hooks(cfg.hook_bind, tx.clone()).await {
-        Ok((addr, _task)) => addr,
+    let hooks = match serve_hooks(cfg.hook_bind, tx.clone()).await {
+        Ok(h) => h,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => return Ok(Outcome::AlreadyRunning),
         Err(e) => return Err(e),
     };
+    let hook_addr = hooks.addr;
+    let store_lock = lock_store(&cfg.home).await?;
 
     let store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
     let recent = store
@@ -121,8 +126,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             .collect(),
     );
     web.flush(crate::now_ms());
-    let (web_addr, _web_task) = serve_web(cfg.web_bind, web.clone()).await?;
-    let _flusher = web.spawn_flusher();
+    let (web_addr, web_task) = serve_web(cfg.web_bind, web.clone()).await?;
+    let flusher = web.spawn_flusher();
 
     let info = cfg.home.join("collector.json");
     let me = std::process::id();
@@ -176,6 +181,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     rebase.tick().await; // 第一次立即觸發，啟動時已經算過
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
     let mut last_hook = Instant::now();
+    // 決定閒置結束的時間；多等一個 tick，期間有 hook 進來就取消（佇列裡可能已有拿到 200 的 hook）
+    let mut closing_since: Option<Instant> = None;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -226,12 +233,23 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 sink(events);
                 web.set_health(json!({ "tails": tails.len(), "schedLagMs": lag.as_millis() as u64 }));
                 let quiet = last_hook.elapsed();
-                if !idle.is_zero()
+                let idle_now = !idle.is_zero()
                     && quiet >= idle
-                    && (open_sessions.is_empty() || quiet >= ABANDONED_AFTER.max(idle))
-                {
-                    log("閒置，自動結束");
-                    break;
+                    && (open_sessions.is_empty() || quiet >= ABANDONED_AFTER.max(idle));
+                match closing_since {
+                    Some(at) if idle_now && last_hook < at => {
+                        log("閒置，自動結束");
+                        break;
+                    }
+                    Some(_) => {
+                        hooks.set_closing(false);
+                        closing_since = None;
+                    }
+                    None if idle_now => {
+                        hooks.set_closing(true);
+                        closing_since = Some(Instant::now());
+                    }
+                    None => {}
                 }
             }
             _ = rebase.tick() => {
@@ -254,6 +272,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         }
     }
 
+    // 先放掉 hook 埠：之後 ensure 的 probe 會失敗而拉起新的 collector（它會等 store 鎖）
+    hooks.set_closing(true);
+    hooks.close().await;
     stop_all(tails.into_values(), &mut rx, |input| {
         sink(merger.handle(input))
     })
@@ -261,8 +282,43 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
         log(&format!("寫入 store 失敗：{e}"));
     }
+    for task in [web_task, flusher] {
+        task.abort();
+        let _ = task.await;
+    }
     remove_info_if_mine(&info, me);
+    drop(store_lock);
     Ok(Outcome::Stopped)
+}
+
+/// 拿 `<home>/collector.lock` 的獨佔鎖；上一個 collector 還在結束時等它放掉。
+async fn lock_store(home: &Path) -> io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(home.join("collector.lock"))?;
+    let deadline = Instant::now() + STORE_LOCK_WAIT;
+    let mut waited = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                if !waited {
+                    log("上一個 collector 還在結束，等它寫完 store");
+                    waited = true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::other(format!(
+                    "store 被另一個程序鎖住超過 {} 秒",
+                    STORE_LOCK_WAIT.as_secs()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
 }
 
 /// 把 store 裡還沒解除的注意列交給 merge；fail 要知道是哪個 agent 的連續失敗，從重放的 Event 找，找不到當 main。

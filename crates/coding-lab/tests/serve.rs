@@ -734,3 +734,58 @@ fn idle_from_before_a_restart_returns_to_run_on_the_next_prompt() {
     wait_for("新的 prompt 讓 live 回到 run", || status() == "run");
     wait_for("store 也回到 run", || stored_status() == "run");
 }
+
+/// #685：hook 埠放掉之後，新的 collector 要等舊的寫完 store 才開（store 鎖），不能兩個同時寫。
+#[test]
+fn serve_waits_for_the_store_lock_before_opening_the_store() {
+    let e = env(0);
+    let lock = std::fs::File::create(e.home.join("collector.lock")).unwrap();
+    lock.lock().unwrap();
+    let child = Kill(cmd(&e, &["serve"]).spawn().unwrap());
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        collector(&e).is_none(),
+        "還拿不到 store 鎖時不能開始服務（collector.json 不能出現）"
+    );
+    lock.unlock().unwrap();
+    let pid = child.0.id();
+    wait_for("拿到鎖後開始服務", || {
+        collector(&e).is_some_and(|c| c["pid"] == pid)
+    });
+}
+
+/// #685：ensure 轉送時拿到 503（舊的 collector 正在閒置結束），要等埠放掉後拉起新的再轉送一次。
+#[test]
+fn ensure_retries_on_a_new_collector_when_the_old_one_is_exiting() {
+    let e = env(5);
+    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let exiting = std::thread::spawn(move || {
+        // probe 只連線不送資料；轉送的那一條回 503，然後放掉埠（模擬舊 collector 結束）
+        for conn in old.incoming() {
+            let Ok(mut c) = conn else { continue };
+            c.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            if matches!(c.read(&mut buf), Ok(n) if n > 0) {
+                let _ =
+                    c.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n");
+                return;
+            }
+        }
+    });
+    let start = json!({"session_id": "s7", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t7.jsonl"), "cwd": "/p"})
+    .to_string();
+    let t = Instant::now();
+    let out = ensure(&e, &start);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
+    exiting.join().unwrap();
+    let jsonl = e.home.join("events/s7.jsonl");
+    wait_for("SessionStart 轉送到新的 collector", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    if let Some(c) = collector(&e) {
+        kill_pid(c["pid"].as_u64().unwrap());
+    }
+}

@@ -121,7 +121,8 @@ fn run_serve(overrides: &Overrides) -> ExitCode {
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-const START_WAIT: Duration = Duration::from_secs(3);
+/// ensure 整體最多花多久（plugin 的 SessionStart hook timeout 是 5 秒）
+const ENSURE_BUDGET: Duration = Duration::from_secs(4);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SessionStart command hook：確保 collector 在跑，再把 stdin 的 payload 轉送給它。
@@ -135,20 +136,33 @@ fn ensure() -> Result<(), String> {
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    if !probe(cfg.hook_bind) {
-        spawn_collector(&cfg)?;
-        let deadline = Instant::now() + START_WAIT;
-        while !probe(cfg.hook_bind) {
-            if Instant::now() > deadline {
-                return Err("collector 3 秒內沒有起來".into());
+    // 轉送拿到 503 表示舊的 collector 正在閒置結束（#685）：等它放掉埠，拉起新的再送一次
+    let deadline = Instant::now() + ENSURE_BUDGET;
+    let mut spawned = false;
+    loop {
+        if probe(cfg.hook_bind) {
+            if body.is_empty() || forward(cfg.hook_bind, &body)? == Forwarded::Accepted {
+                return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(50));
+        } else if !spawned {
+            spawn_collector(&cfg)?;
+            spawned = true;
         }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "collector {} 秒內沒有起來",
+                ENSURE_BUDGET.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    if !body.is_empty() {
-        forward(cfg.hook_bind, &body)?;
-    }
-    Ok(())
+}
+
+#[derive(PartialEq)]
+enum Forwarded {
+    Accepted,
+    /// collector 正在結束，沒有收下
+    Exiting,
 }
 
 fn probe(addr: SocketAddr) -> bool {
@@ -188,7 +202,7 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
 }
 
 /// 把 SessionStart 轉送到 `/hook`（實測 SessionStart 不送 http hook）。
-fn forward(addr: SocketAddr, body: &[u8]) -> Result<(), String> {
+fn forward(addr: SocketAddr, body: &[u8]) -> Result<Forwarded, String> {
     let mut s = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).map_err(|e| e.to_string())?;
     s.set_write_timeout(Some(FORWARD_TIMEOUT))
         .map_err(|e| e.to_string())?;
@@ -206,7 +220,9 @@ fn forward(addr: SocketAddr, body: &[u8]) -> Result<(), String> {
         .read(&mut resp)
         .map_err(|e| format!("collector 沒有回應：{e}"))?;
     if resp[..n].starts_with(b"HTTP/1.1 200") {
-        Ok(())
+        Ok(Forwarded::Accepted)
+    } else if resp[..n].starts_with(b"HTTP/1.1 503") {
+        Ok(Forwarded::Exiting)
     } else {
         Err("collector 回應不是 200".into())
     }
