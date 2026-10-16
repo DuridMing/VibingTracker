@@ -17,15 +17,34 @@ struct Env {
     web: u16,
 }
 
+static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// 從各平台的 ephemeral 範圍（Linux 32768 起、macOS／Windows 49152 起）以下挑埠，同一個 process 不重複發。
+/// 綁 0 再放掉的埠，平行測試再綁 0 時核心可能又發同一個，兩個 collector 就搶同一個埠。
+/// 起點混入時間，連續幾輪測試的範圍才不會重疊到上一輪還在閒置結束的 collector。
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        (std::process::id() ^ nanos).wrapping_mul(2_654_435_761) % SPAN
+    });
+    loop {
+        let port = (LOW + (start + NEXT_PORT.fetch_add(1, Ordering::SeqCst)) % SPAN) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn env(idle_secs: u64) -> Env {
+    env_on(idle_secs, free_port())
+}
+
+fn env_on(idle_secs: u64, hook: u16) -> Env {
     let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "serve-{}-{}",
         std::process::id(),
@@ -33,7 +52,7 @@ fn env(idle_secs: u64) -> Env {
     ));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    let (hook, web) = (free_port(), free_port());
+    let web = free_port();
     std::fs::write(
         home.join("config.toml"),
         format!(
@@ -270,8 +289,9 @@ fn ensure_twice_starts_one_collector_and_forwards_session_start() {
 
 #[test]
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
-    let e = env(0);
-    let squatter = TcpListener::bind(("127.0.0.1", e.hook)).unwrap(); // 接受連線但從不回應
+    // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap(); // 接受連線但從不回應
+    let e = env_on(0, squatter.local_addr().unwrap().port());
     let t = Instant::now();
     let out = ensure(&e, r#"{"session_id":"s","hook_event_name":"SessionStart"}"#);
     assert!(out.status.success() && out.stdout.is_empty());
