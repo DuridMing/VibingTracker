@@ -2,8 +2,12 @@
 //! 時間模擬 tail 讀檔，確認每行只讀一次、session 開著時寫的行都讀到；再把結果交給 merge 與 live，
 //! 確認串流只 append，而且 resume／compact 在串流裡各有一行狀態。沒有 samples/ 時略過。
 
+mod common;
+
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use common::{arrivals, read_jsonl, sample_sessions, sessions_in};
 
 use coding_lab::event::{Danger, Event};
 use coding_lab::hook::HookInput;
@@ -43,20 +47,12 @@ fn rfc3339_ms(s: &str) -> Option<u64> {
     Some((((days * 24 + hh) * 60 + mm) * 60 + ss) as u64 * 1000 + ms as u64)
 }
 
-fn read_jsonl(p: &Path) -> Vec<Value> {
-    std::fs::read_to_string(p)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .collect()
-}
-
 struct Sample {
     name: String,
     /// (到達時間, hook)：SessionStart 只有 command hook（`ensure` 轉送），其他取 http 那一份
     hooks: Vec<(u64, Value)>,
     lines: Vec<Value>,
-    /// 每行寫進檔案的時間：有 transcript-arrivals 就用它，否則用行的 timestamp（取前綴最大值，timestamp 會倒退）
+    /// 每行寫進檔案的時間：有 transcript-arrivals 就用它（缺的行沿用前一行），否則用行的 timestamp（取前綴最大值，timestamp 會倒退）
     written_at: Vec<u64>,
 }
 
@@ -77,9 +73,9 @@ fn load(dir: &Path) -> Option<Sample> {
     if !lifecycle || lines.is_empty() {
         return None;
     }
-    let arrivals = read_jsonl(&dir.join("transcript-arrivals.jsonl"));
+    let arrived = arrivals(&dir.join("transcript-arrivals.jsonl"));
     let mut written_at = vec![u64::MAX; lines.len()];
-    if arrivals.is_empty() {
+    if arrived.is_empty() {
         let mut t = 0;
         for (i, v) in lines.iter().enumerate() {
             if let Some(ts) = v["timestamp"].as_str().and_then(rfc3339_ms) {
@@ -88,12 +84,13 @@ fn load(dir: &Path) -> Option<Sample> {
             written_at[i] = t;
         }
     } else {
-        for a in arrivals {
-            if let (Some(no), Some(ts)) = (a["line_no"].as_u64(), a["ts_seen_ms"].as_u64())
-                && let Some(w) = written_at.get_mut(no as usize - 1)
-            {
-                *w = (*w).min(ts);
+        // 沒有到達紀錄的行（hook-capture 提早停止記錄）當成和前一行同時寫入；行號從 1 起算，0 是壞資料
+        let mut t = arrived.values().copied().min().unwrap_or(0);
+        for (i, w) in written_at.iter_mut().enumerate() {
+            if let Some(&ts) = arrived.get(&(i as u64 + 1)) {
+                t = ts;
             }
+            *w = t;
         }
     }
     Some(Sample {
@@ -184,25 +181,11 @@ fn simulate(s: &Sample) -> (Vec<(u64, Input)>, Vec<u64>) {
     (inputs, read)
 }
 
-fn samples() -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
-    let mut dirs: Vec<_> = std::fs::read_dir(root)
-        .map(|d| d.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    dirs.sort();
-    dirs
-}
-
-#[test]
-fn samples_compact_and_resume_neither_repeat_nor_drop_lines() {
-    let dirs = samples();
-    if dirs.is_empty() {
-        eprintln!("略過：沒有 samples/sessions");
-        return;
-    }
+/// 檢查 `dirs` 裡每個有 resume／compact 的樣本；回傳檢查了幾個。
+fn check_samples(dirs: &[std::path::PathBuf]) -> usize {
     let mut checked = 0;
     for dir in dirs {
-        let Some(s) = load(&dir) else { continue };
+        let Some(s) = load(dir) else { continue };
         checked += 1;
         let name = &s.name;
         let (inputs, read) = simulate(&s);
@@ -283,5 +266,94 @@ fn samples_compact_and_resume_neither_repeat_nor_drop_lines() {
             events.len()
         );
     }
-    assert!(checked > 0, "samples 裡沒有任何 resume／compact 的 session");
+    checked
+}
+
+#[test]
+fn samples_compact_and_resume_neither_repeat_nor_drop_lines() {
+    let dirs = sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("略過：沒有 samples/sessions");
+        return;
+    }
+    if check_samples(&dirs) == 0 {
+        // samples 不進 git、每台機器不同：沒有 resume／compact 的樣本就略過，不讓 check.sh 紅燈（#688）
+        eprintln!("略過：samples 裡沒有 resume／compact 的 session");
+    }
+}
+
+/// 把一個樣本複製到 target/tmp，給測試改動用。
+fn copy_sample(name: &str, to: &Path) -> Option<std::path::PathBuf> {
+    let from = sample_sessions().into_iter().find(|d| d.ends_with(name))?;
+    let dir = to.join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    for entry in std::fs::read_dir(&from).ok()?.flatten() {
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), dir.join(entry.file_name())).ok()?;
+        }
+    }
+    Some(dir)
+}
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lifecycle-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// hook-capture 漏記檔尾幾行的到達時間（提早停止記錄，#688）：那些行當成和前一行同時寫入，不算 collector 漏讀。
+#[test]
+fn missing_arrival_is_not_reported_as_a_dropped_line() {
+    let root = tmp("gap");
+    let Some(dir) = copy_sample("a41c94d2", &root) else {
+        eprintln!("略過：沒有樣本 a41c94d2");
+        return;
+    };
+    let lines = read_jsonl(&dir.join("transcript.jsonl"));
+    let gap = lines
+        .iter()
+        .rposition(|v| v["type"] == "assistant")
+        .map(|i| i as u64 + 1)
+        .unwrap();
+    let path = dir.join("transcript-arrivals.jsonl");
+    let kept: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|l| {
+            serde_json::from_str::<Value>(l)
+                .is_ok_and(|a| a["line_no"].as_u64().is_some_and(|n| n < gap))
+        })
+        .map(str::to_string)
+        .collect();
+    std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+    assert_eq!(check_samples(&sessions_in(&root)), 1);
+}
+
+/// arrivals 有 line_no 0 這種壞資料時不 panic（#688）。
+#[test]
+fn zero_line_number_in_arrivals_does_not_panic() {
+    let root = tmp("zero");
+    let Some(dir) = copy_sample("a41c94d2", &root) else {
+        eprintln!("略過：沒有樣本 a41c94d2");
+        return;
+    };
+    let path = dir.join("transcript-arrivals.jsonl");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("{\"line_no\":0,\"ts_seen_ms\":1}\n");
+    std::fs::write(&path, text).unwrap();
+    assert_eq!(check_samples(&sessions_in(&root)), 1);
+}
+
+/// 有 samples 但沒有 resume／compact 的樣本時略過，不失敗（#688）。
+#[test]
+fn samples_without_lifecycle_are_skipped() {
+    let root = tmp("none");
+    let Some(_) = copy_sample("377fa132", &root) else {
+        eprintln!("略過：沒有樣本 377fa132");
+        return;
+    };
+    assert_eq!(check_samples(&sessions_in(&root)), 0);
 }

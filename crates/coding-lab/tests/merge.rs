@@ -1,7 +1,11 @@
 //! merge 的行為測試（方案 C，docs/plan/PLAN.md「順序問題與解法」、#632）。
 
+mod common;
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+use common::{arrivals, read_jsonl, sample_sessions};
 
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
@@ -570,15 +574,8 @@ struct Replay {
 }
 
 fn replay(dir: &Path) -> Option<Replay> {
-    let read = |p: PathBuf| -> Vec<Value> {
-        std::fs::read_to_string(p)
-            .unwrap_or_default()
-            .lines()
-            .map(|l| serde_json::from_str(l).unwrap())
-            .collect()
-    };
-    let hooks = read(dir.join("hooks.jsonl"));
-    if read(dir.join("transcript-arrivals.jsonl")).is_empty() {
+    let hooks = read_jsonl(&dir.join("hooks.jsonl"));
+    if read_jsonl(&dir.join("transcript-arrivals.jsonl")).is_empty() {
         return None;
     }
     let session = hooks.first()?["payload"]["session_id"]
@@ -627,17 +624,11 @@ fn replay(dir: &Path) -> Option<Replay> {
         ));
     }
     let mut message_of_line = HashMap::new();
-    for (file, transcript, arrivals) in files {
+    for (file, transcript, arrival_file) in files {
         // session 中途重開（resume）時同一個檔會被 tail 兩輪，第二輪把舊行重讀一次（backfill）；
         // 同一行號取最早的到達時間
-        let mut arrival_ts: HashMap<u64, u64> = HashMap::new();
-        for a in read(arrivals) {
-            if let (Some(no), Some(ts)) = (a["line_no"].as_u64(), a["ts_seen_ms"].as_u64()) {
-                let t = arrival_ts.entry(no).or_insert(ts);
-                *t = (*t).min(ts);
-            }
-        }
-        for (i, t) in read(transcript).into_iter().enumerate() {
+        let arrival_ts = arrivals(&arrival_file);
+        for (i, t) in read_jsonl(&transcript).into_iter().enumerate() {
             let no = i as u64 + 1;
             let Some(&ts) = arrival_ts.get(&no) else {
                 continue;
@@ -667,15 +658,6 @@ fn replay(dir: &Path) -> Option<Replay> {
         events,
         message_of_line,
     })
-}
-
-fn sample_sessions() -> Vec<PathBuf> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
-    let mut dirs: Vec<_> = std::fs::read_dir(root)
-        .map(|d| d.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    dirs.sort();
-    dirs
 }
 
 #[test]
