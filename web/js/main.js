@@ -4,7 +4,8 @@ import { sessionColor, shortId } from "./color.js";
 import { installMock } from "./mock-feed.js";
 import { createStream } from "./stream.js";
 import { createStreamView } from "./stream-view.js";
-import { formatRow } from "./format.js";
+import { formatRow, esc } from "./format.js";
+import { createChanges, diffRows, writeRows } from "./changes.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -230,7 +231,61 @@ function render(urgent = false) {
     renderSessions();
     renderAgents();
     renderLive();
+    renderChanges();
+    renderDiff();
   });
+}
+
+// ---------- 改動紀錄（中欄）與修改情形（右欄） ----------
+const changes = createChanges();
+
+function renderChanges() {
+  if (!changed("chg", changes.selectedKey + "|" + changes.list.map((c) => c.key).join(","))) return;
+  const box = $("#chg");
+  if (!changes.list.length) {
+    box.replaceChildren(h("div", { class: "none" }, "尚無改動"));
+    return;
+  }
+  box.replaceChildren(
+    ...(changes.following ? [] : [h("button", { class: "hint", onclick: () => selectChange(changes.list[0].key) }, "已停在選中的那筆；點這裡回到最新並恢復自動切換")]),
+    ...changes.list.map((c) => {
+      const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
+      return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
+        h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
+        h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
+        h("span", { class: "pth" }, c.path),
+        n,
+        h("span", { class: "ag" }, c.agent === "main" ? "main" : c.agent === "bg" ? "背景" : agentName(c.session, c.agent) ?? shortId(c.agent)));
+    }),
+  );
+}
+
+// diff 以資料存，只在選中時才轉成 HTML
+function renderDiff() {
+  const c = changes.selected();
+  if (!changed("diff", c?.key ?? "")) return;
+  $("#gfb").hidden = !c;
+  $("#gfbNone").hidden = !!c;
+  if (!c) return;
+  const who = `${shortId(c.session)} · ${c.agent === "main" ? "main" : c.agent === "bg" ? "背景" : agentName(c.session, c.agent) ?? shortId(c.agent)}`;
+  $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
+  $("#fbPath").textContent = c.path;
+  $("#fbPath").title = c.path;
+  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource) : writeRows(c.content, c.truncated);
+  const no = (v) => (v == null ? "" : String(v));
+  $("#fbBody").innerHTML = rows.map((r) => {
+    if (r.type === "hunk") return `<div class="hunk">${esc(r.text)}</div>`;
+    if (r.type === "note") return `<div class="note">${esc(r.text)}</div>`;
+    if (r.type === "line") return `<div class="dl w"><span class="no">${r.new}</span><span class="tx">${esc(r.text)}</span></div>`;
+    const mk = r.type === "add" ? "+" : r.type === "del" ? "−" : " ";
+    return `<div class="dl ${r.type}"><span class="no">${no(r.old)}</span><span class="no">${no(r.new)}</span><span class="mk">${mk}</span><span class="tx">${esc(r.text)}</span></div>`;
+  }).join("");
+  $("#gfb").scrollTop = 0;
+}
+
+function selectChange(key) {
+  changes.select(key);
+  render(true);
 }
 
 // ---------- 合流串流 ----------
@@ -390,6 +445,7 @@ const client = createClient({
       if (m.ch === "*") {
         applySnapshot(store, m);
         onStreamSnapshot(m);
+        changes.load(m.changes);
       }
       render(true);
     },
@@ -399,6 +455,7 @@ const client = createClient({
       if (m.ch === "*") {
         if (bench.on) benchFrame(m);
         else onStreamFrame(m);
+        changes.apply(m.events);
       }
       render();
     },

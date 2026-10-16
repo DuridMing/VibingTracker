@@ -84,6 +84,7 @@ function createWorld(n) {
   const glog = [];
   const cardEv = new Map(); // toolUseId → { called, updated, result, extra: [] }
   const staged = new Map(); // toolUseId → tool.called
+  const changeLog = []; // file.edit／file.write，snapshot 的 changes 用
   const GLOG_MAX = 60_000;
 
   function ev(s, type, payload, { pos = null, agent = "main" } = {}) {
@@ -133,6 +134,10 @@ function createWorld(n) {
           const d = ev(s, x.type, { toolUseId: t.id, ...x.payload }, { agent: t.agent });
           c.extra.push(d);
           out.push(d);
+          if (d.type === "file.edit" || d.type === "file.write") {
+            changeLog.push(d);
+            if (changeLog.length > 60) changeLog.shift();
+          }
         }
         const a = agents.get(`${s.id}/${t.agent}`);
         if (a) { a.toolCount++; a.current = null; rowsOut.agents.push({ id: a.id, toolCount: a.toolCount, current: null }); }
@@ -297,7 +302,7 @@ function createWorld(n) {
         kpi: { ...kpi },
         agents: [...agents.values()].map((a) => ({ ...a })),
         attention: [...attention.values()].map((a) => ({ ...a })),
-        changes: [],
+        changes: [...changeLog],
         staged: [...staged.values()],
         stream: stream.flatMap(expand),
       };
