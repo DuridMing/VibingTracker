@@ -12,6 +12,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+# 解除「等你」的事件：同一工具（tool_name＋tool_input）的結果，或任何表示這一批工具／這一回合已結束的事件
+WAIT_CLEAR_SAME_TOOL = ("PostToolUse", "PostToolUseFailure", "PermissionDenied")
+WAIT_CLEAR_ANY = ("PostToolBatch", "UserPromptSubmit", "Stop", "SessionEnd")
+
 
 def load(path: Path):
     if not path.exists():
@@ -43,6 +47,8 @@ def main():
     idle_delays = []
     probes = Counter()
     wait_lag = []
+    wait_clear = []
+    decision = []
 
     for s in sessions:
         hooks = load(s / "hooks.jsonl")
@@ -77,6 +83,55 @@ def main():
                      and x["payload"].get("tool_input") == p.get("tool_input") and x["ts_seen_ms"] <= r["ts_seen_ms"]]
             if match:
                 wait_lag.append(r["ts_seen_ms"] - match[-1]["ts_seen_ms"])
+
+        # ── 放行前的決策耗時：(Post − Pre) − duration_ms，扣掉工具本身執行時間後剩下的就是權限判斷。
+        #    非自動模式只有 hook 來回（約 10–30 ms）；明顯更長代表跑了自動模式分類器或在等人。
+        #    PermissionDenied 沒有 duration_ms，記 Pre 到 Denied 的時間。
+        pre_rows_by_id = {r["payload"]["tool_use_id"]: r for r in pre_rows}
+        asks = [r for r in http if r["event"] == "PermissionRequest"]
+        for r in http:
+            if r["event"] not in WAIT_CLEAR_SAME_TOOL:
+                continue
+            p = r["payload"]
+            x = pre_rows_by_id.get(p.get("tool_use_id"))
+            if not x:
+                continue
+            xp = x["payload"]
+            gap = r["ts_seen_ms"] - x["ts_seen_ms"]
+            ms = gap - p["duration_ms"] if p.get("duration_ms") is not None else gap
+            was_asked = any(a["payload"].get("tool_name") == xp.get("tool_name") and a["payload"].get("tool_input") == xp.get("tool_input")
+                            and x["ts_seen_ms"] <= a["ts_seen_ms"] <= r["ts_seen_ms"] for a in asks)
+            decision.append((xp.get("permission_mode"), r["event"], was_asked, ms, p.get("reason")))
+
+        # ── 等你的解除：PermissionRequest 之後第一個能解除它的事件（P3 #645）
+        #    按 Esc 拒絕時沒有任何 hook，只有 transcript 的 tool_result，所以它也算解除事件。
+        tr_result = {}
+        for a in arrivals:
+            if a.get("type") == "user" and "tool_result" in (a.get("blocks") or []) and not a.get("backfill"):
+                for tid in a.get("tool_ids") or []:
+                    tr_result.setdefault(tid, a["ts_seen_ms"])
+        for i, r in enumerate(http):
+            if r["event"] != "PermissionRequest":
+                continue
+            p = r["payload"]
+            match = [x for x in pre_rows if x["payload"].get("tool_name") == p.get("tool_name")
+                     and x["payload"].get("tool_input") == p.get("tool_input") and x["ts_seen_ms"] <= r["ts_seen_ms"]]
+            tr_ts = tr_result.get(match[-1]["payload"]["tool_use_id"]) if match else None
+            hit = None
+            for x in http[i + 1:]:
+                xp = x["payload"]
+                same = xp.get("tool_name") == p.get("tool_name") and xp.get("tool_input") == p.get("tool_input")
+                if x["event"] in WAIT_CLEAR_SAME_TOOL and same:
+                    hit = x["event"]
+                elif x["event"] in WAIT_CLEAR_ANY:
+                    hit = x["event"]
+                if tr_ts is not None and tr_ts < x["ts_seen_ms"]:
+                    hit, x = "transcript tool_result", {"ts_seen_ms": tr_ts}
+                if hit:
+                    wait_clear.append((p.get("permission_mode"), p.get("tool_name"), hit, x["ts_seen_ms"] - r["ts_seen_ms"]))
+                    break
+            if not hit:
+                wait_clear.append((p.get("permission_mode"), p.get("tool_name"), None, None))
 
         # ── idle_prompt 距離前一個非 Notification 事件
         last = None
@@ -148,6 +203,23 @@ def main():
     print(f"  PermissionRequest − PreToolUse ms：{stats(wait_lag)}")
     print(f"  idle_prompt 距離前一個事件 s：{stats(idle_delays)}")
     check("PermissionRequest 在 1 秒內到", wait_lag and all(x < 1000 for x in wait_lag))
+
+    print("\n== 等你的解除（P3 #645；依 permission_mode 分組）")
+    groups = {}
+    for mode, tool, ev, ms in wait_clear:
+        groups.setdefault((mode or "-", tool, ev or "（找不到）"), []).append(ms)
+    for (mode, tool, ev), xs in sorted(groups.items()):
+        print(f"  {mode:12} {tool:16} → {ev:20} ms：{stats([x for x in xs if x is not None])}")
+    print("\n== 放行前的決策耗時（(Post − Pre) − duration_ms；有 PermissionRequest＝問了人）")
+    dgroups = {}
+    for mode, ev, was_asked, ms, _ in decision:
+        dgroups.setdefault((mode or "-", ev, "問了人" if was_asked else "沒問人"), []).append(ms)
+    for (mode, ev, a), xs in sorted(dgroups.items()):
+        print(f"  {mode:12} {ev:20} {a:4} ms：{stats(xs)}")
+    for mode, ev, was_asked, ms, reason in decision:
+        if ev == "PermissionDenied":
+            print(f"  駁回：{mode} {ms} ms {'問了人' if was_asked else '沒問人'} reason={reason!r}")
+    check("每個 PermissionRequest 都找得到解除事件", all(ev for _, _, ev, _ in wait_clear))
 
     print("\n== Edit 讀檔（#626 未決 3）")
     for (k, ok), n in sorted(probes.items()):

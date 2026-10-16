@@ -280,7 +280,11 @@ fn classifier_denial_then_late_tool_use_line() {
 fn danger_is_raised_when_pre_tool_use_arrives() {
     let mut m = Merger::new(Box::new(RmRf));
     let a = m.handle(pre("t1", "Bash", json!({"command": "rm -rf build"}), 1000));
-    assert_eq!(types(&a), ["tool.called", "attention.raised"]);
+    // 危險進佇列，session.status 跟著變成 danger（#645）
+    assert_eq!(
+        types(&a),
+        ["tool.called", "attention.raised", "session.status"]
+    );
     assert_eq!(a[0].payload["danger"]["rule"], "rm-rf");
     assert_eq!(a[1].payload["kind"], "danger");
     assert_eq!(a[1].payload["ref"], "t1");
@@ -291,7 +295,10 @@ fn danger_on_transcript_first_card_goes_into_update() {
     let mut m = Merger::new(Box::new(RmRf));
     m.handle(line(1, tool_use("u1", "m1", "t1"), 1000));
     let a = m.handle(pre("t1", "Bash", json!({"command": "rm -rf build"}), 1050));
-    assert_eq!(types(&a), ["tool.updated", "attention.raised"]);
+    assert_eq!(
+        types(&a),
+        ["tool.updated", "attention.raised", "session.status"]
+    );
     assert_eq!(a[0].payload["danger"]["rule"], "rm-rf");
 }
 
@@ -445,10 +452,11 @@ fn background_tool_that_really_ran_is_shown_late() {
                        "tool_response": { "stdout": "", "stderr": "", "interrupted": false } });
     let a = m.handle(at(agent_hook("PostToolUse", "bg1", None, post), 1200));
     assert_eq!(
-        types(&a)[..4],
+        types(&a)[..5],
         [
             "tool.called",
             "attention.raised",
+            "session.status",
             "tool.placed",
             "tool.updated"
         ],
@@ -456,7 +464,7 @@ fn background_tool_that_really_ran_is_shown_late() {
     );
     assert_eq!(a[0].agent, "bg");
     assert_eq!(a[0].ts_exec, Some(1000));
-    assert_eq!(a[2].payload["placement"], "fallback");
+    assert_eq!(a[3].payload["placement"], "fallback");
     assert!(m.tick(1000 + FALLBACK_AFTER_MS).is_empty(), "只放一次");
 
     // 失敗也算執行過
@@ -530,7 +538,7 @@ fn session_boundaries_and_prompt() {
         hook: hook(json!({ "session_id": S, "hook_event_name": "SessionEnd", "reason": "other" })),
         ts_seen: 3,
     });
-    assert_eq!(types(&c), ["session.ended"]);
+    assert_eq!(types(&c), ["session.ended", "session.status"]);
     assert_eq!([a[0].seq, b[0].seq, c[0].seq], [1, 2, 3]);
 }
 

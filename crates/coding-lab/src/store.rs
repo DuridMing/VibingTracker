@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::event::{Event, Payload};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -181,7 +181,12 @@ CREATE TABLE attention (
   acked_at INTEGER,
   PRIMARY KEY (session, kind, ref)
 ) WITHOUT ROWID;
-CREATE INDEX attention_open ON attention (raised_at) WHERE cleared_at IS NULL AND acked_at IS NULL;
+";
+
+/// v2：佇列是「未確認，且未解除或是 danger」（danger 解除後留到 ack）。
+const ATTENTION_OPEN_V2: &str = "
+CREATE INDEX attention_open ON attention (raised_at)
+  WHERE acked_at IS NULL AND (cleared_at IS NULL OR kind = 'danger');
 ";
 
 /// 一次 flush 裡同一個 session 檔要追加的內容。
@@ -582,11 +587,11 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// 注意佇列：還沒自動解除、也還沒被使用者確認的。
+    /// 注意佇列：還沒被使用者確認，且還沒自動解除或是 danger（danger 解除後留到 ack）。
     pub fn open_attention(&self) -> Result<Vec<AttentionRow>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT session, kind, ref, reason, raised_at FROM attention
-             WHERE cleared_at IS NULL AND acked_at IS NULL ORDER BY raised_at",
+             WHERE acked_at IS NULL AND (cleared_at IS NULL OR kind = 'danger') ORDER BY raised_at",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(AttentionRow {
@@ -657,20 +662,35 @@ fn read_version(db: &Connection) -> rusqlite::Result<Option<u32>> {
     Ok(v.and_then(|s| s.parse().ok()))
 }
 
-/// 依版本逐步升級；v0（空資料庫）直接建 v1。
+/// 依版本逐步升級；v0（空資料庫）先建 v1 的表，再一路升上來。
 fn migrate(db: &Connection) -> Result<(), StoreError> {
-    match read_version(db)? {
-        Some(v) if v > SCHEMA_VERSION => Err(StoreError::FutureSchema(v)),
-        Some(_) => Ok(()),
+    let mut v = match read_version(db)? {
+        Some(v) if v > SCHEMA_VERSION => return Err(StoreError::FutureSchema(v)),
+        Some(v) => v,
         None => {
             db.execute_batch(SCHEMA_V1)?;
             db.execute(
-                "INSERT INTO meta (key, value) VALUES ('schema_version', ?1)",
-                params![SCHEMA_VERSION.to_string()],
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
+                [],
             )?;
-            Ok(())
+            1
         }
+    };
+    while v < SCHEMA_VERSION {
+        let tx = db.unchecked_transaction()?;
+        if v == 1 {
+            tx.execute_batch(&format!(
+                "DROP INDEX IF EXISTS attention_open;{ATTENTION_OPEN_V2}"
+            ))?;
+        }
+        v += 1;
+        tx.execute(
+            "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
+            params![v.to_string()],
+        )?;
+        tx.commit()?;
     }
+    Ok(())
 }
 
 const SESSION_COLUMNS: &str = "id, host, cwd, transcript_path, model, branch, first_prompt, started_at, ended_at,

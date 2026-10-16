@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::derive::relative_path;
+use crate::doing::Doing;
 use crate::event::{DangerLevel, Event, Payload};
 
 pub const STREAM_PER_SESSION: usize = 3000;
@@ -225,6 +226,10 @@ struct SessionLive {
     cost: f64,
     thinking: u64,
     last_pos: Option<u64>,
+    /// merge 定期重算的 session 分數（契約 §6）
+    score: i64,
+    /// 「現在在做什麼」一句話的這一輪來源（#648）
+    doing: Doing,
 }
 
 #[derive(Clone)]
@@ -251,6 +256,8 @@ struct AttentionLive {
     reference: String,
     reason: String,
     raised_at: u64,
+    /// danger 解除（工具結束）的時間：列留到 ack（契約 §6）
+    cleared_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -460,6 +467,11 @@ impl Live {
                 let text = clip(&p.text);
                 s.first_prompt.get_or_insert_with(|| text.clone());
                 s.last_prompt = Some(text);
+                s.doing.prompt(&p.text, p.source.as_deref() == Some("task"));
+            }
+            Payload::AssistantText(t) if e.agent == "main" => s.doing.text(&t.text),
+            Payload::AssistantThinking(t) if e.agent == "main" => {
+                s.doing.thinking(&t.text);
             }
             Payload::Usage(u) => {
                 s.cost += u.cost_usd;
@@ -492,14 +504,24 @@ impl Live {
                         reference: a.reference,
                         reason: a.reason.unwrap_or_default(),
                         raised_at: ts,
+                        cleared_at: None,
                     },
                 );
                 self.dirty_attention.insert(id, false);
             }
             Payload::AttentionCleared(a) => {
                 let id = format!("{sid}/{}/{}", enum_str(&a.kind), a.reference);
-                if self.attention.remove(&id).is_some() {
-                    self.dirty_attention.insert(id, true);
+                match self.attention.get_mut(&id) {
+                    // danger 解除只標時間，留到 ack
+                    Some(row) if row.kind == "danger" => {
+                        row.cleared_at = Some(ts);
+                        self.dirty_attention.insert(id, false);
+                    }
+                    Some(_) => {
+                        self.attention.remove(&id);
+                        self.dirty_attention.insert(id, true);
+                    }
+                    None => {}
                 }
             }
             Payload::ToolCalled(c) => {
@@ -509,8 +531,14 @@ impl Live {
                         .insert((sid.clone(), c.tool_use_id.clone()), vec![e.clone()]);
                 }
                 let id = self.ensure_agent(&sid, &e.agent, ts);
+                let current = describe(&c.tool, &c.input, &cwd);
+                if e.agent == "main"
+                    && let Some(s) = self.sessions.get_mut(&sid)
+                {
+                    s.doing.tool(&current);
+                }
                 if let Some(a) = self.agents.get_mut(&id) {
-                    a.current = Some(describe(&c.tool, &c.input, &cwd));
+                    a.current = Some(current);
                     a.tool_count += 1;
                     let danger = c
                         .danger
@@ -592,6 +620,32 @@ impl Live {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// merge 定期重算的分數（契約 §6 `sessions.score`）；變了才標記該列要送。
+    pub fn set_scores(&mut self, scores: &[(String, i64)]) {
+        for (sid, v) in scores {
+            if let Some(s) = self.sessions.get_mut(sid)
+                && s.score != *v
+            {
+                s.score = *v;
+                self.dirty_sessions.insert(sid.clone());
+            }
+        }
+    }
+
+    /// 重啟重建後對齊 store 的佇列：ack 不是 Event，重放會讓已確認的列跑回來。
+    pub fn keep_attention(&mut self, open: &std::collections::HashSet<String>) {
+        let gone: Vec<String> = self
+            .attention
+            .keys()
+            .filter(|id| !open.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.attention.remove(&id);
+            self.dirty_attention.insert(id, true);
         }
     }
 
@@ -904,7 +958,7 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": Value::Null, "score": 0,
+            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
         }))
@@ -922,7 +976,7 @@ fn agent_row(id: &str, a: &AgentLive) -> Value {
 fn attention_row(id: &str, a: &AttentionLive) -> Value {
     json!({
         "id": id, "session": a.session, "kind": a.kind, "ref": a.reference,
-        "reason": a.reason, "raisedAt": a.raised_at,
+        "reason": a.reason, "raisedAt": a.raised_at, "clearedAt": a.cleared_at,
     })
 }
 

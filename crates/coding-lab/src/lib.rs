@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod derive;
+pub mod doing;
 pub mod event;
 pub mod hook;
 pub mod hooks;
@@ -11,6 +12,7 @@ pub mod merge;
 pub mod prices;
 pub mod rules;
 pub mod serve;
+pub mod status;
 pub mod store;
 pub mod transcript;
 pub mod ws;

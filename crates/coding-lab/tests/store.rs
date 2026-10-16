@@ -329,6 +329,83 @@ fn attention_raise_clear_and_ack() {
     assert!(s.open_attention().unwrap().is_empty());
 }
 
+/// danger 解除（工具結束）後仍在佇列，ack 才離開；重開也讀得回來（契約 §5 `attention_open`）。
+#[test]
+fn cleared_danger_stays_open_until_ack() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        for (seq, kind, r) in [(2, "danger", "t1"), (3, "fail", "t2")] {
+            s.append(ev(
+                "s1",
+                seq,
+                "attention.raised",
+                None,
+                4000,
+                json!({"kind": kind, "ref": r, "reason": "x"}),
+            ));
+        }
+        for (seq, kind, r) in [(4, "danger", "t1"), (5, "fail", "t2")] {
+            s.append(ev(
+                "s1",
+                seq,
+                "attention.cleared",
+                None,
+                4100,
+                json!({"kind": kind, "ref": r, "reason": "done"}),
+            ));
+        }
+        s.flush().unwrap();
+    }
+    let mut s = Store::open(&h).unwrap();
+    let open = s.open_attention().unwrap();
+    assert_eq!(
+        open.iter()
+            .map(|a| (a.kind.as_str(), a.reference.as_str()))
+            .collect::<Vec<_>>(),
+        [("danger", "t1")],
+        "解除的 danger 留到 ack；fail 解除就離開"
+    );
+    assert!(s.ack("s1", "danger", "t1", 4200).unwrap());
+    assert!(s.open_attention().unwrap().is_empty());
+}
+
+/// v1 的資料庫開啟時升到 v2：換掉 attention_open 索引，資料不動（不變式 9）。
+#[test]
+fn v1_database_is_migrated_to_v2() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.flush().unwrap();
+    }
+    // 把它改回 v1 的樣子：舊索引條件與版本號
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX attention_open;
+         CREATE INDEX attention_open ON attention (raised_at) WHERE cleared_at IS NULL AND acked_at IS NULL;
+         UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 2);
+    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p", "資料不動");
+    drop(s);
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    let sql: String = db
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = 'attention_open'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("kind = 'danger'"), "索引換成 v2：{sql}");
+}
+
 #[test]
 fn schema_is_versioned_and_data_survives_reopen() {
     let h = home();

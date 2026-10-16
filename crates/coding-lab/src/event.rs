@@ -161,6 +161,8 @@ payloads! {
 #[serde(rename_all = "lowercase")]
 pub enum SessionState {
     Run,
+    /// 使用者按 Esc 中斷（沒有 hook、沒有 Stop），不進佇列（#645）
+    Idle,
     Wait,
     Done,
     Fail,
@@ -242,6 +244,9 @@ pub struct SessionStatus {
 pub struct PromptSubmitted {
     pub text: String,
     pub prompt_id: Option<String>,
+    /// `"task"`：背景工作完成叫醒 Claude 的 `<task-notification>`，不是使用者輸入；使用者輸入時不輸出
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
