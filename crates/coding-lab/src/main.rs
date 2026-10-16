@@ -137,23 +137,30 @@ fn ensure() -> Result<(), String> {
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    // 轉送拿到 503 表示舊的 collector 正在閒置結束（#685）：等它放掉埠，拉起新的再送一次
+    // 轉送拿到 503，或 probe 之後埠就被放掉（連線被拒、還沒回應就被 RST），表示舊的 collector 正在閒置結束
+    // （#685）：等它放掉埠，拉起新的再送一次。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout
     let deadline = Instant::now() + ENSURE_BUDGET;
     let mut spawned = false;
     loop {
-        if probe(cfg.hook_bind) {
-            if body.is_empty() || forward(cfg.hook_bind, &body)? == Forwarded::Accepted {
-                return Ok(());
-            }
-        } else if !spawned {
-            spawn_collector(&cfg)?;
-            spawned = true;
-        }
-        if Instant::now() > deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
             return Err(format!(
                 "collector {} 秒內沒有起來",
                 ENSURE_BUDGET.as_secs()
             ));
+        }
+        if probe(cfg.hook_bind, left) {
+            if body.is_empty() {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match forward(cfg.hook_bind, &body, left)? {
+                Forwarded::Accepted => return Ok(()),
+                Forwarded::Exiting => {}
+            }
+        } else if !spawned {
+            spawn_collector(&cfg)?;
+            spawned = true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -162,12 +169,12 @@ fn ensure() -> Result<(), String> {
 #[derive(PartialEq)]
 enum Forwarded {
     Accepted,
-    /// collector 正在結束，沒有收下
+    /// collector 正在結束、或連線在送達前就斷了：確定沒有收下，可以再送
     Exiting,
 }
 
-fn probe(addr: SocketAddr) -> bool {
-    TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+fn probe(addr: SocketAddr, left: Duration) -> bool {
+    !left.is_zero() && TcpStream::connect_timeout(&addr, PROBE_TIMEOUT.min(left)).is_ok()
 }
 
 fn spawn_collector(cfg: &Config) -> Result<(), String> {
@@ -203,23 +210,36 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
 }
 
 /// 把 SessionStart 轉送到 `/hook`（實測 SessionStart 不送 http hook）。
-fn forward(addr: SocketAddr, body: &[u8]) -> Result<Forwarded, String> {
-    let mut s = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).map_err(|e| e.to_string())?;
-    s.set_write_timeout(Some(FORWARD_TIMEOUT))
+///
+/// 連線被拒、寫入失敗、還沒回應就斷線（EOF、RST）都表示 collector 沒收下，回 [`Forwarded::Exiting`] 讓呼叫端再送；
+/// 讀取逾時不重送：對方可能已經收下，重送會多一個 SessionStart。
+fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, String> {
+    use std::io::ErrorKind;
+    let step = |d: Duration| d.min(left).max(Duration::from_millis(1));
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(PROBE_TIMEOUT)) else {
+        return Ok(Forwarded::Exiting);
+    };
+    s.set_write_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
-    s.set_read_timeout(Some(FORWARD_TIMEOUT))
+    s.set_read_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
     let head = format!(
         "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::HOOK_PATH,
         body.len()
     );
-    s.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    s.write_all(body).map_err(|e| e.to_string())?;
+    if s.write_all(head.as_bytes()).is_err() || s.write_all(body).is_err() {
+        return Ok(Forwarded::Exiting);
+    }
     let mut resp = [0u8; 64];
-    let n = s
-        .read(&mut resp)
-        .map_err(|e| format!("collector 沒有回應：{e}"))?;
+    let n = match s.read(&mut resp) {
+        Ok(0) => return Ok(Forwarded::Exiting),
+        Ok(n) => n,
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            return Err(format!("collector 沒有回應：{e}"));
+        }
+        Err(_) => return Ok(Forwarded::Exiting),
+    };
     if resp[..n].starts_with(b"HTTP/1.1 200") {
         Ok(Forwarded::Accepted)
     } else if resp[..n].starts_with(b"HTTP/1.1 503") {

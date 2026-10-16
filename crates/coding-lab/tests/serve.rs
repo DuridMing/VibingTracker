@@ -848,3 +848,62 @@ fn detached_serve_writes_its_own_log() {
             .is_ok_and(|t| t.contains("hook 127.0.0.1"))
     });
 }
+
+/// #685（驗證找到的缺口）：probe 連上之後、轉送之前舊的 collector 就放掉了埠——轉送被拒或被 RST，
+/// ensure 要在預算內改拉新的 collector，不能直接放棄（SessionStart 會掉）。
+#[test]
+fn ensure_retries_when_the_port_closes_between_probe_and_forward() {
+    let e = env(5);
+    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let exiting = std::thread::spawn(move || {
+        // 只接 probe 那一條，接著放掉埠（還在 backlog 的轉送連線會被 RST）
+        let probe = old.accept();
+        drop(old);
+        drop(probe);
+    });
+    let start = json!({"session_id": "s8", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t8.jsonl"), "cwd": "/p"})
+    .to_string();
+    let t = Instant::now();
+    let out = ensure(&e, &start);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
+    exiting.join().unwrap();
+    let jsonl = e.home.join("events/s8.jsonl");
+    wait_for("SessionStart 轉送到新的 collector", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    if let Some(c) = collector(&e) {
+        kill_pid(c["pid"].as_u64().unwrap());
+    }
+}
+
+/// #685：進入「結束中」（ensure 轉送回 503）之後有一般 hook 進來，取消結束、繼續服務。
+#[test]
+fn a_hook_during_closing_cancels_the_idle_exit() {
+    let e = env(1);
+    let mut s = start_serve(&e);
+    let via_ensure = |body: &str| {
+        let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    };
+    // 壞掉的 body 不會變成 hook（不重設閒置計時），只用來看 collector 進入結束中了沒
+    wait_for("進入結束中", || {
+        via_ensure("x").starts_with("HTTP/1.1 503")
+    });
+    let stop = json!({"session_id": "s1", "hook_event_name": "Stop"});
+    assert!(http(e.hook, "POST", "/hook", &stop.to_string()).starts_with("HTTP/1.1 200"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "結束中收到 hook 要取消結束"
+    );
+    assert!(
+        via_ensure("x").starts_with("HTTP/1.1 200"),
+        "取消後 ensure 轉送照常收"
+    );
+}

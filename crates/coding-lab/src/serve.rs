@@ -95,7 +95,17 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         Err(e) => return Err(e),
     };
     let hook_addr = hooks.addr;
-    let store_lock = lock_store(&cfg.home).await?;
+    let store_lock = match lock_store(&cfg.home).await {
+        Ok(lock) => lock,
+        Err(e) => {
+            // 等鎖期間已經回 200 的 hook 還在佇列裡，結束就丟了：至少留下紀錄
+            log(&format!(
+                "{e}；放棄啟動，等鎖期間收到的 {} 個 hook 沒有寫入",
+                INPUT_QUEUE - tx.capacity()
+            ));
+            return Err(e);
+        }
+    };
 
     let store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
     let recent = store
