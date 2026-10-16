@@ -278,6 +278,81 @@ async fn ack_removes_attention_and_is_stored() {
     );
 }
 
+/// 「載入更多」也附卡片的伴隨 Event 與狀態行，並回傳請求的 session、beforePos。
+#[tokio::test]
+async fn more_includes_companions_and_status_lines() {
+    let home = tmp("more-companions");
+    let store = Arc::new(std::sync::Mutex::new(Store::open(&home).unwrap()));
+    {
+        let mut s = store.lock().unwrap();
+        s.append(ev(
+            "s1",
+            1,
+            "prompt.submitted",
+            None,
+            json!({"text": "修 bug", "promptId": "p1"}),
+        ));
+        s.append(ev(
+            "s1",
+            2,
+            "tool.called",
+            None,
+            json!({"toolUseId": "t1", "tool": "Bash", "input": {"command": "ls"},
+            "status": "running", "placement": "staged", "danger": null}),
+        ));
+        s.append(ev(
+            "s1",
+            3,
+            "tool.placed",
+            Some(1),
+            json!({"toolUseId": "t1", "placement": "stream"}),
+        ));
+        s.append(ev("s1", 4, "tool.result", None, json!({"toolUseId": "t1", "ok": true, "exitCode": 0, "output": "a\n", "truncated": false})));
+        s.append(text("s1", 5, 2));
+        s.append(ev(
+            "s1",
+            6,
+            "prompt.submitted",
+            None,
+            json!({"text": "下一個", "promptId": "p2"}),
+        ));
+        s.append(text("s1", 7, 3));
+        s.flush().unwrap();
+    }
+    let state = WebState::new(Some(store), None, 8);
+    let addr = start(state).await;
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({})).await;
+    send(
+        &mut ws,
+        json!({"op": "more", "session": "s1", "beforePos": 3, "limit": 10}),
+    )
+    .await;
+    let m = recv(&mut ws).await;
+    assert_eq!(
+        (m["session"].as_str(), m["beforePos"].as_u64()),
+        (Some("s1"), Some(3))
+    );
+    let types: Vec<&str> = m["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        [
+            "prompt.submitted",
+            "tool.called",
+            "tool.placed",
+            "tool.result",
+            "assistant.text",
+            "prompt.submitted"
+        ],
+        "伴隨 Event 與窗口內的狀態行；pos 3 之後的不送"
+    );
+}
+
 #[tokio::test]
 async fn more_reads_older_stream_from_store() {
     let home = tmp("more");
@@ -304,7 +379,7 @@ async fn more_reads_older_stream_from_store() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| e["pos"].as_u64().unwrap())
+        .filter_map(|e| e["pos"].as_u64())
         .collect();
     assert_eq!(pos, [3, 4, 5]);
 }

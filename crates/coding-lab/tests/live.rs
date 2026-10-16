@@ -382,7 +382,15 @@ fn staged_cards_move_to_stream_when_placed() {
     ));
     let snap = l.snapshot(&Channel::All, 0, DAY + 1);
     assert!(rows(&snap, "staged").is_empty());
-    assert_eq!(rows(&snap, "stream")[0]["type"], "tool.placed");
+    let types: Vec<&str> = rows(&snap, "stream")
+        .iter()
+        .map(|e| e["type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"tool.placed"), "{types:?}");
+    assert!(
+        types.contains(&"tool.called"),
+        "放進串流的卡片附上它的 tool.called：{types:?}"
+    );
 }
 
 #[test]
@@ -484,5 +492,98 @@ fn frames_can_be_resumed_within_history() {
     assert!(
         l.frames_since(first + 99).is_none(),
         "未來的編號不合理，回 snapshot"
+    );
+}
+
+// ── 串流的伴隨 Event 與狀態行（與 #639 前端協調，contracts.md §6）
+
+#[test]
+fn stream_carries_card_companions_and_status_lines() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let t = |v: &str| json!({"toolUseId": "t1", "status": v, "durationMs": null, "error": null, "interrupted": null});
+    apply_all(&mut l, &[
+        b.started("s1", DAY),
+        b.ev("s1", "prompt.submitted", "main", DAY + 1, false, json!({"text": "修 bug", "promptId": "p1"})),
+        b.called("s1", "t1", "Edit", json!({"file_path": "/p/a.rs"}), DAY + 2, Value::Null),
+        b.ev("s1", "tool.updated", "main", DAY + 3, false, t("running")),
+        b.ev("s1", "file.edit", "main", DAY + 3, false, json!({"toolUseId": "t1", "path": "a.rs", "hunk": null, "hunkSource": "none"})),
+        b.ev("s1", "tool.updated", "main", DAY + 4, false, t("done")),
+        b.ev("s1", "tool.result", "main", DAY + 5, false, json!({"toolUseId": "t1", "ok": true, "exitCode": null, "output": "", "truncated": false})),
+        b.ev("s1", "tool.placed", "main", DAY + 6, true, json!({"toolUseId": "t1", "placement": "stream"})),
+        b.ev("s1", "session.status", "main", DAY + 7, false, json!({"status": "wait", "since": DAY + 7, "score": 1.0})),
+        b.ev("s1", "agent.spawned", "main", DAY + 8, false, json!({"agentId": "a1", "agentType": "Explore", "name": "n", "task": null, "parentToolUseId": "t1"})),
+    ]);
+    for ch in [Channel::All, Channel::Session("s1".into())] {
+        let snap = l.snapshot(&ch, 0, DAY + 10);
+        let stream = rows(&snap, "stream");
+        let types: Vec<&str> = stream.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        for want in [
+            "prompt.submitted",
+            "tool.called",
+            "tool.result",
+            "file.edit",
+            "tool.placed",
+            "session.status",
+            "agent.spawned",
+        ] {
+            assert!(types.contains(&want), "{ch:?} 缺 {want}：{types:?}");
+        }
+        let updates: Vec<&&Value> = stream
+            .iter()
+            .filter(|e| e["type"] == "tool.updated")
+            .collect();
+        assert_eq!(updates.len(), 1, "只附最新一筆 tool.updated");
+        assert_eq!(updates[0]["payload"]["status"], "done");
+        let ts: Vec<u64> = stream
+            .iter()
+            .map(|e| e["ts_seen"].as_u64().unwrap())
+            .collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "依 ts_seen 排");
+    }
+}
+
+#[test]
+fn status_lines_outside_the_window_are_dropped() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.apply(&b.ev(
+        "s1",
+        "prompt.submitted",
+        "main",
+        DAY,
+        false,
+        json!({"text": "很早的 prompt", "promptId": "p0"}),
+    ));
+    for i in 0..250 {
+        l.apply(&b.text("s1", DAY + 10 + i));
+    }
+    l.apply(&b.ev(
+        "s1",
+        "prompt.submitted",
+        "main",
+        DAY + 1000,
+        false,
+        json!({"text": "新的 prompt", "promptId": "p1"}),
+    ));
+    let snap = l.snapshot(&Channel::All, 0, DAY + 2000);
+    let prompts: Vec<&str> = rows(&snap, "stream")
+        .iter()
+        .filter(|e| e["type"] == "prompt.submitted")
+        .map(|e| e["payload"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        prompts,
+        ["新的 prompt"],
+        "窗口（最後 200 個 pos）之前的狀態行不送"
+    );
+    // 單一 session 頻道的窗口是 3000，從 pos 1 開始，全部都送
+    let one = l.snapshot(&Channel::Session("s1".into()), 0, DAY + 2000);
+    assert_eq!(
+        rows(&one, "stream")
+            .iter()
+            .filter(|e| e["type"] == "prompt.submitted")
+            .count(),
+        2
     );
 }

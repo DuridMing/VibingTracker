@@ -370,6 +370,55 @@ impl Store {
         Ok(out)
     }
 
+    /// 某 session 在 seq 範圍（含兩端）內的所有 Event，依 seq 排序。
+    pub fn events_by_seq(
+        &self,
+        session: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT offset FROM events WHERE session = ?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq",
+        )?;
+        let offsets: Vec<i64> = stmt
+            .query_map(params![session, from as i64, to as i64], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        self.read_at(session, offsets)
+    }
+
+    /// `pos` 之後的第一個帶 pos 的 Event：(seq, ts_seen)。
+    pub fn next_pos_after(
+        &self,
+        session: &str,
+        pos: u64,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT seq, ts_seen FROM events WHERE session = ?1 AND pos > ?2 ORDER BY pos LIMIT 1",
+                params![session, pos as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+            )
+            .optional()?)
+    }
+
+    fn read_at(&self, session: &str, offsets: Vec<i64>) -> Result<Vec<Event>, StoreError> {
+        let mut out = Vec::with_capacity(offsets.len());
+        if offsets.is_empty() {
+            return Ok(out);
+        }
+        let mut file = BufReader::new(File::open(self.events_dir.join(file_name(session)))?);
+        for off in offsets {
+            file.seek(SeekFrom::Start(off as u64))?;
+            let mut line = String::new();
+            file.read_line(&mut line)?;
+            if let Ok(e) = Event::from_json_line(line.trim_end()) {
+                out.push(e);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>, StoreError> {
         Ok(self
             .db

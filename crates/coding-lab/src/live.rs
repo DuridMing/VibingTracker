@@ -21,6 +21,79 @@ const SLOT_MS: u64 = 15 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const SLOTS_KEPT_MS: u64 = 50 * 60 * 60 * 1000;
 const TEXT_LIMIT: usize = 200;
+const STATUS_PER_SESSION: usize = 500;
+
+/// 卡片的伴隨 Event：沒有 pos，附在串流裡帶 pos 的卡片 Event 旁邊（contracts.md §6）。
+const COMPANIONS: &[&str] = &[
+    "tool.called",
+    "tool.updated",
+    "tool.result",
+    "file.read",
+    "file.edit",
+    "file.write",
+    "git.op",
+    "agent.spawned",
+];
+/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…）
+const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status"];
+
+/// 這個 Event 屬於哪張卡片（toolUseId）；agent.spawned 屬於開它的那個工具呼叫。
+fn card_key(e: &Event) -> Option<String> {
+    let key = if e.kind == "agent.spawned" {
+        "parentToolUseId"
+    } else {
+        "toolUseId"
+    };
+    e.payload[key].as_str().map(str::to_string)
+}
+
+/// 組串流：`window` 是依 pos 排好的帶 pos Event，`pool` 是候選的伴隨 Event 與狀態行。
+/// 附上窗口內卡片的伴隨 Event（同卡只留最新的 tool.updated）；狀態行只取窗口範圍內的——
+/// 窗口從 pos 1 開始時沒有下限，否則從窗口第一個 Event 的時間起，`until`（不含）為上限。
+/// 結果依 (ts_seen, session, pos) 排序；伴隨 Event 沒有 pos，前端依 toolUseId 併進卡片。
+pub fn assemble_stream(window: Vec<Event>, pool: Vec<Event>, until: Option<u64>) -> Vec<Event> {
+    let lower = match window.first() {
+        Some(first) if first.pos == Some(1) => 0,
+        Some(first) => first.ts_seen,
+        None => 0,
+    };
+    let cards: HashSet<String> = window
+        .iter()
+        .filter(|e| e.kind == "tool.placed" || e.kind == "tool.called")
+        .filter_map(card_key)
+        .collect();
+    let mut latest_update: HashMap<String, u64> = HashMap::new();
+    for e in pool.iter().filter(|e| e.kind == "tool.updated") {
+        if let Some(id) = card_key(e) {
+            let seq = latest_update.entry(id).or_insert(e.seq);
+            *seq = (*seq).max(e.seq);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = window;
+    for e in pool {
+        if e.pos.is_some() || !seen.insert((e.session.clone(), e.seq)) {
+            continue;
+        }
+        let keep = if STATUS_LINES.contains(&e.kind.as_str()) {
+            e.ts_seen >= lower && until.is_none_or(|u| e.ts_seen < u)
+        } else if COMPANIONS.contains(&e.kind.as_str()) {
+            card_key(&e).is_some_and(|id| {
+                cards.contains(&id)
+                    && (e.kind != "tool.updated" || latest_update.get(&id) == Some(&e.seq))
+            })
+        } else {
+            false
+        };
+        if keep {
+            out.push(e);
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.ts_seen, &a.session, a.pos, a.seq).cmp(&(b.ts_seen, &b.session, b.pos, b.seq))
+    });
+    out
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Channel {
@@ -185,6 +258,9 @@ pub struct Live {
     slots: BTreeMap<u64, Counts>,
     /// 有連線用的時區，以及上次送出的 kpi
     offsets: BTreeMap<i32, Option<Value>>,
+    /// 卡片的伴隨 Event（同卡只留最新的 tool.updated）與每個 session 的狀態行
+    card_events: HashMap<(String, String), Vec<Event>>,
+    status_lines: HashMap<String, VecDeque<Event>>,
     /// 執行中的背景 subagent（每個 session 只顯示一列「背景」）
     bg_running: HashMap<String, HashSet<String>>,
     pending: Vec<Event>,
@@ -241,11 +317,33 @@ impl Live {
         if !ended {
             self.ensure_agent(&sid, "main", ts);
         }
+        if e.pos.is_none()
+            && COMPANIONS.contains(&e.kind.as_str())
+            && let Some(id) = card_key(e)
+        {
+            let list = self.card_events.entry((sid.clone(), id)).or_default();
+            if e.kind == "tool.updated" {
+                list.retain(|x| x.kind != "tool.updated");
+            }
+            list.push(e.clone());
+        }
+        if STATUS_LINES.contains(&e.kind.as_str()) {
+            let lines = self.status_lines.entry(sid.clone()).or_default();
+            lines.push_back(e.clone());
+            while lines.len() > STATUS_PER_SESSION {
+                lines.pop_front();
+            }
+        }
         if let Some(p) = e.pos {
             let stream = self.streams.entry(sid.clone()).or_default();
             stream.push_back(e.clone());
             while stream.len() > STREAM_PER_SESSION {
-                stream.pop_front();
+                // 卡片被擠出串流，它的伴隨 Event 也不用留了
+                if let Some(old) = stream.pop_front()
+                    && let Some(id) = card_key(&old)
+                {
+                    self.card_events.remove(&(sid.clone(), id));
+                }
             }
             if let Some(s) = self.sessions.get_mut(&sid) {
                 s.last_pos = Some(p);
@@ -624,13 +722,39 @@ impl Live {
         } else {
             STREAM_PER_SESSION
         };
-        let mut stream: Vec<&Event> = self
-            .streams
+        let mut stream: Vec<Event> = Vec::new();
+        for (sid, q) in self.streams.iter().filter(|(s, _)| ch.wants(s)) {
+            let window: Vec<Event> = q
+                .iter()
+                .skip(q.len().saturating_sub(per_session))
+                .cloned()
+                .collect();
+            let mut pool: Vec<Event> = self
+                .status_lines
+                .get(sid)
+                .map(|l| l.iter().cloned().collect())
+                .unwrap_or_default();
+            for e in &window {
+                if let Some(list) =
+                    card_key(e).and_then(|id| self.card_events.get(&(sid.clone(), id)))
+                {
+                    pool.extend(list.iter().cloned());
+                }
+            }
+            stream.extend(assemble_stream(window, pool, None));
+        }
+        // 還沒有任何 pos 的 session：只有狀態行
+        for (sid, lines) in self
+            .status_lines
             .iter()
-            .filter(|(s, _)| ch.wants(s))
-            .flat_map(|(_, q)| q.iter().skip(q.len().saturating_sub(per_session)))
-            .collect();
-        stream.sort_by(|a, b| (a.ts_seen, &a.session, a.pos).cmp(&(b.ts_seen, &b.session, b.pos)));
+            .filter(|(s, _)| ch.wants(s) && !self.streams.contains_key(*s))
+        {
+            let _ = sid;
+            stream.extend(lines.iter().cloned());
+        }
+        stream.sort_by(|a, b| {
+            (a.ts_seen, &a.session, a.pos, a.seq).cmp(&(b.ts_seen, &b.session, b.pos, b.seq))
+        });
 
         let mut snap = json!({
             "t": "snapshot", "ch": ch.name(), "frame": self.frame_no,

@@ -30,6 +30,7 @@ use crate::store::Store;
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
 const MORE_LIMIT: u64 = 500;
+const COMPANION_LOOKBACK: u64 = 1000;
 
 pub struct WebState {
     live: Mutex<Live>,
@@ -288,17 +289,16 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             let events = match &state.store {
                 Some(store) => {
                     let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                    store
-                        .stream_before(&session, before, limit)
-                        .unwrap_or_default()
+                    more_events(&store, &session, before, limit).unwrap_or_else(|e| {
+                        eprintln!("coding-lab web：載入更多失敗：{e}");
+                        Vec::new()
+                    })
                 }
                 None => Vec::new(),
             };
-            send(
-                socket,
-                &json!({ "t": "more", "session": session, "events": events }),
-            )
-            .await
+            let reply =
+                json!({ "t": "more", "session": session, "beforePos": before, "events": events });
+            send(socket, &reply).await
         }
         other => {
             send(
@@ -308,6 +308,31 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             .await
         }
     }
+}
+
+/// 「載入更多」：窗口內的帶 pos Event，加上卡片的伴隨 Event 與窗口範圍內的狀態行（contracts.md §6）。
+/// 伴隨 Event 從窗口第一個 seq 往前 [`COMPANION_LOOKBACK`] 個、往後到下一個帶 pos 的 Event 為止找。
+fn more_events(
+    store: &Store,
+    session: &str,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<Vec<Event>, crate::store::StoreError> {
+    let window = store.stream_before(session, before, limit)?;
+    let (Some(first), Some(last)) = (window.first(), window.last()) else {
+        return Ok(window);
+    };
+    let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
+    let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
+    let to = next.map_or(last.seq + COMPANION_LOOKBACK, |(seq, _)| {
+        seq.saturating_sub(1)
+    });
+    let pool = store.events_by_seq(session, from, to)?;
+    Ok(crate::live::assemble_stream(
+        window,
+        pool,
+        next.map(|(_, ts)| ts),
+    ))
 }
 
 async fn healthz(State(state): State<Arc<WebState>>) -> Response {
