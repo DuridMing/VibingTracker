@@ -405,7 +405,7 @@ impl TailAction {
 
 /// 看 hook 決定要開／關哪些 tail（純邏輯；執行由組裝 collector 的地方負責）。
 ///
-/// - 主 transcript：`SessionStart(startup)` 從檔頭；resume／compact 或沒收到 SessionStart 就先看到
+/// - 主 transcript：`SessionStart(startup／clear)` 從檔頭；resume／compact 或沒收到 SessionStart 就先看到
 ///   其他事件時從檔尾。實測 compact 與 resume 沿用同一個檔，所以已在 tail 的 session 不重開。
 /// - subagent：`SubagentStart` 開 `<transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`，`SubagentStop` 關。
 /// - `SessionEnd` 關掉該 session 的全部 tail；之後若 resume 會再開。
@@ -444,7 +444,9 @@ impl TailPlanner {
                             file: "main".into(),
                         });
                     }
-                    let fresh = event == "SessionStart" && h.str_field("source") == Some("startup");
+                    // startup 與 clear 都是新的 session、新的檔（`/clear` 換 session id，#688 實測），從檔頭讀
+                    let fresh = event == "SessionStart"
+                        && matches!(h.str_field("source"), Some("startup" | "clear"));
                     let start = if fresh { Start::Beginning } else { Start::End };
                     out.push(TailAction::Start {
                         session: sid.clone(),

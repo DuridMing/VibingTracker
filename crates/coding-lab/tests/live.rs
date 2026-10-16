@@ -1200,3 +1200,25 @@ fn rows_carry_the_full_model_id_next_to_the_short_name() {
         "切換模型後兩個一起換"
     );
 }
+
+/// `/clear` 是新 session 的第一行（#688 實測），不是「接回」：串流裡只有 resume／compact 標狀態行。
+#[test]
+fn clear_is_not_a_resume_status_line() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let start = |b: &mut B, s: &str, source: &str, ts: u64| {
+        b.ev(s, "session.started", "main", ts, false, json!({"cwd": "/p", "source": source, "model": null, "transcriptPath": "/t", "branch": null}))
+    };
+    let evs = [
+        start(&mut b, "s1", "resume", DAY),
+        start(&mut b, "s2", "clear", DAY + 1),
+    ];
+    apply_all(&mut l, &evs);
+    let snap = l.snapshot(&Channel::All, 0, DAY + 2);
+    let sources: Vec<&str> = rows(&snap, "stream")
+        .iter()
+        .filter(|e| e["type"] == "session.started")
+        .map(|e| e["payload"]["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(sources, ["resume"]);
+}

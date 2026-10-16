@@ -363,3 +363,20 @@ fn probe_never_blocks_the_hook_server() {
     assert!(other_ok, "其他 hook 被 Edit 探針卡住");
     assert!(first_ok, "不是一般檔案就不讀，Edit 的 hook 也照常回應");
 }
+
+/// `/clear` 換一個新的 session（新 id、新 transcript 檔，SessionStart 的 source 是 clear；#688 實測）：
+/// 和 startup 一樣從檔頭讀，否則新檔開頭幾行會漏掉。
+#[test]
+fn clear_starts_a_new_session_read_from_the_top() {
+    let mut p = TailPlanner::default();
+    let a = p.on_hook(&h(json!({"session_id": "s2", "hook_event_name": "SessionStart", "source": "clear", "transcript_path": T})));
+    assert_eq!(
+        a,
+        [TailAction::Start {
+            session: "s2".into(),
+            file: "main".into(),
+            path: PathBuf::from(T),
+            start: Start::Beginning
+        }]
+    );
+}

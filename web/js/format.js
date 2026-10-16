@@ -95,7 +95,6 @@ const STATUS_TEXT = {
 const SESSION_TEXT = {
   resume: '<span class="st">↻ 已 resume，接續先前的對話</span>',
   compact: '<span class="st">⇣ 已 compact，之前的對話已摘要</span>',
-  clear: '<span class="st">⌫ 已 clear，清空對話</span>',
 };
 
 export function formatRow(row, { agentName } = {}) {

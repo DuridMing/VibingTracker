@@ -168,8 +168,9 @@ export function createStream({ cap = CAP } = {}) {
         break;
       }
       case "session.started":
-        // resume／compact／clear 接回同一個 session（#651）：一行狀態；startup 是第一行，不必標
-        if (p.source && p.source !== "startup") newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: "session", source: p.source, text: "" }, out);
+        // resume／compact 接回同一個 session（#651）：一行狀態。startup 與 clear 都是新 session 的第一行，不必標
+        // （`/clear` 換 session id，#688 實測）；判斷和 collector 的 is_status_line 一致
+        if (p.source === "resume" || p.source === "compact") newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: "session", source: p.source, text: "" }, out);
         break;
       case "session.ended":
         // 中途結束的 session：還在暫存區的卡片不會再有進展，從「即時」計數拿掉。

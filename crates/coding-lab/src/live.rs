@@ -39,7 +39,7 @@ const COMPANIONS: &[&str] = &[
 ];
 /// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
 const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
-/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗、↻ resume／compact，#651）
+/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗、↻ resume／compact，#651、#688）
 const STATUS_LINES: &[&str] = &[
     "prompt.submitted",
     "session.status",
@@ -47,11 +47,12 @@ const STATUS_LINES: &[&str] = &[
     "session.started",
 ];
 
-/// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact／clear）才算，startup 不標。
+/// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact）才算。startup 與 clear
+/// 都是新 session 的第一行，不標（`/clear` 換 session id、舊 session 收到 SessionEnd reason clear，#688 實測）。
 fn is_status_line(e: &Event) -> bool {
     STATUS_LINES.contains(&e.kind.as_str())
         && (e.kind != "session.started"
-            || e.payload["source"].as_str().is_some_and(|s| s != "startup"))
+            || matches!(e.payload["source"].as_str(), Some("resume" | "compact")))
 }
 
 /// 這個 Event 屬於哪張卡片（toolUseId）；agent.spawned 屬於開它的那個工具呼叫。
