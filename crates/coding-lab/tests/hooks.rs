@@ -278,3 +278,32 @@ async fn edit_hunk_is_read_before_the_response() {
         hunk.lines
     );
 }
+
+/// #670-2：每個開／關 tail 的動作都要讓 merge 清掉那個檔的降級（新 tail 從健康狀態開始）。
+#[test]
+fn every_tail_action_resets_degraded_in_merge() {
+    let reset = |a: TailAction| match a.reset(7) {
+        Input::TailReset {
+            session,
+            file,
+            ts_seen,
+        } => (session, file, ts_seen),
+        _ => panic!("要是 TailReset"),
+    };
+    let start = TailAction::Start {
+        session: "s".into(),
+        file: "agent-a1".into(),
+        path: PathBuf::from("/t/agent-a1.jsonl"),
+        start: Start::Beginning,
+    };
+    assert_eq!(reset(start), ("s".into(), Some("agent-a1".into()), 7));
+    let stop = TailAction::Stop {
+        session: "s".into(),
+        file: "main".into(),
+    };
+    assert_eq!(reset(stop), ("s".into(), Some("main".into()), 7));
+    let all = TailAction::StopSession {
+        session: "s".into(),
+    };
+    assert_eq!(reset(all), ("s".into(), None, 7));
+}

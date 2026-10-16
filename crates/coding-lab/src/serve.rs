@@ -138,6 +138,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     let actions = planner.on_hook(hook);
                     if !actions.is_empty() {
                         for action in actions {
+                            sink(merger.handle(action.reset(crate::now_ms())));
                             apply_tail(action, &mut tails, &tx);
                         }
                         web.set_health(json!({ "tails": tails.len(), "schedLagMs": 0 }));

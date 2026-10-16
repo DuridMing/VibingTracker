@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -31,6 +32,9 @@ use crate::store::Store;
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
 const MORE_LIMIT: u64 = 500;
+/// hello 帶的 `resume` 只套用在這段時間內收到的 subscribe：前端重連時是 hello 後立刻重送所有訂閱，
+/// 之後才新開的頻道客戶端沒有它的狀態，要給 snapshot（server 分不出兩者，只能看時間）。
+pub const RESUME_WINDOW: Duration = Duration::from_secs(2);
 const COMPANION_LOOKBACK: u64 = 1000;
 
 pub struct WebState {
@@ -40,6 +44,7 @@ pub struct WebState {
     frames: broadcast::Sender<Arc<Frame>>,
     /// collector 主迴圈回報的健康資訊（tail 數、排程延遲…），併進 /healthz
     health: Mutex<Value>,
+    resume_window_ms: AtomicU64,
 }
 
 impl WebState {
@@ -56,7 +61,14 @@ impl WebState {
             web_root,
             frames,
             health: Mutex::new(json!({})),
+            resume_window_ms: AtomicU64::new(RESUME_WINDOW.as_millis() as u64),
         })
+    }
+
+    /// hello 的 `resume` 對之後多久內的 subscribe 有效，見 [`RESUME_WINDOW`]（測試用）。
+    pub fn set_resume_window(&self, window: Duration) {
+        self.resume_window_ms
+            .store(window.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn set_health(&self, extra: Value) {
@@ -180,7 +192,8 @@ struct Conn {
     /// 訂閱的頻道，以及這個頻道已經送到的 frame 編號
     subs: BTreeMap<Channel, u64>,
     offset: i32,
-    resume: Option<u64>,
+    /// hello 帶的 frame 編號與收到 hello 的時間
+    resume: Option<(u64, Instant)>,
 }
 
 async fn send(socket: &mut WebSocket, v: &Value) -> bool {
@@ -259,7 +272,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 .as_i64()
                 .unwrap_or(0)
                 .clamp(-14 * 60, 14 * 60) as i32;
-            conn.resume = msg["resume"].as_u64();
+            conn.resume = msg["resume"].as_u64().map(|n| (n, Instant::now()));
             state.live().register_offset(conn.offset);
             let welcome = json!({
                 "t": "welcome", "protocol": PROTOCOL, "host": "local",
@@ -272,10 +285,14 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 return send(socket, &json!({ "t": "error", "message": "不認得的頻道" })).await;
             };
             // 帶 resume 而且接得上：補送漏掉的 frame；否則送 snapshot
-            let missed = conn.resume.and_then(|n| {
-                let live = state.live();
-                live.frames_since(n).map(|frames| (frames, live.frame_no()))
-            });
+            let window = Duration::from_millis(state.resume_window_ms.load(Ordering::Relaxed));
+            let missed = conn
+                .resume
+                .filter(|(_, at)| at.elapsed() <= window)
+                .and_then(|(n, _)| {
+                    let live = state.live();
+                    live.frames_since(n).map(|frames| (frames, live.frame_no()))
+                });
             match missed {
                 Some((frames, now_no)) => {
                     conn.subs.insert(ch.clone(), now_no);

@@ -501,3 +501,24 @@ async fn non_loopback_host_is_rejected_even_when_origin_matches() {
         );
     }
 }
+
+/// #670-5：hello 的 resume 只給重連時一起送出的那批 subscribe；之後才新開的頻道
+/// （例如重連後幾秒才打開的 session tab）客戶端沒有它的狀態，要給 snapshot。
+#[tokio::test]
+async fn resume_only_covers_the_resubscribe_burst() {
+    let state = WebState::new(None, None, 64);
+    let addr = start(state.clone()).await;
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({})).await;
+    send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
+    let last = recv(&mut ws).await["frame"].as_u64().unwrap();
+    drop(ws);
+    state.apply(&[text("s1", 1, 1)]);
+    state.flush(2_000);
+
+    state.set_resume_window(Duration::ZERO); // 模擬「過了重連那一刻」
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({"resume": last})).await;
+    send(&mut ws, json!({"op": "subscribe", "channel": "session:s1"})).await;
+    assert_eq!(recv(&mut ws).await["t"], "snapshot");
+}

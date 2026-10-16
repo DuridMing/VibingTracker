@@ -340,6 +340,23 @@ pub enum TailAction {
     },
 }
 
+impl TailAction {
+    /// 執行這個動作時要交給 merge 的 [`Input::TailReset`]：被停掉或重開的 tail 不會再送 Recovered。
+    pub fn reset(&self, ts_seen: u64) -> Input {
+        let (session, file) = match self {
+            TailAction::Start { session, file, .. } | TailAction::Stop { session, file } => {
+                (session, Some(file.clone()))
+            }
+            TailAction::StopSession { session } => (session, None),
+        };
+        Input::TailReset {
+            session: session.clone(),
+            file,
+            ts_seen,
+        }
+    }
+}
+
 /// 看 hook 決定要開／關哪些 tail（純邏輯；執行由組裝 collector 的地方負責）。
 ///
 /// - 主 transcript：`SessionStart(startup)` 從檔頭；resume／compact 或沒收到 SessionStart 就先看到
