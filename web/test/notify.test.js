@@ -159,3 +159,16 @@ test("leader：只有自己時立刻就是 leader；沒有 BroadcastChannel 時�
   const none = createLeader({ id: "y", channel: null, ...c });
   assert.equal(none.isLeader(), true);
 });
+
+test("危險列解除時的更新（帶 clearedAt）不會再通知一次", () => {
+  const c = fakeClock();
+  const out = [];
+  const n = createNotifier({ ...c, emit: (x) => out.push(x) });
+  n.connected();
+  n.snapshot([]);
+  n.frame([{ ...att("s1/danger/t1", "danger", c.now()), clearedAt: null }]);
+  c.advance(1000);
+  n.frame([{ id: "s1/danger/t1", clearedAt: c.now() }]);
+  c.advance(1000);
+  assert.equal(out.length, 1);
+});

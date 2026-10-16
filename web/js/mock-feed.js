@@ -241,8 +241,21 @@ function createWorld(n) {
     kpi.attention = attention.size;
   }
 
+  // 解除：危險列留到確認、帶 clearedAt（§6）；其他種類直接刪
+  function clearSession(s, rows) {
+    for (const [id, a] of attention) {
+      if (a.session !== s.id) continue;
+      if (a.kind === "danger") {
+        if (a.clearedAt == null) { a.clearedAt = Date.now(); rows.attention.push({ id, clearedAt: a.clearedAt }); }
+      } else {
+        attention.delete(id);
+        rows.attention.push({ id, deleted: true });
+      }
+    }
+  }
+
   function statusStep(s, events, rows) {
-    for (const [id, a] of attention) if (a.session === s.id) { attention.delete(id); rows.attention.push({ id, deleted: true }); }
+    clearSession(s, rows);
     const prev = s.status;
     s.status = pick(STATUSES);
     if (s.status === prev) return;
@@ -259,14 +272,14 @@ function createWorld(n) {
     events.push(se);
     logStream(se);
     if (ATTENTION_REASON[s.status]) {
-      const a = { id: `${s.id}/${s.status}/toolu_${frame}`, session: s.id, kind: s.status, ref: `toolu_${frame}`, reason: ATTENTION_REASON[s.status], raisedAt: Date.now() };
+      const a = { id: `${s.id}/${s.status}/toolu_${frame}`, session: s.id, kind: s.status, ref: `toolu_${frame}`, reason: ATTENTION_REASON[s.status], raisedAt: Date.now(), clearedAt: null };
       attention.set(a.id, a);
       rows.attention.push(a);
     }
     // §6 sessions.score：佇列裡的種類給基礎分，再加一點動態分（真的算法在 collector，#645）
     s.score = (SCORE_BASE[s.status] ?? 0) + Math.floor(r() * 20);
     changed.score = s.score;
-    if (s.status === "danger") changed.dangers = ++s.dangers;
+    if (s.status === "danger") { changed.dangers = ++s.dangers; s.dangerUntil = frame + 5; }
     if (s.status === "fail") changed.failures = ++s.failures;
     rows.sessions.push(changed);
   }
@@ -345,6 +358,14 @@ function createWorld(n) {
       const events = [];
       const rows = { sessions: [], agents: [], attention: [] };
       const ticks = minEvents ? 10_000 : 1 + Math.floor(r() * 3);
+      // 危險指令跑完就解除（§6：危險列留著、帶 clearedAt，等確認才刪），session 回到執行中
+      for (const s of sessions) {
+        if (s.status !== "danger" || frame < (s.dangerUntil ?? 0)) continue;
+        s.status = "run";
+        s.statusSince = Date.now();
+        rows.sessions.push({ id: s.id, status: "run", statusSince: s.statusSince });
+        clearSession(s, rows);
+      }
       for (let k = 0; k < ticks && (!minEvents || events.length < minEvents); k++) {
         const s = pick(sessions);
         if (r() < (minEvents ? 0.02 : 0.08)) statusStep(s, events, rows);
@@ -353,7 +374,7 @@ function createWorld(n) {
           s.statusSince = Date.now();
           s.score = Math.floor(r() * 10);
           rows.sessions.push({ id: s.id, status: "run", statusSince: s.statusSince, score: s.score });
-          for (const [id, a] of attention) if (a.session === s.id) { attention.delete(id); rows.attention.push({ id, deleted: true }); }
+          clearSession(s, rows);
         }
         tick(s, events, rows);
         finishAgents(s, rows);

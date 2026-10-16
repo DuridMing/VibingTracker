@@ -305,7 +305,7 @@ function renderAttention() {
   const rows = sortAttention([...store.attention.values()], scoreOf);
   const now = Date.now();
   const canAck = ui.welcome?.scope !== "view";
-  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}`).join(",");
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
   const box = $("#att");
   if (!rows.length) {
@@ -319,15 +319,15 @@ function renderAttention() {
     const ack = { class: "btn sm", title: "已確認：從佇列移除（所有視窗一致）", onclick: (e) => { e.stopPropagation(); ackRow(r); } };
     if (pend) ack.disabled = "";
     return h("div", {
-      class: `arow ${r.kind}${pend ? " pend" : ""}${ui.tab === r.session ? " on" : ""}`, role: "button", tabindex: "0",
-      title: `${r.session}${s?.lastPrompt ? `\n${s.lastPrompt}` : ""}${score ? `\n分數 ${score}` : ""}`,
+      class: `arow ${r.kind}${r.clearedAt != null ? " cleared" : ""}${pend ? " pend" : ""}${ui.tab === r.session ? " on" : ""}`, role: "button", tabindex: "0",
+      title: `${r.session}${s?.lastPrompt ? `\n${s.lastPrompt}` : ""}${score ? `\n分數 ${score}` : ""}${r.clearedAt != null ? "\n工具已結束，等你確認" : ""}`,
       onclick: () => selectTab(r.session),
       onkeydown: (e) => { if (e.key === "Enter" && e.target === e.currentTarget) selectTab(r.session); },
     },
     h("span", { class: "ak" }, KIND_TEXT[r.kind] ?? r.kind),
     h("span", { class: "ss", style: `color:${sessionColor(r.session)}` }, shortId(r.session)),
     h("span", { class: "ar" }, r.reason ?? ""),
-    h("span", { class: "at" }, ago(now - (r.raisedAt ?? now))),
+    h("span", { class: "at" }, r.clearedAt != null ? "已結束" : ago(now - (r.raisedAt ?? now))),
     h("button", { class: "btn sm", onclick: (e) => { e.stopPropagation(); selectTab(r.session); } }, "查看"),
     canAck ? h("button", ack, pend ? "確認中…" : "已確認") : null);
   }));

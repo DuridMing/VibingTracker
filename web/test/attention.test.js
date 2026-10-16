@@ -27,3 +27,21 @@ test("已確認：collector 送 deleted 後從佇列消失", () => {
   applyFrame(st, { rows: { attention: [{ id: "s1/done/p1", deleted: true }] } });
   assert.deepEqual(sortAttention([...st.attention.values()], () => 0).map((r) => r.id), ["s2/wait/t1"]);
 });
+
+test("危險項目工具已結束（clearedAt 有值）但還沒確認：仍在危險類，排在還沒結束的危險之後、失敗之前", () => {
+  const rows = [
+    { ...row("c", "s1", "danger", 1), clearedAt: 5 },
+    row("f", "s1", "fail", 2),
+    { ...row("a", "s2", "danger", 3), clearedAt: null },
+  ];
+  assert.deepEqual(sortAttention(rows, (s) => (s === "s1" ? 99 : 0)).map((r) => r.id), ["a", "c", "f"]);
+});
+
+test("collector 把危險列更新成已解除：store 淺合併帶上 clearedAt，列還在", () => {
+  const st = createStore();
+  applySnapshot(st, { attention: [{ ...row("s1/danger/t1", "s1", "danger", 1), clearedAt: null }] });
+  applyFrame(st, { rows: { attention: [{ id: "s1/danger/t1", clearedAt: 9 }] } });
+  const r = st.attention.get("s1/danger/t1");
+  assert.equal(r.clearedAt, 9);
+  assert.equal(r.kind, "danger");
+});
