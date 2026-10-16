@@ -128,13 +128,14 @@ export function createFileTree() {
   let git = new Map();
   let gitDirs = new Map(); // 目錄 → { conflict }
   const counts = new Map(); // path → { r, e, w, x, isNew }
-  const edits = new Map(); // path → Map(session → "A" | "M")，「本次開啟以來」用
+  const edits = new Map(); // path → Map(session → Map(toolUseId → "A" | "M"))，「本次開啟以來」用
   const activeDirs = new Set();
   const user = new Map(); // 目錄 → 手動展開（true）／收起（false）
   const last = new Map(); // session → 最後碰的檔
   const seen = new Set(); // session:seq
-  const toolPath = new Map(); // toolUseId → { path, session }
-  const pendingFail = new Set(); // 失敗先到、file.* 還沒到的 toolUseId
+  const toolPath = new Map(); // toolUseId → { path, session, kind }
+  const pendingFail = new Map(); // 失敗先到、file.* 還沒到的 toolUseId → 是不是 Esc 中斷
+  const revoked = new Set(); // 以 failed 結束、已收回「改／新建」的 toolUseId（#682）
   const countedFail = new Set();
   let early = []; // 樹還沒載入（不知道根）時先收著的 Event
   let worktrees = null; // /api/files 的 worktrees（路徑）
@@ -215,6 +216,28 @@ export function createFileTree() {
     hits.push({ path: tp.path, kind: "x", session: tp.session });
   }
 
+  // 被拒或失敗的 Edit／Write 視為沒有發生（contracts §4，#682）：收回改／新建的計數與「本次開啟以來」
+  function revoke(id) {
+    const tp = toolPath.get(id);
+    if (!tp || tp.kind === "r" || revoked.has(id)) return;
+    revoked.add(id);
+    const c = count(tp.path);
+    c[tp.kind] = Math.max(0, c[tp.kind] - 1);
+    if (tp.kind === "w" && c.w === 0) c.isNew = false;
+    const m = edits.get(tp.path);
+    const ids = m?.get(tp.session);
+    ids?.delete(id);
+    if (ids && ids.size === 0) m.delete(tp.session);
+    if (m && m.size === 0) edits.delete(tp.path);
+  }
+
+  // 一張卡片以 failed 結束：收回改動；Esc 中斷不算失敗（失敗計數只看真的失敗）
+  function failCard(id, interrupted, hits) {
+    revoke(id);
+    if (!interrupted && !countedFail.has(id)) countFail(id, hits);
+    pendingFail.delete(id);
+  }
+
   // tree 換了（換基準、重抓）：根一樣就保留累積計數與展開狀態
   t.setFiles = ({ root, tree = [], treeTruncated = false, worktrees: wts = null }) => {
     const r = norm(root);
@@ -246,7 +269,7 @@ export function createFileTree() {
     for (const e of events ?? []) {
       const ty = e.type;
       const isFile = ty === "file.read" || ty === "file.edit" || ty === "file.write";
-      const isFail = ty === "tool.updated" && e.payload?.status === "failed" && !e.payload?.interrupted;
+      const isFail = ty === "tool.updated" && e.payload?.status === "failed";
       if (!isFile && !isFail) continue;
       if (t.root == null) {
         if (early.length < 20_000) early.push(e);
@@ -258,11 +281,12 @@ export function createFileTree() {
       const pl = e.payload ?? {};
       const id = pl.toolUseId;
       if (isFail) {
-        if (!id || countedFail.has(id)) continue;
-        if (toolPath.has(id)) countFail(id, hits);
+        if (!id) continue;
+        const interrupted = !!pl.interrupted;
+        if (toolPath.has(id)) failCard(id, interrupted, hits);
         else {
-          pendingFail.add(id);
-          if (pendingFail.size > PENDING_MAX) pendingFail.delete(pendingFail.values().next().value);
+          pendingFail.set(id, interrupted);
+          if (pendingFail.size > PENDING_MAX) pendingFail.delete(pendingFail.keys().next().value);
         }
         continue;
       }
@@ -275,15 +299,17 @@ export function createFileTree() {
       if (kind !== "r") {
         let m = edits.get(path);
         if (!m) edits.set(path, (m = new Map()));
-        if (m.get(e.session) !== "A") m.set(e.session, kind === "w" ? "A" : "M");
+        let ids = m.get(e.session);
+        if (!ids) m.set(e.session, (ids = new Map()));
+        ids.set(id ?? key, kind === "w" ? "A" : "M");
       }
       addNode(path);
       for (const d of ancestors(path)) activeDirs.add(d);
       last.set(e.session, path);
       hits.push({ path, kind, session: e.session });
       if (id) {
-        toolPath.set(id, { path, session: e.session });
-        if (pendingFail.has(id) && !countedFail.has(id)) countFail(id, hits);
+        toolPath.set(id, { path, session: e.session, kind });
+        if (pendingFail.has(id)) failCard(id, pendingFail.get(id), hits);
       }
     }
     return hits;
@@ -297,7 +323,9 @@ export function createFileTree() {
   // 正在碰這個檔的 session：每個 session 最後碰的檔，只算 running 裡的（還在跑的 session）
   t.touching = (path, running) => [...last].filter(([s, p]) => p === path && running.has(s)).map(([s]) => s);
 
-  t.editsBySession = () => edits;
+  // path → Map(session → "A" | "M")：同一個 session 對同一檔有新建就是 A
+  t.editsBySession = () =>
+    new Map([...edits].map(([path, m]) => [path, new Map([...m].map(([s, ids]) => [s, [...ids.values()].includes("A") ? "A" : "M"]))]));
 
   // 基準的 changes；mapPath 把 changes 的 path 換成相對專案根（session 基準的 path 相對該 session 的 cwd）
   t.setGit = (changes, mapPath = (p) => p) => {

@@ -372,6 +372,9 @@ pub struct FileWrite {
     pub is_new: bool,
     pub content: String,
     pub truncated: bool,
+    /// 全文行數（`content` 只留前 200 行）；舊的 Event 沒有（#682）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

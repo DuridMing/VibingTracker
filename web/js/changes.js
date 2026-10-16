@@ -1,6 +1,7 @@
 // 改動紀錄（不碰 DOM）。規則見 PLAN.md「前端狀態機與合流串流」：
 // - 跨 session 的獨立清單，最新在上，最多 60 筆。
 // - 新改動進來自動選中；點舊的一筆就停住，直到手動選最新。
+// - 被拒或失敗的 Edit／Write（同一張卡片的 tool.updated failed）視為沒有發生，從清單拿掉（contracts §4，#682）。
 // diff 以資料存（hunk／全文），顯示時才由 diffRows／writeRows 轉成行。
 
 export const CAP = 60;
@@ -26,13 +27,36 @@ function entryOf(ev) {
 export function createChanges({ cap = CAP } = {}) {
   const ch = { list: [], following: true, selectedKey: null };
   const keys = new Set();
+  const failed = new Set(); // 以 failed 結束的 toolUseId（失敗可能比 file.* 先到）
+
+  function isFailure(ev) {
+    return ev.type === "tool.updated" && ev.payload?.status === "failed" && ev.payload?.toolUseId != null;
+  }
+
+  // 拿掉這張卡片的改動；回傳是否有拿掉
+  function drop(id) {
+    failed.add(id);
+    const before = ch.list.length;
+    ch.list = ch.list.filter((c) => {
+      if (c.toolUseId !== id) return true;
+      keys.delete(c.key);
+      return false;
+    });
+    return ch.list.length !== before;
+  }
 
   function add(ev) {
     const e = entryOf(ev);
-    if (!e || keys.has(e.key)) return false;
+    if (!e || keys.has(e.key) || failed.has(e.toolUseId)) return false;
     keys.add(e.key);
     ch.list.unshift(e);
     return true;
+  }
+
+  // 選中的那筆被拿掉：跟著最新時選最新，停住時改選最接近的（留下來最新的一筆）
+  function reselect() {
+    if (keys.has(ch.selectedKey)) return;
+    ch.selectedKey = ch.list[0]?.key ?? null;
   }
 
   function trim() {
@@ -44,10 +68,15 @@ export function createChanges({ cap = CAP } = {}) {
   // 回傳是否有新改動
   ch.apply = (events) => {
     let added = false;
-    for (const ev of events ?? []) if (add(ev)) added = true;
-    if (!added) return false;
+    let dropped = false;
+    for (const ev of events ?? []) {
+      if (isFailure(ev)) dropped = drop(ev.payload.toolUseId) || dropped;
+      else if (add(ev)) added = true;
+    }
+    if (!added && !dropped) return false;
     trim();
     if (ch.following) ch.selectedKey = ch.list[0]?.key ?? null;
+    else reselect();
     return true;
   };
 
@@ -55,7 +84,9 @@ export function createChanges({ cap = CAP } = {}) {
   ch.load = (events) => {
     ch.list = [];
     keys.clear();
-    for (const ev of events ?? []) add(ev);
+    failed.clear();
+    for (const ev of events ?? []) if (isFailure(ev)) failed.add(ev.payload.toolUseId);
+    for (const ev of events ?? []) if (!isFailure(ev)) add(ev);
     trim();
     ch.following = true;
     ch.selectedKey = ch.list[0]?.key ?? null;

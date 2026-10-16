@@ -573,10 +573,8 @@ impl Live {
                 if g.op == "commit" && g.ok {
                     s.commits += 1;
                 }
-                if g.ok
-                    && matches!(g.op.as_str(), "switch" | "checkout" | "worktree")
-                    && g.branch.is_some()
-                {
+                // `worktree add -b X` 是在另一個 worktree 建分支，這個 session 的分支沒變（#682）
+                if g.ok && matches!(g.op.as_str(), "switch" | "checkout") && g.branch.is_some() {
                     s.branch = g.branch;
                 }
             }
@@ -639,7 +637,16 @@ impl Live {
                     self.dirty_agents.insert(id, false);
                 }
             }
-            Payload::ToolUpdated(u) => self.stage_update(&sid, &u.tool_use_id, e),
+            Payload::ToolUpdated(u) => {
+                // 被拒或失敗的 Edit／Write 視為沒有發生，不留在改動紀錄（contracts §4，#682）
+                if u.status == crate::event::ToolStatus::Failed {
+                    self.changes.retain(|c| {
+                        !(c.session == sid
+                            && card_key(c).as_deref() == Some(u.tool_use_id.as_str()))
+                    });
+                }
+                self.stage_update(&sid, &u.tool_use_id, e)
+            }
             Payload::ToolResult(r) => self.stage_update(&sid, &r.tool_use_id, e),
             Payload::ToolPlaced(p) => {
                 self.staged.remove(&(sid.clone(), p.tool_use_id));

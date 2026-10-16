@@ -134,7 +134,8 @@ export function createStream({ cap = CAP } = {}) {
         touch(id, ops);
         break;
       case "file.write":
-        card(id, ev).write = { path: p.path, isNew: !!p.isNew, lines: (p.content ?? "").replace(/\n$/, "").split("\n").length };
+        // lines 是全文行數（content 只留前 200 行，#682）；舊 Event 沒有時數預覽
+        card(id, ev).write = { path: p.path, isNew: !!p.isNew, lines: p.lines ?? (p.content ?? "").replace(/\n$/, "").split("\n").length };
         touch(id, ops);
         break;
       case "file.read":

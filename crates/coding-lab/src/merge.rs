@@ -1043,6 +1043,7 @@ impl Merger {
                     is_new: !h.probe().is_some_and(|p| p.exists),
                     content,
                     truncated: total > WRITE_PREVIEW_LINES,
+                    lines: Some(total as u64),
                 })
             }),
             "Agent" | "Task" => {

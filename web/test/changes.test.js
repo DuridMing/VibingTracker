@@ -93,3 +93,20 @@ test("Write 全文：從 1 起編行號；去掉結尾換行；截斷時最後�
   assert.equal(t.at(-1).type, "note");
   assert.match(t.at(-1).text, /200 行/);
 });
+
+// ---------- 被拒或失敗的改動（#682，contracts §4） ----------
+
+const failed = (s, id, extra = {}) => ev(s, "tool.updated", { toolUseId: id, status: "failed", durationMs: 1, error: "denied", interrupted: null, ...extra });
+
+test("被拒或失敗的 Edit／Write 從改動紀錄拿掉；失敗先到的也不加進來", () => {
+  const ch = createChanges();
+  const e1 = edit(A, "a.ts");
+  const e2 = edit(A, "b.ts");
+  ch.apply([e1, e2]);
+  ch.apply([failed(A, e1.payload.toolUseId)]);
+  assert.deepEqual(paths(ch), ["b.ts"]);
+  // snapshot 重載：失敗與 file.* 一起來，順序不保證
+  const w = write(B, "c.ts");
+  ch.load([failed(B, w.payload.toolUseId), w, e2]);
+  assert.deepEqual(paths(ch), ["b.ts"]);
+});
