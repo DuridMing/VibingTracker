@@ -99,3 +99,10 @@ test("subagent 結束的狀態行：← 名稱 完成／✗ 失敗／⏹ 已停�
   // 名稱跳脫
   assert.doesNotMatch(formatRow(row("done"), { agentName: () => "<x>" }).html, /<x>/);
 });
+
+test("session 狀態行：resume、compact、clear 各有自己的文字（#651）", () => {
+  const base = { key: "k", session: "s", agent: "main", type: "status", status: "session", text: "" };
+  assert.match(formatRow({ ...base, source: "resume" }).html, /resume/);
+  assert.match(formatRow({ ...base, source: "compact" }).html, /compact/);
+  assert.match(formatRow({ ...base, source: "clear" }).html, /clear/);
+});

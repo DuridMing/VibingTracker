@@ -222,3 +222,14 @@ test("subagent 結束（agent.finished）在串流出現一行狀態：完成、
   assert.equal(rows[0].text, "找到 3 個呼叫點");
   assert.equal(kindOf(rows[0]), "st");
 });
+
+test("resume／compact／clear 在串流出現一行狀態（#651）；startup 不出現；同一筆不重複", () => {
+  const st = createStream();
+  const start = (source) => ev(A, "session.started", { cwd: "/p", source, model: null, transcriptPath: "/t", branch: "main" });
+  const r1 = start("resume");
+  st.apply([start("startup"), r1, start("compact"), start("clear")]);
+  st.apply([r1]);
+  const rows = st.rows.filter((r) => r.type === "status");
+  assert.deepEqual(rows.map((r) => [r.status, r.source]), [["session", "resume"], ["session", "compact"], ["session", "clear"]]);
+  assert.equal(kindOf(rows[0]), "st");
+});

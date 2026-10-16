@@ -91,6 +91,13 @@ const STATUS_TEXT = {
   ended: '<span class="st">■ session 結束</span>',
 };
 
+// session.started 的來源（#651）：同一個 session 接回來，串流裡標一行
+const SESSION_TEXT = {
+  resume: '<span class="st">↻ 已 resume，接續先前的對話</span>',
+  compact: '<span class="st">⇣ 已 compact，之前的對話已摘要</span>',
+  clear: '<span class="st">⌫ 已 clear，清空對話</span>',
+};
+
 export function formatRow(row, { agentName } = {}) {
   const kind = kindOf(row);
   const cls = ["ln", kind];
@@ -120,6 +127,8 @@ export function formatRow(row, { agentName } = {}) {
         : row.result === "killed" ? `<span class="st idle">⏹ ${name} 已停止</span>`
         : `<span class="st agdone">← ${name} 完成</span>`;
       detail = row.text || null;
+    } else if (row.status === "session") {
+      body = SESSION_TEXT[row.source] ?? `<span class="st">↻ ${esc(row.source)}</span>`;
     } else {
       body = STATUS_TEXT[row.status] ?? esc(row.status);
     }

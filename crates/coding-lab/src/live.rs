@@ -39,8 +39,20 @@ const COMPANIONS: &[&str] = &[
 ];
 /// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
 const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
-/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗）
-const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status", "agent.finished"];
+/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗、↻ resume／compact，#651）
+const STATUS_LINES: &[&str] = &[
+    "prompt.submitted",
+    "session.status",
+    "agent.finished",
+    "session.started",
+];
+
+/// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact／clear）才算，startup 不標。
+fn is_status_line(e: &Event) -> bool {
+    STATUS_LINES.contains(&e.kind.as_str())
+        && (e.kind != "session.started"
+            || e.payload["source"].as_str().is_some_and(|s| s != "startup"))
+}
 
 /// 這個 Event 屬於哪張卡片（toolUseId）；agent.spawned 屬於開它的那個工具呼叫。
 fn card_key(e: &Event) -> Option<String> {
@@ -80,7 +92,7 @@ pub fn assemble_stream(window: Vec<Event>, pool: Vec<Event>, until: Option<u64>)
         if e.pos.is_some() || !seen.insert((e.session.clone(), e.seq)) {
             continue;
         }
-        let keep = if STATUS_LINES.contains(&e.kind.as_str()) {
+        let keep = if is_status_line(&e) {
             e.ts_seen >= lower && until.is_none_or(|u| e.ts_seen < u)
         } else if COMPANIONS.contains(&e.kind.as_str()) {
             card_key(&e).is_some_and(|id| {
@@ -363,7 +375,7 @@ impl Live {
             }
             list.push(e.clone());
         }
-        if STATUS_LINES.contains(&e.kind.as_str()) {
+        if is_status_line(e) {
             let lines = self.status_lines.entry(sid.clone()).or_default();
             lines.push_back(e.clone());
             while lines.len() > STATUS_PER_SESSION {
