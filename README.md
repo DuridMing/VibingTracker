@@ -39,7 +39,31 @@ claude plugin install coding-lab
 
 打開 <http://127.0.0.1:4801> 即可。10 分鐘沒有 session 時 collector 自動退出。
 
-支援 Linux、macOS、Windows（hook 不經 shell，Windows 不需要 bash 或 Node）。
+支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行。
+
+### 從原始碼安裝（目前的方式）
+
+還沒有發佈二進位，所以先自己編譯，再從這個 repo 安裝 plugin：
+
+```bash
+cargo install --path crates/coding-lab          # 裝到 ~/.cargo/bin（wrapper 會在 PATH 上找到它）
+claude plugin marketplace add /path/to/VibingTracker
+claude plugin install coding-lab@coding-lab
+```
+
+wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上的 `coding-lab`。都找不到時只在 stderr 印出安裝方式，這個 session 就不追蹤，Claude Code 照常運作。只想試一次、不安裝的話，可以用 `claude --plugin-dir plugin`。
+
+### 已知限制：collector 沒在跑時的 hook 錯誤提示
+
+追蹤只會記錄，不會攔截工具，也不會改變 Claude Code 的行為。collector 沒在跑的時候，Claude Code 照常運作、不會變慢，但 **可能會顯示 hook 錯誤提示**，例如互動模式對話裡的 `PreToolUse hook error`，或 `-p` 模式 stderr 的 `SessionEnd hook [http://127.0.0.1:4800/hook] failed: connect ECONNREFUSED`。Claude Code 會把 http hook 連不上視為不阻擋的錯誤，目前沒有設定能關掉這個提示。
+
+平常不會遇到：新 session 的 `SessionStart` 會自動拉起 collector，collector 也要等**所有 session 都結束**、再閒置 10 分鐘才會自己退出。會看到提示的情況：
+
+- collector 當掉，或被手動停掉：開一個新 session 就會重新拉起（`ensure`）。也可以直接執行 `coding-lab serve`。
+- session 沒有送出 `SessionEnd` 就消失（例如終端機被直接關掉），而且之後 24 小時都沒有任何 hook：collector 會當作這些 session 已經不在了而退出。
+- 找不到 collector 二進位：`SessionStart` 只會在 stderr 印出安裝方式，這個 session 就不追蹤。
+
+不想看到提示時，可以停用 plugin：`claude plugin disable coding-lab`。
 
 ## 設定
 

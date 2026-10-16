@@ -4,7 +4,7 @@
 //! 避免兩個程序同時寫 SQLite。主迴圈是 merge 的唯一消費者（PLAN「collector 設計」）：
 //! hook 與 transcript 的輸入都經同一個 channel 進來，同一個 session 內的順序因此固定。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,8 @@ const REBUILD_WINDOW_MS: u64 = 36 * 60 * 60 * 1000;
 const TICK: Duration = Duration::from_millis(500);
 const STORE_FLUSH: Duration = Duration::from_millis(100);
 const INPUT_QUEUE: usize = 8192;
+/// 進行中的 session 沒送 SessionEnd（終端機被直接關掉）時，最多再撐這麼久沒有 hook 才結束。
+const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const FRAME_QUEUE: usize = 256;
 
 pub enum Outcome {
@@ -53,6 +55,16 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         .recent_events(crate::now_ms().saturating_sub(REBUILD_WINDOW_MS))
         .map_err(|e| io::Error::other(e.to_string()))?;
     let store = Arc::new(Mutex::new(store));
+    // 閒置結束只在沒有進行中的 session 時才算（PLAN「10 分鐘無 session 自動退出」）：session 還開著時
+    // 結束的話，使用者回來一輸入 http hook 就連不上，Claude Code 會顯示 hook 錯誤。
+    let mut open_sessions: HashSet<String> = HashSet::new();
+    for e in &recent {
+        if e.kind == "session.ended" {
+            open_sessions.remove(&e.session);
+        } else {
+            open_sessions.insert(e.session.clone());
+        }
+    }
 
     let (rules, warning) = RuleSet::load(&cfg.home.join("rules.json"));
     if let Some(w) = warning {
@@ -108,6 +120,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             Some(input) = rx.recv() => {
                 if let Input::Hook { hook, .. } = &input {
                     last_hook = Instant::now();
+                    if hook.event_name() == "SessionEnd" {
+                        open_sessions.remove(hook.session_id());
+                    } else {
+                        open_sessions.insert(hook.session_id().to_string());
+                    }
                     let actions = planner.on_hook(hook);
                     if !actions.is_empty() {
                         for action in actions {
@@ -122,7 +139,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 let lag = Instant::now().saturating_duration_since(scheduled.into_std());
                 sink(merger.tick(crate::now_ms()));
                 web.set_health(json!({ "tails": tails.len(), "schedLagMs": lag.as_millis() as u64 }));
-                if !idle.is_zero() && last_hook.elapsed() >= idle {
+                let quiet = last_hook.elapsed();
+                if !idle.is_zero()
+                    && quiet >= idle
+                    && (open_sessions.is_empty() || quiet >= ABANDONED_AFTER.max(idle))
+                {
                     log("閒置，自動結束");
                     break;
                 }

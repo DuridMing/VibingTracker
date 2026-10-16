@@ -44,7 +44,7 @@ struct ServeArgs {
     /// 前端靜態檔的資料夾
     #[arg(long)]
     web_root: Option<PathBuf>,
-    /// 沒有 hook 進來多久就自動結束（秒，0＝不結束）
+    /// 所有 session 都結束後，閒置多久就自動結束（秒，0＝不結束）
     #[arg(long)]
     idle_exit_seconds: Option<u64>,
 }

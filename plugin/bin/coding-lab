@@ -1,0 +1,49 @@
+#!/bin/sh
+# coding-lab plugin wrapper：找到本機的 coding-lab 二進位並執行它（SessionStart 呼叫 `ensure`）。
+#
+# 規則（不變式 4、5）：永遠 exit 0、stdout 永遠是空的（SessionStart 的 stdout 會進 Claude 的上下文）。
+# 找不到二進位時只在 stderr 印安裝方式，不擋 Claude Code。
+#
+# 尋找順序：$CODING_LAB_BIN → ${CODING_LAB_HOME:-~/.coding-lab}/bin/coding-lab → PATH 上的 coding-lab。
+# 自動下載（GitHub Release＋sha256）等第一次發佈後再加。
+
+self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+home_dir=${CODING_LAB_HOME:-$HOME/.coding-lab}
+
+is_self() {
+    [ "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" = "$self_dir" ]
+}
+
+find_bin() {
+    if [ -n "$CODING_LAB_BIN" ] && [ -x "$CODING_LAB_BIN" ]; then
+        echo "$CODING_LAB_BIN"
+        return 0
+    fi
+    for c in "$home_dir/bin/coding-lab" "$home_dir/bin/coding-lab.exe"; do
+        if [ -x "$c" ]; then
+            echo "$c"
+            return 0
+        fi
+    done
+    for name in coding-lab coding-lab.exe; do
+        c=$(command -v "$name" 2>/dev/null) || continue
+        # plugin 的 bin/ 可能在 PATH 上：不要找到自己
+        if [ -n "$c" ] && ! is_self "$c"; then
+            echo "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! bin=$(find_bin); then
+    {
+        echo "coding-lab：找不到 collector 二進位，這次 session 不會被追蹤（Claude Code 照常運作）。"
+        echo "  安裝：在原始碼目錄執行 cargo install --path crates/coding-lab，或把二進位放到 $home_dir/bin/coding-lab"
+        echo "  或設定 CODING_LAB_BIN 指向它。"
+    } >&2
+    exit 0
+fi
+
+"$bin" "$@" >&2
+exit 0

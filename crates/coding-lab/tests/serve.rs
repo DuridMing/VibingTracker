@@ -172,6 +172,55 @@ fn idle_collector_exits_by_itself() {
     assert!(collector(&e).is_none(), "結束時移除 collector.json");
 }
 
+/// session 還開著（沒有 SessionEnd）時不能閒置結束：結束後使用者回來一輸入，http hook 就會連不上，
+/// Claude Code 會顯示 hook 錯誤（官方文件沒有方法能關掉這個提示）。
+#[test]
+fn idle_exit_waits_until_every_session_has_ended() {
+    let e = env(1);
+    let mut s = start_serve(&e);
+    let start = json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t1.jsonl"), "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "還有 session 開著，不能結束"
+    );
+
+    let end = json!({"session_id": "s1", "hook_event_name": "SessionEnd", "reason": "exit"});
+    http(e.hook, "POST", "/hook", &end.to_string());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while s.0.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "所有 session 結束、閒置 1 秒後要結束"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// 重啟後從 store 重建：上一輪還開著的 session 也算進行中。
+#[test]
+fn sessions_open_before_a_restart_still_keep_the_collector_alive() {
+    let e = env(1);
+    {
+        let _first = start_serve(&e);
+        let start = json!({"session_id": "s2", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": e.home.join("t2.jsonl"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &start.to_string());
+        let jsonl = e.home.join("events/s2.jsonl");
+        wait_for("session.started 進 store", || {
+            std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+        });
+    } // Kill：模擬 collector 當掉
+    let mut s = start_serve(&e);
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "s2 沒有 SessionEnd，重啟後也不能閒置結束"
+    );
+}
+
 fn ensure(e: &Env, stdin: &str) -> std::process::Output {
     let mut c = cmd(e, &["ensure"]).stdin(Stdio::piped()).spawn().unwrap();
     c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
