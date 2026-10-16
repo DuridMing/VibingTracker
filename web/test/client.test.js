@@ -18,6 +18,8 @@ function harness(opts = {}) {
     open() { this.readyState = 1; this.onopen?.({}); }
     recv(obj) { this.onmessage?.({ data: typeof obj === "string" ? obj : JSON.stringify(obj) }); }
     drop() { this.readyState = 3; this.onclose?.({}); }
+    // Node（undici）的 WebSocket 連不上時只發 error、不發 close，readyState 停在 0
+    failNoClose() { this.onerror?.({}); }
   }
   const timers = [];
   const clock = {
@@ -169,4 +171,18 @@ test("hello 帶 utcOffsetMin（算「今天」的 KPI），重連時也帶", () 
   clock.fire();
   at(1).open();
   assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: 5, utcOffsetMin: 480 });
+});
+
+test("連線失敗只有 error、沒有 close（Node 的 WebSocket）也會排下一次重連；之後補來的 close 不重複排", () => {
+  const { at, timers, clock, got, client } = harness();
+  client.connect();
+  at(0).failNoClose();
+  assert.deepEqual(got.status, ["connecting", "closed"]);
+  assert.equal(timers.length, 1);
+  at(0).onclose?.({}); // 瀏覽器會在 error 之後補 close
+  assert.equal(timers.length, 1);
+  clock.fire();
+  at(1).open();
+  at(1).recv(welcome);
+  assert.deepEqual(got.status, ["connecting", "closed", "connecting", "open"]);
 });

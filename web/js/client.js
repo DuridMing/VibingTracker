@@ -38,7 +38,9 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
       for (const channel of channels) send({ op: "subscribe", channel });
     };
     sock.onmessage = (ev) => onMessage(ev.data);
-    sock.onclose = () => {
+    // 瀏覽器在 error 之後一定補 close；Node（undici）連不上時只發 error、readyState 停在 0，
+    // 所以兩個都當成斷線，只處理第一個（ws !== sock 之後的都忽略）
+    const lost = () => {
       if (ws !== sock) return;
       ws = null;
       status("closed");
@@ -49,6 +51,8 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
       }, backoff);
       backoff = Math.min(backoff * 2, BACKOFF_MAX_MS);
     };
+    sock.onclose = lost;
+    sock.onerror = lost;
   }
 
   function onMessage(data) {
