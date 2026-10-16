@@ -915,6 +915,62 @@ fn status_lines_outside_the_window_are_dropped() {
     );
 }
 
+/// subagent 結束也是狀態行（#641）：重新整理（snapshot）後仍在窗口範圍內就送，窗口之前的不送。
+#[test]
+fn agent_finished_is_a_status_line_within_the_window() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let fin = |b: &mut B, id: &str, ts: u64| {
+        b.ev(
+            "s1",
+            "agent.finished",
+            "main",
+            ts,
+            false,
+            json!({"agentId": id, "lastMessage": null, "transcriptPath": null}),
+        )
+    };
+    l.apply(&fin(&mut b, "early", DAY));
+    for i in 0..250 {
+        l.apply(&b.text("s1", DAY + 10 + i));
+    }
+    l.apply(&fin(&mut b, "late", DAY + 1000));
+    let ids = |snap: &Value| -> Vec<String> {
+        rows(snap, "stream")
+            .iter()
+            .filter(|e| e["type"] == "agent.finished")
+            .map(|e| e["payload"]["agentId"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids(&l.snapshot(&Channel::All, 0, DAY + 2000)),
+        ["late"],
+        "窗口之前的不送"
+    );
+    assert_eq!(
+        ids(&l.snapshot(&Channel::Session("s1".into()), 0, DAY + 2000)),
+        ["early", "late"],
+        "session 頻道從 pos 1 開始，全部都送"
+    );
+}
+
+/// 「載入更多」走同一個 assemble_stream：窗口範圍內的 agent.finished 要帶上。
+#[test]
+fn more_carries_agent_finished_in_range() {
+    let mut b = B::new();
+    let window: Vec<Event> = (0..3).map(|i| b.text("s1", DAY + i * 10)).collect();
+    let pool = vec![b.ev(
+        "s1",
+        "agent.finished",
+        "main",
+        DAY + 15,
+        false,
+        json!({"agentId": "a1", "lastMessage": null, "transcriptPath": null}),
+    )];
+    let out = coding_lab::live::assemble_stream(window, pool, Some(DAY + 100));
+    assert!(out.iter().any(|e| e.kind == "agent.finished"));
+}
+
 /// #672：之後的 session.started（compact 等）不換 sessions 列的 cwd（路徑基準）。
 #[test]
 fn later_session_started_keeps_the_first_cwd() {

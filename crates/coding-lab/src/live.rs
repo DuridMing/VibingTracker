@@ -38,8 +38,8 @@ const COMPANIONS: &[&str] = &[
 ];
 /// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
 const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
-/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…）
-const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status"];
+/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗）
+const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status", "agent.finished"];
 
 /// 這個 Event 屬於哪張卡片（toolUseId）；agent.spawned 屬於開它的那個工具呼叫。
 fn card_key(e: &Event) -> Option<String> {
