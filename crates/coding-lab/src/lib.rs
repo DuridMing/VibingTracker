@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod derive;
+pub mod doing;
 pub mod event;
 pub mod hook;
 pub mod hooks;

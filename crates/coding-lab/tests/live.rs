@@ -393,6 +393,63 @@ fn session_score_is_sent_only_when_changed() {
     assert!(l.flush(DAY + 3).is_none(), "不認得的 session 略過");
 }
 
+/// `doing`：只看這一輪、只看 main；跟著 sessions 列送（#648，契約 §6）。
+#[test]
+fn session_doing_follows_the_round_and_ignores_subagents() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(&mut l, &[b.started("s1", DAY)]);
+    assert_eq!(l.session_row("s1").unwrap()["doing"], Value::Null);
+    l.flush(DAY);
+
+    let doing = |l: &Live| l.session_row("s1").unwrap()["doing"].clone();
+    l.apply(&b.ev(
+        "s1",
+        "prompt.submitted",
+        "main",
+        DAY,
+        true,
+        json!({"text": "修好 sub", "promptId": "p1"}),
+    ));
+    assert_eq!(doing(&l), "修好 sub");
+    l.apply(&b.called(
+        "s1",
+        "t1",
+        "Bash",
+        json!({"command": "cargo test"}),
+        DAY,
+        Value::Null,
+    ));
+    assert_eq!(doing(&l), "$ cargo test");
+    l.flush(DAY + 1);
+
+    l.apply(&b.ev(
+        "s1",
+        "assistant.text",
+        "a1",
+        DAY,
+        true,
+        json!({"text": "subagent 的話。", "messageId": "m0", "model": null}),
+    ));
+    assert_eq!(doing(&l), "$ cargo test", "subagent 的文字不算");
+    l.flush(DAY + 2);
+
+    l.apply(&b.ev(
+        "s1",
+        "assistant.text",
+        "main",
+        DAY,
+        true,
+        json!({"text": "測試通過。接下來改 sub。", "messageId": "m1", "model": null}),
+    ));
+    assert_eq!(doing(&l), "測試通過。");
+    let f = l.flush(DAY + 3).unwrap();
+    assert_eq!(
+        f.rows_for(&Channel::All)["sessions"][0]["doing"],
+        "測試通過。"
+    );
+}
+
 // ── attention 列
 
 #[test]

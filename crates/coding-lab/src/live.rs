@@ -11,6 +11,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::derive::relative_path;
+use crate::doing::Doing;
 use crate::event::{DangerLevel, Event, Payload};
 
 pub const STREAM_PER_SESSION: usize = 3000;
@@ -227,6 +228,8 @@ struct SessionLive {
     last_pos: Option<u64>,
     /// merge 定期重算的 session 分數（契約 §6）
     score: i64,
+    /// 「現在在做什麼」一句話的這一輪來源（#648）
+    doing: Doing,
 }
 
 #[derive(Clone)]
@@ -464,6 +467,11 @@ impl Live {
                 let text = clip(&p.text);
                 s.first_prompt.get_or_insert_with(|| text.clone());
                 s.last_prompt = Some(text);
+                s.doing.prompt(&p.text, p.source.as_deref() == Some("task"));
+            }
+            Payload::AssistantText(t) if e.agent == "main" => s.doing.text(&t.text),
+            Payload::AssistantThinking(t) if e.agent == "main" => {
+                s.doing.thinking(&t.text);
             }
             Payload::Usage(u) => {
                 s.cost += u.cost_usd;
@@ -523,8 +531,14 @@ impl Live {
                         .insert((sid.clone(), c.tool_use_id.clone()), vec![e.clone()]);
                 }
                 let id = self.ensure_agent(&sid, &e.agent, ts);
+                let current = describe(&c.tool, &c.input, &cwd);
+                if e.agent == "main"
+                    && let Some(s) = self.sessions.get_mut(&sid)
+                {
+                    s.doing.tool(&current);
+                }
                 if let Some(a) = self.agents.get_mut(&id) {
-                    a.current = Some(describe(&c.tool, &c.input, &cwd));
+                    a.current = Some(current);
                     a.tool_count += 1;
                     let danger = c
                         .danger
@@ -944,7 +958,7 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": Value::Null, "score": s.score,
+            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
         }))
