@@ -182,11 +182,12 @@ function createWorld(n) {
       tool = "Write"; input = { file_path: `src/new/${id.slice(-4)}.ts` };
       t.derived.push({ type: "file.write", payload: { path: input.file_path, isNew: true, content: "export const x = 1;\nexport const y = 2;\n", truncated: false } });
       kpi.writes++;
-    } else if (y < 0.62 && [...agents.values()].filter((a) => a.session === s.id).length < 4) {
+    } else if (y < 0.62 && [...agents.values()].filter((a) => a.session === s.id && a.status === "run").length < 4) {
       tool = "Task"; input = { description: "查 users 相關的呼叫點", subagent_type: pick(AGENT_TYPES) };
       const agentId = `a${(++agentSeq).toString(16).padStart(16, "0")}`;
-      const name = `查呼叫點 ${agentSeq}`;
-      const a = { id: `${s.id}/${agentId}`, session: s.id, agentId, agentType: input.subagent_type, name, task: input.description, status: "run", current: null, toolCount: 0, parentToolUseId: id, spawnedAt: Date.now(), finishedAt: null };
+      const name = agentSeq % 5 === 0 ? `找出所有呼叫 listUsers 的地方並整理成清單，\n順便看分頁參數 ${agentSeq}` : `查呼叫點 ${agentSeq}`;
+      const model = r() < 0.4 ? "haiku" : s.model; // §6 agents.model：subagent 可以用不同模型
+      const a = { id: `${s.id}/${agentId}`, session: s.id, agentId, agentType: input.subagent_type, name, model, task: input.description, status: "run", current: null, toolCount: 0, parentToolUseId: id, spawnedAt: Date.now(), finishedAt: null };
       agents.set(a.id, a);
       rowsOut.agents.push(a);
       kpi.agents++;

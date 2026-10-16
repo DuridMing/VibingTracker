@@ -179,8 +179,10 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .agc{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:999px;background:var(--panel-2);font-size:11px;color:var(--muted);max-width:100%}
 .agc i{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none}
 .agc.run i{background:var(--teal)}.agc.done i{background:var(--accent)}.agc.fail i,.agc.danger i{background:var(--rose)}
-.agc b{font-weight:500;color:var(--ink)}
-.agc .cur{font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px}
+.agc b{font-weight:500;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:12em;flex:0 0 auto}
+.agc .mdl{font-size:10px;color:var(--violet);white-space:nowrap}
+.agc.fin{color:var(--muted)}.agc.fin i{background:var(--accent)}
+.agc .cur{font-family:var(--mono);font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;flex:0 1 auto;min-width:0}
 .agc.bg{opacity:.55;font-style:italic}.agc.bg b{font-weight:400;color:var(--muted)}
 .fb{border:1px solid var(--line);border-radius:8px;flex:1;min-height:200px;overflow:auto}
 

@@ -9,6 +9,7 @@ import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, KIND_TEXT } from "./attention.js";
+import { agentView, agentLabel } from "./agents.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -184,12 +185,18 @@ function renderSessions() {
 
 const AGENT_STATUS_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
 
-// 每個 session 一列：main、subagent 各一個 chip；bg 只在執行中出現、淡色（contracts.md §6）。
+// 每個 session 一列：main、背景、執行中與出事的 subagent 各一個 chip；已完成的收成「✓ n」（contracts.md §6）。
 function agentChip(a) {
   const isBg = a.agentId === "bg";
-  return h("span", { class: `agc ${a.status}${isBg ? " bg" : ""}`, title: [a.name, a.task, AGENT_STATUS_TEXT[a.status]].filter(Boolean).join("\n") },
-    h("i"), h("b", {}, a.name ?? a.agentId),
+  const title = [a.label, a.agentType, a.model, a.task, AGENT_STATUS_TEXT[a.status], a.current].filter(Boolean).join("\n");
+  return h("span", { class: `agc ${a.status}${isBg ? " bg" : ""}`, title },
+    h("i"), h("b", {}, a.label),
+    a.model ? h("small", { class: "mdl" }, a.model) : null,
     !isBg && a.current ? h("span", { class: "cur" }, a.current) : null);
+}
+
+function doneChip(done) {
+  return h("span", { class: "agc fin", title: `已完成的 subagent（${done.length}）\n` + done.map((a) => `· ${a.label}`).join("\n") }, h("i"), `✓ ${done.length}`);
 }
 
 // 每個 session 一列，只重建內容有變的那一列（Agents 的「目前動作」幾乎每幀都在變）
@@ -211,16 +218,18 @@ function renderAgents() {
     return;
   }
   lastSig.delete("agentsEmpty");
-  const rank = (a) => (a.agentId === "main" ? 0 : a.agentId === "bg" ? 1 : 2);
   const keep = new Set();
   let prev = null;
   for (const s of live) {
     keep.add(s.id);
-    const list = (bySession.get(s.id) ?? []).sort((x, y) => rank(x) - rank(y) || (x.spawnedAt ?? 0) - (y.spawnedAt ?? 0));
-    const sig = list.map((a) => `${a.id}:${a.status}:${a.name}:${a.current ?? ""}`).join("|");
+    const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model });
+    const chips = [v.main, v.bg, ...v.active].filter(Boolean);
+    const sig = chips.map((a) => `${a.id}:${a.status}:${a.label}:${a.model ?? ""}:${a.current ?? ""}`).join("|") + `|done:${v.done.map((a) => a.id).join(",")}`;
     let row = agentRows.get(s.id);
     if (!row || row.sig !== sig) {
-      const el = h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(list.length ? list.map(agentChip) : [h("span", { class: "none" }, "—")])));
+      const parts = chips.map(agentChip);
+      if (v.done.length) parts.push(doneChip(v.done));
+      const el = h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(parts.length ? parts : [h("span", { class: "none" }, "—")])));
       if (row) row.el.replaceWith(el);
       row = { el, sig };
       agentRows.set(s.id, row);
@@ -515,7 +524,8 @@ function selectChange(key) {
 
 // ---------- 合流串流 ----------
 const stream = createStream();
-const agentName = (session, agentId) => store.agents.get(`${session}/${agentId}`)?.name ?? null;
+// 串流前綴、改動紀錄、Agents 面板用同一套名稱（agents.js）
+const agentName = (session, agentId) => { const a = store.agents.get(`${session}/${agentId}`); return a ? agentLabel(a) : null; };
 const benchProf = new URLSearchParams(location.search).has("bench") ? [] : null;
 const view = createStreamView({
   prof: benchProf,
