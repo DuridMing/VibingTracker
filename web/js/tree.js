@@ -20,6 +20,18 @@ function ancestors(path) {
   return out;
 }
 
+// 絕對目錄 dir 接上相對路徑 rel（處理 . 與 ..）
+function join(dir, rel) {
+  const out = dir.split("/");
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") {
+      if (out.length > 1) out.pop();
+    } else out.push(seg);
+  }
+  return out.join("/");
+}
+
 // 包含 p 的 worktree 裡最深的那個（主工作樹也在清單裡，裡面的 worktree 比它深）
 function worktreeOf(p, worktrees) {
   let best = null;
@@ -28,8 +40,9 @@ function worktreeOf(p, worktrees) {
 }
 
 // file.* 的 path（相對 session 的 cwd，或根以外的絕對路徑，contracts §4）→ 相對專案根的路徑；不在專案裡回 null。
-// collector 給了 worktree 清單（/api/files 的 worktrees）時照它：cwd 在哪個 worktree 底下，路徑就相對那個 worktree；
-// 主工作樹裡不在樹上的目錄（被 ignore 的，例如 e2e 的暫存目錄）不算專案。
+// collector 給了 worktree 清單（/api/files 的 worktrees）時照它：cwd 接上路徑落在哪個 worktree，就相對那個 worktree
+// （session 從主工作樹開、改 worktree 裡的檔時，路徑是 worktrees/… 這種穿進去的相對路徑）；
+// cwd 在主工作樹裡不在樹上的目錄（被 ignore 的，例如 e2e 的暫存目錄）不算專案。
 // 沒有清單（舊的 collector）時用猜的：樹裡有這個目錄就是子目錄（補前綴），沒有就當成 worktree。
 export function projectPath({ root, cwd, path, hasDir, worktrees = null }) {
   const r = norm(root);
@@ -43,12 +56,14 @@ export function projectPath({ root, cwd, path, hasDir, worktrees = null }) {
   if (cwd == null) return null;
   if (wts) {
     const c = norm(cwd);
-    const w = worktreeOf(c, wts);
-    if (!w) return null;
-    const rel = under(c, w);
-    if (!rel) return p;
-    if (w === r && !hasDir(rel)) return null;
-    return `${rel}/${p}`;
+    const cw = worktreeOf(c, wts);
+    if (cw === r) {
+      const rel = under(c, r);
+      if (rel && !hasDir(rel)) return null;
+    }
+    const abs = join(c, p);
+    const w = worktreeOf(abs, wts);
+    return w ? under(abs, w) || null : null;
   }
   const c = under(norm(cwd), r);
   if (c == null) return null;

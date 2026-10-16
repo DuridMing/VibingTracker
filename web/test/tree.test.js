@@ -48,6 +48,9 @@ test("projectPath：collector 給了 worktree 清單就照它；被 ignore 的�
   assert.equal(pp("/elsewhere/wt", "src/a.rs"), "src/a.rs", "放在根以外的 worktree");
   assert.equal(pp("/repo/web", "js/main.js"), "web/js/main.js");
   assert.equal(pp(ROOT, "/repo/worktrees/feature/x/src/a.rs"), "src/a.rs", "絕對路徑在 worktree 裡");
+  // 真資料：session 從主工作樹開、改 worktree 裡的檔，file.* 的 path 是相對第一次的 cwd（#672）
+  assert.equal(pp(ROOT, "worktrees/feature/x/src/a.rs"), "src/a.rs", "相對路徑穿進 worktree");
+  assert.equal(pp("/repo/web", "../worktrees/feature/x/web/js/main.js"), "web/js/main.js", "有 .. 的相對路徑");
 });
 
 test("setFiles 帶 worktrees：e2e 暫存目錄的 session 不進樹", () => {
