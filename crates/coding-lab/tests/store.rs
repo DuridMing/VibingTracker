@@ -1043,3 +1043,31 @@ fn tails_are_rebuilt_with_the_index() {
         [("main".to_string(), Some("/t/s1.jsonl".to_string()), 6)]
     );
 }
+
+/// #686：工具卡片碰的檔（索引改動用）在 session 結束時清掉，不隨時間一直長大。
+#[test]
+fn tool_paths_are_forgotten_when_the_session_ends() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(ev(
+        "s1",
+        2,
+        "file.read",
+        None,
+        1002,
+        json!({"toolUseId": "t1", "path": "a.rs"}),
+    ));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 1);
+    s.append(ev(
+        "s1",
+        3,
+        "session.ended",
+        None,
+        1003,
+        json!({"reason": "exit"}),
+    ));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 0);
+}

@@ -897,6 +897,11 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// 記著的「工具卡片碰的檔」數（測試確認 session 結束後清掉）
+    pub fn cached_tool_paths(&self) -> usize {
+        self.path_of_tool.len()
+    }
+
     pub fn recover_bytes(&self) -> u64 {
         self.recover_bytes
     }
@@ -1103,6 +1108,8 @@ fn index_event(
             }
         }
         Payload::SessionEnded(p) => {
+            // 結束的 session 不會再有工具結束的 Event（#686）
+            path_of_tool.retain(|(s, _), _| s != sid);
             exec(
                 tx,
                 "UPDATE sessions SET ended_at = ?2, end_reason = ?3, status = 'ended', status_since = ?2 WHERE id = ?1",

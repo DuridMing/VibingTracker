@@ -346,8 +346,17 @@ impl Tracker {
         self.signals.push((sig, at));
     }
 
+    /// 還留著的動態訊號數（測試確認衰減到可忽略的會被清掉）
+    pub fn signal_count(&self) -> usize {
+        self.signals.len()
+    }
+
     pub fn tick(&mut self, now: u64) -> Vec<Change> {
         let mut out = Vec::new();
+        // 超過 10 個半衰期的動態訊號（剩不到 0.1%）清掉，scores() 不必一直走過它們（#686）
+        let gone_after = (self.cfg.half_life_min * 10.0 * 60_000.0) as u64;
+        self.signals
+            .retain(|(_, at)| now.saturating_sub(*at) < gone_after);
         let due: Vec<String> = self
             .pending_wait
             .iter()

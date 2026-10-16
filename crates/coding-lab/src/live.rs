@@ -24,6 +24,8 @@ const SLOT_MS: u64 = 15 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const SLOTS_KEPT_MS: u64 = 50 * 60 * 60 * 1000;
 const TEXT_LIMIT: usize = 200;
+/// 結束的 session 在 live 裡多留多久（之後由 /api/sessions 與回放查看，#686）
+pub const ENDED_KEPT_MS: u64 = 2 * 60 * 60 * 1000;
 const STATUS_PER_SESSION: usize = 500;
 
 /// 卡片的伴隨 Event：沒有 pos，附在串流裡帶 pos 的卡片 Event 旁邊（contracts.md §6）。
@@ -375,6 +377,10 @@ pub struct Live {
     dirty_attention: BTreeMap<String, bool>,
     frame_no: u64,
     history: VecDeque<Arc<Frame>>,
+    /// KPI 只在需要時重算（#686 R23）：有新 Event、跨時間格、跨午夜或有新的時區
+    kpi_dirty: bool,
+    kpi_slot: u64,
+    kpi_computes: u64,
 }
 
 impl Live {
@@ -390,12 +396,39 @@ impl Live {
         self.sessions.len()
     }
 
+    /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
+    pub fn kpi_computations(&self) -> u64 {
+        self.kpi_computes
+    }
+
+    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）：之後由 /api/sessions 與回放查看。
+    /// 不送 deleted 列：已經開著的頁面可能還有它的串流行，保留那一列比較不會出錯。
+    fn evict_ended(&mut self, now: u64) {
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for sid in gone {
+            self.sessions.remove(&sid);
+            self.streams.remove(&sid);
+            self.status_lines.remove(&sid);
+            self.bg_running.remove(&sid);
+            self.dirty_sessions.remove(&sid);
+            self.card_events.retain(|(s, _), _| *s != sid);
+            self.staged.retain(|(s, _), _| *s != sid);
+            self.agents.retain(|_, a| a.session != sid);
+        }
+    }
+
     /// 有連線使用這個時區（`hello.utcOffsetMin`），之後的 frame 會帶它的 kpi。
     pub fn register_offset(&mut self, offset_min: i32) {
         self.offsets.entry(offset_min).or_insert(None);
     }
 
     pub fn apply(&mut self, e: &Event) {
+        self.kpi_dirty = true;
         let carried = self.carry_danger(e);
         // 接手來的 danger 只為了顯示，KPI 的 dangers 不再計一次
         let danger_carried = carried.is_some();
@@ -833,8 +866,23 @@ impl Live {
 
     /// 打包這段時間的變化；沒有任何變化回 None。
     pub fn flush(&mut self, now: u64) -> Option<Arc<Frame>> {
+        self.evict_ended(now);
         let mut kpi = BTreeMap::new();
-        let offsets: Vec<i32> = self.offsets.keys().copied().collect();
+        let slot = now / SLOT_MS;
+        let recompute = self.kpi_dirty
+            || slot != self.kpi_slot
+            || self.offsets.iter().any(|(off, last)| {
+                last.as_ref()
+                    .is_none_or(|(day, _)| *day != day_start(*off, now))
+            });
+        let offsets: Vec<i32> = if recompute {
+            self.kpi_dirty = false;
+            self.kpi_slot = slot;
+            self.kpi_computes += 1;
+            self.offsets.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
         for off in offsets {
             let current = self.kpi(off, now);
             let day = day_start(off, now);

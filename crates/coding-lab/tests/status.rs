@@ -1248,3 +1248,17 @@ fn subagent_hook_after_end_does_not_reopen() {
         .feed(pre_agent("tx", "ls", "x", 2_500));
     assert_eq!(r.last_status(), "ended");
 }
+
+/// #686：衰減超過 10 個半衰期的動態訊號在 tick 時清掉（scores() 不必每 10 秒走過全部），四捨五入後分數不變。
+#[test]
+fn decayed_signals_are_dropped_without_changing_the_score() {
+    use coding_lab::status::Tracker;
+    let mut t = Tracker::default();
+    t.signal(Signal::Conflict, NOW);
+    t.signal(Signal::BigEdit, NOW + 95 * MIN);
+    let later = NOW + 101 * MIN; // 第一個已經過 10 個半衰期（半衰期 10 分鐘）
+    let before = t.score(later).round();
+    t.tick(later);
+    assert_eq!(t.signal_count(), 1, "只剩還沒衰減完的那個");
+    assert_eq!(t.score(later).round(), before);
+}
