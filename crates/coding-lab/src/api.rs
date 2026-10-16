@@ -272,6 +272,12 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
         None => (Vec::new(), false),
     };
 
+    // 每種基準都帶 worktree 清單：前端靠它把 session 的 file.* 路徑對到樹上（#644）
+    let wts = root
+        .as_ref()
+        .map(|r| worktrees(Path::new(r)))
+        .unwrap_or_default();
+
     let (base_name, base_ref, sources): (String, Value, Vec<Source>) = match base {
         Base::Session(id) => {
             let entries = session_paths.unwrap_or_default();
@@ -327,8 +333,9 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
                 }) else {
                     return error(StatusCode::CONFLICT, "repo 沒有 main 也沒有 master 分支");
                 };
-                let sources = worktrees(rp)
-                    .into_iter()
+                let sources = wts
+                    .iter()
+                    .cloned()
                     .map(|(wt, branch)| Source {
                         entries: git_changes(Path::new(&wt), &format!("{main}...HEAD")),
                         by: json!({ "worktree": wt, "branch": branch }),
@@ -345,6 +352,7 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
     ok(&json!({
         "root": root_path, "base": base_name, "baseRef": base_ref,
         "tree": tree, "treeTruncated": truncated, "changes": merge_sources(&sources),
+        "worktrees": wts.iter().map(|(path, branch)| json!({ "path": path, "branch": branch })).collect::<Vec<_>>(),
     }))
 }
 
