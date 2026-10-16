@@ -64,8 +64,22 @@ async fn handle(State(state): State<Arc<HookState>>, body: Bytes) -> StatusCode 
     let ts_seen = crate::now_ms();
     match HookInput::from_json(&body) {
         Ok(mut hook) => {
-            // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）
-            crate::derive::attach_probe(&mut hook);
+            // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）。
+            // 讀檔是同步 I/O，放到 blocking 執行緒，不佔住處理其他 hook 的 worker
+            if crate::derive::needs_probe(&hook) {
+                hook = match tokio::task::spawn_blocking(move || {
+                    crate::derive::attach_probe(&mut hook);
+                    hook
+                })
+                .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("coding-lab hooks：讀檔探針失敗：{e}");
+                        return StatusCode::OK;
+                    }
+                };
+            }
             if state.tx.try_send(Input::Hook { hook, ts_seen }).is_err() {
                 let n = state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!("coding-lab hooks：merge 忙碌，丟棄 hook（累計 {n}）");

@@ -23,6 +23,10 @@ use crate::prices::Prices;
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
 /// 降級進串流的卡片等 transcript tool_use 行的上限；過了就不再把之後的文字標成延遲。
 pub const FALLBACK_WAIT_MS: u64 = 60_000;
+/// session 結束後在記憶體留多久（晚到的 transcript 行、tail 關掉前最後一次讀檔）。
+pub const SESSION_EVICT_AFTER_MS: u64 = 10 * 60 * 1000;
+/// 沒有 SessionEnd（終端機被直接關掉）的 session，多久沒有任何事件就移除。
+pub const SESSION_IDLE_EVICT_MS: u64 = 24 * 60 * 60 * 1000;
 /// 背景 agent 的 PreToolUse 等執行結果的上限，過了就丟掉。
 pub const BG_HOLD_MS: u64 = 60_000;
 /// 工具輸出存前截斷的上限（contracts.md §4）。
@@ -100,6 +104,9 @@ struct Session {
     started_agents: HashSet<String>,
     /// 背景 agent 的 PreToolUse：工具通常不會執行，等到 PostToolUse／Failure 才建卡片
     held_bg: HashMap<String, HeldTool>,
+    /// 最後一次收到這個 session 輸入的時間，與 SessionEnd 的時間：決定何時從記憶體移除
+    last_seen: u64,
+    ended_at: Option<u64>,
 }
 
 struct HeldTool {
@@ -166,7 +173,29 @@ impl Merger {
         self.resumed.insert(sid.to_string(), (seq, pos));
     }
 
+    /// 記憶體裡的 session 數。
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     pub fn handle(&mut self, input: Input) -> Vec<Event> {
+        let seen = match &input {
+            Input::Hook { hook, ts_seen } => Some((hook.session_id(), *ts_seen)),
+            Input::Line {
+                session, ts_seen, ..
+            }
+            | Input::Degraded {
+                session, ts_seen, ..
+            }
+            | Input::Recovered {
+                session, ts_seen, ..
+            } => Some((session.as_str(), *ts_seen)),
+            Input::TailReset { .. } => None,
+        };
+        if let Some((sid, ts)) = seen {
+            let s = self.sessions.entry(sid.to_string()).or_default();
+            s.last_seen = s.last_seen.max(ts);
+        }
         match input {
             Input::Hook { hook, ts_seen } => self.on_hook(&hook, ts_seen),
             Input::Line {
@@ -238,6 +267,28 @@ impl Merger {
         }
     }
 
+    /// 結束超過 [`SESSION_EVICT_AFTER_MS`]、或 [`SESSION_IDLE_EVICT_MS`] 沒有任何輸入的 session 移出記憶體；
+    /// seq／pos 留在 `resumed`，resume 回來時接著編號。
+    fn evict(&mut self, now: u64) {
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.ended_at
+                    .is_some_and(|t| t + SESSION_EVICT_AFTER_MS <= now)
+                    || s.last_seen + SESSION_IDLE_EVICT_MS <= now
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            if let Some(s) = self.sessions.remove(&id)
+                && s.seq > 0
+            {
+                self.resumed.insert(id, (s.seq, s.pos));
+            }
+        }
+    }
+
     fn recovered(&mut self, sid: &str, file: String, ts_seen: u64) -> Event {
         let payload = Payload::TranscriptRecovered(TranscriptHealth { file, error: None });
         self.emit(
@@ -253,6 +304,7 @@ impl Merger {
 
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
+        self.evict(now);
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         let mut out = Vec::new();
         for sid in sessions {
@@ -385,6 +437,7 @@ impl Merger {
         let s = |k: &str| h.str_field(k).map(str::to_string);
         match h.event_name() {
             "SessionStart" => {
+                self.sessions.entry(sid.clone()).or_default().ended_at = None;
                 let p = SessionStarted {
                     cwd: s("cwd").unwrap_or_default(),
                     source: s("source").unwrap_or_else(|| "startup".into()),
@@ -462,6 +515,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
             }
             "SessionEnd" => {
+                self.sessions.entry(sid.clone()).or_default().ended_at = Some(ts_seen);
                 let p = SessionEnded {
                     reason: s("reason"),
                 };

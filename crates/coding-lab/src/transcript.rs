@@ -83,11 +83,22 @@ impl TailReader {
         if let Ok(meta) = fs::metadata(path) {
             r.id = file_id(&meta);
             if start == Start::End {
-                let mut bytes = Vec::new();
-                File::open(path)?.read_to_end(&mut bytes)?;
-                let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-                r.line_no = bytes[..complete].iter().filter(|b| **b == b'\n').count() as u64;
-                r.offset = complete as u64;
+                // 分段數換行：transcript 可能上百 MB（Read 大檔整個進一行），不整個讀進記憶體
+                let mut f = File::open(path)?;
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut read = 0u64;
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = &buf[..n];
+                    r.line_no += chunk.iter().filter(|b| **b == b'\n').count() as u64;
+                    if let Some(i) = chunk.iter().rposition(|b| *b == b'\n') {
+                        r.offset = read + i as u64 + 1;
+                    }
+                    read += n as u64;
+                }
             }
         }
         Ok(r)
@@ -231,10 +242,19 @@ async fn run(
     opts: TailOptions,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let mut reader = match TailReader::open(&path, start) {
-        Ok(r) => r,
-        Err(e) => {
+    // 從檔尾開始要掃過整個檔案數行號，放到 blocking 執行緒，不卡住 runtime
+    let opened = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || TailReader::open(&path, start)).await
+    };
+    let mut reader = match opened {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             eprintln!("coding-lab transcript：開不了 {}：{e}", path.display());
+            return;
+        }
+        Err(e) => {
+            eprintln!("coding-lab transcript：開 {} 失敗：{e}", path.display());
             return;
         }
     };

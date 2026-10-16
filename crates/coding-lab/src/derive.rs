@@ -229,15 +229,22 @@ pub fn relative_path(cwd: &str, path: &str) -> String {
     }
 }
 
+/// 這個 hook 要不要讀檔探測（PreToolUse 的 Edit／Write）。
+pub fn needs_probe(h: &HookInput) -> bool {
+    h.event_name() == "PreToolUse"
+        && matches!(
+            h.str_field("tool_name").unwrap_or_default(),
+            "Edit" | "Write"
+        )
+}
+
 /// PreToolUse 的 Edit／Write：**回應 hook 之前**讀檔（#626：Claude Code 等 hook 回應才執行工具）。
+/// 同步 I/O，async 的呼叫端要放進 `spawn_blocking`。
 pub fn attach_probe(h: &mut HookInput) {
-    if h.event_name() != "PreToolUse" {
+    if !needs_probe(h) {
         return;
     }
     let tool = h.str_field("tool_name").unwrap_or_default();
-    if !matches!(tool, "Edit" | "Write") {
-        return;
-    }
     let Some(input) = h.field("tool_input") else {
         return;
     };
@@ -249,8 +256,9 @@ pub fn attach_probe(h: &mut HookInput) {
         exists: meta.is_some(),
         hunk: None,
     };
+    // 只讀一般檔案：FIFO、裝置檔讀了可能不會回來
     if tool == "Edit"
-        && meta.is_some_and(|m| m.len() <= PROBE_MAX_BYTES)
+        && meta.is_some_and(|m| m.is_file() && m.len() <= PROBE_MAX_BYTES)
         && let Ok(text) = std::fs::read_to_string(path)
     {
         let old = input["old_string"].as_str().unwrap_or_default();

@@ -324,3 +324,29 @@ fn every_sample_message_line_has_a_single_content_block() {
     }
     assert!(checked > 0);
 }
+
+/// #670-14：從檔尾開始時分段數換行（不把整個 transcript 讀進記憶體）；行跨過讀取區塊的邊界、
+/// 換行剛好落在邊界上、尾端有半行，行號與位移都要對。
+#[test]
+fn start_at_end_on_a_large_file_counts_lines_across_chunks() {
+    let mut content = String::new();
+    let mut n = 0u64;
+    while content.len() < 300 * 1024 {
+        n += 1;
+        let pad = "x".repeat((n as usize * 37) % 5000);
+        content.push_str(&format!(
+            "{}\n",
+            json!({"type": "assistant", "uuid": format!("u{n}"), "pad": pad})
+        ));
+    }
+    content.push_str(r#"{"half"#);
+    let p = tmpfile(&content);
+    let mut r = TailReader::open(&p, Start::End).unwrap();
+    assert!(r.poll().unwrap().lines.is_empty());
+    append(&p, "\":1}\n");
+    append(&p, &line("next"));
+    let got = r.poll().unwrap();
+    let nos: Vec<u64> = got.lines.iter().map(|l| l.no).collect();
+    assert_eq!(nos, [n + 1, n + 2]);
+    assert_eq!(got.lines[1].value["uuid"], "next");
+}

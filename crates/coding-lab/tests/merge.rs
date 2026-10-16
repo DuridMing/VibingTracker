@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
-use coding_lab::merge::{DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger};
+use coding_lab::merge::{
+    DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger, SESSION_EVICT_AFTER_MS,
+    SESSION_IDLE_EVICT_MS,
+};
 use serde_json::{Value, json};
 
 const S: &str = "s1";
@@ -916,4 +919,50 @@ fn card_known_only_from_post_tool_use_still_enters_the_stream() {
     assert_eq!(b[0].pos(), Some(1));
     let c = m.handle(line(2, tool_use("u2", "m1", "t1"), 1200));
     assert!(c.is_empty(), "已進串流的卡片不再送");
+}
+
+fn hook_at(event: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": event, "source": "resume",
+                          "prompt": "hi", "cwd": "/p"}),
+        ),
+        ts_seen: ts,
+    }
+}
+
+/// #670-12：結束的 session 過了寬限期就從記憶體移除（常駐模式下不能一直長、tick 也不能掃全部歷史），
+/// 之後 resume 回來 seq／pos 照樣接續。
+#[test]
+fn ended_sessions_are_evicted_after_a_grace_period_and_keep_their_numbering() {
+    let mut m = merger();
+    m.handle(hook_at("UserPromptSubmit", 1000));
+    let end = m.handle(hook_at("SessionEnd", 2000));
+    let last_seq = end.last().unwrap().seq;
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_EVICT_AFTER_MS - 1);
+    assert_eq!(m.session_count(), 1, "寬限期內留著（晚到的 transcript 行）");
+    m.tick(2000 + SESSION_EVICT_AFTER_MS);
+    assert_eq!(m.session_count(), 0);
+
+    let back = m.handle(hook_at("SessionStart", 9_000_000));
+    assert_eq!(back[0].seq, last_seq + 1, "移除後 resume 回來接著編號");
+}
+
+/// #670-12：resume 回來的 session 不會被當成已結束移除；完全沒動靜的 session 放久了也移除。
+#[test]
+fn resumed_sessions_stay_and_abandoned_ones_are_evicted() {
+    let mut m = merger();
+    m.handle(hook_at("SessionEnd", 1000));
+    m.handle(hook_at("SessionStart", 2000));
+    m.tick(1000 + SESSION_EVICT_AFTER_MS);
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_IDLE_EVICT_MS - 1);
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_IDLE_EVICT_MS);
+    assert_eq!(
+        m.session_count(),
+        0,
+        "沒有 SessionEnd（終端機被關掉）也不能永遠留著"
+    );
 }
