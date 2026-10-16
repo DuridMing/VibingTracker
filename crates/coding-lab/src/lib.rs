@@ -4,3 +4,12 @@ pub mod event;
 pub mod hook;
 pub mod merge;
 pub mod store;
+pub mod transcript;
+
+/// 現在的 epoch 毫秒（Event 的 `ts_seen`）。
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
