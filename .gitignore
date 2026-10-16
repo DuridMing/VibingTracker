@@ -21,3 +21,6 @@
 
 # 在這個 repo 自我追蹤用的 Claude Code hook 設定（掛本機 coding-lab）
 /.claude/settings.local.json
+
+# Python 快取（scripts/、tests/ 的工具）
+__pycache__/
