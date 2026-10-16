@@ -51,7 +51,8 @@ bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，永遠不開外
 
 [web]
 bind = "127.0.0.1:4801"   # 要從別台看就改 tailnet IP，例如 "100.x.x.x:4801"
-token = ""                 # bind 不是 127.0.0.1 時必填，留空會拒絕啟動
+auth = "local-open"       # 多人共用的機器改成 "always"，連 localhost 也要金鑰
+remote_thinking = "on_demand"   # 遠端看 thinking：on_demand（點開才載入）| hide | show
 ```
 
 | 檔案 | 用途 |
@@ -60,7 +61,18 @@ token = ""                 # bind 不是 127.0.0.1 時必填，留空會拒絕�
 | `~/.coding-lab/prices.json` | 覆寫模型單價表 |
 | `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替 |
 
-資料保留 30 天（`coding-lab prune`）。從別台機器瀏覽時建議走 Tailscale／ZeroTier；遠端瀏覽預設不送出 thinking。
+資料保留 30 天（`coding-lab prune`）。
+
+### 從本機看伺服器上的 session
+
+在伺服器上開發、從自己的電腦看是主要用法，有兩種連法：
+
+- **SSH 通道**（最簡單）：`ssh -N -L 4801:127.0.0.1:4801 <server>`，然後在本機開 <http://127.0.0.1:4801>。
+- **tailnet**：伺服器的 `[web].bind` 改成 tailnet IP，用金鑰登入。在伺服器上執行 `coding-lab key create --name laptop` 產生金鑰（只會顯示一次），或用 `coding-lab key login-link` 印出 5 分鐘有效的一次性登入連結。
+
+要一次看多台伺服器，在本機跑 `coding-lab hub`，用 `coding-lab hub add <名稱> <網址>` 加入各台。
+
+遠端的 thinking 預設收合、點開才載入；讀 `.env` 這類敏感輸出在遠端一律不顯示。金鑰驗證與 hub 仍在規劃中。
 
 ## 開發
 
