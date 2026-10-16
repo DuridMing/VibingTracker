@@ -29,6 +29,11 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
   let raf = 0;
   let pendingShift = 0; // 下次 render 時要加到 scrollTop 的量（上方丟掉為負、補進為正）
   let anchor = null; // 篩選改變時要維持在原位置的行
+  // 上一次 render 時畫面頂端往下的幾行（key 與離可見頂端的距離）。篩選時從裡面挑錨點：
+  // - render 之間若上限丟掉了舊行，model.rows 已經變了但 top 還是舊的，用 top 去 model.rows 查會錯開幾行；
+  // - 頂端那一行如果正好屬於被篩掉的 session，篩選後高度變 0，用它當錨點下面每一行都會往上跳，
+  //   所以要挑篩選後仍看得見的第一行。
+  let lastTopRows = [];
   // 幾何資訊快取起來，render 時不讀 DOM（讀 scrollHeight／offsetTop 會強制排版）
   const geo = { off: 0, vh: 0, stale: true };
   const readGeo = () => {
@@ -121,7 +126,10 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
       top = layout(rows, heightOf);
       dirty = false;
       space.style.height = `${top[n]}px`;
-      if (idx >= 0 && !follow) scroller.scrollTop = geo.off + top[idx] - anchor.delta;
+      if (idx >= 0 && !follow) {
+        scroller.scrollTop = geo.off + top[idx] - anchor.delta;
+        pendingShift = 0; // 已經用錨點直接定位，上方丟掉／補進的位移不能再疊一次
+      }
       anchor = null;
     } else if (dirty) {
       top = layout(rows, heightOf);
@@ -138,6 +146,14 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
       if (pendingShift) scroller.scrollTop += pendingShift;
       pendingShift = 0;
       y0 = scroller.scrollTop - geo.off;
+    }
+    lastTopRows = [];
+    if (!follow && n) {
+      let i = indexAt(top, y0);
+      while (i < n && top[i + 1] === top[i]) i++;
+      for (; i < n && top[i] < y0 + geo.vh && lastTopRows.length < 80; i++) {
+        if (top[i + 1] > top[i]) lastTopRows.push({ key: rows[i].key, delta: top[i] - y0 });
+      }
     }
     const t1 = T();
     const y1 = y0 + geo.vh;
@@ -221,7 +237,11 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
     },
     // 篩選改變：維持畫面頂端那一行的位置
     filterChanged() {
-      if (!follow && model.rows.length) {
+      const byKey = !follow && lastTopRows.length ? new Map(model.rows.map((r) => [r.key, r])) : null;
+      const pick = byKey && lastTopRows.find((a) => byKey.has(a.key) && model.isVisible(byKey.get(a.key)));
+      if (pick) {
+        anchor = { ...pick };
+      } else if (!follow && model.rows.length && !dirty) {
         const y = scroller.scrollTop - geo.off;
         let i = indexAt(top, y);
         while (i < model.rows.length && top[i + 1] === top[i]) i++;
