@@ -7,7 +7,7 @@ const BACKOFF_MAX_MS = 10_000;
 const MORE_LIMIT_MAX = 500;
 const DISPATCH = ["welcome", "snapshot", "frame", "more"];
 
-export function createClient({ url, WebSocket, setTimeout, clearTimeout, handlers = {} }) {
+export function createClient({ url, WebSocket, setTimeout, clearTimeout, handlers = {}, utcOffsetMin = null }) {
   const channels = new Set();
   let ws = null;
   let lastFrame = null;
@@ -33,6 +33,7 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
     sock.onopen = () => {
       const hello = { op: "hello", protocol: PROTOCOL };
       if (lastFrame !== null) hello.resume = lastFrame;
+      if (typeof utcOffsetMin === "number") hello.utcOffsetMin = utcOffsetMin;
       send(hello);
       for (const channel of channels) send({ op: "subscribe", channel });
     };

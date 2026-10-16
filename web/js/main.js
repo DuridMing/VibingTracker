@@ -60,7 +60,7 @@ function renderTabs() {
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) =>
-      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: `${s.id}\n${s.prompt ?? ""}`, onclick: () => selectTab(s.id) },
+      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: `${s.id}\n${s.lastPrompt ?? ""}`, onclick: () => selectTab(s.id) },
         h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
         h("span", { class: "dot" }),
         sessTag(s))),
@@ -84,17 +84,37 @@ function renderSessions() {
       ? all.map((s) =>
           h("button", { class: ui.tab === s.id ? "sel" : "", onclick: () => selectTab(s.id) },
             sessTag(s),
-            h("span", {}, h("span", { class: "pr" }, s.prompt ?? "—"), h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`)),
+            h("span", {}, h("span", { class: "pr", title: s.firstPrompt ?? "" }, s.firstPrompt ?? "—"), h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`)),
             h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")))
       : [h("div", { class: "none" }, "尚無 session")]),
   );
 }
 
+const AGENT_STATUS_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
+
+// 每個 session 一列：main、subagent 各一個 chip；bg 只在執行中出現、淡色（contracts.md §6）。
+function agentChip(a) {
+  const isBg = a.agentId === "bg";
+  return h("span", { class: `agc ${a.status}${isBg ? " bg" : ""}`, title: [a.name, a.task, AGENT_STATUS_TEXT[a.status]].filter(Boolean).join("\n") },
+    h("i"), h("b", {}, a.name ?? a.agentId),
+    !isBg && a.current ? h("span", { class: "cur" }, a.current) : null);
+}
+
 function renderAgents() {
+  const bySession = new Map();
+  for (const a of store.agents.values()) {
+    if (!bySession.has(a.session)) bySession.set(a.session, []);
+    bySession.get(a.session).push(a);
+  }
   const live = liveSessions();
   $("#agall").replaceChildren(
     ...(live.length
-      ? live.map((s) => h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "none" }, `${s.agents ?? 1} 個 agent（#641）`)))
+      ? live.map((s) => {
+          const list = bySession.get(s.id) ?? [];
+          const rank = (a) => (a.agentId === "main" ? 0 : a.agentId === "bg" ? 1 : 2);
+          list.sort((x, y) => rank(x) - rank(y) || (x.spawnedAt ?? 0) - (y.spawnedAt ?? 0));
+          return h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(list.length ? list.map(agentChip) : [h("span", { class: "none" }, "—")])));
+        })
       : [h("div", { class: "none" }, "尚無 session")]),
   );
 }
@@ -145,6 +165,7 @@ const client = createClient({
   WebSocket: mock ? mock.WebSocket : window.WebSocket,
   setTimeout: (fn, ms) => window.setTimeout(fn, ms),
   clearTimeout: (t) => window.clearTimeout(t),
+  utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
     welcome: (m) => { ui.welcome = m; render(); },
     snapshot: (m) => { if (m.ch === "*") applySnapshot(store, m); render(); },

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createClient, PROTOCOL } from "../js/client.js";
 
 // 假的 WebSocket 與計時器：測試不 sleep，由測試推動時間。
-function harness() {
+function harness(opts = {}) {
   const sockets = [];
   class FakeSocket {
     constructor(url) {
@@ -35,7 +35,7 @@ function harness() {
     onStatus: (s) => got.status.push(s),
     onIncompatible: (m) => got.incompatible.push(m),
   };
-  const client = createClient({ url: "ws://h/ws", WebSocket: FakeSocket, ...clock, handlers });
+  const client = createClient({ url: "ws://h/ws", WebSocket: FakeSocket, ...clock, handlers, ...opts });
   const at = (i) => { assert.ok(sockets.at(i), `沒有第 ${i} 條連線`); return sockets.at(i); };
   return { sockets, at, timers, clock, got, client };
 }
@@ -157,4 +157,16 @@ test("ack 與 more 照契約欄位送出；未連線時不送也不丟例外", (
     { op: "ack", session: "s1", kind: "done", ref: "t1" },
     { op: "more", session: "s1", beforePos: 200, limit: 500 },
   ]);
+});
+
+test("hello 帶 utcOffsetMin（算「今天」的 KPI），重連時也帶", () => {
+  const { at, clock, client } = harness({ utcOffsetMin: 480 });
+  client.connect();
+  at(0).open();
+  assert.deepEqual(at(0).sent[0], { op: "hello", protocol: PROTOCOL, utcOffsetMin: 480 });
+  at(0).recv({ t: "frame", frame: 5, ch: "*", events: [], rows: {} });
+  at(0).drop();
+  clock.fire();
+  at(1).open();
+  assert.deepEqual(at(1).sent[0], { op: "hello", protocol: PROTOCOL, resume: 5, utcOffsetMin: 480 });
 });

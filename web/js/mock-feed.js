@@ -24,52 +24,135 @@ function uuid(r) {
   return `${part(8)}-${part(4)}-4${part(3)}-a${part(3)}-${part(12)}`;
 }
 
+const AGENT_TYPES = ["Explore", "general-purpose", "Plan"];
+const ACTIONS = ["read src/api/users.ts", "edit src/api/users.ts", "$ cargo test", "$ git status", "write tests/users.test.ts", "thinking…"];
+const ATTENTION_KIND = { wait: "wait", done: "done", fail: "fail", danger: "danger" };
+const ATTENTION_REASON = { wait: "要不要同時更新 README？", done: "回合結束，等你確認", fail: "cargo test exit 101（連續兩次）", danger: "git push --force" };
+
 // collector 端的狀態在所有連線之間共用，斷線重連後還是同一批 session。
+// 欄位照 contracts.md §6「彙總列」。
 function createWorld(n) {
   const r = rng(20261016);
+  const now = Date.now();
   const sessions = Array.from({ length: n }, (_, i) => ({
     id: uuid(r),
-    status: "run",
-    prompt: PROMPTS[i % PROMPTS.length],
+    host: "local",
+    cwd: "/home/me/my-api",
     branch: i % 3 === 0 ? "develop" : `feature/t${i}`,
     model: i % 4 === 0 ? "opus" : "sonnet",
+    firstPrompt: PROMPTS[i % PROMPTS.length],
+    lastPrompt: PROMPTS[i % PROMPTS.length],
+    startedAt: now - (n - i) * 60_000,
+    endedAt: null,
+    status: "run",
+    statusSince: now,
+    doing: null,
     commits: 0,
     dangers: 0,
-    agents: 1 + (i % 3),
+    failures: 0,
+    agentsLive: 0,
+    costUsd: 0,
+    thinkingTokens: 0,
+    lastPos: null,
   }));
+  const agents = new Map();
+  const attention = new Map();
+  for (const s of sessions) {
+    agents.set(`${s.id}/main`, { id: `${s.id}/main`, session: s.id, agentId: "main", agentType: null, name: "main", task: null, status: "run", current: null, toolCount: 0, parentToolUseId: null, spawnedAt: s.startedAt, finishedAt: null });
+  }
   const kpi = { live: n, attention: 0, sessions: n, agents: 0, edits: 0, writes: 0, commands: 0, failures: 0, dangers: 0, commits: 0, thinkingTokens: 0, costUsd: 0 };
   let frame = 0;
+  let agentSeq = 0;
 
   function recount() {
     kpi.live = sessions.filter((s) => s.status === "run").length;
-    kpi.attention = sessions.filter((s) => s.status !== "run").length;
-    kpi.agents = sessions.reduce((a, s) => a + s.agents - 1, 0);
+    kpi.attention = attention.size;
   }
-  recount();
+
+  function stepAgents(s, out) {
+    const mine = [...agents.values()].filter((a) => a.session === s.id);
+    const x = r();
+    if (x < 0.12 && mine.length < 4) {
+      // 派出 subagent
+      const agentId = `a${(++agentSeq).toString(16).padStart(6, "0")}`;
+      const a = { id: `${s.id}/${agentId}`, session: s.id, agentId, agentType: AGENT_TYPES[agentSeq % AGENT_TYPES.length], name: AGENT_TYPES[agentSeq % AGENT_TYPES.length], task: "查 users 相關的呼叫點", status: "run", current: null, toolCount: 0, parentToolUseId: `toolu_${agentId}`, spawnedAt: Date.now(), finishedAt: null };
+      agents.set(a.id, a);
+      out.push(a);
+      kpi.agents++;
+    } else if (x < 0.2) {
+      // 有 subagent 完成，或背景任務開始／結束
+      const sub = mine.find((a) => a.agentId !== "main" && a.agentId !== "bg" && a.status === "run");
+      const bg = agents.get(`${s.id}/bg`);
+      if (sub) {
+        Object.assign(sub, { status: "done", current: null, finishedAt: Date.now() });
+        out.push({ id: sub.id, status: "done", current: null, finishedAt: sub.finishedAt });
+      } else if (bg) {
+        agents.delete(bg.id);
+        out.push({ id: bg.id, deleted: true });
+      } else {
+        const b = { id: `${s.id}/bg`, session: s.id, agentId: "bg", agentType: null, name: "背景", task: null, status: "run", current: null, toolCount: 0, parentToolUseId: null, spawnedAt: Date.now(), finishedAt: null };
+        agents.set(b.id, b);
+        out.push(b);
+      }
+    } else {
+      const running = mine.filter((a) => a.status === "run" && a.agentId !== "bg");
+      const a = running[Math.floor(r() * running.length)];
+      if (a) {
+        a.current = ACTIONS[Math.floor(r() * ACTIONS.length)];
+        a.toolCount++;
+        out.push({ id: a.id, current: a.current, toolCount: a.toolCount });
+      }
+    }
+    s.agentsLive = [...agents.values()].filter((a) => a.session === s.id && a.agentId !== "main" && a.agentId !== "bg" && a.status === "run").length;
+  }
 
   return {
     snapshot() {
-      return { t: "snapshot", ch: "*", frame, sessions: sessions.map((s) => ({ ...s })), kpi: { ...kpi } };
+      return {
+        t: "snapshot", ch: "*", frame,
+        sessions: sessions.map((s) => ({ ...s })),
+        kpi: { ...kpi },
+        agents: [...agents.values()].map((a) => ({ ...a })),
+        attention: [...attention.values()].map((a) => ({ ...a })),
+        changes: [], staged: [], stream: [],
+      };
     },
     step() {
       frame++;
       const s = sessions[Math.floor(r() * sessions.length)];
       const changed = { id: s.id };
-      if (r() < 0.35) {
+      const agentRows = [];
+      const attRows = [];
+      if (r() < 0.3) {
+        // 狀態改變：舊的注意事項解除，新的（若有）進佇列
+        for (const [id, a] of attention) if (a.session === s.id) { attention.delete(id); attRows.push({ id, deleted: true }); }
         s.status = STATUSES[Math.floor(r() * STATUSES.length)];
-        changed.status = s.status;
-        if (s.status === "danger") changed.dangers = ++s.dangers;
+        s.statusSince = Date.now();
+        Object.assign(changed, { status: s.status, statusSince: s.statusSince });
+        const kind = ATTENTION_KIND[s.status];
+        if (kind) {
+          const a = { id: `${s.id}/${kind}/toolu_${frame}`, session: s.id, kind, ref: `toolu_${frame}`, reason: ATTENTION_REASON[kind], raisedAt: Date.now() };
+          attention.set(a.id, a);
+          attRows.push(a);
+        }
+        if (s.status === "danger") { changed.dangers = ++s.dangers; kpi.dangers++; }
+        if (s.status === "fail") { changed.failures = ++s.failures; kpi.failures++; }
       }
+      stepAgents(s, agentRows);
+      changed.agentsLive = s.agentsLive;
       kpi.commands += 1 + Math.floor(r() * 3);
       kpi.edits += r() < 0.5 ? 1 : 0;
       kpi.writes += r() < 0.1 ? 1 : 0;
-      kpi.failures += s.status === "fail" ? 1 : 0;
-      kpi.dangers += s.status === "danger" ? 1 : 0;
       if (r() < 0.08) { kpi.commits++; changed.commits = ++s.commits; }
-      kpi.thinkingTokens += Math.floor(r() * 900);
-      kpi.costUsd = +(kpi.costUsd + r() * 0.02).toFixed(4);
+      const think = Math.floor(r() * 900);
+      const cost = r() * 0.02;
+      s.thinkingTokens += think;
+      s.costUsd = +(s.costUsd + cost).toFixed(4);
+      Object.assign(changed, { thinkingTokens: s.thinkingTokens, costUsd: s.costUsd });
+      kpi.thinkingTokens += think;
+      kpi.costUsd = +(kpi.costUsd + cost).toFixed(4);
       recount();
-      return { t: "frame", frame, ch: "*", events: [], rows: { sessions: [changed], kpi: { ...kpi } } };
+      return { t: "frame", frame, ch: "*", events: [], rows: { sessions: [changed], kpi: { ...kpi }, agents: agentRows, attention: attRows } };
     },
   };
 }

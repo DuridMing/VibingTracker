@@ -50,3 +50,33 @@ test("沒有 id 的 row 丟掉，不會產生 undefined 的 session", () => {
   applyFrame(st, { t: "frame", frame: 1, ch: "*", events: [], rows: { sessions: [{ status: "run" }] } });
   assert.equal(st.sessions.size, 0);
 });
+
+test("deleted 的列從彙總移除", () => {
+  const st = createStore();
+  applySnapshot(st, snap);
+  applyFrame(st, { t: "frame", frame: 11, ch: "*", events: [], rows: { sessions: [{ id: "a", deleted: true }] } });
+  assert.deepEqual([...st.sessions.keys()], ["b"]);
+});
+
+test("agents 與 attention 也照 snapshot 取代、frame upsert／刪除", () => {
+  const st = createStore();
+  applySnapshot(st, {
+    ...snap,
+    agents: [{ id: "a/main", session: "a", agentId: "main", status: "run" }],
+    attention: [{ id: "b/wait/t1", session: "b", kind: "wait", ref: "t1", raisedAt: 1 }],
+  });
+  assert.ok(st.agents instanceof Map && st.attention instanceof Map, "store 要有 agents 與 attention");
+  assert.deepEqual([...st.agents.keys()], ["a/main"]);
+  assert.deepEqual([...st.attention.keys()], ["b/wait/t1"]);
+  applyFrame(st, {
+    t: "frame", frame: 11, ch: "*", events: [],
+    rows: {
+      agents: [{ id: "a/main", status: "idle" }, { id: "a/bg", session: "a", agentId: "bg", status: "run" }],
+      attention: [{ id: "b/wait/t1", deleted: true }],
+    },
+  });
+  assert.equal(st.agents.get("a/main").status, "idle");
+  assert.equal(st.agents.get("a/main").agentId, "main");
+  assert.ok(st.agents.has("a/bg"));
+  assert.equal(st.attention.size, 0);
+});
