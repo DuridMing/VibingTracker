@@ -34,6 +34,8 @@ const COMPANIONS: &[&str] = &[
     "git.op",
     "agent.spawned",
 ];
+/// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
+const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
 /// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…）
 const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status"];
 
@@ -230,6 +232,8 @@ struct AgentLive {
     session: String,
     agent_id: String,
     agent_type: Option<String>,
+    /// 這個 agent 最近一行 assistant／usage 的模型短名
+    model: Option<String>,
     name: String,
     task: Option<String>,
     status: &'static str,
@@ -318,6 +322,18 @@ impl Live {
             && !matches!(payload, Some(Payload::SessionStarted(_)));
         if !ended {
             self.ensure_agent(&sid, "main", ts);
+        }
+        if MODEL_LINES.contains(&e.kind.as_str())
+            && let Some(m) = e.payload["model"].as_str()
+            && let Some(a) = self.agents.get_mut(&format!("{sid}/{}", e.agent))
+        {
+            let m = Some(short_model(m));
+            if a.model != m {
+                a.model = m;
+                self.dirty_agents
+                    .entry(format!("{sid}/{}", e.agent))
+                    .or_insert(false);
+            }
         }
         if e.pos.is_none()
             && COMPANIONS.contains(&e.kind.as_str())
@@ -518,6 +534,7 @@ impl Live {
                             agent_id: a.agent_id.clone(),
                             name: a.name.clone().unwrap_or_else(|| t.clone()),
                             agent_type: Some(t),
+                            model: None,
                             task: a.task.as_deref().map(clip),
                             status: "run",
                             current: None,
@@ -793,6 +810,7 @@ impl Live {
                     session: sid.to_string(),
                     agent_id: agent.to_string(),
                     agent_type,
+                    model: None,
                     name,
                     task: None,
                     status: "run",
@@ -887,7 +905,7 @@ impl Live {
 
 fn agent_row(id: &str, a: &AgentLive) -> Value {
     json!({
-        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "name": a.name,
+        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "model": a.model, "name": a.name,
         "task": a.task, "status": a.status, "current": a.current, "toolCount": a.tool_count,
         "parentToolUseId": a.parent, "spawnedAt": a.spawned_at, "finishedAt": a.finished_at,
     })

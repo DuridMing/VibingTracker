@@ -682,3 +682,69 @@ fn later_session_started_keeps_the_first_cwd() {
     ));
     assert_eq!(live.session_row("s1").unwrap()["cwd"], "/p");
 }
+
+/// 決定紀錄 #14：agents 列帶各 agent 實際用的模型短名；subagent 可以和 main 不同，中途切換就更新。
+#[test]
+fn agent_rows_carry_their_own_model() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let line = |b: &mut B, agent: &str, kind: &str, model: &str| {
+        b.ev(
+            "s1",
+            kind,
+            agent,
+            DAY,
+            false,
+            json!({"text": "x", "messageId": "m", "model": model}),
+        )
+    };
+    apply_all(&mut l, &[
+        b.started("s1", DAY),
+        b.ev("s1", "agent.spawned", "main", DAY, false, json!({"agentId": "a1", "agentType": "Explore", "name": "找檔案", "task": "t", "parentToolUseId": "t0"})),
+    ]);
+    let model_of = |l: &Live, id: &str| {
+        let snap = l.snapshot(&Channel::All, 0, DAY);
+        rows(&snap, "agents")
+            .iter()
+            .find(|a| a["id"] == id)
+            .map(|a| a["model"].clone())
+            .unwrap()
+    };
+    assert!(model_of(&l, "s1/main").is_null(), "還沒看到 assistant 行");
+    assert!(model_of(&l, "s1/a1").is_null());
+
+    apply_all(
+        &mut l,
+        &[
+            line(&mut b, "main", "assistant.text", "claude-opus-5-5"),
+            line(&mut b, "a1", "assistant.thinking", "claude-haiku-5-5"),
+        ],
+    );
+    assert_eq!(model_of(&l, "s1/main"), "opus 5.5");
+    assert_eq!(model_of(&l, "s1/a1"), "haiku 5.5", "subagent 用自己的模型");
+
+    l.flush(DAY);
+    l.apply(&line(
+        &mut b,
+        "main",
+        "assistant.text",
+        "claude-sonnet-5-5[1m]",
+    ));
+    let f = l.flush(DAY).unwrap();
+    let agents = f.rows_for(&Channel::All)["agents"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        agents
+            .iter()
+            .any(|a| a["id"] == "s1/main" && a["model"] == "sonnet 5.5"),
+        "中途切換要送更新：{agents:?}"
+    );
+    l.apply(&line(&mut b, "main", "assistant.text", "claude-sonnet-5-5"));
+    let f = l.flush(DAY);
+    assert!(
+        f.is_none_or(|f| f.rows_for(&Channel::All).get("agents").is_none()),
+        "模型沒變不送 agents 列"
+    );
+}
