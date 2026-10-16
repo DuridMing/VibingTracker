@@ -161,6 +161,8 @@ pub struct Merger {
     sessions: BTreeMap<String, Session>,
     /// 上一輪 collector（或 evict）留下的編號與路徑基準，見 [`Merger::resume`]
     resumed: HashMap<String, Resumed>,
+    /// 費用暴增的基準（#675）；有花費的日子不到 3 天時是 None
+    cost_baseline: Option<f64>,
 }
 
 struct Resumed {
@@ -177,6 +179,7 @@ impl Merger {
             host: "local".into(),
             sessions: BTreeMap::new(),
             resumed: HashMap::new(),
+            cost_baseline: None,
         }
     }
 
@@ -329,6 +332,19 @@ impl Merger {
                 ..Meta::default()
             },
         )
+    }
+
+    /// 費用暴增的基準（#675）：serve 啟動時與每小時由 store 算好交進來。
+    pub fn set_cost_baseline(&mut self, baseline: Option<f64>) {
+        self.cost_baseline = baseline;
+    }
+
+    /// 重啟時補回 session 最近 24 小時的花費（只進滾動區間，不觸發）。
+    pub fn seed_cost(&mut self, sid: &str, at: u64, usd: f64) {
+        let s = self.sessions.entry(sid.to_string()).or_default();
+        // 新建的 session last_seen 是 0，不更新的話下一次 tick 就被 evict
+        s.last_seen = s.last_seen.max(at);
+        s.status.seed_cost(at, usd);
     }
 
     /// 各 session 目前的分數，四捨五入成整數（契約 §6 `sessions.score`）。
@@ -1156,6 +1172,8 @@ impl Merger {
                 cache_write_5m: w5,
                 cost_usd: self.prices.cost(m, &u),
             };
+            let (usd, base) = (p.cost_usd, self.cost_baseline);
+            self.tracker(sid).cost(ts_seen, usd, base);
             out.push(self.emit(sid, Payload::Usage(p), meta(false)));
         }
         let s = self.sessions.entry(sid.to_string()).or_default();

@@ -28,6 +28,9 @@ const TICK: Duration = Duration::from_millis(500);
 const STORE_FLUSH: Duration = Duration::from_millis(100);
 /// sessions 列的分數多久重算一次（契約 §6）
 const SCORE_EVERY: Duration = Duration::from_secs(10);
+/// 費用暴增的基準多久重算一次（#675）
+const COST_BASELINE_EVERY: Duration = Duration::from_secs(60 * 60);
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const INPUT_QUEUE: usize = 8192;
 /// 進行中的 session 沒送 SessionEnd（終端機被直接關掉）時，最多再撐這麼久沒有 hook 才結束。
 const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
@@ -139,11 +142,20 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             merger.resume(&sid, c.seq, c.pos, &c.cwd);
         }
     }
+    // 費用暴增（#675）：基準＋補回各 session 最近 24 小時的花費
+    let now = crate::now_ms();
+    let usage = cost_usage(&store, now);
+    merger.set_cost_baseline(crate::status::cost_baseline(&usage, now));
+    for (sid, at, usd) in usage.iter().filter(|(_, at, _)| at + DAY_MS >= now) {
+        merger.seed_cost(sid, *at, *usd);
+    }
     let mut planner = TailPlanner::default();
     let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
     let mut tick = tokio::time::interval(TICK);
     let mut flush = tokio::time::interval(STORE_FLUSH);
     let mut rescore = tokio::time::interval(SCORE_EVERY);
+    let mut rebase = tokio::time::interval(COST_BASELINE_EVERY);
+    rebase.tick().await; // 第一次立即觸發，啟動時已經算過
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
     let mut last_hook = Instant::now();
     let shutdown = shutdown_signal();
@@ -195,6 +207,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     log("閒置，自動結束");
                     break;
                 }
+            }
+            _ = rebase.tick() => {
+                let now = crate::now_ms();
+                merger.set_cost_baseline(crate::status::cost_baseline(&cost_usage(&store, now), now));
             }
             _ = rescore.tick() => {
                 // 只更新彙總列，不發 session.status（那是串流裡的狀態行，只在狀態改變時發）
@@ -298,5 +314,21 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// 費用基準要的 usage：最近 8 天（基準 7 天＋滾動 24 小時）；讀不到就當沒有資料（只寫 log）。
+fn cost_usage(store: &Mutex<Store>, now: u64) -> Vec<(String, u64, f64)> {
+    let since = now.saturating_sub((crate::status::COST_BASELINE_DAYS + 1) * DAY_MS);
+    match store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .usage_since(since)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log(&format!("讀取費用紀錄失敗：{e}"));
+            Vec::new()
+        }
     }
 }

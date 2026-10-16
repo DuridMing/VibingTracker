@@ -58,6 +58,32 @@ pub fn task_failed(status: Option<&str>) -> bool {
     status.is_some_and(|s| s != "completed" && s != "killed")
 }
 
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+/// 單 session 最近 24 小時的費用超過基準幾倍算暴增（PLAN「session 分數」）
+pub const COST_SPIKE_FACTOR: f64 = 3.0;
+/// 基準往回看幾天（不含最近 24 小時）
+pub const COST_BASELINE_DAYS: u64 = 7;
+/// 有花費的日子少於幾天時不算
+pub const COST_MIN_DAYS: usize = 3;
+
+/// 費用暴增的基準（#675，方案 C）：過去 7 天（不含最近 24 小時）每個 (session, UTC 日) 的平均費用。
+/// `usage` 是 (session, ts_seen, costUsd)；有花費的 UTC 日不到 3 天回 None。
+pub fn cost_baseline(usage: &[(String, u64, f64)], now: u64) -> Option<f64> {
+    let end = now.saturating_sub(DAY_MS);
+    let start = end.saturating_sub(COST_BASELINE_DAYS * DAY_MS);
+    let mut per: HashMap<(&str, u64), f64> = HashMap::new();
+    for (session, at, usd) in usage {
+        if *at >= start && *at < end && *usd > 0.0 {
+            *per.entry((session.as_str(), at / DAY_MS)).or_default() += usd;
+        }
+    }
+    let days: std::collections::HashSet<u64> = per.keys().map(|(_, d)| *d).collect();
+    if days.len() < COST_MIN_DAYS {
+        return None;
+    }
+    Some(per.values().sum::<f64>() / per.len() as f64)
+}
+
 pub enum Change {
     Raised(Attention),
     Cleared(Attention),
@@ -92,6 +118,9 @@ pub struct Tracker {
     idle: bool,
     ended: bool,
     signals: Vec<(Signal, u64)>,
+    /// 最近 24 小時的 (時間, 費用)，CostSpike 用（#675）
+    recent_cost: std::collections::VecDeque<(u64, f64)>,
+    last_spike: Option<u64>,
 }
 
 impl Default for Tracker {
@@ -109,6 +138,8 @@ impl Default for Tracker {
             idle: false,
             ended: false,
             signals: Vec::new(),
+            recent_cost: Default::default(),
+            last_spike: None,
         }
     }
 }
@@ -224,6 +255,26 @@ impl Tracker {
         self.ended = true;
         out.extend(self.recompute(now));
         out
+    }
+
+    /// 一筆 usage 的費用（#675）：最近 24 小時（滾動）累計超過基準 ×3 時加 CostSpike；24 小時內最多一次。
+    pub fn cost(&mut self, at: u64, usd: f64, baseline: Option<f64>) {
+        self.seed_cost(at, usd);
+        let Some(base) = baseline else { return };
+        let total: f64 = self.recent_cost.iter().map(|(_, c)| c).sum();
+        if total > base * COST_SPIKE_FACTOR && self.last_spike.is_none_or(|t| t + DAY_MS <= at) {
+            self.last_spike = Some(at);
+            self.signal(Signal::CostSpike, at);
+        }
+    }
+
+    /// 重啟時從 store 補回最近 24 小時的花費：只進滾動區間，不觸發。
+    pub fn seed_cost(&mut self, at: u64, usd: f64) {
+        self.recent_cost.push_back((at, usd));
+        let from = at.saturating_sub(DAY_MS);
+        while self.recent_cost.front().is_some_and(|(t, _)| *t < from) {
+            self.recent_cost.pop_front();
+        }
     }
 
     pub fn signal(&mut self, sig: Signal, at: u64) {

@@ -579,6 +579,11 @@ fn replay_sample(name: &str) -> Option<Vec<Event>> {
 
 /// 同 [`replay_sample`]，另外回傳回放完的 merge 與最後的時間（看分數用）。
 fn replay_merger(name: &str) -> Option<(Merger, Vec<Event>, u64)> {
+    replay_with(name, None)
+}
+
+/// 同 [`replay_merger`]，回放前先設好費用基準（#675）。
+fn replay_with(name: &str, cost_baseline: Option<f64>) -> Option<(Merger, Vec<Event>, u64)> {
     use std::collections::HashMap;
     use std::path::PathBuf;
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -628,6 +633,7 @@ fn replay_merger(name: &str) -> Option<(Merger, Vec<Event>, u64)> {
     }
     inputs.sort_by_key(|(ts, k, _)| (*ts, *k));
     let mut m = Merger::new(Box::new(NoDanger));
+    m.set_cost_baseline(cost_baseline);
     let mut evs = Vec::new();
     let mut last = 0;
     for (ts, _, input) in inputs {
@@ -919,4 +925,112 @@ fn samples_agent_launch_failure_counts_once_and_killed_does_not() {
     };
     let score = m.scores(end).first().map_or(0, |(_, v)| *v);
     assert_eq!(score, 20, "啟動失敗算一次，killed 不算");
+}
+
+// ── 分數訊號：單 session 費用超過日均 3 倍（#675，方案 C）
+
+const HOUR: u64 = 60 * MIN;
+const DAY_MS: u64 = 24 * HOUR;
+/// 2026-10-16 00:00 UTC
+const NOW: u64 = 1_792_108_800_000;
+
+fn u(session: &str, at: u64, usd: f64) -> (String, u64, f64) {
+    (session.to_string(), at, usd)
+}
+
+#[test]
+fn cost_baseline_needs_three_days() {
+    use coding_lab::status::cost_baseline;
+    let two_days = [u("a", NOW - 2 * DAY_MS, 1.0), u("b", NOW - 3 * DAY_MS, 1.0)];
+    assert_eq!(cost_baseline(&two_days, NOW), None, "不足 3 天不算");
+    let three = [
+        u("a", NOW - 2 * DAY_MS, 1.0),
+        u("b", NOW - 3 * DAY_MS, 2.0),
+        u("c", NOW - 4 * DAY_MS, 3.0),
+    ];
+    assert_eq!(cost_baseline(&three, NOW), Some(2.0));
+}
+
+#[test]
+fn cost_baseline_averages_session_days() {
+    use coding_lab::status::cost_baseline;
+    let rows = [
+        // a 在同一天兩筆 → 一個 (session, 日)，4.0
+        u("a", NOW - 2 * DAY_MS, 1.0),
+        u("a", NOW - 2 * DAY_MS + HOUR, 3.0),
+        // a 跨到另一天 → 另一組，2.0
+        u("a", NOW - 3 * DAY_MS, 2.0),
+        u("b", NOW - 4 * DAY_MS, 6.0),
+        // 最近 24 小時不算進基準
+        u("c", NOW - HOUR, 100.0),
+        // 超過 7 天（從 24 小時前往回算）不算
+        u("d", NOW - 9 * DAY_MS, 100.0),
+        // 0 元的不算一組
+        u("e", NOW - 5 * DAY_MS, 0.0),
+    ];
+    assert_eq!(cost_baseline(&rows, NOW), Some(4.0), "(4 + 2 + 6) / 3");
+}
+
+#[test]
+fn cost_spike_fires_once_per_day_above_three_times_baseline() {
+    use coding_lab::status::Tracker;
+    let mut t = Tracker::default();
+    let base = Some(1.0);
+    t.cost(NOW, 2.0, base);
+    assert_eq!(t.score(NOW), 0.0, "2 ≤ 3，不觸發");
+    t.cost(NOW + MIN, 1.5, base);
+    assert_eq!(t.score(NOW + MIN), 15.0, "累計 3.5 > 3，+15");
+    t.cost(NOW + 2 * MIN, 5.0, base);
+    assert!(
+        t.score(NOW + 2 * MIN) < 15.0,
+        "24 小時內不重複，只剩衰減的那一次"
+    );
+    // 25 小時後：之前的花費滾出 24 小時，要重新累計才會再觸發
+    let later = NOW + 25 * HOUR;
+    t.cost(later, 1.0, base);
+    assert!(t.score(later) < 1.0, "舊的花費不算，1 ≤ 3");
+    t.cost(later + MIN, 3.0, base);
+    assert!(t.score(later + MIN) >= 15.0, "隔天可以再觸發");
+}
+
+#[test]
+fn cost_spike_needs_a_baseline_and_seed_does_not_fire() {
+    use coding_lab::status::Tracker;
+    let mut t = Tracker::default();
+    t.cost(NOW, 100.0, None);
+    assert_eq!(t.score(NOW), 0.0, "沒有基準（不足 3 天）不觸發");
+
+    let mut t = Tracker::default();
+    t.seed_cost(NOW - HOUR, 100.0);
+    assert_eq!(t.score(NOW), 0.0, "重啟時補回的花費不觸發");
+    t.cost(NOW, 0.01, Some(1.0));
+    assert_eq!(t.score(NOW), 15.0, "補回的花費算進滾動區間");
+}
+
+#[test]
+fn samples_usage_feeds_cost_spike_with_a_baseline() {
+    // dba6a637 有多筆 usage：基準設得很小就一定會觸發一次，沒有基準就不會
+    let Some((plain, _, end)) = replay_with("dba6a637", None) else {
+        eprintln!("略過：沒有 samples/sessions/dba6a637");
+        return;
+    };
+    let (spiky, _, _) = replay_with("dba6a637", Some(0.000_001)).unwrap();
+    let score = |m: &Merger| m.scores(end).first().map_or(0, |(_, v)| *v);
+    let diff = score(&spiky) - score(&plain);
+    assert!(
+        (1..=15).contains(&diff),
+        "多了一次 CostSpike（衰減後）：{diff}"
+    );
+}
+
+#[test]
+fn seeded_cost_survives_the_next_tick() {
+    // 重啟時補回的花費不能被下一次 tick 的 evict 清掉（新建的 session last_seen 是 0）
+    let mut m = Merger::new(Box::new(NoDanger));
+    m.seed_cost(S, NOW - HOUR, 100.0);
+    m.tick(NOW);
+    assert!(
+        m.scores(NOW).iter().any(|(id, _)| id == S),
+        "補回花費的 session 還在 merge 裡"
+    );
 }

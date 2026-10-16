@@ -4,7 +4,7 @@
 //! [`Store::open`] 會截掉 JSONL 尾端沒寫完的半行，並把還沒進索引的完整行補進去。
 //! 索引可以整個刪掉，下次開啟時從 JSONL 重建。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -457,6 +457,31 @@ impl Store {
             start = end;
         }
         out.sort_by(|a, b| (a.ts_seen, &a.session, a.seq).cmp(&(b.ts_seen, &b.session, b.seq)));
+        Ok(out)
+    }
+
+    /// `since` 之後的 usage：(session, ts_seen, costUsd)（#675 費用基準）。
+    pub fn usage_since(&self, since: u64) -> Result<Vec<(String, u64, f64)>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT session, offset FROM events WHERE type = 'usage' AND ts_seen >= ?1 ORDER BY session, seq",
+        )?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![since as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut by_session: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+        for (session, off) in rows {
+            by_session.entry(session).or_default().push(off);
+        }
+        let mut out = Vec::new();
+        for (session, offsets) in by_session {
+            for e in self.read_at(&session, offsets)? {
+                out.push((
+                    session.clone(),
+                    e.ts_seen,
+                    e.payload["costUsd"].as_f64().unwrap_or(0.0),
+                ));
+            }
+        }
         Ok(out)
     }
 

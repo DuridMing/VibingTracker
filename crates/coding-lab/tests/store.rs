@@ -606,3 +606,30 @@ fn session_model_comes_from_the_first_main_usage() {
         "從 JSONL 重建"
     );
 }
+
+/// #675：費用暴增的基準要讀最近的 usage（session、ts_seen、costUsd）。
+#[test]
+fn usage_since_reads_cost_rows() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    let usage = |seq, ts, cost| {
+        ev(
+            "s1",
+            seq,
+            "usage",
+            None,
+            ts,
+            json!({"messageId": format!("m{seq}"), "model": "claude-opus-5-5",
+            "input": 0, "output": 0, "thinking": 0, "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": cost}),
+        )
+    };
+    s.append(usage(2, 1000, 0.5));
+    s.append(usage(3, 5000, 1.25));
+    s.flush().unwrap();
+    assert_eq!(
+        s.usage_since(2000).unwrap(),
+        [("s1".to_string(), 5000, 1.25)],
+        "只取 since 之後的"
+    );
+}
