@@ -88,8 +88,7 @@ def main():
         #    非自動模式只有 hook 來回（約 10–30 ms）；明顯更長代表跑了自動模式分類器或在等人。
         #    PermissionDenied 沒有 duration_ms，記 Pre 到 Denied 的時間。
         pre_rows_by_id = {r["payload"]["tool_use_id"]: r for r in pre_rows}
-        asked = {(r["payload"].get("tool_name"), json.dumps(r["payload"].get("tool_input"), sort_keys=True))
-                 for r in http if r["event"] == "PermissionRequest"}
+        asks = [r for r in http if r["event"] == "PermissionRequest"]
         for r in http:
             if r["event"] not in WAIT_CLEAR_SAME_TOOL:
                 continue
@@ -100,14 +99,24 @@ def main():
             xp = x["payload"]
             gap = r["ts_seen_ms"] - x["ts_seen_ms"]
             ms = gap - p["duration_ms"] if p.get("duration_ms") is not None else gap
-            was_asked = (xp.get("tool_name"), json.dumps(xp.get("tool_input"), sort_keys=True)) in asked
+            was_asked = any(a["payload"].get("tool_name") == xp.get("tool_name") and a["payload"].get("tool_input") == xp.get("tool_input")
+                            and x["ts_seen_ms"] <= a["ts_seen_ms"] <= r["ts_seen_ms"] for a in asks)
             decision.append((xp.get("permission_mode"), r["event"], was_asked, ms, p.get("reason")))
 
         # ── 等你的解除：PermissionRequest 之後第一個能解除它的事件（P3 #645）
+        #    按 Esc 拒絕時沒有任何 hook，只有 transcript 的 tool_result，所以它也算解除事件。
+        tr_result = {}
+        for a in arrivals:
+            if a.get("type") == "user" and "tool_result" in (a.get("blocks") or []) and not a.get("backfill"):
+                for tid in a.get("tool_ids") or []:
+                    tr_result.setdefault(tid, a["ts_seen_ms"])
         for i, r in enumerate(http):
             if r["event"] != "PermissionRequest":
                 continue
             p = r["payload"]
+            match = [x for x in pre_rows if x["payload"].get("tool_name") == p.get("tool_name")
+                     and x["payload"].get("tool_input") == p.get("tool_input") and x["ts_seen_ms"] <= r["ts_seen_ms"]]
+            tr_ts = tr_result.get(match[-1]["payload"]["tool_use_id"]) if match else None
             hit = None
             for x in http[i + 1:]:
                 xp = x["payload"]
@@ -116,6 +125,8 @@ def main():
                     hit = x["event"]
                 elif x["event"] in WAIT_CLEAR_ANY:
                     hit = x["event"]
+                if tr_ts is not None and tr_ts < x["ts_seen_ms"]:
+                    hit, x = "transcript tool_result", {"ts_seen_ms": tr_ts}
                 if hit:
                     wait_clear.append((p.get("permission_mode"), p.get("tool_name"), hit, x["ts_seen_ms"] - r["ts_seen_ms"]))
                     break
