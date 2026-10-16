@@ -322,3 +322,112 @@ impl Sender {
         }
     }
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TailAction {
+    Start {
+        session: String,
+        file: String,
+        path: PathBuf,
+        start: Start,
+    },
+    Stop {
+        session: String,
+        file: String,
+    },
+    StopSession {
+        session: String,
+    },
+}
+
+/// 看 hook 決定要開／關哪些 tail（純邏輯；執行由組裝 collector 的地方負責）。
+///
+/// - 主 transcript：`SessionStart(startup)` 從檔頭；resume／compact 或沒收到 SessionStart 就先看到
+///   其他事件時從檔尾。實測 compact 與 resume 沿用同一個檔，所以已在 tail 的 session 不重開。
+/// - subagent：`SubagentStart` 開 `<transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`，`SubagentStop` 關。
+/// - `SessionEnd` 關掉該 session 的全部 tail；之後若 resume 會再開。
+#[derive(Default)]
+pub struct TailPlanner {
+    main: std::collections::HashMap<String, PathBuf>,
+    agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl TailPlanner {
+    pub fn on_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
+        let sid = h.session_id().to_string();
+        let event = h.event_name();
+        let mut out = Vec::new();
+
+        if event == "SessionEnd" {
+            let had_main = self.main.remove(&sid).is_some();
+            let had_agents = self.agents.remove(&sid).is_some_and(|a| !a.is_empty());
+            if had_main || had_agents {
+                out.push(TailAction::StopSession { session: sid });
+            }
+            return out;
+        }
+
+        let transcript = h
+            .str_field("transcript_path")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        if let Some(path) = &transcript {
+            match self.main.get(&sid) {
+                Some(known) if known == path => {}
+                known => {
+                    if known.is_some() {
+                        out.push(TailAction::Stop {
+                            session: sid.clone(),
+                            file: "main".into(),
+                        });
+                    }
+                    let fresh = event == "SessionStart" && h.str_field("source") == Some("startup");
+                    let start = if fresh { Start::Beginning } else { Start::End };
+                    out.push(TailAction::Start {
+                        session: sid.clone(),
+                        file: "main".into(),
+                        path: path.clone(),
+                        start,
+                    });
+                    self.main.insert(sid.clone(), path.clone());
+                }
+            }
+        }
+
+        let agent = h.str_field("agent_id").filter(|a| !a.is_empty());
+        match (event, agent, &transcript) {
+            ("SubagentStart", Some(id), Some(path)) => {
+                let file = format!("agent-{id}");
+                if self
+                    .agents
+                    .entry(sid.clone())
+                    .or_default()
+                    .insert(file.clone())
+                {
+                    let stem = path
+                        .file_stem()
+                        .map(|s| s.to_os_string())
+                        .unwrap_or_default();
+                    let sub = path
+                        .with_file_name(stem)
+                        .join("subagents")
+                        .join(format!("{file}.jsonl"));
+                    out.push(TailAction::Start {
+                        session: sid,
+                        file,
+                        path: sub,
+                        start: Start::Beginning,
+                    });
+                }
+            }
+            ("SubagentStop", Some(id), _) => {
+                let file = format!("agent-{id}");
+                if self.agents.get_mut(&sid).is_some_and(|a| a.remove(&file)) {
+                    out.push(TailAction::Stop { session: sid, file });
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+}

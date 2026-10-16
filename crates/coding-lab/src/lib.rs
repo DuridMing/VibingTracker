@@ -2,6 +2,7 @@
 
 pub mod event;
 pub mod hook;
+pub mod hooks;
 pub mod merge;
 pub mod store;
 pub mod transcript;
