@@ -2,6 +2,9 @@ import { createClient } from "./client.js";
 import { createStore, applySnapshot, applyFrame } from "./store.js";
 import { sessionColor, shortId } from "./color.js";
 import { installMock } from "./mock-feed.js";
+import { createStream } from "./stream.js";
+import { createStreamView } from "./stream-view.js";
+import { formatRow } from "./format.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -24,6 +27,14 @@ const store = createStore();
 const ui = { tab: "all", conn: "connecting", welcome: null };
 
 // ---------- render ----------
+// 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
+const lastSig = new Map();
+function changed(name, sig) {
+  if (lastSig.get(name) === sig) return false;
+  lastSig.set(name, sig);
+  return true;
+}
+
 function fmtKpi(k, v) {
   if (v == null) return "—";
   if (k === "costUsd") return `$${v.toFixed(2)}`;
@@ -43,6 +54,7 @@ function renderConn() {
 }
 
 function renderKpis() {
+  if (!changed("kpi", JSON.stringify(store.kpi))) return;
   for (const b of document.querySelectorAll("#kpis b[data-k]")) b.textContent = fmtKpi(b.dataset.k, store.kpi[b.dataset.k]);
 }
 
@@ -57,6 +69,7 @@ function sessTag(s, cls = "id") {
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions();
+  if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) =>
@@ -69,15 +82,51 @@ function renderTabs() {
 
 function renderSessFilters() {
   const live = liveSessions();
+  if (!changed("fSess", live.map((s) => `${s.id}:${stream.hiddenSessions.has(s.id)}`).join("|"))) return;
   $("#fSess").replaceChildren(
     ...(live.length
-      ? live.map((s) => h("span", { class: "fchip", title: s.id }, h("i", { style: `background:${sessionColor(s.id)}` }), h("span", { class: "mono" }, shortId(s.id))))
+      ? live.map((s) => {
+          const off = stream.hiddenSessions.has(s.id);
+          return h("button", { class: `fchip${off ? " off" : ""}`, title: `${s.id}\n點一下${off ? "顯示" : "隱藏"}這個 session`, "aria-pressed": String(!off), onclick: () => toggleSession(s.id) },
+            h("i", { style: `background:${sessionColor(s.id)}` }), h("span", { class: "mono" }, shortId(s.id)));
+        })
       : [h("span", { class: "none" }, "無")]),
+  );
+}
+
+const KIND_LABEL = [["th", "思考"], ["tx", "訊息"], ["rd", "讀"], ["ed", "改"], ["wr", "寫／派工"], ["cmd", "指令與輸出"], ["st", "狀態"]];
+
+function renderKindFilters() {
+  if (!changed("fKind", [...stream.hiddenKinds].sort().join("|"))) return;
+  $("#fKind").replaceChildren(
+    ...KIND_LABEL.map(([k, label]) => {
+      const off = stream.hiddenKinds.has(k);
+      return h("button", { class: `fchip${off ? " off" : ""}`, "aria-pressed": String(!off), onclick: () => toggleKind(k) }, label);
+    }),
+  );
+}
+
+// 暫存區：hook 已到、transcript 還沒到的卡片（PLAN「方案 C」），不進串流，只在這裡看
+function renderLive() {
+  $("#liveN").textContent = String(stream.staged.size);
+  const list = $("#liveList");
+  if (list.hidden || !changed("live", [...stream.staged.values()].slice(-30).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
+  const cards = [...stream.staged.values()].slice(-30);
+  list.replaceChildren(
+    ...(cards.length
+      ? cards.map((c) => {
+          const f = formatRow({ key: c.toolUseId, session: c.session, agent: c.agent, type: "tool", card: c, v: 0, expanded: false, delayed: false }, { agentName });
+          const el = h("div", { class: f.cls });
+          el.innerHTML = `<div class="hd">${f.html}</div>`;
+          return el;
+        })
+      : [h("div", { class: "none" }, "沒有進行中的動作")]),
   );
 }
 
 function renderSessions() {
   const all = [...store.sessions.values()];
+  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
   $("#sess").replaceChildren(
     ...(all.length
@@ -107,6 +156,7 @@ function renderAgents() {
     bySession.get(a.session).push(a);
   }
   const live = liveSessions();
+  if (!changed("agents", live.map((s) => s.id).join("|") + "#" + [...store.agents.values()].map((a) => `${a.id}:${a.status}:${a.name}:${a.current ?? ""}`).join("|"))) return;
   $("#agall").replaceChildren(
     ...(live.length
       ? live.map((s) => {
@@ -120,18 +170,137 @@ function renderAgents() {
 }
 
 let rafPending = false;
+let renderOnce = false;
 function render() {
+  if (bench.isolate && renderOnce) return; // 量測用：只畫第一次，之後其他面板不動
   if (rafPending) return;
   rafPending = true;
   requestAnimationFrame(() => {
     rafPending = false;
+    renderOnce = stream.rows.length >= 3000;
     renderConn();
     renderKpis();
     renderTabs();
     renderSessFilters();
+    renderKindFilters();
     renderSessions();
     renderAgents();
+    renderLive();
   });
+}
+
+// ---------- 合流串流 ----------
+const stream = createStream();
+const agentName = (session, agentId) => store.agents.get(`${session}/${agentId}`)?.name ?? null;
+const benchProf = new URLSearchParams(location.search).has("bench") ? [] : null;
+const view = createStreamView({
+  prof: benchProf,
+  scroller: $("#stream"),
+  model: stream,
+  agentName,
+  onNeedMore: requestMore,
+  onFollow: (on) => {
+    // 回到底部恢復跟隨：載入更多時暫時保留的舊行修剪回上限
+    if (on && stream.holding) view.update({ ...stream.trim(), appended: 0, updated: new Set() });
+  },
+});
+
+function updateHasMore() {
+  view.setHasMore([...stream.minPos().values()].some((p) => p > 1));
+}
+
+function toggleSession(id) {
+  stream.setSessionHidden(id, !stream.hiddenSessions.has(id));
+  view.filterChanged();
+  render();
+}
+
+function toggleKind(k) {
+  stream.setKindHidden(k, !stream.hiddenKinds.has(k));
+  view.filterChanged();
+  render();
+}
+
+$("#liveToggle").addEventListener("click", () => {
+  const list = $("#liveList");
+  list.hidden = !list.hidden;
+  $("#liveToggle").setAttribute("aria-expanded", String(!list.hidden));
+  renderLive();
+});
+
+// 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
+const MORE_LIMIT = 200;
+const MORE_TIMEOUT_MS = 3000;
+let moreReq = null;
+
+function requestMore() {
+  if (moreReq) return;
+  const wanted = [...stream.minPos()].filter(([, p]) => p > 1);
+  if (!wanted.length) return;
+  moreReq = { waiting: new Set(wanted.map(([s]) => s)), got: [], timer: setTimeout(finishMore, MORE_TIMEOUT_MS) };
+  for (const [session, beforePos] of wanted) client.more({ session, beforePos, limit: MORE_LIMIT });
+}
+
+function onMore(m) {
+  if (!moreReq || !moreReq.waiting.delete(m.session)) return;
+  moreReq.got.push(m.events ?? []);
+  if (moreReq.waiting.size === 0) finishMore();
+}
+
+function finishMore() {
+  if (!moreReq) return;
+  clearTimeout(moreReq.timer);
+  const res = stream.prepend(moreReq.got);
+  moreReq = null;
+  view.prepended(res);
+  updateHasMore();
+}
+
+function onStreamSnapshot(m) {
+  stream.load({ staged: m.staged, stream: m.stream });
+  moreReq = null;
+  view.reset();
+  updateHasMore();
+}
+
+function onStreamFrame(m) {
+  const ops = stream.apply(m.events);
+  view.update(ops);
+  if (ops.dropped) updateHasMore();
+  return ops;
+}
+
+// ---------- 效能量測（?mock=16&bench）：串流 ≥ 3000 行時，每幀套用 Event＋渲染＋排版的耗時 ----------
+const bench = { on: false, samples: [], apply: [], js: [], events: 0, need: 120 };
+
+function benchFrame(m) {
+  const t0 = performance.now();
+  const ops = onStreamFrame(m);
+  const t1 = performance.now();
+  view.flush();
+  const t2 = performance.now();
+  void $("#stream").scrollHeight; // 強制排版，把 style／layout 算進來
+  const t3 = performance.now();
+  if (stream.rows.length < 3000) return ops;
+  bench.samples.push(t3 - t0);
+  bench.apply.push(t1 - t0);
+  bench.js.push(t2 - t0);
+  bench.events += m.events.length;
+  if (bench.samples.length === bench.need) {
+    const q = (arr, p) => {
+      const s = [...arr].sort((a, b) => a - b);
+      return s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(2);
+    };
+    const s = bench.samples;
+    const text = `bench rows=${stream.rows.length} frames=${s.length} events/frame=${(bench.events / s.length).toFixed(1)} total p50=${q(s, 0.5)}ms p95=${q(s, 0.95)}ms max=${q(s, 1)}ms | apply p50=${q(bench.apply, 0.5)} js(apply+render) p50=${q(bench.js, 0.5)}`
+      + `\nrender: pre p50=${q(benchProf.slice(-120).map((x) => x.pre), 0.5)} dom p50=${q(benchProf.slice(-120).map((x) => x.dom), 0.5)} painted avg=${(benchProf.slice(-120).reduce((a, x) => a + x.painted, 0) / 120).toFixed(1)} nodes=${benchProf.at(-1).nodes}`;
+    const out = $("#benchOut");
+    out.textContent = text;
+    out.hidden = false;
+    document.title = text;
+    console.log(text);
+  }
+  return ops;
 }
 
 // ---------- 互動 ----------
@@ -153,7 +322,9 @@ for (const t of document.querySelectorAll(".tab")) {
 // ---------- 連線 ----------
 const params = new URLSearchParams(location.search);
 const mockN = params.has("mock") ? Math.max(1, Math.min(32, Number(params.get("mock")) || 12)) : 0;
-const mock = mockN ? installMock(mockN) : null;
+bench.on = mockN > 0 && params.has("bench");
+bench.isolate = bench.on && params.has("isolate");
+const mock = mockN ? installMock(mockN, { bench: bench.on }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));
@@ -168,8 +339,23 @@ const client = createClient({
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
     welcome: (m) => { ui.welcome = m; render(); },
-    snapshot: (m) => { if (m.ch === "*") applySnapshot(store, m); render(); },
-    frame: (m) => { applyFrame(store, m); render(); },
+    snapshot: (m) => {
+      if (m.ch === "*") {
+        applySnapshot(store, m);
+        onStreamSnapshot(m);
+      }
+      render();
+    },
+    frame: (m) => {
+      applyFrame(store, m);
+      // session:<id> 頻道的 Event 與 `*` 重複，只有 `*` 進合流串流
+      if (m.ch === "*") {
+        const ops = bench.on ? benchFrame(m) : onStreamFrame(m);
+        if (ops?.stagedChanged) render();
+      }
+      render();
+    },
+    more: onMore,
     onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(); },
     onIncompatible: () => { ui.conn = "incompatible"; render(); },
     onError: (e) => console.warn("ws message", e),
