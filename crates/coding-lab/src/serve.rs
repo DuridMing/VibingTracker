@@ -93,6 +93,20 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
 
     let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
     web.apply(&recent);
+    // ack 不是 Event，重放會讓已確認的注意列跑回來：依 store 的佇列對齊
+    match store
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .open_attention()
+    {
+        Ok(rows) => web.keep_attention(
+            &rows
+                .iter()
+                .map(|a| format!("{}/{}/{}", a.session, a.kind, a.reference))
+                .collect(),
+        ),
+        Err(e) => log(&format!("讀取注意佇列失敗：{e}")),
+    }
     web.flush(crate::now_ms());
     let (web_addr, _web_task) = serve_web(cfg.web_bind, web.clone()).await?;
     let _flusher = web.spawn_flusher();

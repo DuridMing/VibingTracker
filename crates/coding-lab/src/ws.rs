@@ -91,6 +91,11 @@ impl WebState {
         }
     }
 
+    /// 重啟重建後依 store 的佇列去掉已確認的注意列（見 [`Live::keep_attention`]）。
+    pub fn keep_attention(&self, open: &std::collections::HashSet<String>) {
+        self.live().keep_attention(open);
+    }
+
     /// 打包並廣播一個 frame；沒有變化就什麼都不送。
     pub fn flush(&self, now: u64) {
         let frame = self.live().flush(now);

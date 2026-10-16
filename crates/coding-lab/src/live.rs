@@ -251,6 +251,8 @@ struct AttentionLive {
     reference: String,
     reason: String,
     raised_at: u64,
+    /// danger 解除（工具結束）的時間：列留到 ack（契約 §6）
+    cleared_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -492,14 +494,24 @@ impl Live {
                         reference: a.reference,
                         reason: a.reason.unwrap_or_default(),
                         raised_at: ts,
+                        cleared_at: None,
                     },
                 );
                 self.dirty_attention.insert(id, false);
             }
             Payload::AttentionCleared(a) => {
                 let id = format!("{sid}/{}/{}", enum_str(&a.kind), a.reference);
-                if self.attention.remove(&id).is_some() {
-                    self.dirty_attention.insert(id, true);
+                match self.attention.get_mut(&id) {
+                    // danger 解除只標時間，留到 ack
+                    Some(row) if row.kind == "danger" => {
+                        row.cleared_at = Some(ts);
+                        self.dirty_attention.insert(id, false);
+                    }
+                    Some(_) => {
+                        self.attention.remove(&id);
+                        self.dirty_attention.insert(id, true);
+                    }
+                    None => {}
                 }
             }
             Payload::ToolCalled(c) => {
@@ -592,6 +604,20 @@ impl Live {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 重啟重建後對齊 store 的佇列：ack 不是 Event，重放會讓已確認的列跑回來。
+    pub fn keep_attention(&mut self, open: &std::collections::HashSet<String>) {
+        let gone: Vec<String> = self
+            .attention
+            .keys()
+            .filter(|id| !open.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.attention.remove(&id);
+            self.dirty_attention.insert(id, true);
         }
     }
 
@@ -922,7 +948,7 @@ fn agent_row(id: &str, a: &AgentLive) -> Value {
 fn attention_row(id: &str, a: &AttentionLive) -> Value {
     json!({
         "id": id, "session": a.session, "kind": a.kind, "ref": a.reference,
-        "reason": a.reason, "raisedAt": a.raised_at,
+        "reason": a.reason, "raisedAt": a.raised_at, "clearedAt": a.cleared_at,
     })
 }
 

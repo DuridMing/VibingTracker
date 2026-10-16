@@ -431,6 +431,132 @@ fn attention_rows_raise_clear_ack() {
     );
 }
 
+/// danger 解除（工具結束）後列留到 ack，帶 `clearedAt`；其他種類解除就刪（契約 §6）。
+#[test]
+fn danger_row_stays_until_ack_after_clear() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let raise = |b: &mut B, kind: &str, r: &str| {
+        b.ev(
+            "s1",
+            "attention.raised",
+            "main",
+            DAY,
+            false,
+            json!({"kind": kind, "ref": r, "reason": "x"}),
+        )
+    };
+    let clear = |b: &mut B, kind: &str, r: &str| {
+        b.ev(
+            "s1",
+            "attention.cleared",
+            "main",
+            DAY + 5,
+            false,
+            json!({"kind": kind, "ref": r, "reason": "done"}),
+        )
+    };
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            raise(&mut b, "danger", "t1"),
+            raise(&mut b, "fail", "t2"),
+        ],
+    );
+    l.register_offset(0);
+    let snap = l.snapshot(&Channel::All, 0, DAY);
+    assert!(
+        rows(&snap, "attention")
+            .iter()
+            .all(|a| a["clearedAt"].is_null())
+    );
+    l.flush(DAY);
+
+    apply_all(
+        &mut l,
+        &[clear(&mut b, "danger", "t1"), clear(&mut b, "fail", "t2")],
+    );
+    let f = l.flush(DAY + 5).unwrap();
+    let mut att: Vec<Value> = f.rows_for(&Channel::All)["attention"]
+        .as_array()
+        .unwrap()
+        .clone();
+    att.sort_by_key(|a| a["id"].as_str().unwrap().to_string());
+    assert_eq!(att.len(), 2);
+    assert_eq!(att[0]["id"], "s1/danger/t1");
+    assert_eq!(att[0]["clearedAt"], DAY + 5, "danger 解除後更新列，不刪");
+    assert!(att[0].get("deleted").is_none());
+    assert_eq!(att[1]["id"], "s1/fail/t2");
+    assert_eq!(att[1]["deleted"], true, "其他種類解除就刪");
+
+    let snap = l.snapshot(&Channel::All, 0, DAY + 5);
+    assert_eq!(
+        rows(&snap, "attention").len(),
+        1,
+        "snapshot 也留著解除的 danger"
+    );
+    assert_eq!(snap["kpi"]["attention"], 1, "KPI 與佇列列數一致");
+
+    assert!(l.ack("s1", "danger", "t1"));
+    let f = l.flush(DAY + 6).unwrap();
+    assert_eq!(f.rows_for(&Channel::All)["attention"][0]["deleted"], true);
+    assert!(rows(&l.snapshot(&Channel::All, 0, DAY + 6), "attention").is_empty());
+}
+
+/// 重啟重建：ack 不是 Event，重放後要依 store 的佇列去掉已確認的列（含解除後留著的 danger）。
+#[test]
+fn rebuilt_attention_drops_rows_acked_before_restart() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.ev(
+                "s1",
+                "attention.raised",
+                "main",
+                DAY,
+                false,
+                json!({"kind": "danger", "ref": "t1", "reason": "x"}),
+            ),
+            b.ev(
+                "s1",
+                "attention.cleared",
+                "main",
+                DAY,
+                false,
+                json!({"kind": "danger", "ref": "t1", "reason": "done"}),
+            ),
+            b.ev(
+                "s1",
+                "attention.raised",
+                "main",
+                DAY,
+                false,
+                json!({"kind": "danger", "ref": "t2", "reason": "x"}),
+            ),
+            b.ev(
+                "s1",
+                "attention.raised",
+                "main",
+                DAY,
+                false,
+                json!({"kind": "done", "ref": "p1", "reason": "x"}),
+            ),
+        ],
+    );
+    // store 說還在佇列的只有 t2（t1、p1 重啟前已經 ack）
+    l.keep_attention(&["s1/danger/t2".to_string()].into_iter().collect());
+    let snap = l.snapshot(&Channel::All, 0, DAY);
+    let ids: Vec<&str> = rows(&snap, "attention")
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["s1/danger/t2"]);
+}
+
 // ── 暫存區、串流、改動紀錄
 
 #[test]
