@@ -8,6 +8,8 @@ import { formatRow, esc } from "./format.js";
 import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
+import { sortAttention, KIND_TEXT } from "./attention.js";
+import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -271,8 +273,193 @@ function render(urgent = false) {
     renderLive();
     renderChanges();
     renderDiff();
+    renderAttention();
+    renderNotifySwitches();
   });
 }
+
+// ---------- 注意佇列（#646） ----------
+// 排序：種類 > session 分數 > raisedAt（attention.js）。「已確認」送 ack，等 collector 送 deleted 才真的移除；送出後到刪除前先變淡。
+const ackPending = new Set();
+const scoreOf = (id) => store.sessions.get(id)?.score;
+
+function ago(ms) {
+  const m = Math.floor(ms / 60_000);
+  if (m < 1) return "剛剛";
+  return m < 60 ? `${m} 分` : `${Math.floor(m / 60)} 時`;
+}
+
+function renderAttention() {
+  for (const id of ackPending) if (!store.attention.has(id)) ackPending.delete(id);
+  const rows = sortAttention([...store.attention.values()], scoreOf);
+  const now = Date.now();
+  const canAck = ui.welcome?.scope !== "view";
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}`).join(",");
+  if (!changed("att", sig)) return;
+  const box = $("#att");
+  if (!rows.length) {
+    box.replaceChildren(h("div", { class: "none" }, "目前沒有需要處理的 session"));
+    return;
+  }
+  box.replaceChildren(...rows.map((r) => {
+    const s = store.sessions.get(r.session);
+    const pend = ackPending.has(r.id);
+    const score = scoreOf(r.session);
+    const ack = { class: "btn sm", title: "已確認：從佇列移除（所有視窗一致）", onclick: (e) => { e.stopPropagation(); ackRow(r); } };
+    if (pend) ack.disabled = "";
+    return h("div", {
+      class: `arow ${r.kind}${pend ? " pend" : ""}${ui.tab === r.session ? " on" : ""}`, role: "button", tabindex: "0",
+      title: `${r.session}${s?.lastPrompt ? `\n${s.lastPrompt}` : ""}${score ? `\n分數 ${score}` : ""}`,
+      onclick: () => selectTab(r.session),
+      onkeydown: (e) => { if (e.key === "Enter" && e.target === e.currentTarget) selectTab(r.session); },
+    },
+    h("span", { class: "ak" }, KIND_TEXT[r.kind] ?? r.kind),
+    h("span", { class: "ss", style: `color:${sessionColor(r.session)}` }, shortId(r.session)),
+    h("span", { class: "ar" }, r.reason ?? ""),
+    h("span", { class: "at" }, ago(now - (r.raisedAt ?? now))),
+    h("button", { class: "btn sm", onclick: (e) => { e.stopPropagation(); selectTab(r.session); } }, "查看"),
+    canAck ? h("button", ack, pend ? "確認中…" : "已確認") : null);
+  }));
+}
+
+function ackRow(r) {
+  ackPending.add(r.id);
+  client.ack({ session: r.session, kind: r.kind, ref: r.ref });
+  render(true);
+}
+
+// ---------- 通知（#647） ----------
+// toast 每個主視窗各自顯示；聲音與瀏覽器通知只由 leader 發；#monitor 視窗都不發。不補響、1 秒合併在 notify.js。
+const isMonitor = location.hash.startsWith("#monitor=");
+const storage = (() => { try { return window.localStorage; } catch { return null; } })();
+const nset = loadSettings(storage);
+const notifyUi = { reason: "" }; // 開關旁的說明（不能用的原因、點一下啟用聲音）
+
+function canBrowserNotify() {
+  if (!("Notification" in window)) return "這個瀏覽器不支援通知";
+  if (!window.isSecureContext) return "非 HTTPS 的遠端連線不能用瀏覽器通知";
+  if (Notification.permission === "denied") return "瀏覽器已封鎖這個網站的通知";
+  return "";
+}
+
+let audio = null;
+function audioCtx() {
+  if (audio) return audio;
+  const AC = window.AudioContext ?? window.webkitAudioContext;
+  if (!AC) return null;
+  try { audio = new AC(); } catch { return null; }
+  return audio;
+}
+// 完成兩聲上揚、等你一聲中、危險（與失敗）一聲低
+const TONES = { done: [[660, 0], [880, 0.16]], wait: [[620, 0]], danger: [[220, 0]], fail: [[220, 0]], conflict: [[620, 0]] };
+function playTone(kind) {
+  const ctx = audioCtx();
+  if (!ctx || ctx.state !== "running") return;
+  for (const [freq, at] of TONES[kind] ?? TONES.wait) {
+    const t = ctx.currentTime + at;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.2, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    o.connect(g).connect(ctx.destination);
+    o.start(t);
+    o.stop(t + 0.2);
+  }
+}
+// 自動播放政策：重新整理後要使用者先互動，AudioContext 才會 running
+function unlockAudio() {
+  if (!nset.sound) return;
+  const ctx = audioCtx();
+  if (ctx && ctx.state !== "running") ctx.resume().then(() => render(true), () => {});
+}
+addEventListener("pointerdown", unlockAudio, { capture: true });
+addEventListener("keydown", unlockAudio, { capture: true });
+
+function showToast(sum, items) {
+  const box = $("#toasts");
+  const el = h("button", { class: `toast ${sum.kind}`, onclick: () => { selectTab(items[0].session); el.remove(); } },
+    h("b", {}, sum.title), sum.body ? h("span", {}, sum.body) : null);
+  box.prepend(el);
+  while (box.children.length > 4) box.lastChild.remove();
+  setTimeout(() => el.remove(), 6000);
+}
+
+function showBrowserNote(sum, items) {
+  if (canBrowserNotify() || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(sum.title, { body: sum.body, tag: "coding-lab", silent: true });
+    n.onclick = () => { window.focus(); selectTab(items[0].session); n.close(); };
+  } catch {
+    // 有些瀏覽器只允許從 service worker 發；這裡不處理
+  }
+}
+
+const leader = createLeader({
+  id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  channel: !isMonitor && "BroadcastChannel" in window ? new BroadcastChannel(`coding-lab.notify${location.search.includes("mock") ? ".mock" : ""}`) : null,
+  now: () => Date.now(),
+  setInterval: (fn, ms) => window.setInterval(fn, ms),
+  clearInterval: (t) => window.clearInterval(t),
+});
+addEventListener("pagehide", () => leader.stop());
+
+const notifier = createNotifier({
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+  clearTimeout: (t) => window.clearTimeout(t),
+  emit: ({ items }) => {
+    const sum = summarize(items, shortId);
+    for (const sink of sinksFor(nset, { isLeader: leader.isLeader(), isMonitor })) {
+      if (sink === "toast") showToast(sum, items);
+      else if (sink === "sound") playTone(sum.kind);
+      else if (sink === "browser") showBrowserNote(sum, items);
+    }
+  },
+});
+
+function renderNotifySwitches() {
+  const why = canBrowserNotify();
+  const soundLocked = nset.sound && audio?.state !== "running";
+  const hint = nset.browser && why ? why : soundLocked ? "點一下啟用聲音" : notifyUi.reason;
+  if (!changed("nsw", `${nset.toast}${nset.sound}${nset.browser}|${why}|${hint}`)) return;
+  $("#nToast").checked = nset.toast;
+  $("#nSound").checked = nset.sound;
+  $("#nBrowser").checked = nset.browser && !why;
+  $("#nBrowser").disabled = !!why && why !== "瀏覽器已封鎖這個網站的通知";
+  $("#nBrowserL").title = why;
+  $("#nHint").hidden = !hint;
+  $("#nHint").textContent = hint;
+}
+
+function setNotify(key, on) {
+  nset[key] = on;
+  notifyUi.reason = "";
+  saveSettings(storage, nset);
+  render(true);
+}
+$("#nToast").addEventListener("change", (e) => setNotify("toast", e.target.checked));
+$("#nSound").addEventListener("change", (e) => {
+  setNotify("sound", e.target.checked);
+  unlockAudio(); // 勾選本身就是使用者互動
+});
+$("#nBrowser").addEventListener("change", async (e) => {
+  const on = e.target.checked;
+  if (on && !canBrowserNotify() && Notification.permission === "default") {
+    const p = await Notification.requestPermission().catch(() => "denied");
+    if (p !== "granted") {
+      setNotify("browser", false);
+      notifyUi.reason = "沒有取得通知權限";
+      render(true);
+      return;
+    }
+  }
+  setNotify("browser", on && !canBrowserNotify());
+});
+$("#nHint").addEventListener("click", unlockAudio);
+setInterval(() => render(), 30_000); // 佇列的「幾分前」
 
 // ---------- 改動紀錄（中欄）與修改情形（右欄） ----------
 const changes = createChanges();
@@ -489,10 +676,11 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; render(true); },
+    welcome: (m) => { ui.welcome = m; notifier.connected(); render(true); },
     snapshot: (m) => {
       if (m.ch === "*") {
         applySnapshot(store, m);
+        notifier.snapshot(m.attention);
         onStreamSnapshot(m);
         changes.load(m.changes);
       }
@@ -500,6 +688,7 @@ const client = createClient({
     },
     frame: (m) => {
       applyFrame(store, m);
+      if (m.ch === "*") notifier.frame(m.rows?.attention);
       // session:<id> 頻道的 Event 與 `*` 重複，只有 `*` 進合流串流
       if (m.ch === "*") {
         if (bench.on) benchFrame(m);

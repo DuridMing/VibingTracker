@@ -26,6 +26,7 @@ const BASH = [
 ];
 const DANGER = [{ command: "git push --force origin main", why: "強制推送會覆蓋遠端歷史", rule: "git-force-push" }, { command: "rm -rf dist build", why: "遞迴刪除", rule: "rm-rf" }];
 const AGENT_TYPES = ["Explore", "general-purpose", "Plan"];
+const SCORE_BASE = { danger: 100, fail: 60, wait: 50, done: 20 };
 const ATTENTION_REASON = { wait: "要不要同時更新 README？", done: "回合結束，等你確認", fail: "npm test exit 1（連續兩次）", danger: "git push --force" };
 
 function rng(seed) {
@@ -60,6 +61,7 @@ function createWorld(n) {
     status: "run",
     statusSince: now,
     doing: null,
+    score: 0,
     commits: 0,
     dangers: 0,
     failures: 0,
@@ -260,6 +262,9 @@ function createWorld(n) {
       attention.set(a.id, a);
       rows.attention.push(a);
     }
+    // §6 sessions.score：佇列裡的種類給基礎分，再加一點動態分（真的算法在 collector，#645）
+    s.score = (SCORE_BASE[s.status] ?? 0) + Math.floor(r() * 20);
+    changed.score = s.score;
     if (s.status === "danger") changed.dangers = ++s.dangers;
     if (s.status === "fail") changed.failures = ++s.failures;
     rows.sessions.push(changed);
@@ -307,6 +312,14 @@ function createWorld(n) {
         stream: stream.flatMap(expand),
       };
     },
+    // 「已確認」：collector 收到 ack 立刻 flush，送 deleted
+    ack({ session, kind, ref }) {
+      const id = `${session}/${kind}/${ref}`;
+      if (!attention.delete(id)) return null;
+      recount();
+      frame++;
+      return { t: "frame", frame, ch: "*", events: [], rows: { attention: [{ id, deleted: true }], kpi: { attention: kpi.attention } } };
+    },
     more(session, beforePos, limit) {
       const mine = glog.filter((e) => e.session === session && e.pos != null && e.pos < beforePos);
       return { t: "more", session, events: mine.slice(-limit).flatMap(expand) };
@@ -322,7 +335,8 @@ function createWorld(n) {
         if (s.status !== "run" && r() < 0.15) { // 停下來的 session 過一陣子繼續跑
           s.status = "run";
           s.statusSince = Date.now();
-          rows.sessions.push({ id: s.id, status: "run", statusSince: s.statusSince });
+          s.score = Math.floor(r() * 10);
+          rows.sessions.push({ id: s.id, status: "run", statusSince: s.statusSince, score: s.score });
           for (const [id, a] of attention) if (a.session === s.id) { attention.delete(id); rows.attention.push({ id, deleted: true }); }
         }
         tick(s, events, rows);
@@ -383,6 +397,7 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
           ? setInterval(() => this.#emit(world.step({ minEvents: 20 })), 50)
           : setInterval(() => this.#emit(world.step()), 400);
       }
+      if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#emit(f); }, 80);
       if (msg.op === "more") setTimeout(() => this.#emit(world.more(msg.session, msg.beforePos, msg.limit)), 60);
     }
     close() { this.#end(); }

@@ -30,6 +30,7 @@
   </div>
 </header>
 <div class="kpop" id="kpop" role="tooltip" hidden></div>
+<div class="toasts" id="toasts" aria-live="polite"></div>
 
 <div class="main">
   <section class="col col-tree">
@@ -58,9 +59,10 @@
           </div>
           <div class="att-blk">
             <div class="ovh"><h2>需要注意</h2>
-              <label class="swl"><input type="checkbox" disabled>頁內提示</label>
-              <label class="swl"><input type="checkbox" disabled>瀏覽器通知</label>
-              <label class="swl"><input type="checkbox" disabled>提示音</label>
+              <label class="swl"><input type="checkbox" id="nToast">頁內提示</label>
+              <label class="swl" id="nBrowserL"><input type="checkbox" id="nBrowser">瀏覽器通知</label>
+              <label class="swl"><input type="checkbox" id="nSound">提示音</label>
+              <button class="hint nhint" id="nHint" hidden></button>
             </div>
             <div class="att" id="att"><div class="none">目前沒有需要處理的 session</div></div>
           </div>
