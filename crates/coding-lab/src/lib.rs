@@ -1,5 +1,6 @@
 //! coding-lab collector。資料契約見 docs/plan/contracts.md。
 
+pub mod config;
 pub mod derive;
 pub mod event;
 pub mod hook;
@@ -8,6 +9,7 @@ pub mod live;
 pub mod merge;
 pub mod prices;
 pub mod rules;
+pub mod serve;
 pub mod store;
 pub mod transcript;
 pub mod ws;

@@ -1,0 +1,231 @@
+//! `coding-lab serve`：把 hooks、transcript tail、merge、store、ws 組成一個 collector（#629）。
+//!
+//! 先綁 hook 埠——這同時是單例鎖：綁不到就表示已有 collector 在跑，直接結束；綁到了才開 store，
+//! 避免兩個程序同時寫 SQLite。主迴圈是 merge 的唯一消費者（PLAN「collector 設計」）：
+//! hook 與 transcript 的輸入都經同一個 channel 進來，同一個 session 內的順序因此固定。
+
+use std::collections::HashMap;
+use std::io;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde_json::json;
+use tokio::sync::mpsc;
+
+use crate::config::Config;
+use crate::event::Event;
+use crate::hooks::serve_hooks;
+use crate::merge::{Input, Merger};
+use crate::rules::RuleSet;
+use crate::store::Store;
+use crate::transcript::{TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail};
+use crate::ws::{WebState, serve_web};
+
+/// 重啟時從 store 重建多久以內的 live 狀態（涵蓋任何時區的「今天」）。
+const REBUILD_WINDOW_MS: u64 = 36 * 60 * 60 * 1000;
+const TICK: Duration = Duration::from_millis(500);
+const STORE_FLUSH: Duration = Duration::from_millis(100);
+const INPUT_QUEUE: usize = 8192;
+const FRAME_QUEUE: usize = 256;
+
+pub enum Outcome {
+    Stopped,
+    /// hook 埠已被佔用（通常是另一個 collector）
+    AlreadyRunning,
+}
+
+pub fn log(msg: &str) {
+    eprintln!("[{}] coding-lab：{msg}", crate::now_ms());
+}
+
+pub async fn run(cfg: Config) -> io::Result<Outcome> {
+    std::fs::create_dir_all(&cfg.home)?;
+    let (tx, mut rx) = mpsc::channel::<Input>(INPUT_QUEUE);
+    let hook_addr = match serve_hooks(cfg.hook_bind, tx.clone()).await {
+        Ok((addr, _task)) => addr,
+        Err(e) if e.kind() == io::ErrorKind::AddrInUse => return Ok(Outcome::AlreadyRunning),
+        Err(e) => return Err(e),
+    };
+
+    let store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
+    let recent = store
+        .recent_events(crate::now_ms().saturating_sub(REBUILD_WINDOW_MS))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    let store = Arc::new(Mutex::new(store));
+
+    let (rules, warning) = RuleSet::load(&cfg.home.join("rules.json"));
+    if let Some(w) = warning {
+        log(&w);
+    }
+
+    let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
+    web.apply(&recent);
+    web.flush(crate::now_ms());
+    let (web_addr, _web_task) = serve_web(cfg.web_bind, web.clone()).await?;
+    let _flusher = web.spawn_flusher();
+
+    let info = cfg.home.join("collector.json");
+    let me = std::process::id();
+    std::fs::write(
+        &info,
+        json!({
+            "pid": me, "hook": hook_addr.to_string(), "web": web_addr.to_string(),
+            "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(),
+        })
+        .to_string(),
+    )?;
+    log(&format!(
+        "hook {hook_addr}、web http://{web_addr}、資料 {}",
+        cfg.home.display()
+    ));
+
+    let mut merger = Merger::new(Box::new(rules));
+    let mut planner = TailPlanner::default();
+    let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
+    let mut tick = tokio::time::interval(TICK);
+    let mut flush = tokio::time::interval(STORE_FLUSH);
+    let idle = Duration::from_secs(cfg.idle_exit_seconds);
+    let mut last_hook = Instant::now();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+
+    let sink = |events: Vec<Event>| {
+        if events.is_empty() {
+            return;
+        }
+        {
+            let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+            for e in &events {
+                s.append(e.clone());
+            }
+        }
+        web.apply(&events);
+    };
+
+    loop {
+        tokio::select! {
+            Some(input) = rx.recv() => {
+                if let Input::Hook { hook, .. } = &input {
+                    last_hook = Instant::now();
+                    let actions = planner.on_hook(hook);
+                    if !actions.is_empty() {
+                        for action in actions {
+                            apply_tail(action, &mut tails, &tx);
+                        }
+                        web.set_health(json!({ "tails": tails.len(), "schedLagMs": 0 }));
+                    }
+                }
+                sink(merger.handle(input));
+            }
+            scheduled = tick.tick() => {
+                let lag = Instant::now().saturating_duration_since(scheduled.into_std());
+                sink(merger.tick(crate::now_ms()));
+                web.set_health(json!({ "tails": tails.len(), "schedLagMs": lag.as_millis() as u64 }));
+                if !idle.is_zero() && last_hook.elapsed() >= idle {
+                    log("閒置，自動結束");
+                    break;
+                }
+            }
+            _ = flush.tick() => {
+                if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
+                    log(&format!("寫入 store 失敗：{e}"));
+                }
+            }
+            _ = &mut shutdown => {
+                log("收到結束訊號");
+                break;
+            }
+        }
+    }
+
+    for (_, t) in tails.drain() {
+        t.stop().await;
+    }
+    while let Ok(input) = rx.try_recv() {
+        sink(merger.handle(input));
+    }
+    if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
+        log(&format!("寫入 store 失敗：{e}"));
+    }
+    remove_info_if_mine(&info, me);
+    Ok(Outcome::Stopped)
+}
+
+fn apply_tail(
+    action: TailAction,
+    tails: &mut HashMap<(String, String), TailHandle>,
+    tx: &mpsc::Sender<Input>,
+) {
+    let stop = |h: TailHandle| {
+        tokio::spawn(h.stop());
+    };
+    match action {
+        TailAction::Start {
+            session,
+            file,
+            path,
+            start,
+        } => {
+            if let Some(old) = tails.remove(&(session.clone(), file.clone())) {
+                stop(old);
+            }
+            let h = spawn_tail(
+                path,
+                session.clone(),
+                file.clone(),
+                start,
+                tx.clone(),
+                TailOptions::default(),
+            );
+            tails.insert((session, file), h);
+        }
+        TailAction::Stop { session, file } => {
+            if let Some(h) = tails.remove(&(session, file)) {
+                stop(h);
+            }
+        }
+        TailAction::StopSession { session } => {
+            let keys: Vec<_> = tails
+                .keys()
+                .filter(|(s, _)| *s == session)
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(h) = tails.remove(&k) {
+                    stop(h);
+                }
+            }
+        }
+    }
+}
+
+/// 只刪自己寫的 collector.json（另一個 collector 可能已經接手）。
+fn remove_info_if_mine(path: &Path, me: u32) {
+    let mine = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|v| v["pid"] == me);
+    if mine {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return std::future::pending().await,
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}

@@ -37,6 +37,8 @@ pub struct WebState {
     store: Option<Arc<Mutex<Store>>>,
     web_root: Option<PathBuf>,
     frames: broadcast::Sender<Arc<Frame>>,
+    /// collector 主迴圈回報的健康資訊（tail 數、排程延遲…），併進 /healthz
+    health: Mutex<Value>,
 }
 
 impl WebState {
@@ -52,7 +54,12 @@ impl WebState {
             store,
             web_root,
             frames,
+            health: Mutex::new(json!({})),
         })
+    }
+
+    pub fn set_health(&self, extra: Value) {
+        *self.health.lock().unwrap_or_else(|e| e.into_inner()) = extra;
     }
 
     fn live(&self) -> MutexGuard<'_, Live> {
@@ -336,11 +343,21 @@ fn more_events(
 }
 
 async fn healthz(State(state): State<Arc<WebState>>) -> Response {
-    let live = state.live();
-    let body = json!({
-        "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL,
-        "sessions": live.session_count(), "frame": live.frame_no(),
-    });
+    let mut body = {
+        let live = state.live();
+        json!({
+            "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL,
+            "sessions": live.session_count(), "frame": live.frame_no(),
+        })
+    };
+    let extra = state
+        .health
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let (Some(b), Some(x)) = (body.as_object_mut(), extra.as_object()) {
+        b.extend(x.clone());
+    }
     (
         [(header::CONTENT_TYPE, "application/json")],
         body.to_string(),

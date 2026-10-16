@@ -402,6 +402,31 @@ impl Store {
             .optional()?)
     }
 
+    /// `ts_seen` ≥ `since` 的所有 Event，依 (ts_seen, session, seq)：collector 重啟時重建 live 狀態用。
+    pub fn recent_events(&self, since: u64) -> Result<Vec<Event>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT session, offset FROM events WHERE ts_seen >= ?1 ORDER BY ts_seen, session, seq",
+        )?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![since as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut start = 0;
+        while start < rows.len() {
+            // 同一個 session 連續的列一次讀
+            let session = rows[start].0.clone();
+            let end = rows[start..]
+                .iter()
+                .position(|(s, _)| *s != session)
+                .map_or(rows.len(), |n| start + n);
+            let offsets: Vec<i64> = rows[start..end].iter().map(|(_, o)| *o).collect();
+            out.extend(self.read_at(&session, offsets)?);
+            start = end;
+        }
+        out.sort_by(|a, b| (a.ts_seen, &a.session, a.seq).cmp(&(b.ts_seen, &b.session, b.seq)));
+        Ok(out)
+    }
+
     fn read_at(&self, session: &str, offsets: Vec<i64>) -> Result<Vec<Event>, StoreError> {
         let mut out = Vec::with_capacity(offsets.len());
         if offsets.is_empty() {

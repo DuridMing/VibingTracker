@@ -15,12 +15,8 @@ fn version_matches_cargo_toml() {
     );
 }
 
-/// `ensure` 由 SessionStart hook 呼叫：不論成功與否都不能讓 Claude Code 看到失敗。
-#[test]
-fn ensure_always_exits_zero() {
-    let out = coding_lab().arg("ensure").output().unwrap();
-    assert!(out.status.success());
-}
+// `ensure` 的行為（永遠 exit 0、stdout 為空）在 tests/serve.rs，那裡用暫存的資料目錄；
+// 這裡不跑，否則會在真正的 ~/.coding-lab 拉起 collector。
 
 #[test]
 fn unknown_subcommand_fails() {
