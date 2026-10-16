@@ -1,4 +1,4 @@
-//! web 入口（#636，contracts.md §6–§7）：WebSocket、`/healthz`、前端靜態檔。
+//! web 入口（#636，contracts.md §6–§7）：WebSocket、`/healthz`、HTTP API（[`crate::api`]）、前端靜態檔。
 //!
 //! 每 50 ms 從 [`Live`] 取一個 frame，用 broadcast 發給各連線，各連線依自己訂的頻道與時區過濾。
 //! 連線落後超過 broadcast 容量時直接重送 snapshot（snapshot 就是最新狀態，什麼都不會漏）。
@@ -31,7 +31,7 @@ use crate::store::Store;
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
-const MORE_LIMIT: u64 = 500;
+pub(crate) const MORE_LIMIT: u64 = 500;
 /// hello 帶的 `resume` 只套用在這段時間內收到的 subscribe：前端重連時是 hello 後立刻重送所有訂閱，
 /// 之後才新開的頻道客戶端沒有它的狀態，要給 snapshot（server 分不出兩者，只能看時間）。
 pub const RESUME_WINDOW: Duration = Duration::from_secs(2);
@@ -75,7 +75,11 @@ impl WebState {
         *self.health.lock().unwrap_or_else(|e| e.into_inner()) = extra;
     }
 
-    fn live(&self) -> MutexGuard<'_, Live> {
+    pub(crate) fn store(&self) -> Option<&Arc<Mutex<Store>>> {
+        self.store.as_ref()
+    }
+
+    pub(crate) fn live(&self) -> MutexGuard<'_, Live> {
         // 有執行緒 panic 也繼續用（狀態只是顯示用的彙總）
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -125,7 +129,13 @@ pub async fn serve_web(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
+    let api = Router::new()
+        .route("/api/sessions", get(crate::api::sessions))
+        .route("/api/sessions/{id}/events", get(crate::api::events))
+        .route("/api/files", get(crate::api::files))
+        .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
+        .merge(api)
         .route("/ws", get(ws_handler))
         .route("/healthz", get(healthz))
         .fallback(get(static_file))
@@ -159,6 +169,15 @@ fn host_is_loopback(headers: &HeaderMap) -> bool {
     };
     name.eq_ignore_ascii_case("localhost")
         || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `/api/*`：同 `/ws`，使用者瀏覽器裡別的網頁不能讀走 session 資料。
+async fn require_same_origin(req: Request, next: Next) -> Response {
+    if same_origin(req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
+    }
 }
 
 /// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
@@ -360,7 +379,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 
 /// 「載入更多」：窗口內的帶 pos Event，加上卡片的伴隨 Event 與窗口範圍內的狀態行（contracts.md §6）。
 /// 伴隨 Event 從窗口第一個 seq 往前 [`COMPANION_LOOKBACK`] 個、往後到下一個帶 pos 的 Event 為止找。
-fn more_events(
+pub(crate) fn more_events(
     store: &Store,
     session: &str,
     before: Option<u64>,

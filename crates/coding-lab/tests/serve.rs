@@ -375,3 +375,101 @@ fn events_after_session_end_do_not_reopen_it() {
     open.sort();
     assert_eq!(open, ["b", "c"]);
 }
+
+fn ev_with(
+    session: &str,
+    seq: u64,
+    kind: &str,
+    pos: Option<u64>,
+    ts: u64,
+    payload: Value,
+) -> coding_lab::event::Event {
+    coding_lab::event::Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": kind, "agent": "main",
+            "line": null, "pos": pos, "ts_model": null, "ts_exec": null, "ts_seen": ts,
+            "host": "local", "payload": payload,
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn json_body(resp: &str) -> Value {
+    serde_json::from_str(resp.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap_or(Value::Null)
+}
+
+/// #671：真的 collector 起來後，store 裡的 session 從三個 API 都查得到。
+#[test]
+fn http_api_serves_stored_sessions() {
+    let e = env(30);
+    let cwd = e.home.join("proj").to_string_lossy().replace('\\', "/");
+    {
+        let mut s = coding_lab::store::Store::open(&e.home).unwrap();
+        let now = coding_lab::now_ms();
+        s.append(ev_with(
+            "s1",
+            1,
+            "session.started",
+            None,
+            now,
+            json!({"cwd": cwd, "source": "startup",
+            "model": "claude-opus-5-5", "transcriptPath": "/t", "branch": "main"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            2,
+            "prompt.submitted",
+            None,
+            now + 1,
+            json!({"text": "嗨", "promptId": "p"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            3,
+            "assistant.text",
+            Some(1),
+            now + 2,
+            json!({"text": "x", "messageId": "m", "model": "claude-opus-5-5"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            4,
+            "file.write",
+            None,
+            now + 3,
+            json!({"toolUseId": "w", "path": "n.txt",
+            "isNew": true, "content": "", "truncated": false}),
+        ));
+        s.flush().unwrap();
+    }
+    let _c = start_serve(&e);
+
+    let r = http(e.web, "GET", "/api/sessions", "");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let rows = json_body(&r)["sessions"].clone();
+    assert_eq!(
+        (rows[0]["id"].as_str(), rows[0]["lastPos"].as_u64()),
+        (Some("s1"), Some(1)),
+        "{rows}"
+    );
+
+    let r = http(e.web, "GET", "/api/sessions/s1/events?limit=10", "");
+    let types: Vec<String> = json_body(&r)["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| e["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(types, ["prompt.submitted", "assistant.text"], "{r}");
+
+    let r = http(
+        e.web,
+        "GET",
+        &format!("/api/files?cwd={}&base=session:s1", cwd.replace('/', "%2F")),
+        "",
+    );
+    assert_eq!(json_body(&r)["changes"][0]["path"], "n.txt", "{r}");
+}

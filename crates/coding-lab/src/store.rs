@@ -469,14 +469,65 @@ impl Store {
             .optional()?)
     }
 
-    /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案。
+    /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案，否則是 `cwd` 本身與底下（worktree）的。
     pub fn sessions(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<SessionRow>, StoreError> {
         let mut stmt = self.db.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE (?1 IS NULL OR cwd = ?1)
-             ORDER BY started_at DESC LIMIT ?2"
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR REPLACE(cwd, '\\', '/') = ?1
+               OR substr(REPLACE(cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/'
+             ORDER BY started_at DESC, id LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![cwd, limit as i64], session_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 所有 session 的 `cwd`（`/` 分隔、不重複）。
+    pub fn cwds(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT DISTINCT REPLACE(cwd, '\\', '/') FROM sessions WHERE cwd != ''")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 串流最後一個 `pos`。
+    pub fn last_pos(&self, session: &str) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT MAX(pos) FROM events WHERE session = ?1",
+                params![session],
+                |r| r.get::<_, Option<i64>>(0),
+            )?
+            .map(|v| v as u64))
+    }
+
+    /// 某 session 這些 type 的 Event，依 seq 排序。
+    pub fn events_of_types(&self, session: &str, types: &[&str]) -> Result<Vec<Event>, StoreError> {
+        let mut out = Vec::new();
+        for t in types {
+            let mut stmt = self
+                .db
+                .prepare("SELECT seq, offset FROM events WHERE session = ?1 AND type = ?2")?;
+            let rows: Vec<(i64, i64)> = stmt
+                .query_map(params![session, t], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            out.extend(rows);
+        }
+        out.sort();
+        self.read_at(session, out.into_iter().map(|(_, o)| o).collect())
+    }
+
+    /// 某 session 最後一個這種 type 的 Event。
+    pub fn last_of_type(&self, session: &str, kind: &str) -> Result<Option<Event>, StoreError> {
+        let off: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT offset FROM events WHERE session = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+                params![session, kind],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(self.read_at(session, off.into_iter().collect())?.pop())
     }
 
     /// 「誰碰過這檔」。

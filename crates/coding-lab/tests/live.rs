@@ -222,7 +222,84 @@ fn kpi_resets_after_local_midnight_and_only_sends_changes() {
     assert_eq!(f.kpi_for(0).unwrap()["edits"], 1);
     assert!(l.flush(DAY + 23 * H).is_none(), "沒有變化就沒有 frame");
     let f = l.flush(DAY + 25 * H).expect("跨過午夜要送新的 kpi");
-    assert_eq!(f.kpi_for(0).unwrap()["edits"], 0);
+    let k = f.kpi_for(0).unwrap();
+    assert_eq!(k["edits"], 0);
+    for key in ["live", "attention", "sessions", "costUsd", "models"] {
+        assert!(
+            k.get(key).is_some(),
+            "跨午夜整份重算、送完整的 kpi：缺 {key}：{k}"
+        );
+    }
+}
+
+fn usage(b: &mut B, s: &str, ts: u64, model: &str, thinking: u64, cost: f64) -> Event {
+    b.ev(
+        s,
+        "usage",
+        "main",
+        ts,
+        false,
+        json!({"messageId": "m", "model": model, "input": 0, "output": 0, "thinking": thinking,
+               "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": cost}),
+    )
+}
+
+/// 決定紀錄 #12：費用與思考 tokens 依模型分列，各鍵加總等於總數；不認得的模型 costUsd 0 照樣列。
+#[test]
+fn kpi_models_split_cost_and_thinking_by_model() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.register_offset(0);
+    let evs = [
+        b.started("s1", DAY + H),
+        usage(&mut b, "s1", DAY + H, "claude-opus-5-5", 7, 1.25),
+        usage(&mut b, "s1", DAY + H, "claude-opus-5-5[1m]", 1, 0.25),
+        usage(&mut b, "s1", DAY + H, "claude-sonnet-5-5", 3, 0.5),
+        usage(&mut b, "s1", DAY + H, "claude-foo-9", 2, 0.0),
+        usage(&mut b, "old", DAY - H, "claude-haiku-5-5", 100, 9.0), // 昨天
+    ];
+    apply_all(&mut l, &evs);
+    let k = l.snapshot(&Channel::All, 0, DAY + 2 * H)["kpi"].clone();
+    assert_eq!(
+        k["models"],
+        json!({
+            "opus 5.5": {"costUsd": 1.5, "thinkingTokens": 8},
+            "sonnet 5.5": {"costUsd": 0.5, "thinkingTokens": 3},
+            "foo 9": {"costUsd": 0.0, "thinkingTokens": 2},
+        }),
+        "{k}"
+    );
+    let m = k["models"].as_object().unwrap();
+    let cost: f64 = m.values().map(|v| v["costUsd"].as_f64().unwrap()).sum();
+    let think: u64 = m
+        .values()
+        .map(|v| v["thinkingTokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        (cost, think),
+        (
+            k["costUsd"].as_f64().unwrap(),
+            k["thinkingTokens"].as_u64().unwrap()
+        )
+    );
+
+    // 有一個模型變了就送整個 models（取代，不合併）
+    l.flush(DAY + 2 * H);
+    l.apply(&usage(
+        &mut b,
+        "s1",
+        DAY + 2 * H,
+        "claude-sonnet-5-5",
+        1,
+        0.25,
+    ));
+    let f = l.flush(DAY + 2 * H).unwrap();
+    let models = f.kpi_for(0).unwrap()["models"].clone();
+    assert_eq!(models.as_object().unwrap().len(), 3, "{models}");
+    assert_eq!(
+        models["sonnet 5.5"],
+        json!({"costUsd": 0.75, "thinkingTokens": 4})
+    );
 }
 
 // ── agents 列
