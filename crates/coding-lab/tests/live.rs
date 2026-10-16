@@ -1668,3 +1668,41 @@ fn flush_without_new_events_does_not_recompute_kpi() {
     l.flush(DAY + H + 160);
     assert_eq!(l.kpi_computations(), n + 1, "有新 Event 才重算");
 }
+
+/// #687（R32）：重啟後用 store 補 live 時，live 從串流看到的模型保留（照 seed 的說明），沒有才用 store 的。
+#[test]
+fn seed_keeps_the_model_live_already_knows() {
+    use coding_lab::store::SessionRow;
+    let row = |id: &str| SessionRow {
+        id: id.into(),
+        host: "local".into(),
+        cwd: "/p".into(),
+        transcript_path: None,
+        model: Some("claude-sonnet-5-5".into()),
+        branch: None,
+        first_prompt: None,
+        started_at: DAY,
+        ended_at: None,
+        end_reason: None,
+        status: "run".into(),
+        status_since: DAY,
+        commits: 0,
+        dangers: 0,
+        failures: 0,
+        cost_usd: 0.0,
+        thinking_tokens: 0,
+        last_seq: 0,
+    };
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.apply(&b.started("s1", DAY));
+    l.apply(&b.text("s1", DAY + 1)); // main 第一行 assistant：opus
+    l.seed(&row("s1"), DAY);
+    assert_eq!(l.session_row("s1").unwrap()["modelId"], "claude-opus-5-5");
+    l.seed(&row("s2"), DAY);
+    assert_eq!(
+        l.session_row("s2").unwrap()["modelId"],
+        "claude-sonnet-5-5",
+        "live 沒有就用 store 的"
+    );
+}

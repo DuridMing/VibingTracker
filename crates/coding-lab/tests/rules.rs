@@ -241,3 +241,39 @@ fn ruleset_plugs_into_merge() {
             .any(|e| e.type_name() == "attention.raised" && e.payload["kind"] == "danger")
     );
 }
+
+/// #687（R17）：使用者規則的 field 指定 content 時，對 Write 的內容命中、不含時不命中（照 repro r17）。
+#[test]
+fn rule_field_other_than_file_path_is_matched() {
+    let p = rules_file(
+        &json!({ "rules": [{ "id": "aws-key", "tools": ["Write"], "field": "content",
+                             "pattern": "AKIA[0-9A-Z]{4}", "level": "danger", "why": "金鑰" }] })
+        .to_string(),
+    );
+    let (r, warning) = RuleSet::load(&p);
+    assert!(warning.is_none(), "{warning:?}");
+    let hit = r.check(
+        "Write",
+        &json!({ "file_path": "/p/a.txt", "content": "k=AKIA1234" }),
+    );
+    assert_eq!(hit.map(|d| d.rule), Some("aws-key".to_string()));
+    let miss = r.check(
+        "Write",
+        &json!({ "file_path": "/p/a.txt", "content": "nothing" }),
+    );
+    assert!(miss.is_none());
+    // 內建的 file_path 規則照常
+    assert!(file(&r, "Write", "/p/.env").is_some());
+}
+
+/// #687（R17）：Bash 規則只能比對 command，設成別的欄位載入時警告（不再默默永不命中）。
+#[test]
+fn bash_rule_with_an_unsupported_field_warns_on_load() {
+    let p = rules_file(
+        &json!({ "rules": [{ "id": "desc", "tools": ["Bash"], "field": "description",
+                             "pattern": "x", "level": "warn", "why": "x" }] })
+        .to_string(),
+    );
+    let (_, warning) = RuleSet::load(&p);
+    assert!(warning.is_some_and(|w| w.contains("desc")));
+}

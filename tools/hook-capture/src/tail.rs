@@ -113,7 +113,7 @@ fn describe(line: &[u8], line_no: u64, ts: u128, backfill: bool) -> Value {
     let Ok(v) = serde_json::from_slice::<Value>(line) else {
         return json!({
             "ts_seen_ms": ts, "line_no": line_no,
-        "backfill": backfill, "backfill": backfill,
+        "backfill": backfill,
             "bytes": line.len(), "parse_error": true,
         });
     };
@@ -131,7 +131,6 @@ fn describe(line: &[u8], line_no: u64, ts: u128, backfill: bool) -> Value {
     json!({
         "ts_seen_ms": ts,
         "line_no": line_no,
-        "backfill": backfill,
         "backfill": backfill,
         "bytes": line.len(),
         "type": v["type"],

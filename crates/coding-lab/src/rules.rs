@@ -124,6 +124,15 @@ fn compile(specs: Vec<RuleSpec>) -> Result<RuleSet, String> {
             if spec.tools.is_empty() {
                 return Err(format!("規則 {} 沒有指定 tools", spec.id));
             }
+            // Bash 只比對指令（依段切開）；設成別的欄位以前會默默永不命中（#687 R17）
+            if spec.tools.iter().any(|t| t == "Bash")
+                && spec.field.as_deref().is_some_and(|f| f != "command")
+            {
+                return Err(format!(
+                    "規則 {} 套用在 Bash，field 只能是 command",
+                    spec.id
+                ));
+            }
             let re = Regex::new(&spec.pattern).map_err(|e| format!("規則 {}：{e}", spec.id))?;
             Ok(Rule { spec, re })
         })
@@ -274,11 +283,30 @@ impl RuleSet {
 }
 
 impl DangerRules for RuleSet {
+    /// 非 Bash 的工具：每條規則比對它自己的 `field`（預設 `file_path`，例如 Write 的 `content`），
+    /// 依規則順序取第一個命中的（使用者規則在前）。
     fn check(&self, tool: &str, input: &Value) -> Option<Danger> {
-        if tool != "Bash" {
-            let path = input["file_path"].as_str()?;
-            return self.first_match(tool, "file_path", &path.replace('\\', "/"), Scope::Segment);
+        if tool == "Bash" {
+            return self.check_command(tool, input["command"].as_str()?, 0);
         }
-        self.check_command(tool, input["command"].as_str()?, 0)
+        self.rules
+            .iter()
+            .filter(|r| r.spec.scope == Scope::Segment)
+            .filter(|r| r.spec.tools.iter().any(|t| t == tool || t == "*"))
+            .find(|r| {
+                let field = r.spec.field.as_deref().unwrap_or("file_path");
+                input[field].as_str().is_some_and(|text| {
+                    if field == "file_path" {
+                        r.re.is_match(&text.replace('\\', "/"))
+                    } else {
+                        r.re.is_match(text)
+                    }
+                })
+            })
+            .map(|r| Danger {
+                rule: r.spec.id.clone(),
+                level: r.spec.level,
+                why: r.spec.why.clone(),
+            })
     }
 }

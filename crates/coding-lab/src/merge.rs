@@ -115,6 +115,20 @@ struct Card {
     sensitive: bool,
 }
 
+impl Card {
+    /// 還沒進暫存區、什麼都還沒送的卡片（PreToolUse 遺失時由 PostToolUse／tool_result 先建出來）
+    fn new(agent: &str) -> Card {
+        Card {
+            agent: agent.to_string(),
+            staged_at: None,
+            result_sent: false,
+            finished: false,
+            called: false,
+            sensitive: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Session {
     seq: u64,
@@ -1237,12 +1251,10 @@ impl Merger {
             session.cards.insert(
                 id.clone(),
                 Card {
-                    agent: agent.clone(),
                     staged_at: Some(ts_seen),
-                    result_sent: false,
-                    finished: false,
                     called: true,
                     sensitive,
+                    ..Card::new(&agent)
                 },
             );
             let (input, input_truncated) = truncate_input(input);
@@ -1399,14 +1411,7 @@ impl Merger {
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card {
-            agent: agent.to_string(),
-            staged_at: None,
-            result_sent: false,
-            finished: false,
-            called: false,
-            sensitive: false,
-        });
+        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1422,14 +1427,7 @@ impl Merger {
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card {
-            agent: agent.to_string(),
-            staged_at: None,
-            result_sent: false,
-            finished: false,
-            called: false,
-            sensitive: false,
-        });
+        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
         if card.result_sent {
             return None;
         }
@@ -1514,15 +1512,7 @@ impl Merger {
         {
             let u = Value::Object(u.clone());
             let n = |v: &Value| v.as_u64().unwrap_or(0);
-            let cc = &u["cache_creation"];
-            let (w5, w1) = if cc.is_object() {
-                (
-                    n(&cc["ephemeral_5m_input_tokens"]),
-                    n(&cc["ephemeral_1h_input_tokens"]),
-                )
-            } else {
-                (n(&u["cache_creation_input_tokens"]), 0)
-            };
+            let (w5, w1) = crate::prices::cache_writes(&u);
             let p = Usage {
                 message_id: message_id.clone(),
                 model: m.clone(),
@@ -1574,14 +1564,7 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card {
-                            agent: agent.clone(),
-                            staged_at: None,
-                            result_sent: false,
-                            finished: false,
-                            called: false,
-                            sensitive: false,
-                        });
+                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);

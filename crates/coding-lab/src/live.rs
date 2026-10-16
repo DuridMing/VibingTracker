@@ -813,8 +813,8 @@ impl Live {
         if let Some(p) = &r.first_prompt {
             s.first_prompt = Some(clip(p));
         }
-        if let Some(m) = &r.model {
-            s.model = Some(m.clone());
+        if s.model.is_none() {
+            s.model = r.model.clone();
         }
         if s.branch.is_none() {
             s.branch = r.branch.clone();
