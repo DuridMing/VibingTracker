@@ -179,6 +179,32 @@ impl TailHandle {
     }
 }
 
+/// 停掉所有 tail，期間持續把 `rx` 收到的輸入交給 `on_input`。
+pub async fn stop_all(
+    tails: impl IntoIterator<Item = TailHandle>,
+    rx: &mut mpsc::Receiver<Input>,
+    mut on_input: impl FnMut(Input),
+) {
+    // tail 結束前最後一次讀檔用 `send().await`，佇列滿時要靠這裡繼續收才停得下來
+    let mut stopping = tokio::task::JoinSet::new();
+    for t in tails {
+        stopping.spawn(t.stop());
+    }
+    loop {
+        tokio::select! {
+            done = stopping.join_next() => {
+                if done.is_none() {
+                    break;
+                }
+            }
+            Some(input) = rx.recv() => on_input(input),
+        }
+    }
+    while let Ok(input) = rx.try_recv() {
+        on_input(input);
+    }
+}
+
 /// 為一個 transcript 檔開一個 tail task。`file` 是 `"main"` 或 `"agent-<agent_id>"`。
 pub fn spawn_tail(
     path: PathBuf,

@@ -70,6 +70,22 @@ const BASH_CASES: &[(&str, Option<(&str, DangerLevel)>)] = &[
     ("cp .env.local backup/", Some(("env-file-bash", W))),
     ("cat .env.example", None),
     ("echo $SUDO_USER", None),
+    // #670-10：子殼、命令替換、`bash -c`、`xargs` 裡的指令也要看
+    ("(rm -rf /)", Some(("rm-rf", D))),
+    ("cd /tmp && (rm -rf ~)", Some(("rm-rf", D))),
+    ("echo $(rm -rf ~)", Some(("rm-rf", D))),
+    ("echo \"$(git reset --hard)\"", Some(("git-reset-hard", D))),
+    ("echo `rm -rf /`", Some(("rm-rf", D))),
+    ("bash -c 'git push --force'", Some(("git-push-force", D))),
+    ("sh -c \"rm -rf /srv\"", Some(("rm-rf", D))),
+    ("find . -name x | xargs rm -rf", Some(("rm-rf", D))),
+    ("find . | xargs -0 -n 1 rm -rf", Some(("rm-rf", D))),
+    ("(cd src && ls)", None),
+    ("echo $(git status)", None),
+    ("bash -c 'echo hi'", None),
+    ("echo 'bash -c \"rm -rf /\"'", None),
+    ("echo '$(rm -rf /)'", None),
+    ("ls | xargs echo", None),
 ];
 
 #[test]

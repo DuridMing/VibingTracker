@@ -19,7 +19,7 @@ use crate::hooks::serve_hooks;
 use crate::merge::{Input, Merger};
 use crate::rules::RuleSet;
 use crate::store::Store;
-use crate::transcript::{TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail};
+use crate::transcript::{TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail, stop_all};
 use crate::ws::{WebState, serve_web};
 
 /// 重啟時從 store 重建多久以內的 live 狀態（涵蓋任何時區的「今天」）。
@@ -35,6 +35,30 @@ pub enum Outcome {
     Stopped,
     /// hook 埠已被佔用（通常是另一個 collector）
     AlreadyRunning,
+}
+
+/// 依 ts_seen 排序的事件重建「還開著的 session」。結束後只有 session.started（resume）會重新打開：
+/// tail 最後一次讀到的行、關 tail 時的 transcript.recovered 都排在 session.ended 之後。
+pub fn open_sessions(events: &[Event]) -> HashSet<String> {
+    let mut open = HashSet::new();
+    let mut ended = HashSet::new();
+    for e in events {
+        match e.kind.as_str() {
+            "session.ended" => {
+                open.remove(&e.session);
+                ended.insert(e.session.clone());
+            }
+            "session.started" => {
+                ended.remove(&e.session);
+                open.insert(e.session.clone());
+            }
+            _ if !ended.contains(&e.session) => {
+                open.insert(e.session.clone());
+            }
+            _ => {}
+        }
+    }
+    open
 }
 
 pub fn log(msg: &str) {
@@ -57,15 +81,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let store = Arc::new(Mutex::new(store));
     // 閒置結束只在沒有進行中的 session 時才算（PLAN「10 分鐘無 session 自動退出」）：session 還開著時
     // 結束的話，使用者回來一輸入 http hook 就連不上，Claude Code 會顯示 hook 錯誤。
-    let mut open_sessions: HashSet<String> = HashSet::new();
-    for e in &recent {
-        if e.kind == "session.ended" {
-            open_sessions.remove(&e.session);
-        } else {
-            open_sessions.insert(e.session.clone());
-        }
-    }
+    let mut open_sessions = open_sessions(&recent);
 
+    if let Some(w) = cfg.plugin_warning() {
+        log(&w);
+    }
     let (rules, warning) = RuleSet::load(&cfg.home.join("rules.json"));
     if let Some(w) = warning {
         log(&w);
@@ -171,12 +191,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         }
     }
 
-    for (_, t) in tails.drain() {
-        t.stop().await;
-    }
-    while let Ok(input) = rx.try_recv() {
-        sink(merger.handle(input));
-    }
+    stop_all(tails.into_values(), &mut rx, |input| {
+        sink(merger.handle(input))
+    })
+    .await;
     if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
         log(&format!("寫入 store 失敗：{e}"));
     }

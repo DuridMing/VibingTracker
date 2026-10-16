@@ -342,3 +342,36 @@ fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
     assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
     drop(squatter);
 }
+
+fn ev(session: &str, seq: u64, kind: &str, ts: u64) -> coding_lab::event::Event {
+    coding_lab::event::Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": kind, "agent": "main",
+            "line": null, "pos": null, "ts_model": null, "ts_exec": null, "ts_seen": ts,
+            "host": "local", "payload": {},
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+/// #670-8：SessionEnd 之後 tail 最後一次讀到的行、tail 關掉時的 transcript.recovered 都排在
+/// session.ended 後面，不能讓已結束的 session 在重啟後又算成開著（閒置結束會等到 24 小時）。
+#[test]
+fn events_after_session_end_do_not_reopen_it() {
+    let events = [
+        ev("a", 1, "session.started", 1),
+        ev("a", 2, "session.ended", 2),
+        ev("a", 3, "assistant.text", 3),
+        ev("a", 4, "transcript.recovered", 4),
+        ev("b", 1, "prompt.submitted", 5),
+        ev("c", 1, "session.started", 6),
+        ev("c", 2, "session.ended", 7),
+        ev("c", 3, "session.started", 8), // resume
+    ];
+    let mut open: Vec<String> = coding_lab::serve::open_sessions(&events)
+        .into_iter()
+        .collect();
+    open.sort();
+    assert_eq!(open, ["b", "c"]);
+}

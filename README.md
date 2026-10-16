@@ -71,7 +71,7 @@ wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上�
 
 ```toml
 [hook]
-bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，永遠不開外
+bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，永遠不開外；plugin 的 hook 固定送到 4800，改埠只適合測試
 
 [web]
 bind = "127.0.0.1:4801"   # 要從別台看就改 tailnet IP，例如 "100.x.x.x:4801"

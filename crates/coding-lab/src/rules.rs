@@ -153,6 +153,16 @@ fn strip_wrappers(tokens: &[String]) -> &[String] {
                 }
             }
             "env" | "nohup" | "time" | "exec" | "command" => i += 1,
+            "xargs" => {
+                i += 1;
+                while tokens.get(i).is_some_and(|t| t.starts_with('-')) {
+                    let takes_value = matches!(
+                        tokens[i].as_str(),
+                        "-n" | "-I" | "-L" | "-P" | "-d" | "-s" | "-E" | "-a"
+                    );
+                    i += if takes_value { 2 } else { 1 };
+                }
+            }
             t if t.contains('=') && !t.starts_with('-') && !t.starts_with('=') => i += 1,
             _ => break,
         }
@@ -181,28 +191,94 @@ impl RuleSet {
     }
 }
 
+/// 子殼、命令替換、`bash -c` 最多往裡看幾層。
+const MAX_NESTING: usize = 4;
+
+/// `( … )`、`$( … )`、`` ` … ` `` 裡的指令（單引號內的不算）。
+fn nested_commands(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let (mut single, mut double) = (false, false);
+    let mut opens: Vec<usize> = Vec::new();
+    let mut tick: Option<usize> = None;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if single {
+            single = c != '\'';
+        } else {
+            match c {
+                '\\' => i += 1,
+                '\'' if !double => single = true,
+                '"' => double = !double,
+                '`' => match tick.take() {
+                    Some(start) => out.push(chars[start..i].iter().collect()),
+                    None => tick = Some(i + 1),
+                },
+                '(' if !double || (i > 0 && chars[i - 1] == '$') => opens.push(i + 1),
+                ')' => {
+                    if let Some(start) = opens.pop() {
+                        out.push(chars[start..i].iter().collect());
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `bash -c '…'`、`sh -lc "…"` 的指令字串（`tokens` 已去掉引號與 sudo 等前綴）。
+fn shell_c_argument(tokens: &[String]) -> Option<&str> {
+    let shell = tokens.first()?.rsplit('/').next()?;
+    if !matches!(shell, "bash" | "sh" | "zsh" | "dash" | "ksh") {
+        return None;
+    }
+    let flag = tokens[1..]
+        .iter()
+        .position(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('c'))?;
+    tokens.get(flag + 2).map(String::as_str)
+}
+
+impl RuleSet {
+    fn check_command(&self, tool: &str, command: &str, depth: usize) -> Option<Danger> {
+        let mut worst = self.first_match(tool, "command", command, Scope::Command);
+        for seg in shell_segments(command) {
+            let raw = seg.join(" ");
+            let stripped = strip_wrappers(&seg);
+            worst = more_severe(
+                worst,
+                self.first_match(tool, "command", &raw, Scope::Segment),
+            );
+            let joined = stripped.join(" ");
+            if joined != raw {
+                worst = more_severe(
+                    worst,
+                    self.first_match(tool, "command", &joined, Scope::Segment),
+                );
+            }
+            if depth < MAX_NESTING
+                && let Some(inner) = shell_c_argument(stripped)
+            {
+                worst = more_severe(worst, self.check_command(tool, inner, depth + 1));
+            }
+        }
+        if depth < MAX_NESTING {
+            for inner in nested_commands(command) {
+                worst = more_severe(worst, self.check_command(tool, &inner, depth + 1));
+            }
+        }
+        worst
+    }
+}
+
 impl DangerRules for RuleSet {
     fn check(&self, tool: &str, input: &Value) -> Option<Danger> {
         if tool != "Bash" {
             let path = input["file_path"].as_str()?;
             return self.first_match(tool, "file_path", &path.replace('\\', "/"), Scope::Segment);
         }
-        let command = input["command"].as_str()?;
-        let mut worst = self.first_match(tool, "command", command, Scope::Command);
-        for seg in shell_segments(command) {
-            let raw = seg.join(" ");
-            let stripped = strip_wrappers(&seg).join(" ");
-            worst = more_severe(
-                worst,
-                self.first_match(tool, "command", &raw, Scope::Segment),
-            );
-            if stripped != raw {
-                worst = more_severe(
-                    worst,
-                    self.first_match(tool, "command", &stripped, Scope::Segment),
-                );
-            }
-        }
-        worst
+        self.check_command(tool, input["command"].as_str()?, 0)
     }
 }
