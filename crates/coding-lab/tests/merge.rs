@@ -457,10 +457,15 @@ fn replay(dir: &Path) -> Option<Replay> {
     }
     let mut message_of_line = HashMap::new();
     for (file, transcript, arrivals) in files {
-        let arrival_ts: HashMap<u64, u64> = read(arrivals)
-            .iter()
-            .filter_map(|a| Some((a["line_no"].as_u64()?, a["ts_seen_ms"].as_u64()?)))
-            .collect();
+        // session 中途重開（resume）時同一個檔會被 tail 兩輪，第二輪把舊行重讀一次（backfill）；
+        // 同一行號取最早的到達時間
+        let mut arrival_ts: HashMap<u64, u64> = HashMap::new();
+        for a in read(arrivals) {
+            if let (Some(no), Some(ts)) = (a["line_no"].as_u64(), a["ts_seen_ms"].as_u64()) {
+                let t = arrival_ts.entry(no).or_insert(ts);
+                *t = (*t).min(ts);
+            }
+        }
         for (i, t) in read(transcript).into_iter().enumerate() {
             let no = i as u64 + 1;
             let Some(&ts) = arrival_ts.get(&no) else {
