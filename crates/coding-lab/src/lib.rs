@@ -3,3 +3,4 @@
 pub mod event;
 pub mod hook;
 pub mod merge;
+pub mod store;
