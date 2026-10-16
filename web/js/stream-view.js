@@ -67,10 +67,7 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
   });
   more.addEventListener("click", () => onNeedMore?.());
 
-  space.addEventListener("click", (e) => {
-    if (e.target.closest(".full")) return; // 展開內容裡可以選字，不收合
-    const el = e.target.closest(".ln.can-open");
-    if (!el) return;
+  function toggle(el) {
     const nd = nodes.get(el.dataset.key);
     if (!nd) return;
     nd.row.expanded = !nd.row.expanded;
@@ -78,6 +75,19 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
     nd.row.v++;
     dirty = true;
     schedule();
+  }
+  space.addEventListener("click", (e) => {
+    if (e.target.closest(".full")) return; // 展開內容裡可以選字，不收合
+    const el = e.target.closest(".ln.can-open");
+    if (el) toggle(el);
+  });
+  // 鍵盤：可展開的行可以用 Tab 選到，Enter／空白鍵展開或收合
+  space.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const el = e.target.closest(".ln.can-open");
+    if (!el || e.target !== el) return;
+    e.preventDefault();
+    toggle(el);
   });
 
   function paint(nd) {
@@ -85,6 +95,15 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
     const f = formatRow(r, { agentName });
     nd.el.className = f.cls;
     nd.el.dataset.key = r.key;
+    if (f.detail != null) {
+      nd.el.tabIndex = 0;
+      nd.el.setAttribute("role", "button");
+      nd.el.setAttribute("aria-expanded", String(r.expanded));
+    } else {
+      nd.el.removeAttribute("tabindex");
+      nd.el.removeAttribute("role");
+      nd.el.removeAttribute("aria-expanded");
+    }
     nd.el.innerHTML = `<div class="hd">${f.html}</div>` + (r.expanded && f.detail != null ? `<div class="full">${esc(f.detail)}</div>` : "");
     nd.v = r.v;
     nd.open = r.expanded;

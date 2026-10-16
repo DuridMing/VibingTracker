@@ -160,6 +160,16 @@ export function createStream({ cap = CAP } = {}) {
       case "session.status":
         if (STATUS_ROWS.has(p.status)) newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: p.status, text: "" }, out);
         break;
+      case "session.ended":
+        // 中途結束的 session：還在暫存區的卡片不會再有進展，從「即時」計數拿掉。
+        // 卡片本身留著，萬一 tool.placed 晚到仍照常進串流。
+        for (const [tid, c] of st.staged) {
+          if (c.session === ev.session) {
+            st.staged.delete(tid);
+            ops.stagedChanged = true;
+          }
+        }
+        break;
       default:
         break;
     }

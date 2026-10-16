@@ -187,3 +187,14 @@ test("被丟掉的卡片之後的更新不會讓它復活", () => {
   assert.equal(ops.updated.size, 0);
   assert.equal(st.staged.size, 0);
 });
+
+test("session 結束時清掉它還在暫存區的卡片，其他 session 的不動", () => {
+  const st = createStream();
+  st.apply([called(A, "t1", "Bash", { command: "sleep 100" }), called(B, "t2", "Read", { file_path: "x" })]);
+  const ops = st.apply([ev(A, "session.ended", { reason: "other" })]);
+  assert.equal(ops.stagedChanged, true);
+  assert.deepEqual([...st.staged.keys()], ["t2"]);
+  // 已經清掉的卡片之後就算 tool.placed 晚到，也照常進串流（transcript 補上的就是事實）
+  st.apply([placed(A, "t1", 5)]);
+  assert.equal(row(st, st.rows.length - 1).card.toolUseId, "t1");
+});

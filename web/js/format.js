@@ -114,7 +114,8 @@ export function formatRow(row, { agentName } = {}) {
       cls.push("dz");
       body += ` <span class="warn">⚠ ${esc(c.danger.why ?? c.danger.rule)}</span>`;
     }
-    if (c.fallback) tags.push("無 transcript");
+    // 背景 agent 本來就沒有 transcript，一律 fallback 進串流（contracts.md §2），不是降級
+    if (c.fallback && row.agent !== "bg") tags.push("無 transcript");
     if (c.status === "pending") cls.push("pending");
     detail = toolDetail(c);
   }

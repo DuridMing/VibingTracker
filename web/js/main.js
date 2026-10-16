@@ -82,13 +82,14 @@ function renderTabs() {
 }
 
 function renderSessFilters() {
-  const live = liveSessions();
-  if (!changed("fSess", live.map((s) => `${s.id}:${stream.hiddenSessions.has(s.id)}`).join("|"))) return;
+  // 進行中的 session，加上被隱藏的（即使已結束，也要能點回來顯示）
+  const live = [...store.sessions.values()].filter((s) => s.status !== "ended" || stream.hiddenSessions.has(s.id));
+  if (!changed("fSess", live.map((s) => `${s.id}:${s.status === "ended"}:${stream.hiddenSessions.has(s.id)}`).join("|"))) return;
   $("#fSess").replaceChildren(
     ...(live.length
       ? live.map((s) => {
           const off = stream.hiddenSessions.has(s.id);
-          return h("button", { class: `fchip${off ? " off" : ""}`, title: `${s.id}\n點一下${off ? "顯示" : "隱藏"}這個 session`, "aria-pressed": String(!off), onclick: () => toggleSession(s.id) },
+          return h("button", { class: `fchip${off ? " off" : ""}${s.status === "ended" ? " ended" : ""}`, title: `${s.id}${s.status === "ended" ? "（已結束）" : ""}\n點一下${off ? "顯示" : "隱藏"}這個 session`, "aria-pressed": String(!off), onclick: () => toggleSession(s.id) },
             h("i", { style: `background:${sessionColor(s.id)}` }), h("span", { class: "mono" }, shortId(s.id)));
         })
       : [h("span", { class: "none" }, "無")]),
@@ -109,8 +110,7 @@ function renderKindFilters() {
 
 // 暫存區：hook 已到、transcript 還沒到的卡片（PLAN「方案 C」），不進串流，只在這裡看
 function renderLive() {
-  if (!changed("liveN", String(stream.staged.size))) return;
-  $("#liveN").textContent = String(stream.staged.size);
+  if (changed("liveN", String(stream.staged.size))) $("#liveN").textContent = String(stream.staged.size);
   const list = $("#liveList");
   if (list.hidden || !changed("liveList", [...stream.staged.values()].slice(-30).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
   const cards = [...stream.staged.values()].slice(-30);
@@ -201,6 +201,7 @@ function renderAgents() {
 
 // 串流以外的面板（KPI、tab、篩選、Sessions、Agents、即時計數）不需要每幀更新：
 // 資料進來時最多每 PANEL_MS 畫一次；使用者操作與連線狀態改變（urgent）下一幀就畫。
+// （試過把面板分到連續三幀畫，排版的固定成本變成付三次，p50／p95 反而變差，所以一次畫完。）
 const PANEL_MS = 250;
 let rafPending = false;
 let throttleTimer = 0;
@@ -268,6 +269,7 @@ $("#liveToggle").addEventListener("click", () => {
   const list = $("#liveList");
   list.hidden = !list.hidden;
   $("#liveToggle").setAttribute("aria-expanded", String(!list.hidden));
+  lastSig.delete("liveList"); // 剛打開：不管簽章，重畫一次
   renderLive();
 });
 
@@ -368,7 +370,8 @@ const params = new URLSearchParams(location.search);
 const mockN = params.has("mock") ? Math.max(1, Math.min(32, Number(params.get("mock")) || 12)) : 0;
 bench.on = mockN > 0 && params.has("bench");
 bench.isolate = bench.on && params.has("isolate");
-const mock = mockN ? installMock(mockN, { bench: bench.on }) : null;
+// &prefill：mock 先產生一段歷史（每個 session 約 220 個 pos），用來試「載入更多」與 3000 行上限
+const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill") }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));

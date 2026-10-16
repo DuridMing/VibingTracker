@@ -69,3 +69,11 @@ test("只有 tool.placed、缺伴隨 Event 的卡片顯示「內容不可用」"
   assert.match(f.html, /內容不可用/);
   assert.equal(f.detail, null);
 });
+
+test("背景 agent 的工具一律 fallback 進串流（contracts.md §2），不標「無 transcript」", () => {
+  const bg = formatRow({ ...tool({ tool: "Bash", input: { command: "git log -1" }, fallback: true }), agent: "bg" });
+  assert.doesNotMatch(bg.html, /無 transcript/);
+  assert.match(bg.html, /\[背景\]/);
+  // main 的降級卡片照常標示
+  assert.match(formatRow(tool({ tool: "Bash", input: { command: "ls" }, fallback: true })).html, /無 transcript/);
+});

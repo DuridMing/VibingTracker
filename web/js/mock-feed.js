@@ -348,9 +348,9 @@ function createWorld(n) {
   };
 }
 
-export function installMock(n, { bench = false } = {}) {
+export function installMock(n, { bench = false, prefill = false } = {}) {
   const world = createWorld(n);
-  if (bench) world.prefill(220);
+  if (bench || prefill) world.prefill(220);
   const live = new Set();
   let downUntil = 0;
 
