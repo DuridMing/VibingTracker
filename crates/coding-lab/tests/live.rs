@@ -450,6 +450,45 @@ fn session_doing_follows_the_round_and_ignores_subagents() {
     );
 }
 
+/// agent.finished 帶通知的 status：非 completed／killed 的列標 fail（#677）。
+#[test]
+fn finished_agent_row_reflects_notification_status() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let spawn = |b: &mut B, id: &str| {
+        b.ev("s1", "agent.spawned", "main", DAY, false,
+            json!({"agentId": id, "agentType": "general-purpose", "name": id, "task": null, "parentToolUseId": null}))
+    };
+    let fin =
+        |b: &mut B, id: &str, status: &str| {
+            b.ev("s1", "agent.finished", "main", DAY + 1, false,
+            json!({"agentId": id, "lastMessage": null, "transcriptPath": null, "status": status}))
+        };
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            spawn(&mut b, "a1"),
+            spawn(&mut b, "a2"),
+            spawn(&mut b, "a3"),
+            fin(&mut b, "a1", "killed"),
+            fin(&mut b, "a2", "failed"),
+            fin(&mut b, "a3", "completed"),
+        ],
+    );
+    let snap = l.snapshot(&Channel::All, 0, DAY + 1);
+    let status = |id: &str| {
+        rows(&snap, "agents")
+            .iter()
+            .find(|a| a["agentId"] == id)
+            .map(|a| a["status"].clone())
+    };
+    assert_eq!(status("a1"), Some(json!("done")), "killed 不算失敗");
+    assert_eq!(status("a2"), Some(json!("fail")));
+    assert_eq!(status("a3"), Some(json!("done")));
+    assert_eq!(l.session_row("s1").unwrap()["agentsLive"], 0);
+}
+
 // ── attention 列
 
 #[test]

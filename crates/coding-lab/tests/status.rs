@@ -720,3 +720,131 @@ fn score_changes_do_not_emit_status_events() {
     r.tick(2000 + 5 * MIN);
     assert_eq!(r.statuses().len(), n, "分數變了不發 session.status");
 }
+
+// ── 背景 agent 的結束通知（#677：被 TaskStop 停掉時沒有 SubagentStop）
+
+fn notification(task_id: &str, status: Option<&str>) -> String {
+    let status = status
+        .map(|s| format!("<status>{s}</status>\n"))
+        .unwrap_or_default();
+    format!(
+        "<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n\
+         <output-file>/tmp/out</output-file>\n{status}<summary>Agent \"x\" was stopped</summary>\n</task-notification>"
+    )
+}
+
+#[test]
+fn task_notification_is_parsed() {
+    use coding_lab::status::parse_task_notification;
+    let n = parse_task_notification(&notification("a1", Some("killed"))).unwrap();
+    assert_eq!(
+        (
+            n.task_id.as_str(),
+            n.tool_use_id.as_deref(),
+            n.status.as_deref()
+        ),
+        ("a1", Some("toolu_x"), Some("killed"))
+    );
+    let n = parse_task_notification(&notification("a1", None)).unwrap();
+    assert_eq!(n.status, None, "沒有 status 也能解析");
+    assert!(
+        parse_task_notification("<task-notification></task-notification>").is_none(),
+        "沒有 task-id"
+    );
+    assert!(parse_task_notification("一般的 prompt").is_none());
+}
+
+#[test]
+fn task_failed_only_for_statuses_other_than_completed_and_killed() {
+    use coding_lab::status::task_failed;
+    assert!(!task_failed(Some("completed")));
+    assert!(
+        !task_failed(Some("killed")),
+        "主動停掉不算失敗（使用者決定）"
+    );
+    assert!(task_failed(Some("failed")));
+    assert!(!task_failed(None), "不知道就不算");
+}
+
+fn subagent_start(id: &str, ts: u64) -> Input {
+    hook(
+        "SubagentStart",
+        json!({ "agent_id": id, "agent_type": "general-purpose" }),
+        ts,
+    )
+}
+
+fn subagent_stop(id: &str, ts: u64) -> Input {
+    hook(
+        "SubagentStop",
+        json!({ "agent_id": id, "agent_type": "general-purpose" }),
+        ts,
+    )
+}
+
+fn finished(r: &Run) -> Vec<(String, Option<String>)> {
+    r.evs
+        .iter()
+        .filter(|e| e.type_name() == "agent.finished")
+        .map(|e| {
+            (
+                e.payload["agentId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                e.payload["status"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn killed_background_agent_is_finished_by_its_notification() {
+    let mut r = Run::new();
+    r.feed(subagent_start("a1", 1000))
+        .feed(prompt(&notification("a1", Some("killed")), 2000));
+    assert_eq!(
+        finished(&r),
+        [("a1".to_string(), Some("killed".to_string()))]
+    );
+}
+
+#[test]
+fn notification_after_subagent_stop_does_not_finish_twice() {
+    let mut r = Run::new();
+    r.feed(subagent_start("a1", 1000))
+        .feed(subagent_stop("a1", 1500))
+        .feed(prompt(&notification("a1", Some("completed")), 2000));
+    assert_eq!(finished(&r), [("a1".to_string(), None)]);
+}
+
+#[test]
+fn notification_for_unknown_task_is_ignored() {
+    // 背景 Bash（shell task）的通知也長這樣，task-id 不是 agent
+    let mut r = Run::new();
+    r.feed(prompt(&notification("bz0e4vabl", Some("completed")), 2000));
+    assert!(finished(&r).is_empty());
+}
+
+#[test]
+fn samples_killed_background_agent_is_finished() {
+    // cc94acff：general-purpose 背景 agent 啟動後被 TaskStop 停掉，沒有 SubagentStop
+    let Some(evs) = replay_sample("cc94acff") else {
+        eprintln!("略過：沒有 samples/sessions/cc94acff");
+        return;
+    };
+    let spawned: Vec<&str> = evs
+        .iter()
+        .filter(|e| e.type_name() == "agent.spawned")
+        .filter_map(|e| e.payload["agentId"].as_str())
+        .collect();
+    assert!(!spawned.is_empty());
+    for id in spawned {
+        let fin: Vec<&Event> = evs
+            .iter()
+            .filter(|e| e.type_name() == "agent.finished" && e.payload["agentId"] == id)
+            .collect();
+        assert_eq!(fin.len(), 1, "{id} 要結束且只結束一次");
+        assert_eq!(fin[0].payload["status"], "killed");
+    }
+}

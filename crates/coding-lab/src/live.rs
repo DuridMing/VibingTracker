@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::derive::relative_path;
 use crate::doing::Doing;
 use crate::event::{DangerLevel, Event, Payload};
+use crate::status::task_failed;
 
 pub const STREAM_PER_SESSION: usize = 3000;
 pub const ALL_STREAM_PER_SESSION: usize = 200;
@@ -598,7 +599,11 @@ impl Live {
                 } else {
                     let id = format!("{sid}/{}", a.agent_id);
                     if let Some(row) = self.agents.get_mut(&id) {
-                        row.status = "done";
+                        row.status = if task_failed(a.status.as_deref()) {
+                            "fail"
+                        } else {
+                            "done"
+                        };
                         row.current = None;
                         row.finished_at = Some(ts);
                         self.dirty_agents.insert(id, false);

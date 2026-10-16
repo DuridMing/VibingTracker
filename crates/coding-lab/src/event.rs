@@ -402,6 +402,9 @@ pub struct AgentFinished {
     pub agent_id: String,
     pub last_message: Option<String>,
     pub transcript_path: Option<String>,
+    /// 由 `<task-notification>` 結束時的 `<status>`（completed、killed…）；SubagentStop 結束時不輸出（#677）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

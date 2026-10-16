@@ -103,6 +103,8 @@ struct Session {
     pending_agents: Vec<PendingAgent>,
     /// 有 SubagentStart 的 agent_id（真的 subagent）
     started_agents: HashSet<String>,
+    /// 已發過 agent.finished 的 agent_id：SubagentStop 與 task-notification 只結束一次（#677）
+    finished_agents: HashSet<String>,
     /// 背景 agent 的 PreToolUse：工具通常不會執行，等到 PostToolUse／Failure 才建卡片
     held_bg: HashMap<String, HeldTool>,
     /// 最後一次收到這個 session 輸入的時間，與 SessionEnd 的時間：決定何時從記憶體移除
@@ -525,6 +527,21 @@ impl Merger {
                     source: status::is_task_notification(&prompt).then(|| "task".into()),
                 };
                 out.push(self.emit(&sid, Payload::PromptSubmitted(p), meta()));
+                // 被 TaskStop 停掉的背景 agent 沒有 SubagentStop，只有這個通知（#677）
+                if let Some(n) = status::parse_task_notification(&prompt)
+                    && let Some(ss) = self.sessions.get_mut(&sid)
+                    && ss.started_agents.contains(&n.task_id)
+                    && ss.finished_agents.insert(n.task_id.clone())
+                {
+                    ss.held_bg.retain(|_, h| h.agent_id != n.task_id);
+                    let p = AgentFinished {
+                        agent_id: n.task_id,
+                        last_message: None,
+                        transcript_path: None,
+                        status: n.status,
+                    };
+                    out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                }
                 let changes = self.tracker(&sid).prompt(s("prompt_id"), ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
@@ -665,14 +682,17 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                if let Some(ss) = self.sessions.get_mut(&sid) {
-                    ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+                let ss = self.sessions.entry(sid.clone()).or_default();
+                ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+                if !ss.finished_agents.insert(agent_id.clone()) {
+                    return out;
                 }
                 let p = AgentFinished {
                     agent_id,
                     last_message: s("last_assistant_message")
                         .map(|m| truncate(&m, MESSAGE_LIMIT).0),
                     transcript_path: s("agent_transcript_path"),
+                    status: None,
                 };
                 out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
             }

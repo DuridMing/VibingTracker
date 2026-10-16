@@ -26,6 +26,38 @@ pub fn is_task_notification(prompt: &str) -> bool {
     prompt.trim_start().starts_with("<task-notification>")
 }
 
+/// 背景工作的結束通知（`<task-notification>`）的欄位。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskNotification {
+    pub task_id: String,
+    pub tool_use_id: Option<String>,
+    pub status: Option<String>,
+}
+
+/// 解析 `<task-notification>`；沒有 `<task-id>` 回 None。
+pub fn parse_task_notification(prompt: &str) -> Option<TaskNotification> {
+    if !is_task_notification(prompt) {
+        return None;
+    }
+    let tag = |name: &str| -> Option<String> {
+        let open = format!("<{name}>");
+        let start = prompt.find(&open)? + open.len();
+        let end = prompt[start..].find(&format!("</{name}>"))? + start;
+        let v = prompt[start..end].trim();
+        (!v.is_empty()).then(|| v.to_string())
+    };
+    Some(TaskNotification {
+        task_id: tag("task-id")?,
+        tool_use_id: tag("tool-use-id"),
+        status: tag("status"),
+    })
+}
+
+/// 背景工作的結束狀態算不算失敗：`completed`、`killed`（主動停掉）以外的值才算；不知道就不算。
+pub fn task_failed(status: Option<&str>) -> bool {
+    status.is_some_and(|s| s != "completed" && s != "killed")
+}
+
 pub enum Change {
     Raised(Attention),
     Cleared(Attention),
