@@ -528,9 +528,20 @@ impl Merger {
                 };
                 out.push(self.emit(&sid, Payload::PromptSubmitted(p), meta()));
                 // 被 TaskStop 停掉的背景 agent 沒有 SubagentStop，只有這個通知（#677）
-                if let Some(n) = status::parse_task_notification(&prompt)
+                let notice = status::parse_task_notification(&prompt).filter(|n| {
+                    self.sessions
+                        .get(&sid)
+                        .is_some_and(|ss| ss.started_agents.contains(&n.task_id))
+                });
+                // 背景 subagent 失敗（#674）：status 不是 completed／killed
+                if notice
+                    .as_ref()
+                    .is_some_and(|n| status::task_failed(n.status.as_deref()))
+                {
+                    self.tracker(&sid).signal(Signal::SubagentFail, ts_seen);
+                }
+                if let Some(n) = notice
                     && let Some(ss) = self.sessions.get_mut(&sid)
-                    && ss.started_agents.contains(&n.task_id)
                     && ss.finished_agents.insert(n.task_id.clone())
                 {
                     ss.held_bg.retain(|_, h| h.agent_id != n.task_id);
@@ -725,8 +736,11 @@ impl Merger {
     ) -> Vec<Event> {
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
-        if let (Some(ok), Some("Bash")) = (ok, h.str_field("tool_name")) {
-            changes.extend(t.bash_result(agent, id, ok, ts_seen));
+        match (ok, h.str_field("tool_name")) {
+            (Some(ok), Some("Bash")) => changes.extend(t.bash_result(agent, id, ok, ts_seen)),
+            // subagent 失敗（#674）：Agent／Task 工具失敗；Esc 中斷（ok 為 None）不算
+            (Some(false), Some("Agent" | "Task")) => t.signal(Signal::SubagentFail, ts_seen),
+            _ => {}
         }
         self.apply(sid, changes, agent, ts_seen)
     }

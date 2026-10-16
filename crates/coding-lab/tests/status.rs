@@ -574,6 +574,11 @@ fn empty_score_is_positive_zero() {
 
 /// 依到達時間把 hook 與 transcript 行餵進 merge；同一行號取最早的到達時間（resume 會重記 backfill）。
 fn replay_sample(name: &str) -> Option<Vec<Event>> {
+    replay_merger(name).map(|(_, evs, _)| evs)
+}
+
+/// 同 [`replay_sample`]，另外回傳回放完的 merge 與最後的時間（看分數用）。
+fn replay_merger(name: &str) -> Option<(Merger, Vec<Event>, u64)> {
     use std::collections::HashMap;
     use std::path::PathBuf;
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -631,7 +636,7 @@ fn replay_sample(name: &str) -> Option<Vec<Event>> {
         last = ts;
     }
     evs.extend(m.tick(last + 60_000));
-    Some(evs)
+    Some((m, evs, last))
 }
 
 fn statuses_of(evs: &[Event]) -> Vec<String> {
@@ -847,4 +852,71 @@ fn samples_killed_background_agent_is_finished() {
         assert_eq!(fin.len(), 1, "{id} 要結束且只結束一次");
         assert_eq!(fin[0].payload["status"], "killed");
     }
+}
+
+// ── 分數訊號：subagent 失敗（#674，失敗定義見 contracts.md §4）
+
+fn agent_pre(id: &str, ts: u64) -> Input {
+    hook(
+        "PreToolUse",
+        json!({ "tool_name": "Agent", "tool_input": { "subagent_type": "no-such-agent", "prompt": "x" }, "tool_use_id": id }),
+        ts,
+    )
+}
+
+fn agent_fail(id: &str, interrupt: bool, ts: u64) -> Input {
+    hook(
+        "PostToolUseFailure",
+        json!({ "tool_name": "Agent", "tool_use_id": id, "duration_ms": 5,
+                "error": "Agent type 'no-such-agent' not found.", "is_interrupt": interrupt }),
+        ts,
+    )
+}
+
+fn score_of(r: &Run, now: u64) -> i64 {
+    r.m.scores(now).first().map_or(0, |(_, v)| *v)
+}
+
+#[test]
+fn agent_tool_failure_adds_subagent_fail_signal() {
+    let mut r = Run::new();
+    r.feed(agent_pre("t1", 1000))
+        .feed(agent_fail("t1", false, 1100));
+    assert_eq!(score_of(&r, 1100), 20, "subagent 失敗 +20");
+    assert_eq!(score_of(&r, 1100 + 10 * MIN), 10, "半衰期 10 分鐘");
+    assert!(r.attention().is_empty(), "不進注意佇列");
+    assert_ne!(r.last_status(), "fail", "不改 session.status");
+}
+
+#[test]
+fn interrupted_agent_tool_is_not_a_subagent_failure() {
+    let mut r = Run::new();
+    r.feed(agent_pre("t1", 1000))
+        .feed(agent_fail("t1", true, 1100));
+    assert_eq!(score_of(&r, 1100), 0);
+}
+
+#[test]
+fn notification_status_decides_subagent_failure() {
+    for (status, want) in [("failed", 20), ("completed", 0), ("killed", 0)] {
+        let mut r = Run::new();
+        r.feed(subagent_start("a1", 1000))
+            .feed(prompt(&notification("a1", Some(status)), 2000));
+        assert_eq!(score_of(&r, 2000), want, "status {status}");
+    }
+    // 背景 Bash（不是 agent）失敗不算 subagent 失敗
+    let mut r = Run::new();
+    r.feed(prompt(&notification("bz0e4vabl", Some("failed")), 2000));
+    assert_eq!(score_of(&r, 2000), 0);
+}
+
+#[test]
+fn samples_agent_launch_failure_counts_once_and_killed_does_not() {
+    // cc94acff：Agent 類型不存在（PostToolUseFailure）＋背景 agent 被 TaskStop（killed）
+    let Some((m, _, end)) = replay_merger("cc94acff") else {
+        eprintln!("略過：沒有 samples/sessions/cc94acff");
+        return;
+    };
+    let score = m.scores(end).first().map_or(0, |(_, v)| *v);
+    assert_eq!(score, 20, "啟動失敗算一次，killed 不算");
 }
