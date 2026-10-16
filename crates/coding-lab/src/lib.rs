@@ -6,6 +6,7 @@ pub mod hook;
 pub mod hooks;
 pub mod merge;
 pub mod prices;
+pub mod rules;
 pub mod store;
 pub mod transcript;
 

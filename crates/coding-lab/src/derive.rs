@@ -170,7 +170,7 @@ fn git_subcommand(seg: &[String]) -> Option<(String, Vec<String>)> {
 }
 
 /// 把指令依 `&&`、`||`、`;`、`|`、換行切段，引號內的內容不切（所以 `echo 'git commit'` 不算 git）。
-fn shell_segments(command: &str) -> Vec<Vec<String>> {
+pub fn shell_segments(command: &str) -> Vec<Vec<String>> {
     let mut segments = vec![Vec::new()];
     let mut token = String::new();
     let mut quote: Option<char> = None;

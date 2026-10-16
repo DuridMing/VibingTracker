@@ -1,0 +1,135 @@
+{
+  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭）或 command（整條指令）。",
+  "rules": [
+    {
+      "id": "rm-rf-build",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^rm\\s+(-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*|-[a-zA-Z]*[rR][a-zA-Z]*\\s+-[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*\\s+-[a-zA-Z]*[rR][a-zA-Z]*|--recursive\\s+--force|--force\\s+--recursive)\\s+((\\./)?(target|node_modules|dist|build|out|\\.next|__pycache__|\\.pytest_cache|\\.cache|coverage)/?(\\s+|$))+$",
+      "level": "warn",
+      "why": "遞迴強制刪除，但目標只有建置產物或快取"
+    },
+    {
+      "id": "rm-rf",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^rm\\s+(-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*|-[a-zA-Z]*[rR][a-zA-Z]*\\s+-[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*\\s+-[a-zA-Z]*[rR][a-zA-Z]*|--recursive\\s+--force|--force\\s+--recursive)(\\s|$)",
+      "level": "danger",
+      "why": "遞迴強制刪除，刪錯無法復原"
+    },
+    {
+      "id": "git-push-force",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*push\\b.*\\s(-f|--force)(\\s|$)",
+      "level": "danger",
+      "why": "強制推送會覆寫遠端歷史（--force-with-lease 較安全）"
+    },
+    {
+      "id": "git-reset-hard",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*reset\\b.*\\s--hard(\\s|$)",
+      "level": "danger",
+      "why": "丟棄工作目錄與暫存區的所有未提交改動"
+    },
+    {
+      "id": "git-clean-f",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*clean\\b.*\\s-[a-zA-Z]*f",
+      "level": "danger",
+      "why": "永久刪除未追蹤的檔案"
+    },
+    {
+      "id": "sql-drop",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "(?i)\\bdrop\\s+(table|database|schema)\\b",
+      "level": "danger",
+      "why": "刪除資料表或資料庫"
+    },
+    {
+      "id": "sql-truncate",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "(?i)\\btruncate\\s+(table\\s+)?[a-z_\\\"`]",
+      "level": "danger",
+      "why": "清空資料表"
+    },
+    {
+      "id": "chmod-777",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^chmod\\s+(-\\S+\\s+)*0?777\\b",
+      "level": "danger",
+      "why": "任何人都可讀寫執行"
+    },
+    {
+      "id": "curl-pipe-sh",
+      "tools": [
+        "Bash"
+      ],
+      "scope": "command",
+      "pattern": "\\b(curl|wget)\\b[^|]*\\|\\s*(sudo\\s+)?(ba|z|da|k)?sh\\b",
+      "level": "danger",
+      "why": "下載後直接執行未檢查的腳本"
+    },
+    {
+      "id": "package-publish",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^(npm|pnpm|yarn|cargo)\\s+publish\\b",
+      "level": "danger",
+      "why": "發佈套件到公開的 registry"
+    },
+    {
+      "id": "container-rm-f",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^(docker|podman)\\s+(container\\s+)?rm\\b.*\\s-[a-zA-Z]*f",
+      "level": "danger",
+      "why": "強制移除執行中的容器"
+    },
+    {
+      "id": "sudo",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^sudo\\b",
+      "level": "warn",
+      "why": "以 root 權限執行"
+    },
+    {
+      "id": "env-file-bash",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "(^|[\\s/])\\.env(\\.(local|dev|development|prod|production|staging|test))?(\\s|$)",
+      "level": "warn",
+      "why": "讀寫 .env（可能含密鑰）"
+    },
+    {
+      "id": "env-file",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit"
+      ],
+      "field": "file_path",
+      "pattern": "(^|/)\\.env(\\.(local|dev|development|prod|production|staging|test))?$",
+      "level": "warn",
+      "why": "讀寫 .env（可能含密鑰）"
+    }
+  ]
+}
