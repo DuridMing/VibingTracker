@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coding Lab</title>
+<link rel="stylesheet" href="css/app.css">
+<script type="module" src="js/main.js"></script>
+</head>
+<body class="stale">
+<header class="top">
+  <div class="brand"><div><h1>Coding Lab</h1><small id="project">專案即時追蹤，所有 session 合流</small></div></div>
+  <div class="ctl">
+    <span class="conn connecting" id="conn"><i></i><span id="connText">連線中…</span></span>
+    <button class="btn" id="mockDrop" hidden>模擬斷線</button>
+  </div>
+  <div class="kpis" id="kpis">
+    <div class="kpi"><span>進行中</span><b class="live" data-k="live">—</b></div>
+    <div class="kpi"><span>待確認</span><b class="v" data-k="attention">—</b></div>
+    <div class="kpi"><span>Sessions</span><b data-k="sessions">—</b></div>
+    <div class="kpi"><span>Agents</span><b class="v" data-k="agents">—</b></div>
+    <div class="kpi"><span>改動</span><b data-k="edits">—</b></div>
+    <div class="kpi"><span>新檔案</span><b class="v" data-k="writes">—</b></div>
+    <div class="kpi"><span>指令</span><b class="t" data-k="commands">—</b></div>
+    <div class="kpi"><span>失敗</span><b class="r" data-k="failures">—</b></div>
+    <div class="kpi"><span>危險指令</span><b class="r" data-k="dangers">—</b></div>
+    <div class="kpi"><span>Commits</span><b class="t" data-k="commits">—</b></div>
+    <div class="kpi"><span>思考 tokens</span><b class="v" data-k="thinkingTokens">—</b></div>
+    <div class="kpi"><span>費用</span><b data-k="costUsd">—</b></div>
+  </div>
+</header>
+
+<div class="main">
+  <section class="col col-tree">
+    <div class="tabs" role="tablist">
+      <button class="tab on" role="tab" data-t="tree">專案檔案</button>
+      <button class="tab" role="tab" data-t="sess">Sessions<small id="sessCount"></small></button>
+    </div>
+    <div class="tree pane" id="tree"><div class="none">檔案樹（#642）</div></div>
+    <div class="sess pane" id="sess" hidden><div class="none">尚無 session</div></div>
+    <div class="leg"><span><i style="background:var(--teal)"></i>讀</span><span><i style="background:var(--amber)"></i>改</span><span><i style="background:var(--violet)"></i>新建</span><span><i style="background:var(--rose)"></i>失敗</span><span>● 正在碰它的 session</span></div>
+  </section>
+
+  <section class="col col-work">
+    <nav class="stabs" id="stabs"></nav>
+    <div class="blk">
+      <div class="ovh"><h2>專案即時串流<small>所有 session 合在一起，每行標示 [session id] [agent]</small></h2><span class="hint">點 session 標籤只看它；⧉ 開成監視器視窗</span></div>
+      <div class="filters"><span class="lab">session：</span><span id="fSess"><span class="none">無</span></span></div>
+      <div class="sgrid">
+        <div class="scol">
+          <div class="stream" id="stream"><span class="sy"># 合流串流（#639）</span></div>
+          <div class="att-blk">
+            <div class="ovh"><h2>需要注意</h2>
+              <label class="swl"><input type="checkbox" disabled>頁內提示</label>
+              <label class="swl"><input type="checkbox" disabled>瀏覽器通知</label>
+              <label class="swl"><input type="checkbox" disabled>提示音</label>
+            </div>
+            <div class="att" id="att"><div class="none">目前沒有需要處理的 session</div></div>
+          </div>
+        </div>
+        <div class="sside">
+          <div class="sblk"><h2>改動紀錄<small>跨 session，最新在上</small></h2><div class="chg" id="chg"><div class="none">尚無改動</div></div></div>
+          <div class="sblk"><h2>Agents<small>每個 session 的 main 與 subagent</small></h2><div class="agall" id="agall"><div class="none">尚無 session</div></div></div>
+        </div>
+        <div class="sside">
+          <div class="sblk"><h2>修改情形<small>點左側紀錄切換</small></h2><div class="none" id="gfbNone">尚無改動</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+</body>
+</html>
