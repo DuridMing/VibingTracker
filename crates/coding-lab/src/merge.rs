@@ -21,6 +21,12 @@ use crate::prices::Prices;
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
+/// 降級進串流的卡片等 transcript tool_use 行的上限；過了就不再把之後的文字標成延遲。
+pub const FALLBACK_WAIT_MS: u64 = 60_000;
+/// session 結束後在記憶體留多久（晚到的 transcript 行、tail 關掉前最後一次讀檔）。
+pub const SESSION_EVICT_AFTER_MS: u64 = 10 * 60 * 1000;
+/// 沒有 SessionEnd（終端機被直接關掉）的 session，多久沒有任何事件就移除。
+pub const SESSION_IDLE_EVICT_MS: u64 = 24 * 60 * 60 * 1000;
 /// 背景 agent 的 PreToolUse 等執行結果的上限，過了就丟掉。
 pub const BG_HOLD_MS: u64 = 60_000;
 /// 工具輸出存前截斷的上限（contracts.md §4）。
@@ -59,6 +65,13 @@ pub enum Input {
         file: String,
         ts_seen: u64,
     },
+    /// serve 停掉或重開了 tail（`file` 為 None 表示整個 session）。新的 tail 從健康狀態開始、
+    /// 舊的不會再送 Recovered，所以由這裡清掉降級。
+    TailReset {
+        session: String,
+        file: Option<String>,
+        ts_seen: u64,
+    },
 }
 
 struct Card {
@@ -68,6 +81,8 @@ struct Card {
     result_sent: bool,
     /// 已送出結束狀態（done／failed）的 tool.updated
     finished: bool,
+    /// 已送出 tool.called。PreToolUse 遺失時 PostToolUse／tool_result 會先建出沒有 tool.called 的卡片
+    called: bool,
 }
 
 #[derive(Default)]
@@ -77,9 +92,10 @@ struct Session {
     cards: HashMap<String, Card>,
     seen_uuids: HashSet<String>,
     degraded: HashSet<String>,
-    /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片
-    fallback_waiting: HashSet<String>,
-    /// 衍生事件用（#633）
+    /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片：id → (transcript 檔, 開始等的時間)。
+    /// 背景 agent 的卡片沒有 transcript 行，不記。
+    fallback_waiting: HashMap<String, (String, u64)>,
+    /// file.* 的路徑基準：第一次 SessionStart 的 cwd（#672）；之後的 hook 與 SessionStart 都不改
     cwd: Option<String>,
     last_model: HashMap<String, String>,
     seen_messages: HashSet<String>,
@@ -88,6 +104,9 @@ struct Session {
     started_agents: HashSet<String>,
     /// 背景 agent 的 PreToolUse：工具通常不會執行，等到 PostToolUse／Failure 才建卡片
     held_bg: HashMap<String, HeldTool>,
+    /// 最後一次收到這個 session 輸入的時間，與 SessionEnd 的時間：決定何時從記憶體移除
+    last_seen: u64,
+    ended_at: Option<u64>,
 }
 
 struct HeldTool {
@@ -102,6 +121,15 @@ struct PendingAgent {
     subagent_type: Option<String>,
     description: Option<String>,
     prompt: Option<String>,
+}
+
+/// agent 對應的 transcript 檔（[`Input::Line`] 的 `file`）。
+fn file_of(agent: &str) -> String {
+    if agent == "main" {
+        "main".into()
+    } else {
+        format!("agent-{agent}")
+    }
 }
 
 /// Write 的內容只留前 200 行（contracts.md §4）。
@@ -124,6 +152,14 @@ pub struct Merger {
     prices: Prices,
     host: String,
     sessions: BTreeMap<String, Session>,
+    /// 上一輪 collector（或 evict）留下的編號與路徑基準，見 [`Merger::resume`]
+    resumed: HashMap<String, Resumed>,
+}
+
+struct Resumed {
+    seq: u64,
+    pos: u64,
+    cwd: Option<String>,
 }
 
 impl Merger {
@@ -133,10 +169,50 @@ impl Merger {
             prices: Prices::builtin(),
             host: "local".into(),
             sessions: BTreeMap::new(),
+            resumed: HashMap::new(),
         }
     }
 
+    /// collector 重啟時，把 store 裡各 session 已用到的 seq／pos 交給 merge，續跑的 session 接著編號
+    /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
+    /// `cwd` 是 file.* 的路徑基準（store 的 sessions.cwd），空字串表示不知道。
+    pub fn resume(&mut self, sid: &str, seq: u64, pos: u64, cwd: &str) {
+        let cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+        self.resumed
+            .insert(sid.to_string(), Resumed { seq, pos, cwd });
+    }
+
+    /// file.* 的路徑基準；還沒套用的 resume 也算（第一個 file.* 在 emit 之前就要用到）。
+    fn path_base(&self, sid: &str) -> Option<&str> {
+        self.sessions
+            .get(sid)
+            .and_then(|s| s.cwd.as_deref())
+            .or_else(|| self.resumed.get(sid).and_then(|r| r.cwd.as_deref()))
+    }
+
+    /// 記憶體裡的 session 數。
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
     pub fn handle(&mut self, input: Input) -> Vec<Event> {
+        let seen = match &input {
+            Input::Hook { hook, ts_seen } => Some((hook.session_id(), *ts_seen)),
+            Input::Line {
+                session, ts_seen, ..
+            }
+            | Input::Degraded {
+                session, ts_seen, ..
+            }
+            | Input::Recovered {
+                session, ts_seen, ..
+            } => Some((session.as_str(), *ts_seen)),
+            Input::TailReset { .. } => None,
+        };
+        if let Some((sid, ts)) = seen {
+            let s = self.sessions.entry(sid.to_string()).or_default();
+            s.last_seen = s.last_seen.max(ts);
+        }
         match input {
             Input::Hook { hook, ts_seen } => self.on_hook(&hook, ts_seen),
             Input::Line {
@@ -155,6 +231,7 @@ impl Merger {
                 let mut out = Vec::new();
                 let s = self.sessions.entry(session.clone()).or_default();
                 s.degraded.insert(file.clone());
+                let file_name = file.clone();
                 let payload = Payload::TranscriptDegraded(TranscriptHealth {
                     file,
                     error: Some(error),
@@ -168,7 +245,7 @@ impl Merger {
                         ..Meta::default()
                     },
                 ));
-                out.extend(self.fall_back(&session, |_| true, ts_seen));
+                out.extend(self.fall_back(&session, |c| file_of(&c.agent) == file_name, ts_seen));
                 out
             }
             Input::Recovered {
@@ -181,41 +258,101 @@ impl Merger {
                     .or_default()
                     .degraded
                     .remove(&file);
-                let payload = Payload::TranscriptRecovered(TranscriptHealth { file, error: None });
-                vec![self.emit(
-                    &session,
-                    payload,
-                    Meta {
-                        agent: "main".into(),
-                        ts_seen,
-                        ..Meta::default()
-                    },
-                )]
+                vec![self.recovered(&session, file, ts_seen)]
+            }
+            Input::TailReset {
+                session,
+                file,
+                ts_seen,
+            } => {
+                let Some(s) = self.sessions.get_mut(&session) else {
+                    return Vec::new();
+                };
+                // 重開的 tail 從檔尾讀，降級卡片的 tool_use 行不會再來
+                s.fallback_waiting
+                    .retain(|_, (f, _)| file.as_ref().is_some_and(|reset| reset != f));
+                let mut cleared: Vec<String> = match file {
+                    Some(f) => s.degraded.take(&f).into_iter().collect(),
+                    None => s.degraded.drain().collect(),
+                };
+                cleared.sort();
+                cleared
+                    .into_iter()
+                    .map(|f| self.recovered(&session, f, ts_seen))
+                    .collect()
             }
         }
     }
 
+    /// 結束超過 [`SESSION_EVICT_AFTER_MS`]、或 [`SESSION_IDLE_EVICT_MS`] 沒有任何輸入的 session 移出記憶體；
+    /// seq／pos 與路徑基準留在 `resumed`，resume 回來時接著用。
+    fn evict(&mut self, now: u64) {
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| {
+                s.ended_at
+                    .is_some_and(|t| t + SESSION_EVICT_AFTER_MS <= now)
+                    || s.last_seen + SESSION_IDLE_EVICT_MS <= now
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            if let Some(s) = self.sessions.remove(&id)
+                && s.seq > 0
+            {
+                let r = Resumed {
+                    seq: s.seq,
+                    pos: s.pos,
+                    cwd: s.cwd,
+                };
+                self.resumed.insert(id, r);
+            }
+        }
+    }
+
+    fn recovered(&mut self, sid: &str, file: String, ts_seen: u64) -> Event {
+        let payload = Payload::TranscriptRecovered(TranscriptHealth { file, error: None });
+        self.emit(
+            sid,
+            payload,
+            Meta {
+                agent: "main".into(),
+                ts_seen,
+                ..Meta::default()
+            },
+        )
+    }
+
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
+        self.evict(now);
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         let mut out = Vec::new();
         for sid in sessions {
             if let Some(s) = self.sessions.get_mut(&sid) {
                 s.held_bg.retain(|_, h| h.ts_seen + BG_HOLD_MS > now);
+                s.fallback_waiting
+                    .retain(|_, (_, since)| *since + FALLBACK_WAIT_MS > now);
             }
-            out.extend(self.fall_back(&sid, |staged_at| staged_at + FALLBACK_AFTER_MS <= now, now));
+            out.extend(self.fall_back(
+                &sid,
+                |c| c.staged_at.is_some_and(|t| t + FALLBACK_AFTER_MS <= now),
+                now,
+            ));
         }
         out
     }
 
-    fn fall_back(&mut self, sid: &str, due: impl Fn(u64) -> bool, ts_seen: u64) -> Vec<Event> {
+    /// 把 `due` 選中的暫存卡片依暫存先後放進串流末端。
+    fn fall_back(&mut self, sid: &str, due: impl Fn(&Card) -> bool, ts_seen: u64) -> Vec<Event> {
         let Some(s) = self.sessions.get(sid) else {
             return Vec::new();
         };
         let mut ids: Vec<(u64, String)> = s
             .cards
             .iter()
-            .filter_map(|(id, c)| c.staged_at.filter(|t| due(*t)).map(|t| (t, id.clone())))
+            .filter_map(|(id, c)| c.staged_at.filter(|_| due(c)).map(|t| (t, id.clone())))
             .collect();
         ids.sort();
         let mut out = Vec::new();
@@ -243,8 +380,9 @@ impl Merger {
             }
             None => "main".into(),
         };
-        if placement == Placement::Fallback {
-            s.fallback_waiting.insert(id.to_string());
+        if placement == Placement::Fallback && agent != "bg" {
+            s.fallback_waiting
+                .insert(id.to_string(), (file_of(&agent), ts_seen));
         }
         let payload = Payload::ToolPlaced(ToolPlaced {
             tool_use_id: id.to_string(),
@@ -266,6 +404,14 @@ impl Merger {
 
     fn emit(&mut self, sid: &str, payload: Payload, meta: Meta) -> Event {
         let s = self.sessions.entry(sid.to_string()).or_default();
+        if s.seq == 0
+            && let Some(r) = self.resumed.remove(sid)
+        {
+            (s.seq, s.pos) = (r.seq, r.pos);
+            if s.cwd.is_none() {
+                s.cwd = r.cwd;
+            }
+        }
         s.seq += 1;
         let pos = meta.in_stream.then(|| {
             s.pos += 1;
@@ -294,9 +440,6 @@ impl Merger {
 
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
-        if let Some(cwd) = h.str_field("cwd").filter(|c| !c.is_empty()) {
-            self.sessions.entry(sid.clone()).or_default().cwd = Some(cwd.to_string());
-        }
         let agent = self.agent_of_hook(&sid, h);
         let mut out = Vec::new();
         if agent == "bg" {
@@ -316,8 +459,15 @@ impl Merger {
         let s = |k: &str| h.str_field(k).map(str::to_string);
         match h.event_name() {
             "SessionStart" => {
+                let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
+                let base = (self.path_base(&sid).is_none() && !cwd.is_empty()).then(|| cwd.clone());
+                let session = self.sessions.entry(sid.clone()).or_default();
+                session.ended_at = None;
+                if base.is_some() {
+                    session.cwd = base;
+                }
                 let p = SessionStarted {
-                    cwd: s("cwd").unwrap_or_default(),
+                    cwd,
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
                     transcript_path: s("transcript_path"),
@@ -393,6 +543,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
             }
             "SessionEnd" => {
+                self.sessions.entry(sid.clone()).or_default().ended_at = Some(ts_seen);
                 let p = SessionEnded {
                     reason: s("reason"),
                 };
@@ -570,7 +721,7 @@ impl Merger {
         let danger = self.danger.check(&tool, &input);
         let raw = Some(h.raw().clone());
         let session = self.sessions.entry(sid.to_string()).or_default();
-        let degraded = !session.degraded.is_empty();
+        let degraded = session.degraded.contains(&file_of(&agent));
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {
@@ -599,6 +750,7 @@ impl Merger {
                     staged_at: Some(ts_seen),
                     result_sent: false,
                     finished: false,
+                    called: true,
                 },
             );
             let p = ToolCalled {
@@ -658,11 +810,7 @@ impl Merger {
             ts_seen,
             ..Meta::default()
         };
-        let cwd = self
-            .sessions
-            .get(sid)
-            .and_then(|s| s.cwd.clone())
-            .unwrap_or_default();
+        let cwd = self.path_base(sid).unwrap_or_default().to_string();
         let path = || {
             input["file_path"]
                 .as_str()
@@ -759,6 +907,7 @@ impl Merger {
             staged_at: None,
             result_sent: false,
             finished: false,
+            called: false,
         });
         !std::mem::replace(&mut card.finished, true)
     }
@@ -780,6 +929,7 @@ impl Merger {
             staged_at: None,
             result_sent: false,
             finished: false,
+            called: false,
         });
         if card.result_sent {
             return None;
@@ -833,7 +983,7 @@ impl Merger {
         };
         let message_id = v["message"]["id"].as_str().unwrap_or_default().to_string();
         let model = v["message"]["model"].as_str().map(str::to_string);
-        let delayed = !s.fallback_waiting.is_empty();
+        let delayed = s.fallback_waiting.values().any(|(f, _)| f == file);
 
         // 模型切換（每個 agent 各自追蹤；`<synthetic>` 這類 Claude Code 自己產生的訊息不算）
         let real_model = model.clone().filter(|m| !m.starts_with('<'));
@@ -912,24 +1062,23 @@ impl Merger {
                 let Some(id) = block["id"].as_str().map(str::to_string) else {
                     return out;
                 };
-                if s.fallback_waiting.remove(&id) {
+                if s.fallback_waiting.remove(&id).is_some() {
                     return out; // 已降級進串流，不搬位置
                 }
                 match s.cards.get(&id) {
                     Some(card) if card.staged_at.is_some() => {
                         vec![self.place(sid, &id, Placement::Stream, line, ts_model, ts_seen)]
                     }
-                    Some(_) => Vec::new(),
-                    None => {
-                        s.cards.insert(
-                            id.clone(),
-                            Card {
-                                agent: agent.clone(),
-                                staged_at: None,
-                                result_sent: false,
-                                finished: false,
-                            },
-                        );
+                    Some(card) if card.called => Vec::new(),
+                    _ => {
+                        let card = s.cards.entry(id.clone()).or_insert(Card {
+                            agent: agent.clone(),
+                            staged_at: None,
+                            result_sent: false,
+                            finished: false,
+                            called: false,
+                        });
+                        card.called = true;
                         let p = ToolCalled {
                             tool_use_id: id,
                             tool: block["name"].as_str().unwrap_or_default().to_string(),

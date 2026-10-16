@@ -83,11 +83,22 @@ impl TailReader {
         if let Ok(meta) = fs::metadata(path) {
             r.id = file_id(&meta);
             if start == Start::End {
-                let mut bytes = Vec::new();
-                File::open(path)?.read_to_end(&mut bytes)?;
-                let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-                r.line_no = bytes[..complete].iter().filter(|b| **b == b'\n').count() as u64;
-                r.offset = complete as u64;
+                // 分段數換行：transcript 可能上百 MB（Read 大檔整個進一行），不整個讀進記憶體
+                let mut f = File::open(path)?;
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut read = 0u64;
+                loop {
+                    let n = f.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let chunk = &buf[..n];
+                    r.line_no += chunk.iter().filter(|b| **b == b'\n').count() as u64;
+                    if let Some(i) = chunk.iter().rposition(|b| *b == b'\n') {
+                        r.offset = read + i as u64 + 1;
+                    }
+                    read += n as u64;
+                }
             }
         }
         Ok(r)
@@ -179,6 +190,32 @@ impl TailHandle {
     }
 }
 
+/// 停掉所有 tail，期間持續把 `rx` 收到的輸入交給 `on_input`。
+pub async fn stop_all(
+    tails: impl IntoIterator<Item = TailHandle>,
+    rx: &mut mpsc::Receiver<Input>,
+    mut on_input: impl FnMut(Input),
+) {
+    // tail 結束前最後一次讀檔用 `send().await`，佇列滿時要靠這裡繼續收才停得下來
+    let mut stopping = tokio::task::JoinSet::new();
+    for t in tails {
+        stopping.spawn(t.stop());
+    }
+    loop {
+        tokio::select! {
+            done = stopping.join_next() => {
+                if done.is_none() {
+                    break;
+                }
+            }
+            Some(input) = rx.recv() => on_input(input),
+        }
+    }
+    while let Ok(input) = rx.try_recv() {
+        on_input(input);
+    }
+}
+
 /// 為一個 transcript 檔開一個 tail task。`file` 是 `"main"` 或 `"agent-<agent_id>"`。
 pub fn spawn_tail(
     path: PathBuf,
@@ -205,10 +242,19 @@ async fn run(
     opts: TailOptions,
     mut stop: oneshot::Receiver<()>,
 ) {
-    let mut reader = match TailReader::open(&path, start) {
-        Ok(r) => r,
-        Err(e) => {
+    // 從檔尾開始要掃過整個檔案數行號，放到 blocking 執行緒，不卡住 runtime
+    let opened = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || TailReader::open(&path, start)).await
+    };
+    let mut reader = match opened {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             eprintln!("coding-lab transcript：開不了 {}：{e}", path.display());
+            return;
+        }
+        Err(e) => {
+            eprintln!("coding-lab transcript：開 {} 失敗：{e}", path.display());
             return;
         }
     };
@@ -338,6 +384,23 @@ pub enum TailAction {
     StopSession {
         session: String,
     },
+}
+
+impl TailAction {
+    /// 執行這個動作時要交給 merge 的 [`Input::TailReset`]：被停掉或重開的 tail 不會再送 Recovered。
+    pub fn reset(&self, ts_seen: u64) -> Input {
+        let (session, file) = match self {
+            TailAction::Start { session, file, .. } | TailAction::Stop { session, file } => {
+                (session, Some(file.clone()))
+            }
+            TailAction::StopSession { session } => (session, None),
+        };
+        Input::TailReset {
+            session: session.clone(),
+            file,
+            ts_seen,
+        }
+    }
 }
 
 /// 看 hook 決定要開／關哪些 tail（純邏輯；執行由組裝 collector 的地方負責）。

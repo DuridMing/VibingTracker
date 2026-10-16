@@ -60,6 +60,18 @@ struct CollectorSection {
 }
 
 impl Config {
+    /// plugin 的 hooks.json 寫死 POST 到 [`DEFAULT_HOOK_BIND`]（Claude Code 的 http hook 只有 headers
+    /// 能內插環境變數，url 不行）；hook 埠改掉的話，除了經 `ensure` 轉送的 SessionStart 都會連不上。
+    pub fn plugin_warning(&self) -> Option<String> {
+        let plugin = DEFAULT_HOOK_BIND;
+        (self.hook_bind.to_string() != plugin).then(|| {
+            format!(
+                "hook 入口是 {}，但 plugin 的 hook 固定送到 {plugin}：除了 SessionStart 以外的事件都收不到（改埠只適合測試）",
+                self.hook_bind
+            )
+        })
+    }
+
     /// 讀真正的環境變數與 `<home>/config.toml`。
     pub fn load(cli: &Overrides) -> Result<Config, String> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());

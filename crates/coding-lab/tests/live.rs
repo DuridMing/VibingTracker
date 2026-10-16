@@ -222,7 +222,84 @@ fn kpi_resets_after_local_midnight_and_only_sends_changes() {
     assert_eq!(f.kpi_for(0).unwrap()["edits"], 1);
     assert!(l.flush(DAY + 23 * H).is_none(), "沒有變化就沒有 frame");
     let f = l.flush(DAY + 25 * H).expect("跨過午夜要送新的 kpi");
-    assert_eq!(f.kpi_for(0).unwrap()["edits"], 0);
+    let k = f.kpi_for(0).unwrap();
+    assert_eq!(k["edits"], 0);
+    for key in ["live", "attention", "sessions", "costUsd", "models"] {
+        assert!(
+            k.get(key).is_some(),
+            "跨午夜整份重算、送完整的 kpi：缺 {key}：{k}"
+        );
+    }
+}
+
+fn usage(b: &mut B, s: &str, ts: u64, model: &str, thinking: u64, cost: f64) -> Event {
+    b.ev(
+        s,
+        "usage",
+        "main",
+        ts,
+        false,
+        json!({"messageId": "m", "model": model, "input": 0, "output": 0, "thinking": thinking,
+               "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": cost}),
+    )
+}
+
+/// 決定紀錄 #12：費用與思考 tokens 依模型分列，各鍵加總等於總數；不認得的模型 costUsd 0 照樣列。
+#[test]
+fn kpi_models_split_cost_and_thinking_by_model() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.register_offset(0);
+    let evs = [
+        b.started("s1", DAY + H),
+        usage(&mut b, "s1", DAY + H, "claude-opus-5-5", 7, 1.25),
+        usage(&mut b, "s1", DAY + H, "claude-opus-5-5[1m]", 1, 0.25),
+        usage(&mut b, "s1", DAY + H, "claude-sonnet-5-5", 3, 0.5),
+        usage(&mut b, "s1", DAY + H, "claude-foo-9", 2, 0.0),
+        usage(&mut b, "old", DAY - H, "claude-haiku-5-5", 100, 9.0), // 昨天
+    ];
+    apply_all(&mut l, &evs);
+    let k = l.snapshot(&Channel::All, 0, DAY + 2 * H)["kpi"].clone();
+    assert_eq!(
+        k["models"],
+        json!({
+            "opus 5.5": {"costUsd": 1.5, "thinkingTokens": 8},
+            "sonnet 5.5": {"costUsd": 0.5, "thinkingTokens": 3},
+            "foo 9": {"costUsd": 0.0, "thinkingTokens": 2},
+        }),
+        "{k}"
+    );
+    let m = k["models"].as_object().unwrap();
+    let cost: f64 = m.values().map(|v| v["costUsd"].as_f64().unwrap()).sum();
+    let think: u64 = m
+        .values()
+        .map(|v| v["thinkingTokens"].as_u64().unwrap())
+        .sum();
+    assert_eq!(
+        (cost, think),
+        (
+            k["costUsd"].as_f64().unwrap(),
+            k["thinkingTokens"].as_u64().unwrap()
+        )
+    );
+
+    // 有一個模型變了就送整個 models（取代，不合併）
+    l.flush(DAY + 2 * H);
+    l.apply(&usage(
+        &mut b,
+        "s1",
+        DAY + 2 * H,
+        "claude-sonnet-5-5",
+        1,
+        0.25,
+    ));
+    let f = l.flush(DAY + 2 * H).unwrap();
+    let models = f.kpi_for(0).unwrap()["models"].clone();
+    assert_eq!(models.as_object().unwrap().len(), 3, "{models}");
+    assert_eq!(
+        models["sonnet 5.5"],
+        json!({"costUsd": 0.75, "thinkingTokens": 4})
+    );
 }
 
 // ── agents 列
@@ -585,5 +662,89 @@ fn status_lines_outside_the_window_are_dropped() {
             .filter(|e| e["type"] == "prompt.submitted")
             .count(),
         2
+    );
+}
+
+/// #672：之後的 session.started（compact 等）不換 sessions 列的 cwd（路徑基準）。
+#[test]
+fn later_session_started_keeps_the_first_cwd() {
+    let mut b = B::new();
+    let mut live = Live::new();
+    live.apply(&b.started("s1", DAY));
+    live.apply(&b.ev(
+        "s1",
+        "session.started",
+        "main",
+        DAY + 1,
+        false,
+        json!({"cwd": "/p/worktrees/x", "source": "compact",
+               "model": "claude-opus-5-5", "transcriptPath": "/t", "branch": "main"}),
+    ));
+    assert_eq!(live.session_row("s1").unwrap()["cwd"], "/p");
+}
+
+/// 決定紀錄 #14：agents 列帶各 agent 實際用的模型短名；subagent 可以和 main 不同，中途切換就更新。
+#[test]
+fn agent_rows_carry_their_own_model() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let line = |b: &mut B, agent: &str, kind: &str, model: &str| {
+        b.ev(
+            "s1",
+            kind,
+            agent,
+            DAY,
+            false,
+            json!({"text": "x", "messageId": "m", "model": model}),
+        )
+    };
+    apply_all(&mut l, &[
+        b.started("s1", DAY),
+        b.ev("s1", "agent.spawned", "main", DAY, false, json!({"agentId": "a1", "agentType": "Explore", "name": "找檔案", "task": "t", "parentToolUseId": "t0"})),
+    ]);
+    let model_of = |l: &Live, id: &str| {
+        let snap = l.snapshot(&Channel::All, 0, DAY);
+        rows(&snap, "agents")
+            .iter()
+            .find(|a| a["id"] == id)
+            .map(|a| a["model"].clone())
+            .unwrap()
+    };
+    assert!(model_of(&l, "s1/main").is_null(), "還沒看到 assistant 行");
+    assert!(model_of(&l, "s1/a1").is_null());
+
+    apply_all(
+        &mut l,
+        &[
+            line(&mut b, "main", "assistant.text", "claude-opus-5-5"),
+            line(&mut b, "a1", "assistant.thinking", "claude-haiku-5-5"),
+        ],
+    );
+    assert_eq!(model_of(&l, "s1/main"), "opus 5.5");
+    assert_eq!(model_of(&l, "s1/a1"), "haiku 5.5", "subagent 用自己的模型");
+
+    l.flush(DAY);
+    l.apply(&line(
+        &mut b,
+        "main",
+        "assistant.text",
+        "claude-sonnet-5-5[1m]",
+    ));
+    let f = l.flush(DAY).unwrap();
+    let agents = f.rows_for(&Channel::All)["agents"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        agents
+            .iter()
+            .any(|a| a["id"] == "s1/main" && a["model"] == "sonnet 5.5"),
+        "中途切換要送更新：{agents:?}"
+    );
+    l.apply(&line(&mut b, "main", "assistant.text", "claude-sonnet-5-5"));
+    let f = l.flush(DAY);
+    assert!(
+        f.is_none_or(|f| f.rows_for(&Channel::All).get("agents").is_none()),
+        "模型沒變不送 agents 列"
     );
 }

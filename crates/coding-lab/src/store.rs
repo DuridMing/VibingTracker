@@ -72,6 +72,15 @@ pub struct SessionRow {
     pub last_seq: u64,
 }
 
+/// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Counters {
+    pub seq: u64,
+    pub pos: u64,
+    /// 路徑基準（session 第一次 `session.started` 的 cwd）；不知道時是空字串
+    pub cwd: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Touch {
     pub session: String,
@@ -402,6 +411,25 @@ impl Store {
             .optional()?)
     }
 
+    /// 每個 session 已用到的最大 seq、pos（沒進過串流的是 0）與路徑基準 cwd。
+    pub fn counters(&self) -> Result<HashMap<String, Counters>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT e.session, MAX(e.seq), COALESCE(MAX(e.pos), 0), COALESCE(s.cwd, '')
+             FROM events e LEFT JOIN sessions s ON s.id = e.session GROUP BY e.session",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                Counters {
+                    seq: r.get::<_, i64>(1)? as u64,
+                    pos: r.get::<_, i64>(2)? as u64,
+                    cwd: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// `ts_seen` ≥ `since` 的所有 Event，依 (ts_seen, session, seq)：collector 重啟時重建 live 狀態用。
     pub fn recent_events(&self, since: u64) -> Result<Vec<Event>, StoreError> {
         let mut stmt = self.db.prepare(
@@ -455,14 +483,65 @@ impl Store {
             .optional()?)
     }
 
-    /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案。
+    /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案，否則是 `cwd` 本身與底下（worktree）的。
     pub fn sessions(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<SessionRow>, StoreError> {
         let mut stmt = self.db.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE (?1 IS NULL OR cwd = ?1)
-             ORDER BY started_at DESC LIMIT ?2"
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR REPLACE(cwd, '\\', '/') = ?1
+               OR substr(REPLACE(cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/'
+             ORDER BY started_at DESC, id LIMIT ?2"
         ))?;
         let rows = stmt.query_map(params![cwd, limit as i64], session_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 所有 session 的 `cwd`（`/` 分隔、不重複）。
+    pub fn cwds(&self) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT DISTINCT REPLACE(cwd, '\\', '/') FROM sessions WHERE cwd != ''")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 串流最後一個 `pos`。
+    pub fn last_pos(&self, session: &str) -> Result<Option<u64>, StoreError> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT MAX(pos) FROM events WHERE session = ?1",
+                params![session],
+                |r| r.get::<_, Option<i64>>(0),
+            )?
+            .map(|v| v as u64))
+    }
+
+    /// 某 session 這些 type 的 Event，依 seq 排序。
+    pub fn events_of_types(&self, session: &str, types: &[&str]) -> Result<Vec<Event>, StoreError> {
+        let mut out = Vec::new();
+        for t in types {
+            let mut stmt = self
+                .db
+                .prepare("SELECT seq, offset FROM events WHERE session = ?1 AND type = ?2")?;
+            let rows: Vec<(i64, i64)> = stmt
+                .query_map(params![session, t], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<Result<_, _>>()?;
+            out.extend(rows);
+        }
+        out.sort();
+        self.read_at(session, out.into_iter().map(|(_, o)| o).collect())
+    }
+
+    /// 某 session 最後一個這種 type 的 Event。
+    pub fn last_of_type(&self, session: &str, kind: &str) -> Result<Option<Event>, StoreError> {
+        let off: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT offset FROM events WHERE session = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+                params![session, kind],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(self.read_at(session, off.into_iter().collect())?.pop())
     }
 
     /// 「誰碰過這檔」。
@@ -676,9 +755,13 @@ fn index_event(
 
     match payload {
         Payload::SessionStarted(p) => {
-            cwd_of.insert(sid.to_string(), p.cwd.clone());
+            // 路徑基準只取第一次的 cwd（#672）；之後的 compact／clear／resume 不換
+            let cwd = cwd_of.entry(sid.to_string()).or_default();
+            if cwd.is_empty() {
+                *cwd = p.cwd.clone();
+            }
             tx.execute(
-                "UPDATE sessions SET cwd = ?2, transcript_path = COALESCE(?3, transcript_path),
+                "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
                    ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
                 params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],

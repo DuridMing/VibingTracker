@@ -17,15 +17,34 @@ struct Env {
     web: u16,
 }
 
+static NEXT_PORT: AtomicU32 = AtomicU32::new(0);
+
+/// 從各平台的 ephemeral 範圍（Linux 32768 起、macOS／Windows 49152 起）以下挑埠，同一個 process 不重複發。
+/// 綁 0 再放掉的埠，平行測試再綁 0 時核心可能又發同一個，兩個 collector 就搶同一個埠。
+/// 起點混入時間，連續幾輪測試的範圍才不會重疊到上一輪還在閒置結束的 collector。
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    static START: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        (std::process::id() ^ nanos).wrapping_mul(2_654_435_761) % SPAN
+    });
+    loop {
+        let port = (LOW + (start + NEXT_PORT.fetch_add(1, Ordering::SeqCst)) % SPAN) as u16;
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn env(idle_secs: u64) -> Env {
+    env_on(idle_secs, free_port())
+}
+
+fn env_on(idle_secs: u64, hook: u16) -> Env {
     let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "serve-{}-{}",
         std::process::id(),
@@ -33,7 +52,7 @@ fn env(idle_secs: u64) -> Env {
     ));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    let (hook, web) = (free_port(), free_port());
+    let web = free_port();
     std::fs::write(
         home.join("config.toml"),
         format!(
@@ -221,6 +240,50 @@ fn sessions_open_before_a_restart_still_keep_the_collector_alive() {
     );
 }
 
+/// #670-1：重啟後續跑的 session，seq 與 pos 接著上一輪編號，新事件也進得了索引。
+#[test]
+fn seq_and_pos_continue_after_a_restart() {
+    let e = env(1);
+    let jsonl = e.home.join("events/s3.jsonl");
+    let events = || -> Vec<Value> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let prompt = |text: &str| {
+        json!({"session_id": "s3", "hook_event_name": "UserPromptSubmit", "prompt": text, "cwd": "/p"})
+            .to_string()
+    };
+    {
+        let _first = start_serve(&e);
+        let start = json!({"session_id": "s3", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": e.home.join("t3.jsonl"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &start.to_string());
+        http(e.hook, "POST", "/hook", &prompt("一"));
+        wait_for("第一輪的 prompt 進 store", || {
+            events().iter().any(|v| v["type"] == "prompt.submitted")
+        });
+    } // Kill：模擬 collector 當掉
+    let before = events().len();
+    let _second = start_serve(&e);
+    http(e.hook, "POST", "/hook", &prompt("二"));
+    wait_for("第二輪的 prompt 進 store", || events().len() > before);
+
+    let all = events();
+    let seqs: Vec<u64> = all.iter().map(|v| v["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "seq 要嚴格遞增：{seqs:?}"
+    );
+    let pos: Vec<u64> = all.iter().filter_map(|v| v["pos"].as_u64()).collect();
+    assert!(
+        pos.windows(2).all(|w| w[0] < w[1]),
+        "pos 要嚴格遞增：{pos:?}"
+    );
+}
+
 fn ensure(e: &Env, stdin: &str) -> std::process::Output {
     let mut c = cmd(e, &["ensure"]).stdin(Stdio::piped()).spawn().unwrap();
     c.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
@@ -270,11 +333,143 @@ fn ensure_twice_starts_one_collector_and_forwards_session_start() {
 
 #[test]
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
-    let e = env(0);
-    let squatter = TcpListener::bind(("127.0.0.1", e.hook)).unwrap(); // 接受連線但從不回應
+    // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap(); // 接受連線但從不回應
+    let e = env_on(0, squatter.local_addr().unwrap().port());
     let t = Instant::now();
     let out = ensure(&e, r#"{"session_id":"s","hook_event_name":"SessionStart"}"#);
     assert!(out.status.success() && out.stdout.is_empty());
     assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
     drop(squatter);
+}
+
+fn ev(session: &str, seq: u64, kind: &str, ts: u64) -> coding_lab::event::Event {
+    coding_lab::event::Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": kind, "agent": "main",
+            "line": null, "pos": null, "ts_model": null, "ts_exec": null, "ts_seen": ts,
+            "host": "local", "payload": {},
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+/// #670-8：SessionEnd 之後 tail 最後一次讀到的行、tail 關掉時的 transcript.recovered 都排在
+/// session.ended 後面，不能讓已結束的 session 在重啟後又算成開著（閒置結束會等到 24 小時）。
+#[test]
+fn events_after_session_end_do_not_reopen_it() {
+    let events = [
+        ev("a", 1, "session.started", 1),
+        ev("a", 2, "session.ended", 2),
+        ev("a", 3, "assistant.text", 3),
+        ev("a", 4, "transcript.recovered", 4),
+        ev("b", 1, "prompt.submitted", 5),
+        ev("c", 1, "session.started", 6),
+        ev("c", 2, "session.ended", 7),
+        ev("c", 3, "session.started", 8), // resume
+    ];
+    let mut open: Vec<String> = coding_lab::serve::open_sessions(&events)
+        .into_iter()
+        .collect();
+    open.sort();
+    assert_eq!(open, ["b", "c"]);
+}
+
+fn ev_with(
+    session: &str,
+    seq: u64,
+    kind: &str,
+    pos: Option<u64>,
+    ts: u64,
+    payload: Value,
+) -> coding_lab::event::Event {
+    coding_lab::event::Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": kind, "agent": "main",
+            "line": null, "pos": pos, "ts_model": null, "ts_exec": null, "ts_seen": ts,
+            "host": "local", "payload": payload,
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn json_body(resp: &str) -> Value {
+    serde_json::from_str(resp.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap_or(Value::Null)
+}
+
+/// #671：真的 collector 起來後，store 裡的 session 從三個 API 都查得到。
+#[test]
+fn http_api_serves_stored_sessions() {
+    let e = env(30);
+    let cwd = e.home.join("proj").to_string_lossy().replace('\\', "/");
+    {
+        let mut s = coding_lab::store::Store::open(&e.home).unwrap();
+        let now = coding_lab::now_ms();
+        s.append(ev_with(
+            "s1",
+            1,
+            "session.started",
+            None,
+            now,
+            json!({"cwd": cwd, "source": "startup",
+            "model": "claude-opus-5-5", "transcriptPath": "/t", "branch": "main"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            2,
+            "prompt.submitted",
+            None,
+            now + 1,
+            json!({"text": "嗨", "promptId": "p"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            3,
+            "assistant.text",
+            Some(1),
+            now + 2,
+            json!({"text": "x", "messageId": "m", "model": "claude-opus-5-5"}),
+        ));
+        s.append(ev_with(
+            "s1",
+            4,
+            "file.write",
+            None,
+            now + 3,
+            json!({"toolUseId": "w", "path": "n.txt",
+            "isNew": true, "content": "", "truncated": false}),
+        ));
+        s.flush().unwrap();
+    }
+    let _c = start_serve(&e);
+
+    let r = http(e.web, "GET", "/api/sessions", "");
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let rows = json_body(&r)["sessions"].clone();
+    assert_eq!(
+        (rows[0]["id"].as_str(), rows[0]["lastPos"].as_u64()),
+        (Some("s1"), Some(1)),
+        "{rows}"
+    );
+
+    let r = http(e.web, "GET", "/api/sessions/s1/events?limit=10", "");
+    let types: Vec<String> = json_body(&r)["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|e| e["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(types, ["prompt.submitted", "assistant.text"], "{r}");
+
+    let r = http(
+        e.web,
+        "GET",
+        &format!("/api/files?cwd={}&base=session:s1", cwd.replace('/', "%2F")),
+        "",
+    );
+    assert_eq!(json_body(&r)["changes"][0]["path"], "n.txt", "{r}");
 }

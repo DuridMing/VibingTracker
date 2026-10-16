@@ -1,4 +1,4 @@
-//! web 入口（#636，contracts.md §6–§7）：WebSocket、`/healthz`、前端靜態檔。
+//! web 入口（#636，contracts.md §6–§7）：WebSocket、`/healthz`、HTTP API（[`crate::api`]）、前端靜態檔。
 //!
 //! 每 50 ms 從 [`Live`] 取一個 frame，用 broadcast 發給各連線，各連線依自己訂的頻道與時區過濾。
 //! 連線落後超過 broadcast 容量時直接重送 snapshot（snapshot 就是最新狀態，什麼都不會漏）。
@@ -8,15 +8,17 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::{Value, json};
@@ -29,7 +31,10 @@ use crate::store::Store;
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
-const MORE_LIMIT: u64 = 500;
+pub(crate) const MORE_LIMIT: u64 = 500;
+/// hello 帶的 `resume` 只套用在這段時間內收到的 subscribe：前端重連時是 hello 後立刻重送所有訂閱，
+/// 之後才新開的頻道客戶端沒有它的狀態，要給 snapshot（server 分不出兩者，只能看時間）。
+pub const RESUME_WINDOW: Duration = Duration::from_secs(2);
 const COMPANION_LOOKBACK: u64 = 1000;
 
 pub struct WebState {
@@ -39,6 +44,7 @@ pub struct WebState {
     frames: broadcast::Sender<Arc<Frame>>,
     /// collector 主迴圈回報的健康資訊（tail 數、排程延遲…），併進 /healthz
     health: Mutex<Value>,
+    resume_window_ms: AtomicU64,
 }
 
 impl WebState {
@@ -55,14 +61,25 @@ impl WebState {
             web_root,
             frames,
             health: Mutex::new(json!({})),
+            resume_window_ms: AtomicU64::new(RESUME_WINDOW.as_millis() as u64),
         })
+    }
+
+    /// hello 的 `resume` 對之後多久內的 subscribe 有效，見 [`RESUME_WINDOW`]（測試用）。
+    pub fn set_resume_window(&self, window: Duration) {
+        self.resume_window_ms
+            .store(window.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn set_health(&self, extra: Value) {
         *self.health.lock().unwrap_or_else(|e| e.into_inner()) = extra;
     }
 
-    fn live(&self) -> MutexGuard<'_, Live> {
+    pub(crate) fn store(&self) -> Option<&Arc<Mutex<Store>>> {
+        self.store.as_ref()
+    }
+
+    pub(crate) fn live(&self) -> MutexGuard<'_, Live> {
         // 有執行緒 panic 也繼續用（狀態只是顯示用的彙總）
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -112,10 +129,17 @@ pub async fn serve_web(
     }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
+    let api = Router::new()
+        .route("/api/sessions", get(crate::api::sessions))
+        .route("/api/sessions/{id}/events", get(crate::api::events))
+        .route("/api/files", get(crate::api::files))
+        .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
+        .merge(api)
         .route("/ws", get(ws_handler))
         .route("/healthz", get(healthz))
         .fallback(get(static_file))
+        .layer(middleware::from_fn(loopback_host))
         .with_state(state);
     let task = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -123,6 +147,37 @@ pub async fn serve_web(
         }
     });
     Ok((local, task))
+}
+
+/// 只接受 loopback 名稱的 `Host`。DNS rebinding 時攻擊者的網域解析到 127.0.0.1，瀏覽器送出的
+/// `Origin` 與 `Host` 都是攻擊者網域、彼此相同，[`same_origin`] 擋不住；P6 開放遠端時改由金鑰驗證把關。
+async fn loopback_host(req: Request, next: Next) -> Response {
+    if host_is_loopback(req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Host 不是本機").into_response()
+    }
+}
+
+fn host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or_default(),
+        None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+    };
+    name.eq_ignore_ascii_case("localhost")
+        || name.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `/api/*`：同 `/ws`，使用者瀏覽器裡別的網頁不能讀走 session 資料。
+async fn require_same_origin(req: Request, next: Next) -> Response {
+    if same_origin(req.headers()) {
+        next.run(req).await
+    } else {
+        (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
+    }
 }
 
 /// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
@@ -156,7 +211,8 @@ struct Conn {
     /// 訂閱的頻道，以及這個頻道已經送到的 frame 編號
     subs: BTreeMap<Channel, u64>,
     offset: i32,
-    resume: Option<u64>,
+    /// hello 帶的 frame 編號與收到 hello 的時間
+    resume: Option<(u64, Instant)>,
 }
 
 async fn send(socket: &mut WebSocket, v: &Value) -> bool {
@@ -235,7 +291,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 .as_i64()
                 .unwrap_or(0)
                 .clamp(-14 * 60, 14 * 60) as i32;
-            conn.resume = msg["resume"].as_u64();
+            conn.resume = msg["resume"].as_u64().map(|n| (n, Instant::now()));
             state.live().register_offset(conn.offset);
             let welcome = json!({
                 "t": "welcome", "protocol": PROTOCOL, "host": "local",
@@ -248,10 +304,14 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 return send(socket, &json!({ "t": "error", "message": "不認得的頻道" })).await;
             };
             // 帶 resume 而且接得上：補送漏掉的 frame；否則送 snapshot
-            let missed = conn.resume.and_then(|n| {
-                let live = state.live();
-                live.frames_since(n).map(|frames| (frames, live.frame_no()))
-            });
+            let window = Duration::from_millis(state.resume_window_ms.load(Ordering::Relaxed));
+            let missed = conn
+                .resume
+                .filter(|(_, at)| at.elapsed() <= window)
+                .and_then(|(n, _)| {
+                    let live = state.live();
+                    live.frames_since(n).map(|frames| (frames, live.frame_no()))
+                });
             match missed {
                 Some((frames, now_no)) => {
                     conn.subs.insert(ch.clone(), now_no);
@@ -319,7 +379,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 
 /// 「載入更多」：窗口內的帶 pos Event，加上卡片的伴隨 Event 與窗口範圍內的狀態行（contracts.md §6）。
 /// 伴隨 Event 從窗口第一個 seq 往前 [`COMPANION_LOOKBACK`] 個、往後到下一個帶 pos 的 Event 為止找。
-fn more_events(
+pub(crate) fn more_events(
     store: &Store,
     session: &str,
     before: Option<u64>,

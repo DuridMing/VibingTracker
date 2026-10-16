@@ -34,6 +34,8 @@ const COMPANIONS: &[&str] = &[
     "git.op",
     "agent.spawned",
 ];
+/// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
+const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
 /// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…）
 const STATUS_LINES: &[&str] = &["prompt.submitted", "session.status"];
 
@@ -201,6 +203,8 @@ struct Counts {
     commits: u64,
     thinking: u64,
     cost: f64,
+    /// 短名 → (costUsd, thinking)
+    models: BTreeMap<String, (f64, u64)>,
 }
 
 #[derive(Clone, Default)]
@@ -228,6 +232,8 @@ struct AgentLive {
     session: String,
     agent_id: String,
     agent_type: Option<String>,
+    /// 這個 agent 最近一行 assistant／usage 的模型短名
+    model: Option<String>,
     name: String,
     task: Option<String>,
     status: &'static str,
@@ -256,8 +262,8 @@ pub struct Live {
     streams: HashMap<String, VecDeque<Event>>,
     changes: VecDeque<Event>,
     slots: BTreeMap<u64, Counts>,
-    /// 有連線用的時區，以及上次送出的 kpi
-    offsets: BTreeMap<i32, Option<Value>>,
+    /// 有連線用的時區，以及上次送出的 kpi 與它的「今天」起點（跨午夜就送完整的 kpi）
+    offsets: BTreeMap<i32, Option<(u64, Value)>>,
     /// 卡片的伴隨 Event（同卡只留最新的 tool.updated）與每個 session 的狀態行
     card_events: HashMap<(String, String), Vec<Event>>,
     status_lines: HashMap<String, VecDeque<Event>>,
@@ -316,6 +322,18 @@ impl Live {
             && !matches!(payload, Some(Payload::SessionStarted(_)));
         if !ended {
             self.ensure_agent(&sid, "main", ts);
+        }
+        if MODEL_LINES.contains(&e.kind.as_str())
+            && let Some(m) = e.payload["model"].as_str()
+            && let Some(a) = self.agents.get_mut(&format!("{sid}/{}", e.agent))
+        {
+            let m = Some(short_model(m));
+            if a.model != m {
+                a.model = m;
+                self.dirty_agents
+                    .entry(format!("{sid}/{}", e.agent))
+                    .or_insert(false);
+            }
         }
         if e.pos.is_none()
             && COMPANIONS.contains(&e.kind.as_str())
@@ -385,6 +403,9 @@ impl Live {
             Payload::Usage(u) => {
                 counts.thinking += u.thinking;
                 counts.cost += u.cost_usd;
+                let m = counts.models.entry(short_model(&u.model)).or_default();
+                m.0 += u.cost_usd;
+                m.1 += u.thinking;
             }
             _ => {}
         }
@@ -394,7 +415,10 @@ impl Live {
         };
         match payload {
             Payload::SessionStarted(p) => {
-                s.cwd = p.cwd.replace('\\', "/");
+                // 第一次的 cwd 是路徑基準（#672），之後的 session.started 不換
+                if s.cwd.is_empty() {
+                    s.cwd = p.cwd.replace('\\', "/");
+                }
                 s.model = p.model.as_deref().map(short_model).or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
@@ -510,6 +534,7 @@ impl Live {
                             agent_id: a.agent_id.clone(),
                             name: a.name.clone().unwrap_or_else(|| t.clone()),
                             agent_type: Some(t),
+                            model: None,
                             task: a.task.as_deref().map(clip),
                             status: "run",
                             current: None,
@@ -578,9 +603,9 @@ impl Live {
         let offsets: Vec<i32> = self.offsets.keys().copied().collect();
         for off in offsets {
             let current = self.kpi(off, now);
+            let day = day_start(off, now);
             let changed = match self.offsets.get(&off).cloned().flatten() {
-                None => current.clone(),
-                Some(prev) => {
+                Some((prev_day, prev)) if prev_day == day => {
                     let mut diff = Map::new();
                     if let (Some(c), Some(p)) = (current.as_object(), prev.as_object()) {
                         for (k, v) in c {
@@ -591,11 +616,13 @@ impl Live {
                     }
                     Value::Object(diff)
                 }
+                // 第一次，或跨過當地午夜：整份重算、送完整的 kpi
+                _ => current.clone(),
             };
             if changed.as_object().is_some_and(|o| !o.is_empty()) {
                 kpi.insert(off, changed);
             }
-            self.offsets.insert(off, Some(current));
+            self.offsets.insert(off, Some((day, current)));
         }
         let oldest = now.saturating_sub(SLOTS_KEPT_MS) / SLOT_MS;
         self.slots.retain(|slot, _| *slot >= oldest);
@@ -783,6 +810,7 @@ impl Live {
                     session: sid.to_string(),
                     agent_id: agent.to_string(),
                     agent_type,
+                    model: None,
                     name,
                     task: None,
                     status: "run",
@@ -809,9 +837,7 @@ impl Live {
     }
 
     fn kpi(&self, offset_min: i32, now: u64) -> Value {
-        let offset_ms = i64::from(offset_min) * 60_000;
-        let local = now as i64 + offset_ms;
-        let start = (local - local.rem_euclid(DAY_MS) - offset_ms).max(0) as u64;
+        let start = day_start(offset_min, now);
         let mut total = Counts::default();
         for c in self.slots.range(start / SLOT_MS..).map(|(_, c)| c) {
             total.sessions.extend(c.sessions.iter().cloned());
@@ -824,7 +850,22 @@ impl Live {
             total.commits += c.commits;
             total.thinking += c.thinking;
             total.cost += c.cost;
+            for (name, (cost, thinking)) in &c.models {
+                let m = total.models.entry(name.clone()).or_default();
+                m.0 += cost;
+                m.1 += thinking;
+            }
         }
+        let models: Map<String, Value> = total
+            .models
+            .iter()
+            .map(|(name, (cost, thinking))| {
+                (
+                    name.clone(),
+                    json!({ "costUsd": cost, "thinkingTokens": thinking }),
+                )
+            })
+            .collect();
         json!({
             "live": self.sessions.values().filter(|s| s.status == "run").count(),
             "attention": self.attention.len(),
@@ -838,10 +879,12 @@ impl Live {
             "commits": total.commits,
             "thinkingTokens": total.thinking,
             "costUsd": total.cost,
+            "models": models,
         })
     }
 
-    fn session_row(&self, id: &str) -> Option<Value> {
+    /// 某 session 的 `sessions` 列（contracts.md §6）；不在 live 狀態裡回 None。
+    pub fn session_row(&self, id: &str) -> Option<Value> {
         let s = self.sessions.get(id)?;
         let agents_live = self
             .agents
@@ -853,7 +896,7 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": Value::Null,
+            "status": s.status, "statusSince": s.status_since, "doing": Value::Null, "score": 0,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
         }))
@@ -862,7 +905,7 @@ impl Live {
 
 fn agent_row(id: &str, a: &AgentLive) -> Value {
     json!({
-        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "name": a.name,
+        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "model": a.model, "name": a.name,
         "task": a.task, "status": a.status, "current": a.current, "toolCount": a.tool_count,
         "parentToolUseId": a.parent, "spawnedAt": a.spawned_at, "finishedAt": a.finished_at,
     })
@@ -882,12 +925,20 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
         .unwrap_or_default()
 }
 
-fn clip(s: &str) -> String {
+/// `offset_min` 時區的當地今天 00:00（epoch ms）。
+fn day_start(offset_min: i32, now: u64) -> u64 {
+    let offset_ms = i64::from(offset_min) * 60_000;
+    let local = now as i64 + offset_ms;
+    (local - local.rem_euclid(DAY_MS) - offset_ms).max(0) as u64
+}
+
+/// 截成 sessions 列的文字長度（firstPrompt、lastPrompt）。
+pub fn clip(s: &str) -> String {
     s.chars().take(TEXT_LIMIT).collect()
 }
 
 /// `claude-opus-5-5` → `opus 5.5`
-fn short_model(id: &str) -> String {
+pub fn short_model(id: &str) -> String {
     let base = id.split('[').next().unwrap_or(id);
     let rest = base.strip_prefix("claude-").unwrap_or(base);
     let mut parts = rest.split('-');

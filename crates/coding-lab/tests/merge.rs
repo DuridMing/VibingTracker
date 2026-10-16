@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
-use coding_lab::merge::{DangerRules, FALLBACK_AFTER_MS, Input, Merger};
+use coding_lab::merge::{
+    DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger, SESSION_EVICT_AFTER_MS,
+    SESSION_IDLE_EVICT_MS,
+};
 use serde_json::{Value, json};
 
 const S: &str = "s1";
@@ -743,4 +746,223 @@ fn samples_replay_never_inserts_and_keeps_thinking_before_action() {
     } else {
         assert!(replayed > 0, "有 samples/ 卻沒有任何 session 可回放");
     }
+}
+
+/// #670-1：collector 重啟後，續跑的 session 接著 store 裡最後的 seq／pos 編號，不從 1 重來。
+#[test]
+fn resumed_session_continues_seq_and_pos() {
+    let mut m = merger();
+    m.resume(S, 500, 200, "");
+    let a = m.handle(line(1, thinking("u1", "m1"), 1000));
+    assert_eq!((a[0].seq, a[0].pos()), (501, Some(201)));
+    let b = m.handle(Input::Line {
+        session: "s2".into(),
+        file: "main".into(),
+        no: 1,
+        value: thinking("v1", "n1"),
+        ts_seen: 1001,
+    });
+    assert_eq!(
+        (b[0].seq, b[0].pos()),
+        (1, Some(1)),
+        "沒記錄的 session 照常從 1 開始"
+    );
+}
+
+fn degraded(file: &str, ts: u64) -> Input {
+    Input::Degraded {
+        session: S.into(),
+        file: file.into(),
+        error: "invalid JSON".into(),
+        ts_seen: ts,
+    }
+}
+
+fn sub_pre(id: &str, agent: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "PreToolUse", "tool_name": "Glob",
+            "tool_input": {}, "tool_use_id": id, "agent_id": agent, "agent_type": "Explore",
+        })),
+        ts_seen: ts,
+    }
+}
+
+/// #670-2：subagent 檔降級只影響那個 subagent 的卡片，main 照常等 transcript。
+#[test]
+fn degraded_subagent_file_does_not_push_main_into_fallback() {
+    let mut m = merger();
+    m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStart",
+                          "agent_id": "a1", "agent_type": "Explore"})),
+        ts_seen: 900,
+    });
+    m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
+    m.handle(sub_pre("t2", "a1", 1010));
+    let a = m.handle(degraded("agent-a1", 1100));
+    let placed: Vec<&Value> = a
+        .iter()
+        .filter(|e| e.kind == "tool.placed")
+        .map(|e| &e.payload["toolUseId"])
+        .collect();
+    assert_eq!(placed, [&json!("t2")], "只有 a1 的暫存卡片降級");
+
+    let b = m.handle(pre("t3", "Bash", json!({"command": "pwd"}), 1200));
+    assert_eq!(types(&b), ["tool.called"], "main 的新卡片照常暫存");
+    let c = m.handle(sub_pre("t4", "a1", 1210));
+    assert_eq!(
+        types(&c),
+        ["tool.called", "tool.placed"],
+        "a1 的新卡片直接進串流"
+    );
+}
+
+/// #670-2：降級的 tail 被停掉或重開後不會再送 Recovered（新 tail 從健康狀態開始），
+/// merge 要自己清掉降級並告訴前端，否則之後的卡片永遠走降級。
+#[test]
+fn degraded_is_cleared_when_the_tail_is_stopped_or_restarted() {
+    let mut m = merger();
+    m.handle(degraded("agent-a1", 1000));
+    m.handle(degraded("main", 1000));
+    let a = m.handle(Input::TailReset {
+        session: S.into(),
+        file: Some("agent-a1".into()),
+        ts_seen: 1100,
+    });
+    assert_eq!(types(&a), ["transcript.recovered"]);
+    assert_eq!(a[0].payload["file"], "agent-a1");
+    let b = m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1200));
+    assert_eq!(types(&b), ["tool.called", "tool.placed"], "main 還在降級");
+
+    let c = m.handle(Input::TailReset {
+        session: S.into(),
+        file: None,
+        ts_seen: 1300,
+    });
+    assert_eq!(types(&c), ["transcript.recovered"]);
+    assert_eq!(c[0].payload["file"], "main");
+    let d = m.handle(pre("t2", "Bash", json!({"command": "pwd"}), 1400));
+    assert_eq!(types(&d), ["tool.called"], "重開 tail 後回到暫存");
+
+    let e = m.handle(Input::TailReset {
+        session: S.into(),
+        file: Some("main".into()),
+        ts_seen: 1500,
+    });
+    assert!(e.is_empty(), "沒降級時不送事件");
+}
+
+/// #670-3：背景 agent 的工具沒有 transcript 行，降級進串流後不能讓之後的文字一直標延遲。
+#[test]
+fn background_tool_fallback_does_not_mark_later_text_delayed() {
+    let mut m = merger();
+    m.handle(at(
+        agent_hook("PreToolUse", "bg1", None, bg_pre("t1", "ls")),
+        1000,
+    ));
+    let post = json!({ "tool_name": "Bash", "tool_use_id": "t1", "duration_ms": 5,
+                       "tool_response": { "stdout": "", "stderr": "", "interrupted": false } });
+    m.handle(at(agent_hook("PostToolUse", "bg1", None, post), 1200));
+    let a = m.handle(line(1, text("u1", "m1"), 1300));
+    assert!(a[0].payload.get("delayed").is_none(), "{:?}", a[0].payload);
+}
+
+/// #670-3：subagent 的卡片在等 transcript，不影響 main 的文字。
+#[test]
+fn waiting_subagent_card_does_not_mark_main_text_delayed() {
+    let mut m = merger();
+    m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStart",
+                          "agent_id": "a1", "agent_type": "Explore"})),
+        ts_seen: 900,
+    });
+    m.handle(sub_pre("t1", "a1", 1000));
+    m.tick(1000 + FALLBACK_AFTER_MS);
+    let a = m.handle(line(1, text("u1", "m1"), 12_000));
+    assert!(a[0].payload.get("delayed").is_none(), "{:?}", a[0].payload);
+}
+
+/// #670-3：降級卡片的 tool_use 行一直沒來（那行解析失敗被跳過、或 tail 重開從檔尾讀），
+/// 過了 FALLBACK_WAIT_MS 或 tail 重開後就不再等，之後的文字不標延遲。
+#[test]
+fn fallback_wait_expires_or_is_reset_with_the_tail() {
+    let mut m = merger();
+    m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
+    m.tick(1000 + FALLBACK_AFTER_MS);
+    let a = m.handle(line(1, text("u1", "m1"), 12_000));
+    assert_eq!(a[0].payload["delayed"], true, "還在等的時候照常標延遲");
+    m.tick(1000 + FALLBACK_AFTER_MS + FALLBACK_WAIT_MS);
+    let b = m.handle(line(2, text("u2", "m2"), 80_000));
+    assert!(b[0].payload.get("delayed").is_none(), "{:?}", b[0].payload);
+
+    m.handle(pre("t2", "Bash", json!({"command": "pwd"}), 90_000));
+    m.tick(90_000 + FALLBACK_AFTER_MS);
+    m.handle(Input::TailReset {
+        session: S.into(),
+        file: Some("main".into()),
+        ts_seen: 100_001,
+    });
+    let c = m.handle(line(3, text("u3", "m3"), 100_002));
+    assert!(c[0].payload.get("delayed").is_none(), "{:?}", c[0].payload);
+}
+
+/// #670-4：PreToolUse 遺失（佇列滿被丟、或在 collector 重啟前）時，PostToolUse 先建了卡片；
+/// transcript 的 tool_use 行到時卡片仍要進串流。
+#[test]
+fn card_known_only_from_post_tool_use_still_enters_the_stream() {
+    let mut m = merger();
+    let a = m.handle(post("t1", 1000));
+    assert!(types(&a).contains(&"tool.updated"), "{:?}", types(&a));
+    let b = m.handle(line(1, tool_use("u1", "m1", "t1"), 1100));
+    assert_eq!(types(&b), ["tool.called"], "{b:?}");
+    assert_eq!(b[0].payload["placement"], "stream");
+    assert_eq!(b[0].pos(), Some(1));
+    let c = m.handle(line(2, tool_use("u2", "m1", "t1"), 1200));
+    assert!(c.is_empty(), "已進串流的卡片不再送");
+}
+
+fn hook_at(event: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": event, "source": "resume",
+                          "prompt": "hi", "cwd": "/p"}),
+        ),
+        ts_seen: ts,
+    }
+}
+
+/// #670-12：結束的 session 過了寬限期就從記憶體移除（常駐模式下不能一直長、tick 也不能掃全部歷史），
+/// 之後 resume 回來 seq／pos 照樣接續。
+#[test]
+fn ended_sessions_are_evicted_after_a_grace_period_and_keep_their_numbering() {
+    let mut m = merger();
+    m.handle(hook_at("UserPromptSubmit", 1000));
+    let end = m.handle(hook_at("SessionEnd", 2000));
+    let last_seq = end.last().unwrap().seq;
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_EVICT_AFTER_MS - 1);
+    assert_eq!(m.session_count(), 1, "寬限期內留著（晚到的 transcript 行）");
+    m.tick(2000 + SESSION_EVICT_AFTER_MS);
+    assert_eq!(m.session_count(), 0);
+
+    let back = m.handle(hook_at("SessionStart", 9_000_000));
+    assert_eq!(back[0].seq, last_seq + 1, "移除後 resume 回來接著編號");
+}
+
+/// #670-12：resume 回來的 session 不會被當成已結束移除；完全沒動靜的 session 放久了也移除。
+#[test]
+fn resumed_sessions_stay_and_abandoned_ones_are_evicted() {
+    let mut m = merger();
+    m.handle(hook_at("SessionEnd", 1000));
+    m.handle(hook_at("SessionStart", 2000));
+    m.tick(1000 + SESSION_EVICT_AFTER_MS);
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_IDLE_EVICT_MS - 1);
+    assert_eq!(m.session_count(), 1);
+    m.tick(2000 + SESSION_IDLE_EVICT_MS);
+    assert_eq!(
+        m.session_count(),
+        0,
+        "沒有 SessionEnd（終端機被關掉）也不能永遠留著"
+    );
 }

@@ -278,3 +278,88 @@ async fn edit_hunk_is_read_before_the_response() {
         hunk.lines
     );
 }
+
+/// #670-2：每個開／關 tail 的動作都要讓 merge 清掉那個檔的降級（新 tail 從健康狀態開始）。
+#[test]
+fn every_tail_action_resets_degraded_in_merge() {
+    let reset = |a: TailAction| match a.reset(7) {
+        Input::TailReset {
+            session,
+            file,
+            ts_seen,
+        } => (session, file, ts_seen),
+        _ => panic!("要是 TailReset"),
+    };
+    let start = TailAction::Start {
+        session: "s".into(),
+        file: "agent-a1".into(),
+        path: PathBuf::from("/t/agent-a1.jsonl"),
+        start: Start::Beginning,
+    };
+    assert_eq!(reset(start), ("s".into(), Some("agent-a1".into()), 7));
+    let stop = TailAction::Stop {
+        session: "s".into(),
+        file: "main".into(),
+    };
+    assert_eq!(reset(stop), ("s".into(), Some("main".into()), 7));
+    let all = TailAction::StopSession {
+        session: "s".into(),
+    };
+    assert_eq!(reset(all), ("s".into(), None, 7));
+}
+
+/// 同步送一個 hook，回傳是否在 `wait` 內收到回應。
+fn post_blocking(addr: SocketAddr, body: &str, wait: Duration) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(addr) else {
+        return false;
+    };
+    s.set_read_timeout(Some(wait)).unwrap();
+    let req = format!(
+        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).unwrap();
+    let mut buf = [0u8; 64];
+    matches!(s.read(&mut buf), Ok(n) if n > 0 && buf.starts_with(b"HTTP/1.1 200"))
+}
+
+/// #670-13：Edit 探針讀檔不能卡住處理 hook 的執行緒（大檔、慢的磁碟、FIFO 這類讀了就不回來的檔案）。
+/// 只有 1 個 worker 的 runtime 上，卡住的探針會讓其他 hook 都等不到回應。
+#[cfg(unix)]
+#[test]
+fn probe_never_blocks_the_hook_server() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("hooks-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("pipe.txt");
+    let _ = std::fs::remove_file(&fifo);
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr, _rx) = rt.block_on(server(8));
+
+    let edit = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                      "tool_input": {"file_path": fifo, "old_string": "a", "new_string": "b"},
+                      "tool_use_id": "e1"})
+    .to_string();
+    let first = std::thread::spawn(move || post_blocking(addr, &edit, Duration::from_secs(2)));
+    std::thread::sleep(Duration::from_millis(200)); // 讓 Edit 先進 handler
+    let other = json!({"session_id": "s1", "hook_event_name": "UserPromptSubmit", "prompt": "hi"})
+        .to_string();
+    let other_ok = post_blocking(addr, &other, Duration::from_secs(2));
+    let first_ok = first.join().unwrap();
+    // 卡在讀 FIFO 的執行緒（修好之前）不等它，測試程式結束時一起收掉
+    rt.shutdown_background();
+    assert!(other_ok, "其他 hook 被 Edit 探針卡住");
+    assert!(first_ok, "不是一般檔案就不讀，Edit 的 hook 也照常回應");
+}

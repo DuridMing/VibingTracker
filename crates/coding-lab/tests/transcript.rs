@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use coding_lab::merge::Input;
-use coding_lab::transcript::{Start, TailOptions, TailReader, spawn_tail};
+use coding_lab::transcript::{Start, TailOptions, TailReader, spawn_tail, stop_all};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -251,4 +251,102 @@ fn every_sample_transcript_reads_cleanly() {
             f.display()
         );
     }
+}
+
+/// #670-7：關機時佇列是滿的（主迴圈已不再收），tail 最後一次讀檔的 `send().await` 會一直等；
+/// 停 tail 的同時要繼續消化佇列，否則 collector 卡住、store 不 flush。
+#[tokio::test]
+async fn stop_all_keeps_draining_so_a_full_queue_cannot_hang_shutdown() {
+    let p = tmpfile("");
+    let (tx, mut rx) = mpsc::channel(1);
+    let h = spawn_tail(
+        p.clone(),
+        "s1".into(),
+        "main".into(),
+        Start::Beginning,
+        tx,
+        TailOptions {
+            poll_every: Duration::from_secs(3600),
+            use_notify: false,
+        },
+    );
+    for i in 0..50 {
+        append(&p, &line(&format!("u{i}")));
+    }
+    let mut got = 0;
+    let done = tokio::time::timeout(
+        Duration::from_secs(5),
+        stop_all([h], &mut rx, |input| {
+            if matches!(input, Input::Line { .. }) {
+                got += 1;
+            }
+        }),
+    )
+    .await;
+    assert!(done.is_ok(), "關機卡住");
+    assert_eq!(got, 50, "停之前寫進去的行都要送出");
+}
+
+/// #670-11：merge 只看 `message.content` 的第一個區塊，依據是 Claude Code 一行只寫一個區塊——
+/// 平行的多個工具呼叫也是 tool_use、tool_result 各自一行。格式改了這裡會紅。沒有 samples/ 時略過。
+#[test]
+fn every_sample_message_line_has_a_single_content_block() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        eprintln!("略過：沒有 samples/sessions");
+        return;
+    };
+    let mut checked = 0;
+    for d in dirs.flatten() {
+        let mut files = vec![d.path().join("transcript.jsonl")];
+        for s in std::fs::read_dir(d.path().join("subagents"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            files.push(s.path());
+        }
+        for f in files.into_iter().filter(|f| f.exists()) {
+            for (i, l) in std::fs::read_to_string(&f).unwrap().lines().enumerate() {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                if let Some(blocks) = v["message"]["content"].as_array() {
+                    assert!(
+                        blocks.len() <= 1,
+                        "{}:{} 有 {} 個區塊",
+                        f.display(),
+                        i + 1,
+                        blocks.len()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 0);
+}
+
+/// #670-14：從檔尾開始時分段數換行（不把整個 transcript 讀進記憶體）；行跨過讀取區塊的邊界、
+/// 換行剛好落在邊界上、尾端有半行，行號與位移都要對。
+#[test]
+fn start_at_end_on_a_large_file_counts_lines_across_chunks() {
+    let mut content = String::new();
+    let mut n = 0u64;
+    while content.len() < 300 * 1024 {
+        n += 1;
+        let pad = "x".repeat((n as usize * 37) % 5000);
+        content.push_str(&format!(
+            "{}\n",
+            json!({"type": "assistant", "uuid": format!("u{n}"), "pad": pad})
+        ));
+    }
+    content.push_str(r#"{"half"#);
+    let p = tmpfile(&content);
+    let mut r = TailReader::open(&p, Start::End).unwrap();
+    assert!(r.poll().unwrap().lines.is_empty());
+    append(&p, "\":1}\n");
+    append(&p, &line("next"));
+    let got = r.poll().unwrap();
+    let nos: Vec<u64> = got.lines.iter().map(|l| l.no).collect();
+    assert_eq!(nos, [n + 1, n + 2]);
+    assert_eq!(got.lines[1].value["uuid"], "next");
 }

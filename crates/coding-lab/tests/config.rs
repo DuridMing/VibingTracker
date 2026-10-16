@@ -128,3 +128,19 @@ fn bad_values_are_reported() {
         .is_err()
     );
 }
+
+/// #670-9：plugin 的 hooks.json 只能寫死 127.0.0.1:4800（http hook 的 url 不能內插變數），
+/// hook 埠改掉的話除了 SessionStart 以外的 hook 都會連不上，要警告。
+#[test]
+fn hook_port_other_than_the_plugins_is_warned() {
+    let c = resolve(Overrides::default(), &[], None).unwrap();
+    assert_eq!(c.plugin_warning(), None);
+    let c = resolve(
+        Overrides::default(),
+        &[],
+        Some("[hook]\nbind = \"127.0.0.1:4900\"\n"),
+    )
+    .unwrap();
+    let w = c.plugin_warning().expect("要警告");
+    assert!(w.contains("4800") && w.contains("4900"), "{w}");
+}
