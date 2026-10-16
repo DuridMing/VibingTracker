@@ -113,6 +113,13 @@ export function formatRow(row, { agentName } = {}) {
     } else if (row.status === "prompt") {
       body = `<span class="p">▶</span> <span class="pr">${esc(firstLine(row.text))}</span>`;
       detail = row.text.includes("\n") || row.text.length > LONG ? row.text : null;
+    } else if (row.status === "agent") {
+      // subagent 結束：名稱與 Agents 面板同一套（agentName），最後的訊息放展開
+      const name = `<b>${esc(agentName?.(row.session, row.agentId) ?? String(row.agentId ?? "").slice(0, 8))}</b>`;
+      body = row.result === "fail" ? `<span class="st bad">✗ ${name} 失敗</span>`
+        : row.result === "killed" ? `<span class="st idle">⏹ ${name} 已停止</span>`
+        : `<span class="st agdone">← ${name} 完成</span>`;
+      detail = row.text || null;
     } else {
       body = STATUS_TEXT[row.status] ?? esc(row.status);
     }

@@ -86,3 +86,16 @@ test("狀態行：已中斷；背景工作完成不當成使用者的 prompt", (
   assert.equal(task.detail, "<task-notification>build done</task-notification>");
   assert.match(formatRow({ ...base, type: "status", status: "prompt", source: "user", text: "修 bug" }).html, /▶.*修 bug/);
 });
+
+test("subagent 結束的狀態行：← 名稱 完成／✗ 失敗／⏹ 已停止；最後的訊息放展開", () => {
+  const row = (result, text = "找到 3 個呼叫點") => ({ ...base, key: `k${result}`, agent: "a1", type: "status", status: "agent", agentId: "a1", result, text });
+  const name = { agentName: (s, a) => (a === "a1" ? "查呼叫點" : null) };
+  const d = formatRow(row("done"), name);
+  assert.match(d.html, /← <b>查呼叫點<\/b> 完成/);
+  assert.equal(d.detail, "找到 3 個呼叫點");
+  assert.match(formatRow(row("fail"), name).html, /✗ <b>查呼叫點<\/b> 失敗/);
+  assert.match(formatRow(row("killed"), name).html, /⏹ <b>查呼叫點<\/b> 已停止/);
+  assert.equal(formatRow(row("done", ""), name).detail, null);
+  // 名稱跳脫
+  assert.doesNotMatch(formatRow(row("done"), { agentName: () => "<x>" }).html, /<x>/);
+});

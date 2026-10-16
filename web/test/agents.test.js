@@ -55,3 +55,16 @@ test("即時反映：frame 派出 subagent 後出現在 active，結束後移到
   assert.equal(v.main, null);
   assert.deepEqual(v.done, []);
 });
+
+test("剛完成的 subagent 先留在標籤列 5 秒（recent），之後才收進 done；沒給 now 時不分", () => {
+  const rows = [ag("main"), ag("x1", { status: "done", finishedAt: 10_000 }), ag("x2", { status: "done", finishedAt: 3_000 })];
+  const v = agentView(rows, S, { now: 12_000 });
+  assert.deepEqual((v.recent ?? []).map((a) => a.agentId), ["x1"]);
+  assert.deepEqual(v.done.map((a) => a.agentId), ["x2"]);
+  const later = agentView(rows, S, { now: 15_001 });
+  assert.deepEqual(later.recent, []);
+  assert.deepEqual(later.done.map((a) => a.agentId), ["x1", "x2"]);
+  const noClock = agentView(rows, S);
+  assert.deepEqual(noClock.recent, []);
+  assert.equal(noClock.done.length, 2);
+});

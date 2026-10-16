@@ -284,14 +284,20 @@ function createWorld(n) {
     rows.sessions.push(changed);
   }
 
-  function finishAgents(s, rows) {
+  function finishAgents(s, rows, events = []) {
     for (const a of agents.values()) {
       if (a.session !== s.id || a.agentId === "main") continue;
       if (a.agentId === "bg") {
         if (r() < 0.3) { agents.delete(a.id); rows.agents.push({ id: a.id, deleted: true }); }
       } else if (a.status === "run" && r() < 0.08) {
-        Object.assign(a, { status: "done", current: null, finishedAt: Date.now() });
-        rows.agents.push({ id: a.id, status: "done", current: null, finishedAt: a.finishedAt });
+        // 偶爾失敗或被 TaskStop 停掉（#677），agents 列照 collector 的規則：killed 也算 done
+        const how = r() < 0.15 ? "failed" : r() < 0.1 ? "killed" : undefined;
+        const status = how === "failed" ? "fail" : "done";
+        Object.assign(a, { status, current: null, finishedAt: Date.now() });
+        rows.agents.push({ id: a.id, status, current: null, finishedAt: a.finishedAt });
+        const fe = ev(s, "agent.finished", { agentId: a.agentId, lastMessage: how === "failed" ? "npm test 一直失敗，放棄" : `找到 ${1 + Math.floor(r() * 5)} 個呼叫點，都在 src/api`, transcriptPath: null, ...(how ? { status: how } : {}) }, { agent: a.agentId });
+        events.push(fe);
+        logStream(fe);
       }
     }
     if (!agents.has(`${s.id}/bg`) && r() < 0.03) {
@@ -377,7 +383,7 @@ function createWorld(n) {
           clearSession(s, rows);
         }
         tick(s, events, rows);
-        finishAgents(s, rows);
+        finishAgents(s, rows, events);
         const cost = r() * 0.004;
         const think = Math.floor(r() * 300);
         s.costUsd = +(s.costUsd + cost).toFixed(4);

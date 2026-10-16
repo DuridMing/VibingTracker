@@ -9,8 +9,11 @@ export function agentLabel(a) {
   return oneLine(a.name) || oneLine(a.agentType) || String(a.agentId).slice(0, 8);
 }
 
+export const LINGER_MS = 5000;
+
 // rows：store.agents 的值；sessionModel：sessions 列的 model（main 的模型）
-export function agentView(rows, session, { sessionModel = null } = {}) {
+// now：給了就把 LINGER_MS 內剛完成的 subagent 放進 recent（Agents 面板先留在標籤列，#641），之後才收進 done
+export function agentView(rows, session, { sessionModel = null, now = null, lingerMs = LINGER_MS } = {}) {
   let main = null;
   let bg = null;
   const active = [];
@@ -31,5 +34,7 @@ export function agentView(rows, session, { sessionModel = null } = {}) {
   }
   active.sort((x, y) => (x.spawnedAt ?? 0) - (y.spawnedAt ?? 0) || String(x.agentId).localeCompare(String(y.agentId)));
   done.sort((x, y) => (y.finishedAt ?? 0) - (x.finishedAt ?? 0));
-  return { main, bg, active, done, running: active.filter((a) => a.status === "run").length };
+  const recent = now == null ? [] : done.filter((a) => a.finishedAt != null && now - a.finishedAt <= lingerMs);
+  const settled = recent.length ? done.filter((a) => !recent.includes(a)) : done;
+  return { main, bg, active, recent, done: settled, running: active.filter((a) => a.status === "run").length };
 }

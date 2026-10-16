@@ -161,6 +161,12 @@ export function createStream({ cap = CAP } = {}) {
       case "session.status":
         if (STATUS_ROWS.has(p.status)) newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: p.status, text: "" }, out);
         break;
+      case "agent.finished": {
+        // subagent 結束（#641）：一行狀態。status 省略或 completed＝完成、killed＝被停掉（TaskStop），其他＝失敗（#677）
+        const result = p.status == null || p.status === "completed" ? "done" : p.status === "killed" ? "killed" : "fail";
+        newRow(ev, { key: `${ev.session}:s${ev.seq}`, type: "status", status: "agent", agentId: p.agentId, result, text: p.lastMessage ?? "" }, out);
+        break;
+      }
       case "session.ended":
         // 中途結束的 session：還在暫存區的卡片不會再有進展，從「即時」計數拿掉。
         // 卡片本身留著，萬一 tool.placed 晚到仍照常進串流。

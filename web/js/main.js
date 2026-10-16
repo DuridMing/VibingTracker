@@ -208,6 +208,13 @@ function doneChip(done) {
   return h("span", { class: "agc fin", title: `已完成的 subagent（${done.length}）\n` + done.map((a) => `· ${a.label}`).join("\n") }, h("i"), `✓ ${done.length}`);
 }
 
+// 剛完成的 subagent 在標籤列停 LINGER_MS：期間每秒重畫一次，時間到就收進「✓ n」
+let lingerTimer = 0;
+function lingerRecheck() {
+  if (lingerTimer) return;
+  lingerTimer = setTimeout(() => { lingerTimer = 0; render(true); }, 1000);
+}
+
 // 每個 session 一列，只重建內容有變的那一列（Agents 的「目前動作」幾乎每幀都在變）
 const agentRows = new Map(); // session id → { el, sig }
 
@@ -231,8 +238,9 @@ function renderAgents() {
   let prev = null;
   for (const s of live) {
     keep.add(s.id);
-    const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model });
-    const chips = [v.main, v.bg, ...v.active].filter(Boolean);
+    const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model, now: Date.now() });
+    if (v.recent.length) lingerRecheck();
+    const chips = [v.main, v.bg, ...v.active, ...v.recent].filter(Boolean);
     const sig = chips.map((a) => `${a.id}:${a.status}:${a.label}:${a.model ?? ""}:${a.current ?? ""}`).join("|") + `|done:${v.done.map((a) => a.id).join(",")}`;
     let row = agentRows.get(s.id);
     if (!row || row.sig !== sig) {

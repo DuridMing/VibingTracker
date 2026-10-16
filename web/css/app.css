@@ -333,3 +333,10 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .files .k.w{font-size:10px;padding:0 5px;border-radius:4px;background:var(--violet-soft);color:var(--violet)}
 .dzbox[hidden]{display:none!important}
 .spane > .sblk{flex:none}
+.ln .st.agdone{color:var(--teal)}
+/* 剛完成的 subagent 在標籤列停幾秒再收進「✓ n」（#641） */
+.agc.done{background:var(--accent-soft);color:var(--accent);animation:agdone .4s ease-out}
+.agc.done b{color:var(--accent)}
+.agc.done b::before{content:"✓ "}
+@keyframes agdone{from{box-shadow:0 0 0 3px var(--accent-soft)}to{box-shadow:none}}
+@media (prefers-reduced-motion: reduce){.agc.done{animation:none}}

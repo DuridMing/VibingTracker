@@ -210,3 +210,15 @@ test("按 Esc 中斷（session.status idle）在串流出現狀態行；背景�
   assert.equal(row(st, 1).source, "task");
   assert.equal(row(st, 2).source, "user");
 });
+
+test("subagent 結束（agent.finished）在串流出現一行狀態：完成、失敗、被停掉分開；同一筆不重複", () => {
+  const st = createStream();
+  const fin = (agentId, status, last = "結果") => ev(A, "agent.finished", { agentId, lastMessage: last, transcriptPath: null, ...(status ? { status } : {}) }, { agent: agentId });
+  const f1 = fin("a1", undefined, "找到 3 個呼叫點");
+  st.apply([f1, fin("a2", "completed"), fin("a3", "killed"), fin("a4", "failed")]);
+  st.apply([f1]);
+  const rows = st.rows.filter((r) => r.type === "status");
+  assert.deepEqual(rows.map((r) => [r.status, r.agentId, r.result]), [["agent", "a1", "done"], ["agent", "a2", "done"], ["agent", "a3", "killed"], ["agent", "a4", "fail"]]);
+  assert.equal(rows[0].text, "找到 3 個呼叫點");
+  assert.equal(kindOf(rows[0]), "st");
+});
