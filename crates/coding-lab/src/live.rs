@@ -14,6 +14,7 @@ use crate::derive::relative_path;
 use crate::doing::Doing;
 use crate::event::{DangerLevel, Event, Payload};
 use crate::status::task_failed;
+use crate::store::SessionRow;
 
 pub const STREAM_PER_SESSION: usize = 3000;
 pub const ALL_STREAM_PER_SESSION: usize = 200;
@@ -626,6 +627,44 @@ impl Live {
             }
             _ => {}
         }
+    }
+
+    pub fn has_session(&self, id: &str) -> bool {
+        self.sessions.contains_key(id)
+    }
+
+    /// collector 重啟後用 store 的 `sessions` 列補回 live 看不到的部分（#676）：cwd、第一個 prompt、
+    /// 開始時間與累計值以 store 為準；模型與分支 live 已經有的保留（重放看得到 checkout，store 不追）。
+    /// live 還沒有這個 session 時新建一列，`ts` 是狀態的起點。
+    pub fn seed(&mut self, r: &SessionRow, ts: u64) {
+        let s = self
+            .sessions
+            .entry(r.id.clone())
+            .or_insert_with(|| SessionLive {
+                host: r.host.clone(),
+                status: "run".into(),
+                status_since: ts,
+                ..SessionLive::default()
+            });
+        if !r.cwd.is_empty() {
+            s.cwd = r.cwd.replace('\\', "/");
+        }
+        if let Some(p) = &r.first_prompt {
+            s.first_prompt = Some(clip(p));
+        }
+        if let Some(m) = &r.model {
+            s.model = Some(short_model(m));
+        }
+        if s.branch.is_none() {
+            s.branch = r.branch.clone();
+        }
+        s.started_at = r.started_at;
+        s.commits = r.commits;
+        s.dangers = r.dangers;
+        s.failures = r.failures;
+        s.cost = r.cost_usd;
+        s.thinking = r.thinking_tokens;
+        self.dirty_sessions.insert(r.id.clone());
     }
 
     /// merge 定期重算的分數（契約 §6 `sessions.score`）；變了才標記該列要送。

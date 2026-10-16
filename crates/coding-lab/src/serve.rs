@@ -98,7 +98,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     }
 
     let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
-    web.apply(&recent);
+    web.rebuild(&recent);
     // ack 不是 Event，重放會讓已確認的注意列跑回來：依 store 的佇列對齊
     match store
         .lock()

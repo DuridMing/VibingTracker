@@ -547,3 +547,68 @@ fn broken_prices_json_warns_and_keeps_the_builtin_price() {
     assert_eq!(cost, 4.0, "照內建表");
     assert!(err.contains("prices.json"), "log 要有警告：{err}");
 }
+
+// ── 重啟後的 sessions 列（#676）
+
+/// 真的重啟 collector：還在跑的 session 收到新 prompt 後，`/api/sessions` 的列除了這一輪的欄位都和重啟前相同。
+#[test]
+fn sessions_row_survives_a_restart() {
+    let e = env(30);
+    let transcript = e.home.join("tr.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let hook = |name: &str, extra: Value| {
+        let mut body = json!({"session_id": "sr", "hook_event_name": name,
+                              "transcript_path": transcript, "cwd": "/p"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        http(e.hook, "POST", "/hook", &body.to_string());
+    };
+    let row = || {
+        json_body(&http(e.web, "GET", "/api/sessions", ""))["sessions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["id"] == "sr").cloned())
+            .unwrap_or(Value::Null)
+    };
+    let before = {
+        let _first = start_serve(&e);
+        hook(
+            "SessionStart",
+            json!({"source": "startup", "model": "claude-opus-5-5"}),
+        );
+        hook("UserPromptSubmit", json!({"prompt": "一"}));
+        let line = json!({"type": "assistant", "uuid": "u1", "timestamp": "2026-10-16T00:00:00Z",
+                          "message": {"id": "m1", "model": "claude-opus-5-5",
+                                      "content": [{"type": "text", "text": "好。"}],
+                                      "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}});
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        wait_for("重啟前的列有費用", || {
+            row()["costUsd"].as_f64().is_some_and(|c| c > 0.0)
+        });
+        row()
+    }; // Kill：模擬 collector 當掉
+    let _second = start_serve(&e);
+    hook("UserPromptSubmit", json!({"prompt": "二"}));
+    wait_for("重啟後的 prompt 進 live", || {
+        row()["lastPrompt"] == "二"
+    });
+    std::thread::sleep(Duration::from_millis(1_000)); // tail 重開後若重算 usage 會在這段時間進來
+    let after = row();
+    for k in [
+        "cwd",
+        "firstPrompt",
+        "startedAt",
+        "costUsd",
+        "thinkingTokens",
+        "commits",
+        "model",
+        "branch",
+    ] {
+        assert_eq!(after[k], before[k], "{k}：重啟前 {before}\n重啟後 {after}");
+    }
+}

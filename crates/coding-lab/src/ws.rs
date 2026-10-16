@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
-use crate::store::Store;
+use crate::store::{SessionRow, Store};
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
@@ -84,11 +84,56 @@ impl WebState {
         self.live.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// live 第一次看到的 session（collector 重啟後）先用 store 的列種起來（#676）。
+    /// 呼叫端先把 `events` 放進 store 的緩衝才給這裡，store 的列還不含它們，不會重複計算。
     pub fn apply(&self, events: &[Event]) {
+        let mut unseen: Vec<(&str, u64)> = Vec::new();
+        {
+            let live = self.live();
+            for e in events {
+                if !live.has_session(&e.session) && unseen.iter().all(|(s, _)| *s != e.session) {
+                    unseen.push((&e.session, e.ts_seen));
+                }
+            }
+        }
+        let rows = self.stored_sessions(unseen.iter().map(|(s, _)| *s));
+        let mut live = self.live();
+        for (r, (_, ts)) in rows.iter().zip(&unseen) {
+            if let Some(r) = r {
+                live.seed(r, *ts);
+            }
+        }
+        for e in events {
+            live.apply(e);
+        }
+    }
+
+    /// 啟動時重放 store 最近的 Event 重建 live，再把累計值等對齊 store 的列：重放區間可能沒涵蓋
+    /// session 的開頭，而 store 的列已經含這些 Event，不能邊種邊重放（會算兩次）。
+    pub fn rebuild(&self, events: &[Event]) {
+        let mut ids: Vec<&str> = Vec::new();
+        for e in events {
+            if !ids.contains(&e.session.as_str()) {
+                ids.push(&e.session);
+            }
+        }
+        let rows = self.stored_sessions(ids.iter().copied());
         let mut live = self.live();
         for e in events {
             live.apply(e);
         }
+        for r in rows.iter().flatten() {
+            live.seed(r, r.status_since);
+        }
+    }
+
+    /// 依序讀 store 的 `sessions` 列（沒有 store、沒有這列或讀不到都是 None）；不同時拿 live 的鎖。
+    fn stored_sessions<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Vec<Option<SessionRow>> {
+        let Some(store) = &self.store else {
+            return ids.map(|_| None).collect();
+        };
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        ids.map(|id| store.session(id).ok().flatten()).collect()
     }
 
     /// merge 定期重算的 session 分數（見 [`Live::set_scores`]）。
