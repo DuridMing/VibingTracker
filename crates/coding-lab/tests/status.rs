@@ -1034,3 +1034,99 @@ fn seeded_cost_survives_the_next_tick() {
         "補回花費的 session 還在 merge 裡"
     );
 }
+
+// ── resume、重啟與被丟棄的 session（#679）
+
+fn start(source: &str, ts: u64) -> Input {
+    hook("SessionStart", json!({ "source": source, "cwd": "/p" }), ts)
+}
+
+fn end(ts: u64) -> Input {
+    hook("SessionEnd", json!({ "reason": "exit" }), ts)
+}
+
+#[test]
+fn resume_after_end_reports_status_again() {
+    let mut r = Run::with_rules();
+    r.feed(start("startup", 1_000))
+        .feed(end(2_000))
+        .feed(start("resume", 3_000))
+        .feed(pre("t1", "rm -rf build", 4_000));
+    assert_eq!(r.statuses(), ["ended", "run", "danger"]);
+}
+
+#[test]
+fn resume_after_eviction_still_clears_old_done() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("hi", 2_000))
+        .feed(stop(3_000))
+        .tick(9_000)
+        .feed(end(10_000))
+        .tick(10_000 + 11 * 60 * 1000); // 結束 10 分鐘後移出記憶體
+    assert_eq!(r.m.session_count(), 0, "前提：已移出記憶體");
+    r.feed(start("resume", 20 * 60 * 1000))
+        .feed(prompt("again", 21 * 60 * 1000));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "done", "p2000"), a("cleared", "done", "p2000")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn restart_seeded_attention_is_cleared_like_before() {
+    // collector 重啟：merge 只拿到 store 的計數與還開著的注意項目
+    let mut r = Run::with_rules();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_attention(S, AttentionKind::Done, "p1", "main", 9_000);
+    r.m.resume_attention(S, AttentionKind::Danger, "t9", "main", 9_500);
+    r.m.resume_attention(S, AttentionKind::Fail, "t8", "main", 9_600);
+    // t9 的 Bash 成功同時結束 danger、讓 main 的連續失敗歸零；新的 prompt 撤回 done
+    r.feed(ok("t9", 20_000)).feed(prompt("again", 21_000));
+    assert_eq!(
+        r.attention(),
+        [
+            a("cleared", "danger", "t9"),
+            a("cleared", "fail", "t8"),
+            a("cleared", "done", "p1"),
+        ]
+    );
+    assert_eq!(r.last_status(), "run");
+    assert!(r.evs.iter().all(|e| e.seq > 40), "seq 接著 store 的編號");
+}
+
+#[test]
+fn abandoned_session_is_ended_when_evicted() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("hi", 2_000))
+        .tick(2_000 + 24 * 60 * 60 * 1000);
+    let ended: Vec<&Event> = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "session.ended")
+        .collect();
+    assert_eq!(
+        ended.len(),
+        1,
+        "沒有 SessionEnd 的 session 被丟棄時要結束它"
+    );
+    assert_eq!(ended[0].payload["reason"], "abandoned");
+    assert_eq!(r.last_status(), "ended");
+    assert_eq!(r.m.session_count(), 0);
+}
+
+#[test]
+fn ended_session_is_not_abandoned_again() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(end(2_000))
+        .tick(2_000 + 24 * 60 * 60 * 1000);
+    let ended = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "session.ended")
+        .count();
+    assert_eq!(ended, 1, "已經結束的 session 不再補一次");
+}

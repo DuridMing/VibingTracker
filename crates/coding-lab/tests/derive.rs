@@ -586,10 +586,11 @@ fn session_started_cwd_is_normalized_to_forward_slashes() {
 #[test]
 fn evicted_session_keeps_its_path_base() {
     let mut m = Merger::new(Box::new(NoDanger));
-    let s = handle(&mut m, session_start("s1", "/r", "startup"), 1);
-    let last_seq = s.last().unwrap().seq;
-    m.tick(1 + SESSION_IDLE_EVICT_MS);
+    handle(&mut m, session_start("s1", "/r", "startup"), 1);
+    // 沒有 SessionEnd：移出記憶體前先補 session.ended（abandoned）與 status（#679）
+    let gone = m.tick(1 + SESSION_IDLE_EVICT_MS);
     assert_eq!(m.session_count(), 0);
+    let last_seq = gone.last().unwrap().seq;
     let e = handle(
         &mut m,
         edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
