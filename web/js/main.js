@@ -8,9 +8,10 @@ import { formatRow, esc } from "./format.js";
 import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
-import { sortAttention, KIND_TEXT } from "./attention.js";
+import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel } from "./agents.js";
 import { createSessionPane, nowOf, switchTab } from "./session-pane.js";
+import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -31,7 +32,9 @@ const STATUS_TEXT = { run: "執行中", idle: "已中斷", wait: "等你", done:
 const CONN_TEXT = { connecting: "連線中…", open: "已連線", closed: "已斷線，重新連線中…", incompatible: "collector 版本不相容，請重新整理或更新" };
 
 const store = createStore();
-const ui = { tab: "all", conn: "connecting", welcome: null };
+// #monitor=<id>：監視器視窗（#650），整頁只看一個 session、自己連 collector
+const monitorId = parseMonitor(location.hash);
+const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null };
 
 // ---------- render ----------
 // 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
@@ -119,8 +122,13 @@ function renderTabs() {
       h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: `${s.id}\n${s.lastPrompt ?? ""}`, onclick: () => selectTab(s.id) },
         h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
         h("span", { class: "dot" }),
-        sessTag(s))),
+        sessTag(s),
+        h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"))),
   );
+}
+
+function openMonitor(id) {
+  window.open(monitorUrl(location, id), `coding-lab-monitor-${id}`, "popup,width=980,height=760");
 }
 
 function renderSessFilters() {
@@ -341,7 +349,7 @@ function ackRow(r) {
 
 // ---------- 通知（#647） ----------
 // toast 每個主視窗各自顯示；聲音與瀏覽器通知只由 leader 發；#monitor 視窗都不發。不補響、1 秒合併在 notify.js。
-const isMonitor = location.hash.startsWith("#monitor=");
+const isMonitor = monitorId != null;
 const storage = (() => { try { return window.localStorage; } catch { return null; } })();
 const nset = loadSettings(storage);
 const notifyUi = { reason: "" }; // 開關旁的說明（不能用的原因、點一下啟用聲音）
@@ -470,6 +478,7 @@ $("#nBrowser").addEventListener("change", async (e) => {
   setNotify("browser", on && !canBrowserNotify());
 });
 $("#nHint").addEventListener("click", unlockAudio);
+$("#spPop").addEventListener("click", () => openMonitor(pane.session));
 setInterval(() => render(), 30_000); // 佇列的「幾分前」
 
 // ---------- 單 session 畫面（#649）：tab 切到某個 session 時取代全部串流那一塊 ----------
@@ -550,27 +559,65 @@ function renderPane() {
       $("#spThinkTag").textContent = `${th.agent === "main" ? "main" : agentName(id, th.agent) ?? shortId(th.agent)}${th.summarized ? " · 摘要" : ""}`;
     }
   }
-  const ch = pane.changes;
-  if (changed("spChg", `${id}|${ch.selectedKey}|${ch.list.map((c) => c.key).join(",")}`)) {
-    const box = $("#spChg");
-    box.replaceChildren(...(ch.list.length ? ch.list.slice(0, 20).map((c) => h("button", {
-      class: c.key === ch.selectedKey ? "sel" : "", title: c.path, "aria-pressed": String(c.key === ch.selectedKey),
-      onclick: () => { ch.select(c.key); render(true); },
-    },
-    h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
-    h("span", { class: "pth" }, c.path),
-    c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫"))) : [h("div", { class: "none" }, "尚無改動")]));
-    const c = ch.selected();
-    $("#spFb").hidden = !c;
-    if (c) {
-      $("#spFbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added}` : `WRITE${c.isNew ? "（新檔案）" : ""}`;
-      $("#spFbPath").textContent = c.path;
-      $("#spFbBody").innerHTML = diffHtml(c);
-    }
-  }
-  const lanes = [v.main, v.bg, ...v.active, ...v.done.slice(0, 4)].filter(Boolean);
+  renderPaneDanger(id);
+  renderPaneFiles(id);
+  // 開出來的 agent：全部列出（執行中與出事的在前，已完成的依完成時間），main 與背景放最前面
+  const lanes = [v.main, v.bg, ...v.active, ...v.done].filter(Boolean);
   if (changed("spLanes", JSON.stringify(lanes.map((a) => [a.id, a.status, a.label, a.model, a.current, a.toolCount])))) {
     $("#spLanes").replaceChildren(...(lanes.length ? lanes.map(lane) : [h("div", { class: "none" }, "尚無 agent")]));
+    $("#spAgN").textContent = `subagent 執行中 ${v.running} · 完成 ${v.done.length}`;
+  }
+}
+
+// 危險指令提示框：這個 session 還沒確認的危險列；工具已結束（clearedAt）的變淡
+function renderPaneDanger(id) {
+  const rows = sessionDangers([...store.attention.values()], id);
+  const canAck = ui.welcome?.scope !== "view";
+  if (!changed("spDz", `${Math.floor(Date.now() / 30_000)}|${canAck}|` + rows.map((r) => `${r.id}:${r.clearedAt ?? ""}:${ackPending.has(r.id)}`).join(","))) return;
+  $("#spDz").hidden = !rows.length;
+  $("#spDzN").textContent = rows.length ? `${rows.length} 筆待確認` : "";
+  const now = Date.now();
+  $("#spDzList").replaceChildren(...rows.map((r) => {
+    const pend = ackPending.has(r.id);
+    const ack = { class: "btn sm", onclick: () => ackRow(r) };
+    if (pend) ack.disabled = "";
+    return h("div", { class: `dz${r.clearedAt != null ? " cleared" : ""}${pend ? " pend" : ""}` },
+      h("span", { class: "ar" }, r.reason ?? ""),
+      h("span", { class: "at" }, r.clearedAt != null ? "已結束" : `執行中 · ${ago(now - (r.raisedAt ?? now))}`),
+      canAck ? h("button", ack, pend ? "確認中…" : "已確認") : null);
+  }));
+}
+
+// 正在修改的檔案：這個 session 碰過的每個檔案一列（session-pane.js 的 files()）；點一列看它最近一次的 diff
+function renderPaneFiles(id) {
+  const files = pane.files();
+  const ch = pane.changes;
+  // 還沒手動點過：跟著清單第一列（正在改的、或最近改的那個檔案）；點過就停在那一列，跟改動紀錄的規則一樣
+  if (ch.following && files.length) ch.selectedKey = `${id}:${files[0].lastSeq}`;
+  const sel = ch.selected();
+  if (!changed("spFiles", `${id}|${sel?.key ?? ""}|` + files.map((f) => `${f.path}:${f.edits}:${f.writes}:${f.running}:${f.lastSeq}`).join(","))) return;
+  const who = (a) => (a === "main" ? "main" : a === "bg" ? "背景" : agentName(id, a) ?? shortId(a));
+  $("#spFilesN").textContent = files.length ? `${files.length} 個檔案${files.some((f) => f.running) ? "，正在改的在最上面" : ""}` : "這個 session 碰過的檔案";
+  $("#spFiles").replaceChildren(...(files.length ? files.map((f) => h("button", {
+    class: `${f.running ? "run" : ""}${sel?.path === f.path ? " sel" : ""}`, title: `${f.path}\n${f.agents.map(who).join("、")}`,
+    "aria-pressed": String(sel?.path === f.path),
+    onclick: () => {
+      ch.select(`${id}:${f.lastSeq}`);
+      ch.following = f === files[0]; // 點回第一列就恢復自動跟隨
+      render(true);
+    },
+  },
+  h("i", { class: "fdot" }),
+  h("span", { class: "pth" }, f.path),
+  f.isNew ? h("span", { class: "k w" }, "新") : null,
+  h("span", { class: "n" }, f.edits ? h("span", {}, `改 ${f.edits}`) : null, f.writes ? h("span", {}, ` 寫 ${f.writes}`) : null,
+    f.added || f.removed ? h("span", {}, " ", h("span", { class: "a" }, `+${f.added}`), " ", h("span", { class: "d" }, `−${f.removed}`)) : null),
+  h("span", { class: "ag" }, f.agents.map(who).join("、")))) : [h("div", { class: "none" }, "尚無改動")]));
+  $("#spFb").hidden = !sel;
+  if (sel) {
+    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT −${sel.removed} +${sel.added} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
+    $("#spFbPath").textContent = sel.path;
+    $("#spFbBody").innerHTML = diffHtml(sel);
   }
 }
 
@@ -814,6 +861,8 @@ const client = createClient({
   handlers: {
     welcome: (m) => { ui.welcome = m; notifier.connected(); render(true); },
     snapshot: (m) => {
+      // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
+      if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
       if (ui.tab !== "all" && m.ch === `session:${pane.session}`) {
         pane.load({ staged: m.staged, stream: m.stream });
         paneMoreReq = null;
@@ -847,6 +896,13 @@ const client = createClient({
     onError: (e) => console.warn("ws message", e),
   },
 });
-client.subscribe("*");
+if (isMonitor) {
+  document.body.classList.add("monitor");
+  document.title = `監視 ${shortId(monitorId)} · Coding Lab`;
+  pane.open(monitorId);
+}
+// 改 hash（主視窗 ↔ 監視器、換 session）時整頁重來，訂閱與畫面都從頭建立
+addEventListener("hashchange", () => location.reload());
+for (const ch of channelsFor(monitorId)) client.subscribe(ch);
 client.connect();
 render();

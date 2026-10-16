@@ -81,7 +81,7 @@
     </div>
     <div class="blk spane" id="spane" hidden>
       <div class="ph">
-        <span class="sid" id="spSid"></span><span class="pr" id="spPrompt"></span><span class="mdl" id="spModel"></span>
+        <span class="sid" id="spSid"></span><span class="pr" id="spPrompt"></span><span class="right"><span class="mdl" id="spModel"></span><button class="btn sm" id="spPop" title="開成監視器視窗">⧉ 監視器</button></span>
         <span class="meta">
           <span>⎇ <b id="spBranch">—</b></span>
           <span title="session 的 cwd（第一次 SessionStart）">📁 <b id="spCwd">—</b></span>
@@ -93,14 +93,18 @@
       </div>
       <div class="now" id="spNow"><span class="st" id="spNowSt">—</span><span class="what" id="spNowWhat"></span><span class="tag" id="spNowAg"></span></div>
       <div class="thinkbox" id="spThink" hidden><b>思考</b><span id="spThinkText"></span><small id="spThinkTag"></small></div>
+      <div class="dzbox" id="spDz" hidden role="alert">
+        <h2>⚠ 危險指令<small id="spDzN"></small></h2>
+        <div class="dzlist" id="spDzList"></div>
+      </div>
       <div class="spgrid">
-        <div class="streamwrap"><div class="stream" id="spStream"></div></div>
-        <div class="sblk"><h2>檔案變更<small>這個 session 最近的改動</small></h2>
-          <div class="chg spchg" id="spChg"><div class="none">尚無改動</div></div>
+        <div class="streamwrap"><h2>終端機<small>這個 session 的完整串流</small></h2><div class="stream" id="spStream"></div></div>
+        <div class="sblk"><h2>正在修改的檔案<small id="spFilesN">這個 session 碰過的檔案</small></h2>
+          <div class="files" id="spFiles"><div class="none">尚無改動</div></div>
           <div class="fb" id="spFb" hidden><div class="h"><span id="spFbKind"></span><b id="spFbPath"></b></div><div class="diff" id="spFbBody"></div></div>
         </div>
       </div>
-      <div class="lanes" id="spLanes"></div>
+      <div class="sblk"><h2>開出來的 agent<small id="spAgN"></small></h2><div class="lanes" id="spLanes"></div></div>
     </div>
   </section>
 </div>

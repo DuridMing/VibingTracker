@@ -295,7 +295,6 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 .spgrid{flex:1;display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:12px;min-height:420px}
 @media (max-width:1100px){.spgrid{grid-template-columns:1fr}}
 .spgrid .sblk{display:flex;flex-direction:column;gap:6px;min-height:0}
-.spchg{flex:none;max-height:150px;min-height:0;contain:none}
 .lanes{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(180px,1fr);gap:8px;overflow-x:auto;padding-bottom:2px}
 .lane{border:1px solid var(--line);border-radius:10px;background:var(--panel-2);padding:6px 10px;display:grid;gap:3px;min-width:0}
 .lane .nm{display:flex;justify-content:space-between;gap:8px;font-size:12px;font-weight:500;white-space:nowrap;overflow:hidden}
@@ -307,3 +306,30 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 .lane .tsk{color:var(--dim);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lane.bg{opacity:.6}
 #spStream .ss{display:none} /* 單 session 的終端機不必每行標 session */
+
+/* 監視器視窗（#650）：只留連線狀態與單 session 畫面 */
+.spane .ph .right{display:inline-flex;gap:8px;align-items:center}
+body.monitor .kpis,body.monitor .col-tree,body.monitor .stabs,body.monitor #allblk,body.monitor #spPop{display:none!important}
+body.monitor .main{grid-template-columns:1fr}
+body.monitor .top{grid-template-columns:auto 1fr}
+
+/* 單 session：危險指令框、正在修改的檔案、開出來的 agent（#650） */
+.spane h2 small{margin-left:8px}
+.dzbox{border:1px solid var(--rose);border-left-width:4px;border-radius:8px;background:var(--rose-soft);padding:6px 12px;display:flex;flex-direction:column;gap:4px}
+.dzbox h2{color:var(--rose);font-size:12.5px}
+.dzbox .dz{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;font-size:12px}
+.dzbox .dz .ar{font-family:var(--mono);color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dzbox .dz .at{color:var(--rose);font-size:11px}
+.dzbox .dz.cleared{opacity:.65}.dzbox .dz.cleared .at{color:var(--muted)}
+.dzbox .dz.pend{opacity:.45}
+.files{display:flex;flex-direction:column;gap:2px;overflow:auto;max-height:220px;flex:none;font-size:11.5px}
+.files button{display:grid;grid-template-columns:10px minmax(0,1fr) auto auto auto;gap:8px;align-items:center;text-align:left;padding:3px 6px;border-radius:6px;border:1px solid transparent;color:var(--ink)}
+.files button:hover{background:var(--panel-2)}.files button.sel{background:var(--accent-soft);border-color:var(--line)}
+.files .fdot{width:7px;height:7px;border-radius:50%;background:var(--line)}
+.files button.run .fdot{background:var(--amber);box-shadow:0 0 0 3px var(--amber-soft)}
+.files .pth{font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.files .n{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}.files .n .a{color:var(--teal)}.files .n .d{color:var(--rose)}
+.files .ag{color:var(--dim);font-size:10.5px;max-width:9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.files .k.w{font-size:10px;padding:0 5px;border-radius:4px;background:var(--violet-soft);color:var(--violet)}
+.dzbox[hidden]{display:none!important}
+.spane > .sblk{flex:none}

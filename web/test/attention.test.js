@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sortAttention } from "../js/attention.js";
+import { sortAttention, sessionDangers } from "../js/attention.js";
 import { createStore, applySnapshot, applyFrame } from "../js/store.js";
 
 const row = (id, session, kind, raisedAt) => ({ id, session, kind, ref: id, reason: "r", raisedAt });
@@ -44,4 +44,15 @@ test("collector 把危險列更新成已解除：store 淺合併帶上 clearedAt
   const r = st.attention.get("s1/danger/t1");
   assert.equal(r.clearedAt, 9);
   assert.equal(r.kind, "danger");
+});
+
+test("單一 session 的危險提示：只取這個 session 的 danger 列，未結束的在前", () => {
+  const rows = [
+    { ...row("s1/danger/a", "s1", "danger", 1), clearedAt: 3 },
+    row("s1/fail/b", "s1", "fail", 2),
+    row("s2/danger/c", "s2", "danger", 3),
+    { ...row("s1/danger/d", "s1", "danger", 4), clearedAt: null },
+  ];
+  assert.deepEqual(sessionDangers(rows, "s1").map((r) => r.id), ["s1/danger/d", "s1/danger/a"]);
+  assert.deepEqual(sessionDangers(rows, "s3"), []);
 });

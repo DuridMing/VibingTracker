@@ -14,3 +14,8 @@ export function sortAttention(rows, scoreOf) {
   return [...rows].sort((a, b) =>
     rank(a.kind) - rank(b.kind) || cleared(a) - cleared(b) || score(b) - score(a) || (a.raisedAt ?? 0) - (b.raisedAt ?? 0) || String(a.id).localeCompare(String(b.id)));
 }
+
+// 單 session 畫面的危險提示框：這個 session 的危險列（未結束的在前）
+export function sessionDangers(rows, session) {
+  return sortAttention(rows.filter((r) => r.session === session && r.kind === "danger"), () => 0);
+}

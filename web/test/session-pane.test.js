@@ -93,3 +93,36 @@ test("open 換到另一個 session：清空終端機、git 列、思考條、改
   p.apply([{ ...ev("assistant.text", { text: "新的" }, { pos: 1 }), session: T }]);
   assert.equal(p.stream.rows.length, 1);
 });
+
+const edit = (tid, path, lines, opts = {}) => ev("file.edit", { toolUseId: tid, path, hunk: { start: 1, oldLines: 1, newLines: 1, lines }, hunkSource: "pre" }, opts);
+const write = (tid, path, isNew, opts = {}) => ev("file.write", { toolUseId: tid, path, isNew, content: "x\n", truncated: false }, opts);
+const called = (tid, tool, status = "running") => ev("tool.called", { toolUseId: tid, tool, input: {}, status, placement: "staged", danger: null });
+const updated = (tid, status) => ev("tool.updated", { toolUseId: tid, status });
+
+test("碰過的檔案彙總：每個檔案一列，累計改幾次、+/− 行數、是否新檔、哪些 agent；正在改的排最前面並標出來", () => {
+  const p = createSessionPane(S);
+  p.load({ staged: [], stream: [
+    called("e1", "Edit", "done"), edit("e1", "src/a.ts", ["-x", "+y", "+z"], { agent: "main" }),
+    called("w1", "Write", "done"), write("w1", "src/new.ts", true),
+    called("e2", "Edit", "done"), edit("e2", "src/a.ts", ["-q"], { agent: "a1" }),
+    called("e3", "Edit", "running"), edit("e3", "src/b.ts", ["+1"]),
+  ] });
+  const f = p.files();
+  assert.deepEqual(f.map((x) => x.path), ["src/b.ts", "src/a.ts", "src/new.ts"]);
+  assert.equal(f[0].running, true);
+  const a = f[1];
+  assert.deepEqual([a.edits, a.writes, a.added, a.removed, a.running], [2, 0, 2, 2, false]);
+  assert.deepEqual(a.agents, ["main", "a1"]);
+  assert.equal(f[2].isNew, true);
+  // 工具結束：不再標正在改，排序改回依最近一次
+  p.apply([updated("e3", "done")]);
+  assert.equal(p.files().find((x) => x.path === "src/b.ts").running, false);
+});
+
+test("檔案彙總不受改動紀錄 60 筆上限影響：同一個 session 改很多次也全部算進去", () => {
+  const p = createSessionPane(S);
+  p.load({ staged: [], stream: Array.from({ length: 80 }, (_, i) => edit(`t${i}`, `src/f${i % 5}.ts`, ["+a"])) });
+  const f = p.files();
+  assert.equal(f.length, 5);
+  assert.equal(f.reduce((n, x) => n + x.edits, 0), 80);
+});

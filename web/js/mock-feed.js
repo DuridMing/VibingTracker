@@ -419,6 +419,7 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
       this.readyState = 0;
       this.timer = null;
       this.subs = new Set();
+      this.all = false;
       live.add(this);
       setTimeout(() => {
         if (Date.now() < downUntil) return this.#end(); // collector「還沒起來」
@@ -430,15 +431,19 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
       const msg = JSON.parse(text);
       if (msg.op === "hello") this.#emit({ t: "welcome", protocol: 1, host: "local", version: "0.0.0-mock", remote: false, thinking: "full", scope: "operate" });
       if (msg.op === "subscribe" && msg.channel === "*") {
+        this.all = true;
         this.#emit(world.snapshot());
-        this.timer = bench
-          ? setInterval(() => this.#frame(world.step({ minEvents: 20 })), 50)
-          : setInterval(() => this.#frame(world.step()), 400);
       }
       if (msg.op === "subscribe" && msg.channel.startsWith("session:")) {
         const id = msg.channel.slice(8);
         this.subs.add(id);
         setTimeout(() => this.#emit(world.sessionSnapshot(id)), 40);
+      }
+      // 監視器視窗只訂 session 頻道：訂了任何頻道就開始推進世界
+      if (msg.op === "subscribe" && this.timer == null) {
+        this.timer = bench
+          ? setInterval(() => this.#frame(world.step({ minEvents: 20 })), 50)
+          : setInterval(() => this.#frame(world.step()), 400);
       }
       if (msg.op === "unsubscribe" && msg.channel.startsWith("session:")) this.subs.delete(msg.channel.slice(8));
       if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#emit(f); }, 80);
@@ -447,7 +452,7 @@ export function installMock(n, { bench = false, prefill = false } = {}) {
     close() { this.#end(); }
     // `*` 的 frame，再為每個訂閱中的 session 頻道各送一份只含它的
     #frame(f) {
-      this.#emit(f);
+      if (this.all) this.#emit(f);
       for (const id of this.subs) {
         const pick = (list) => (list ?? []).filter((x) => (x.session ?? x.id) === id || String(x.id).startsWith(`${id}/`));
         const events = f.events.filter((e) => e.session === id);
