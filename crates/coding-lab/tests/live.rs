@@ -748,3 +748,82 @@ fn agent_rows_carry_their_own_model() {
         "模型沒變不送 agents 列"
     );
 }
+
+/// #673：VSCode 與 resume 的 SessionStart 不送 model，session 主模型取 main 第一行帶真模型的 assistant 行。
+#[test]
+fn session_model_falls_back_to_the_first_main_assistant_line() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let line = |b: &mut B, agent: &str, model: &str| {
+        b.ev(
+            "s1",
+            "assistant.text",
+            agent,
+            DAY,
+            true,
+            json!({"text": "x", "messageId": "m", "model": model}),
+        )
+    };
+    let model_of = |l: &Live| l.session_row("s1").unwrap()["model"].clone();
+    l.apply(&b.ev(
+        "s1",
+        "session.started",
+        "main",
+        DAY,
+        false,
+        json!({"cwd": "/p", "source": "startup", "model": null, "transcriptPath": "/t", "branch": null}),
+    ));
+    assert!(model_of(&l).is_null());
+
+    l.apply(&line(&mut b, "a1", "claude-haiku-5-5"));
+    assert!(model_of(&l).is_null(), "subagent 的行不算 session 主模型");
+    l.apply(&line(&mut b, "main", "<synthetic>"));
+    assert!(model_of(&l).is_null(), "<synthetic> 不是模型");
+
+    l.apply(&line(&mut b, "main", "claude-opus-5-5"));
+    assert_eq!(model_of(&l), "opus 5.5");
+    l.apply(&line(&mut b, "main", "claude-sonnet-5-5"));
+    assert_eq!(
+        model_of(&l),
+        "opus 5.5",
+        "之後的行不換，切換走 model.changed"
+    );
+
+    l.apply(&b.ev(
+        "s1",
+        "model.changed",
+        "main",
+        DAY,
+        true,
+        json!({"from": "claude-opus-5-5", "to": "claude-sonnet-5-5"}),
+    ));
+    assert_eq!(model_of(&l), "sonnet 5.5");
+}
+
+/// #673：SessionStart 有送 model 時沿用，不被 transcript 第一行換掉；agents 列也不收 `<synthetic>`。
+#[test]
+fn session_start_model_wins_and_synthetic_is_ignored() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.apply(&b.started("s1", DAY));
+    for model in ["<synthetic>", "claude-sonnet-5-5"] {
+        l.apply(&b.ev(
+            "s1",
+            "assistant.text",
+            "main",
+            DAY,
+            true,
+            json!({"text": "x", "messageId": "m", "model": model}),
+        ));
+        if model == "<synthetic>" {
+            let snap = l.snapshot(&Channel::All, 0, DAY);
+            let main = rows(&snap, "agents")
+                .into_iter()
+                .find(|a| a["id"] == "s1/main")
+                .unwrap()
+                .clone();
+            assert!(main["model"].is_null(), "{main}");
+        }
+    }
+    assert_eq!(l.session_row("s1").unwrap()["model"], "opus 5.5");
+}

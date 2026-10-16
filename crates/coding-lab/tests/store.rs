@@ -479,3 +479,53 @@ fn later_session_started_keeps_the_first_cwd() {
     let c = Store::open(&h).unwrap().counters().unwrap();
     assert_eq!(c["s1"].cwd, "/r", "重啟後交給 merge 的也是第一次的 cwd");
 }
+
+/// #673：SessionStart 沒有 model 時，sessions.model 取 main 第一筆 usage 的模型；model.changed 換掉；重建後一樣。
+#[test]
+fn session_model_comes_from_the_first_main_usage() {
+    let h = home();
+    let usage = |seq: u64, agent: &str, model: &str| {
+        let mut e = ev(
+            "s1",
+            seq,
+            "usage",
+            None,
+            1000 + seq,
+            json!({"messageId": format!("m{seq}"), "model": model, "input": 0, "output": 0, "thinking": 0,
+                   "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": 0.0}),
+        );
+        e.agent = agent.into();
+        e
+    };
+    let model = |s: &Store| s.session("s1").unwrap().unwrap().model;
+    {
+        let mut s = Store::open(&h).unwrap();
+        let mut start = started("s1", 1, "/p");
+        start.payload["model"] = Value::Null;
+        s.append(start);
+        s.append(usage(2, "a1", "claude-haiku-5-5"));
+        s.flush().unwrap();
+        assert_eq!(model(&s), None, "subagent 不算");
+        s.append(usage(3, "main", "claude-opus-5-5"));
+        s.append(usage(4, "main", "claude-sonnet-5-5"));
+        s.flush().unwrap();
+        assert_eq!(model(&s).as_deref(), Some("claude-opus-5-5"));
+        s.append(ev(
+            "s1",
+            5,
+            "model.changed",
+            Some(1),
+            1005,
+            json!({"from": "claude-opus-5-5", "to": "claude-sonnet-5-5"}),
+        ));
+        s.flush().unwrap();
+        assert_eq!(model(&s).as_deref(), Some("claude-sonnet-5-5"));
+    }
+    std::fs::remove_file(h.join("index.sqlite")).unwrap();
+    let s = Store::open(&h).unwrap();
+    assert_eq!(
+        model(&s).as_deref(),
+        Some("claude-sonnet-5-5"),
+        "從 JSONL 重建"
+    );
+}
