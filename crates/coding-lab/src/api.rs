@@ -98,29 +98,28 @@ fn norm(p: &str) -> String {
 pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     let q = query(&uri);
     let cwd = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty());
-    let Some(store) = state.store() else {
+    let Some(store) = state.store().cloned() else {
         return ok(&json!({ "sessions": [] }));
     };
-    // 先讀完 store 再碰 live，不同時拿兩把鎖
-    let stored: Vec<(SessionRow, Value)> = {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        let rows = match store.sessions(cwd.as_deref(), limit(&q, SESSIONS_DEFAULT, SESSIONS_MAX)) {
-            Ok(r) => r,
-            Err(e) => return store_error(e),
-        };
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            match stored_row(&store, &r) {
-                Ok(v) => out.push((r, v)),
-                Err(e) => return store_error(e),
-            }
-        }
-        out
+    let n = limit(&q, SESSIONS_DEFAULT, SESSIONS_MAX);
+    // SQLite 與 JSONL 都會阻塞：放到 blocking 執行緒，不佔住 async worker（#683）。先讀完 store 再碰 live，不同時拿兩把鎖
+    let stored = tokio::task::spawn_blocking(move || {
+        stored_rows(
+            &store.lock().unwrap_or_else(|e| e.into_inner()),
+            cwd.as_deref(),
+            n,
+        )
+    })
+    .await;
+    let stored = match stored {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => return store_error(e),
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let live = state.live();
     let rows: Vec<Value> = stored
         .into_iter()
-        .map(|(r, v)| match live.session_row(&r.id) {
+        .map(|(id, v)| match live.session_row(&id) {
             // 重啟後 live 列還沒看到 assistant 行時，模型用 store 的（#673）
             Some(mut row) => {
                 if row["model"].is_null() {
@@ -135,12 +134,28 @@ pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
     ok(&json!({ "sessions": rows }))
 }
 
-/// 不在 live 狀態裡的 session：從 §5 `sessions` 表組成與 WS 相同欄位的列。
-fn stored_row(store: &Store, r: &SessionRow) -> Result<Value, crate::store::StoreError> {
-    let last_prompt = store
-        .last_of_type(&r.id, "prompt.submitted")?
-        .and_then(|e| e.payload["text"].as_str().map(clip));
-    Ok(json!({
+/// store 的 sessions 列，組成與 WS 相同欄位（不在 live 狀態裡的 session 直接用）。
+/// 最後一個 prompt 與 `lastPos` 用兩句批次查詢取，不是每列各查一次。
+fn stored_rows(
+    store: &Store,
+    cwd: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(String, Value)>, crate::store::StoreError> {
+    let rows = store.sessions(cwd, limit)?;
+    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+    let extra = store.last_prompt_and_pos(&ids)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let (last_prompt, last_pos) = extra.get(&r.id).cloned().unwrap_or_default();
+            let v = stored_row(&r, last_prompt.as_deref().map(clip), last_pos);
+            (r.id, v)
+        })
+        .collect())
+}
+
+fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>) -> Value {
+    json!({
         "id": r.id, "host": r.host, "cwd": r.cwd.replace('\\', "/"), "branch": r.branch,
         "model": r.model.as_deref().map(short_model), "modelId": r.model,
         "firstPrompt": r.first_prompt.as_deref().map(clip), "lastPrompt": last_prompt,
@@ -148,8 +163,8 @@ fn stored_row(store: &Store, r: &SessionRow) -> Result<Value, crate::store::Stor
         "status": r.status, "statusSince": r.status_since, "doing": Value::Null, "score": 0,
         "commits": r.commits, "dangers": r.dangers, "failures": r.failures,
         "agentsLive": 0, "costUsd": r.cost_usd, "thinkingTokens": r.thinking_tokens,
-        "lastPos": store.last_pos(&r.id)?,
-    }))
+        "lastPos": last_pos,
+    })
 }
 
 // ── /api/sessions/<id>/events

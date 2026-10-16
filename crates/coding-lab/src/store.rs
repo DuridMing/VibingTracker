@@ -81,6 +81,9 @@ pub struct Counters {
     pub cwd: String,
 }
 
+/// session 最後一個 prompt 的文字與串流最後一個 `pos`（見 [`Store::last_prompt_and_pos`]）。
+pub type LastSeen = (Option<String>, Option<u64>);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Touch {
     pub session: String,
@@ -207,6 +210,10 @@ pub struct Store {
     /// 索引時需要的狀態：session 的 cwd、工具卡片碰的是哪個檔
     cwd_of: HashMap<String, String>,
     path_of_tool: HashMap<(String, String), String>,
+    /// 已寫進 JSONL、還沒進索引的 (Event, offset)：索引寫入失敗時留到下次 flush
+    unindexed: Vec<(Event, u64)>,
+    /// 開啟時 recover 讀了多少 bytes
+    recover_bytes: u64,
 }
 
 impl Store {
@@ -226,6 +233,8 @@ impl Store {
             file_len: HashMap::new(),
             cwd_of: HashMap::new(),
             path_of_tool: HashMap::new(),
+            unindexed: Vec::new(),
+            recover_bytes: 0,
         };
         {
             let mut stmt = store.db.prepare("SELECT id, cwd FROM sessions")?;
@@ -245,14 +254,17 @@ impl Store {
         self.pending.push(e);
     }
 
+    /// 寫入失敗時不丟資料（#683）：JSONL 寫不進去的 Event 放回緩衝、寫到一半的檔截回原長度；
+    /// 已寫進 JSONL 但索引交易失敗的留在 `unindexed`，下次 flush 再索引。
     pub fn flush(&mut self) -> Result<(), StoreError> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.unindexed.is_empty() {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending);
 
         // 1. 依 session 分組寫 JSONL（每檔一次 write_all），記下每行的 offset
         let mut batches: Vec<Batch> = Vec::new();
+        let mut members: Vec<Vec<usize>> = Vec::new();
         let mut offset_of = vec![0u64; pending.len()];
         for (i, e) in pending.iter().enumerate() {
             let name = file_name(&e.session);
@@ -270,6 +282,7 @@ impl Store {
                         base,
                         buf: Vec::new(),
                     });
+                    members.push(Vec::new());
                     batches.len() - 1
                 }
             };
@@ -277,27 +290,65 @@ impl Store {
             offset_of[i] = batch.base + batch.buf.len() as u64;
             batch.buf.extend_from_slice(e.to_json_line().as_bytes());
             batch.buf.push(b'\n');
+            members[b].push(i);
         }
-        for b in batches {
-            let path = self.events_dir.join(&b.name);
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?
-                .write_all(&b.buf)?;
-            self.file_len.insert(b.name, b.base + b.buf.len() as u64);
+        let mut written = vec![false; pending.len()];
+        let mut failure = None;
+        for (b, idx) in batches.into_iter().zip(&members) {
+            if failure.is_some() {
+                break;
+            }
+            match self.write_batch(&b) {
+                Ok(()) => {
+                    self.file_len.insert(b.name, b.base + b.buf.len() as u64);
+                    for &i in idx {
+                        written[i] = true;
+                    }
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        for (i, e) in pending.into_iter().enumerate() {
+            if written[i] {
+                self.unindexed.push((e, offset_of[i]));
+            } else {
+                self.pending.push(e);
+            }
         }
 
-        // 2. 再寫索引（同一個交易）
+        // 2. 再寫索引（同一個交易）；失敗時交易回滾，整批留到下次
         let tx = self.db.transaction()?;
-        for (e, off) in pending.iter().zip(offset_of) {
-            index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, off)?;
+        for (e, off) in &self.unindexed {
+            index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
         }
         tx.commit()?;
+        self.unindexed.clear();
+        match failure {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// 追加一批到 session 檔；寫到一半失敗就截回原長度，不留半行。
+    fn write_batch(&mut self, b: &Batch) -> io::Result<()> {
+        let path = self.events_dir.join(&b.name);
+        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        if let Err(e) = f.write_all(&b.buf) {
+            self.file_len.remove(&b.name);
+            if let Err(t) = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_len(b.base))
+            {
+                eprintln!("coding-lab store：截回 {} 失敗：{t}", b.name);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
     /// 截掉半行、補上 JSONL 有但索引沒有的行、刪掉索引超前 JSONL 的列。
+    /// 只讀索引最後一行（含）之後的部分（#683）：索引完整時每個檔只讀一行。
     fn recover(&mut self) -> Result<(), StoreError> {
         let mut files: Vec<PathBuf> = fs::read_dir(&self.events_dir)?
             .flatten()
@@ -306,20 +357,32 @@ impl Store {
             .collect();
         files.sort();
         for path in files {
+            let len = fs::metadata(&path)?.len();
+            let Some(session) = first_session(&path)? else {
+                continue;
+            };
+            let indexed: Option<i64> = self.db.query_row(
+                "SELECT MAX(offset) FROM events WHERE session = ?1",
+                params![session],
+                |r| r.get(0),
+            )?;
+            // 索引超前 JSONL（檔案被截短）時從頭讀
+            let from = indexed.map(|o| o as u64).filter(|o| *o < len).unwrap_or(0);
+            let mut file = File::open(&path)?;
+            file.seek(SeekFrom::Start(from))?;
             let mut bytes = Vec::new();
-            File::open(&path)?.read_to_end(&mut bytes)?;
+            file.read_to_end(&mut bytes)?;
+            self.recover_bytes += bytes.len() as u64;
             let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-            if complete < bytes.len() {
-                OpenOptions::new()
-                    .write(true)
-                    .open(&path)?
-                    .set_len(complete as u64)?;
+            let end = from + complete as u64;
+            if end < len {
+                OpenOptions::new().write(true).open(&path)?.set_len(end)?;
             }
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            self.file_len.insert(name, complete as u64);
+            self.file_len.insert(name, end);
 
             let mut start = 0usize;
             let mut lines: Vec<(Event, u64)> = Vec::new();
@@ -327,18 +390,15 @@ impl Store {
                 if *b == b'\n' {
                     let text = String::from_utf8_lossy(&bytes[start..i]);
                     if let Ok(e) = Event::from_json_line(&text) {
-                        lines.push((e, start as u64));
+                        lines.push((e, from + start as u64));
                     }
                     start = i + 1;
                 }
             }
-            let Some(session) = lines.first().map(|(e, _)| e.session.clone()) else {
-                continue;
-            };
             let tx = self.db.transaction()?;
             tx.execute(
                 "DELETE FROM events WHERE session = ?1 AND offset >= ?2",
-                params![session, complete as i64],
+                params![session, end as i64],
             )?;
             let indexed: Option<i64> = tx.query_row(
                 "SELECT MAX(offset) FROM events WHERE session = ?1",
@@ -547,6 +607,46 @@ impl Store {
             .map(|v| v as u64))
     }
 
+    /// 這些 session 各自最後一個 `prompt.submitted` 的文字與串流最後一個 `pos`，兩句查詢批次取（#683，Sessions tab）。
+    pub fn last_prompt_and_pos(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, LastSeen>, StoreError> {
+        let mut out: HashMap<String, LastSeen> = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
+        // SQLite 的 MAX() 聚合時，同列的其他欄位取自最大值那一列
+        let mut stmt = self.db.prepare(
+            "SELECT session, offset, MAX(seq) FROM events
+             WHERE type = 'prompt.submitted' AND session IN (SELECT value FROM json_each(?1))
+             GROUP BY session",
+        )?;
+        let prompts: Vec<(String, i64)> = stmt
+            .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        for (session, off) in prompts {
+            let text = self
+                .read_at(&session, vec![off])?
+                .pop()
+                .and_then(|e| e.payload["text"].as_str().map(str::to_string));
+            out.entry(session).or_default().0 = text;
+        }
+        let mut stmt = self.db.prepare(
+            "SELECT session, MAX(pos) FROM events
+             WHERE pos IS NOT NULL AND session IN (SELECT value FROM json_each(?1))
+             GROUP BY session",
+        )?;
+        let rows: Vec<(String, i64)> = stmt
+            .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        for (session, pos) in rows {
+            out.entry(session).or_default().1 = Some(pos as u64);
+        }
+        Ok(out)
+    }
+
     /// 某 session 這些 type 的 Event，依 seq 排序。
     pub fn events_of_types(&self, session: &str, types: &[&str]) -> Result<Vec<Event>, StoreError> {
         let mut out = Vec::new();
@@ -648,9 +748,23 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
+    pub fn recover_bytes(&self) -> u64 {
+        self.recover_bytes
+    }
+
     pub fn schema_version(&self) -> Result<u32, StoreError> {
         Ok(read_version(&self.db)?.unwrap_or(0))
     }
+}
+
+/// JSONL 第一行的 session（檔名經過清理，不一定等於 session id）。
+fn first_session(path: &Path) -> Result<Option<String>, StoreError> {
+    let mut line = String::new();
+    BufReader::new(File::open(path)?).read_line(&mut line)?;
+    Ok(Event::from_json_line(line.trim_end())
+        .ok()
+        .map(|e| e.session))
 }
 
 /// session id 只留安全字元當檔名，payload 不能決定寫入路徑。
@@ -757,15 +871,29 @@ fn index_event(
 ) -> rusqlite::Result<()> {
     let sid = e.session.as_str();
     let ts = e.ts_seen as i64;
-    tx.execute(
+    let inserted = exec(
+        tx,
         "INSERT OR IGNORE INTO events (session, seq, type, pos, ts_seen, offset) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![sid, e.seq as i64, e.kind, e.pos.map(|p| p as i64), ts, offset as i64],
+        params![
+            sid,
+            e.seq as i64,
+            e.kind,
+            e.pos.map(|p| p as i64),
+            ts,
+            offset as i64
+        ],
     )?;
-    tx.execute(
+    // 同一個 (session, seq) 已經索引過：彙總也已經算過，不再累加（#683）
+    if inserted == 0 {
+        return Ok(());
+    }
+    exec(
+        tx,
         "INSERT OR IGNORE INTO sessions (id, host, cwd, started_at, status_since) VALUES (?1, ?2, '', ?3, ?3)",
         params![sid, e.host, ts],
     )?;
-    tx.execute(
+    exec(
+        tx,
         "UPDATE sessions SET last_seq = MAX(last_seq, ?2) WHERE id = ?1",
         params![sid, e.seq as i64],
     )?;
@@ -776,14 +904,14 @@ fn index_event(
     };
     let cwd = cwd_of.get(sid).cloned().unwrap_or_default();
     let touch = |kind: &str, path: &str| {
-        tx.execute(
+        exec(tx,
             "INSERT INTO file_touch (cwd, path, session, kind, count, last_ts) VALUES (?1, ?2, ?3, ?4, 1, ?5)
              ON CONFLICT (cwd, path, session, kind) DO UPDATE SET count = count + 1, last_ts = excluded.last_ts",
             params![cwd, path, sid, kind, ts],
         )
     };
     let change = |tool: &str, path: &str, kind: &str, added: Option<u64>, removed: Option<u64>| {
-        tx.execute(
+        exec(tx,
             "INSERT OR IGNORE INTO changes (session, seq, tool_use_id, cwd, path, kind, agent, ts, added, removed)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
@@ -808,7 +936,7 @@ fn index_event(
             if cwd.is_empty() {
                 *cwd = p.cwd.clone();
             }
-            tx.execute(
+            exec(tx,
                 "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
                    ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
@@ -816,7 +944,8 @@ fn index_event(
             )?;
         }
         Payload::SessionEnded(p) => {
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET ended_at = ?2, end_reason = ?3, status = 'ended', status_since = ?2 WHERE id = ?1",
                 params![sid, ts, p.reason],
             )?;
@@ -825,13 +954,15 @@ fn index_event(
             let status = serde_json::to_value(p.status)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string));
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET status = ?2, status_since = ?3 WHERE id = ?1",
                 params![sid, status, p.since as i64],
             )?;
         }
         Payload::PromptSubmitted(p) => {
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET first_prompt = COALESCE(first_prompt, ?2) WHERE id = ?1",
                 params![sid, p.text],
             )?;
@@ -839,20 +970,22 @@ fn index_event(
         Payload::Usage(p) => {
             // SessionStart 沒送 model 時（VSCode、resume），主模型取 main 第一筆 usage（#673）
             let model = (e.agent == "main").then_some(p.model.as_str());
-            tx.execute(
+            exec(tx,
                 "UPDATE sessions SET cost_usd = cost_usd + ?2, thinking_tokens = thinking_tokens + ?3,
                    model = COALESCE(model, ?4) WHERE id = ?1",
                 params![sid, p.cost_usd, p.thinking as i64, model],
             )?;
         }
         Payload::ModelChanged(p) if e.agent == "main" => {
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET model = ?2 WHERE id = ?1",
                 params![sid, p.to],
             )?;
         }
         Payload::GitOp(p) if p.op == "commit" && p.ok => {
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET commits = commits + 1 WHERE id = ?1",
                 params![sid],
             )?;
@@ -862,12 +995,13 @@ fn index_event(
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string));
             if p.kind == crate::event::AttentionKind::Danger {
-                tx.execute(
+                exec(
+                    tx,
                     "UPDATE sessions SET dangers = dangers + 1 WHERE id = ?1",
                     params![sid],
                 )?;
             }
-            tx.execute(
+            exec(tx,
                 "INSERT OR REPLACE INTO attention (session, kind, ref, reason, raised_at, cleared_at, acked_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
                 params![sid, kind, p.reference, p.reason, ts],
@@ -877,13 +1011,15 @@ fn index_event(
             let kind = serde_json::to_value(p.kind)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string));
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE attention SET cleared_at = ?4 WHERE session = ?1 AND kind = ?2 AND ref = ?3 AND cleared_at IS NULL",
                 params![sid, kind, p.reference, ts],
             )?;
         }
         Payload::ToolResult(p) if !p.ok => {
-            tx.execute(
+            exec(
+                tx,
                 "UPDATE sessions SET failures = failures + 1 WHERE id = ?1",
                 params![sid],
             )?;
@@ -921,4 +1057,9 @@ fn index_event(
         _ => {}
     }
     Ok(())
+}
+
+/// 執行一句 SQL；語句快取在連線上，每筆 Event 不必重新 prepare（#683）。
+fn exec(tx: &Transaction<'_>, sql: &str, p: impl rusqlite::Params) -> rusqlite::Result<usize> {
+    tx.prepare_cached(sql)?.execute(p)
 }

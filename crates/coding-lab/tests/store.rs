@@ -633,3 +633,76 @@ fn usage_since_reads_cost_rows() {
         "只取 since 之後的"
     );
 }
+
+// ── 寫入失敗與重複索引（#683）
+
+/// flush 寫 JSONL 失敗時，這批 Event 留著下次再寫，不會遺失。
+#[test]
+#[cfg(unix)]
+fn failed_flush_keeps_events_for_the_next_one() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(text("s1", 2, 1));
+    let events = h.join("events");
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = s.flush();
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(first.is_err(), "前提：events/ 唯讀時寫不進去");
+    s.flush().unwrap();
+    assert_eq!(s.recent_events(0).unwrap().len(), 2, "失敗的那批要補寫");
+    let pos: Vec<u64> = s
+        .stream_before("s1", None, 10)
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.pos)
+        .collect();
+    assert_eq!(pos, [1], "offset 指得到正確的行");
+    assert_eq!(
+        std::fs::read_to_string(events.join("s1.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+}
+
+/// 同一個 (session, seq) 再索引一次時不重複累加。
+#[test]
+fn duplicate_seq_is_not_counted_twice() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    let usage = json!({ "messageId": "m", "model": "claude-opus-5-5", "input": 1, "output": 1,
+                        "thinking": 5, "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0,
+                        "costUsd": 1.0 });
+    s.append(ev("s1", 1, "usage", None, 1, usage.clone()));
+    s.append(ev("s1", 1, "usage", None, 1, usage));
+    s.flush().unwrap();
+    let row = s.session("s1").unwrap().unwrap();
+    assert_eq!(row.cost_usd, 1.0);
+    assert_eq!(row.thinking_tokens, 5);
+}
+
+/// 重開時只讀索引最後一行之後的部分，不把整個 JSONL 讀進記憶體。
+#[test]
+fn reopen_reads_only_the_unindexed_tail() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        for seq in 2..50 {
+            s.append(text("s1", seq, seq - 1));
+        }
+        s.flush().unwrap();
+    }
+    let size = std::fs::metadata(h.join("events/s1.jsonl")).unwrap().len();
+    let s = Store::open(&h).unwrap();
+    assert!(s.recover_bytes() > 0, "至少讀最後一行確認");
+    assert!(
+        s.recover_bytes() < size / 10,
+        "recover 讀了 {} bytes，檔案 {size} bytes",
+        s.recover_bytes()
+    );
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 49);
+}
