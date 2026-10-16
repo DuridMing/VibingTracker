@@ -135,6 +135,7 @@ fn opts(notify: bool) -> TailOptions {
     TailOptions {
         poll_every: Duration::from_millis(50),
         use_notify: notify,
+        ..TailOptions::default()
     }
 }
 
@@ -202,6 +203,7 @@ async fn stop_drains_lines_written_before_stop() {
         TailOptions {
             poll_every: Duration::from_secs(3600),
             use_notify: false,
+            ..TailOptions::default()
         },
     );
     append(&p, &line("last"));
@@ -268,6 +270,7 @@ async fn stop_all_keeps_draining_so_a_full_queue_cannot_hang_shutdown() {
         TailOptions {
             poll_every: Duration::from_secs(3600),
             use_notify: false,
+            ..TailOptions::default()
         },
     );
     for i in 0..50 {
@@ -404,4 +407,80 @@ async fn missing_agent_meta_gives_up_after_the_tries() {
     .await;
     assert_eq!(got, AgentMetaRead::Unreadable);
     assert_eq!(waits.get(), 2, "試 3 次、中間等 2 次");
+}
+
+/// #684 R11：從第 n 行之後接著讀；檔案不到 n 行（被替換或截短）就從頭讀。
+#[test]
+fn after_n_skips_lines_already_read_or_rereads_a_shorter_file() {
+    let content: String = ["a", "b", "c", "d", "e"].iter().map(|u| line(u)).collect();
+    let p = tmpfile(&content);
+    let mut r = TailReader::open(&p, Start::After(3)).unwrap();
+    let got: Vec<u64> = r.poll().unwrap().lines.iter().map(|l| l.no).collect();
+    assert_eq!(got, [4, 5]);
+
+    let mut r = TailReader::open(&p, Start::After(9)).unwrap();
+    let got: Vec<u64> = r.poll().unwrap().lines.iter().map(|l| l.no).collect();
+    assert_eq!(got, [1, 2, 3, 4, 5], "不到 9 行：從頭讀");
+}
+
+/// #684 R28、R21：1 MB 的一行分 100 次寫入，每次只掃描新增的部分；> 256 KB 的行只留必要欄位，
+/// 長字串截短（記憶體不隨行長倍數成長）。
+#[test]
+fn big_line_written_in_pieces_is_scanned_once_and_kept_small() {
+    let p = tmpfile("");
+    let mut r = TailReader::open(&p, Start::Beginning).unwrap();
+    let big = "x".repeat(1024 * 1024);
+    let text = format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "big", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": big}]}})
+    );
+    let bytes = text.as_bytes();
+    let chunk = bytes.len().div_ceil(100);
+    let mut lines = Vec::new();
+    for piece in bytes.chunks(chunk) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(piece).unwrap();
+        lines.extend(r.poll().unwrap().lines);
+    }
+    assert_eq!(lines.len(), 1);
+    assert!(
+        r.scanned_bytes() <= 2 * bytes.len() as u64,
+        "掃描了 {} bytes（行長 {}）：每次重掃整個半行",
+        r.scanned_bytes(),
+        bytes.len()
+    );
+    let v = &lines[0].value;
+    assert_eq!(
+        (v["type"].as_str(), v["uuid"].as_str()),
+        (Some("user"), Some("big"))
+    );
+    assert_eq!(v["message"]["content"][0]["tool_use_id"], "t1");
+    let kept = v["message"]["content"][0]["content"].as_str().unwrap();
+    assert!(kept.len() <= 70 * 1024, "長字串要截短：{}", kept.len());
+}
+
+/// #684 R20：Degraded 帶著 tail 的編號，merge 才能忽略被取代的舊 tail。
+#[tokio::test]
+async fn degraded_carries_the_tail_number() {
+    let p = tmpfile("{壞掉\n");
+    let (tx, mut rx) = mpsc::channel(16);
+    let h = spawn_tail(
+        p,
+        "s1".into(),
+        "main".into(),
+        Start::Beginning,
+        tx,
+        TailOptions {
+            poll_every: Duration::from_millis(50),
+            use_notify: false,
+            tail: 5,
+        },
+    );
+    let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(got, Input::Degraded { tail: 5, .. }));
+    h.stop().await;
 }

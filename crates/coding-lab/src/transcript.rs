@@ -17,12 +17,20 @@ use tokio::task::JoinHandle;
 
 use crate::merge::{AgentMetaRead, Input};
 
+/// 超過這個長度的行（Read 大檔、Write 大檔）只留必要欄位：字串截短到 [`BIG_LINE_STRING_CAP`]（#684 R21）
+pub const BIG_LINE: usize = 256 * 1024;
+pub const BIG_LINE_STRING_CAP: usize = 64 * 1024;
+/// 被截短的字串後面接這個標記，不假裝是完整內容
+pub const CUT_MARK: &str = "…（原文過長，已截斷）";
+
 /// 從哪裡開始讀。`startup` 的 session 從檔頭；resume／compact 或 collector 中途才看到的 session
 /// 從檔尾（只數行號），避免 collector 重啟後把整份 transcript 再寫一次進 store。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start {
     Beginning,
     End,
+    /// 接著第 n 行之後讀（collector 重啟後依 store 記的行號，#684）；檔案不到 n 行就從頭讀
+    After(u64),
 }
 
 #[derive(Debug)]
@@ -67,7 +75,11 @@ pub struct TailReader {
     offset: u64,
     line_no: u64,
     pending: Vec<u8>,
+    /// `pending` 裡已經找過換行的長度（大行分很多次寫入時不從頭再找，#684 R28）
+    searched: usize,
     id: Option<FileId>,
+    /// 累計掃描過的 bytes（找換行用；測試確認大行分段寫入時不重複掃描）
+    scanned: u64,
 }
 
 impl TailReader {
@@ -78,26 +90,42 @@ impl TailReader {
             offset: 0,
             line_no: 0,
             pending: Vec::new(),
+            searched: 0,
             id: None,
+            scanned: 0,
         };
         if let Ok(meta) = fs::metadata(path) {
             r.id = file_id(&meta);
-            if start == Start::End {
+            let stop_at = match start {
+                Start::Beginning => None,
+                Start::End => Some(u64::MAX),
+                Start::After(n) => Some(n),
+            };
+            if let Some(stop_at) = stop_at.filter(|n| *n > 0) {
                 // 分段數換行：transcript 可能上百 MB（Read 大檔整個進一行），不整個讀進記憶體
                 let mut f = File::open(path)?;
                 let mut buf = vec![0u8; 64 * 1024];
                 let mut read = 0u64;
-                loop {
+                'scan: loop {
                     let n = f.read(&mut buf)?;
                     if n == 0 {
                         break;
                     }
-                    let chunk = &buf[..n];
-                    r.line_no += chunk.iter().filter(|b| **b == b'\n').count() as u64;
-                    if let Some(i) = chunk.iter().rposition(|b| *b == b'\n') {
-                        r.offset = read + i as u64 + 1;
+                    for (i, b) in buf[..n].iter().enumerate() {
+                        if *b == b'\n' {
+                            r.line_no += 1;
+                            r.offset = read + i as u64 + 1;
+                            if r.line_no == stop_at {
+                                break 'scan;
+                            }
+                        }
                     }
                     read += n as u64;
+                }
+                // 記錄的行號比檔案還長：檔案被替換或截短，從頭讀
+                if matches!(start, Start::After(n) if r.line_no < n) {
+                    r.offset = 0;
+                    r.line_no = 0;
                 }
             }
         }
@@ -118,6 +146,7 @@ impl TailReader {
             self.offset = 0;
             self.line_no = 0;
             self.pending.clear();
+            self.searched = 0;
             out.restarted = true;
         }
         self.id = id;
@@ -133,7 +162,8 @@ impl TailReader {
         self.pending.extend_from_slice(&buf);
 
         let mut start = 0;
-        for i in 0..self.pending.len() {
+        self.scanned += (self.pending.len() - self.searched) as u64;
+        for i in self.searched..self.pending.len() {
             if self.pending[i] != b'\n' {
                 continue;
             }
@@ -141,7 +171,7 @@ impl TailReader {
             let raw = &self.pending[start..i];
             let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
             if !raw.is_empty() {
-                match serde_json::from_slice::<Value>(raw) {
+                match parse_line(raw) {
                     Ok(value) => out.lines.push(TailLine {
                         no: self.line_no,
                         value,
@@ -155,7 +185,89 @@ impl TailReader {
             start = i + 1;
         }
         self.pending.drain(..start);
+        // 剩下的是還沒寫完的半行，裡面沒有換行
+        self.searched = self.pending.len();
         Ok(out)
+    }
+
+    pub fn scanned_bytes(&self) -> u64 {
+        self.scanned
+    }
+}
+
+/// 一般的行整個解析；大行用 [`Capped`] 邊解析邊截短長字串，記憶體不隨行長倍數成長（#684 R21）。
+fn parse_line(raw: &[u8]) -> Result<Value, serde_json::Error> {
+    if raw.len() <= BIG_LINE {
+        return serde_json::from_slice(raw);
+    }
+    let mut de = serde_json::Deserializer::from_slice(raw);
+    let v = serde::de::DeserializeSeed::deserialize(Capped(BIG_LINE_STRING_CAP), &mut de)?;
+    de.end()?;
+    Ok(v)
+}
+
+/// 解析成 `Value`，但超過上限的字串只留前面（UTF-8 邊界）並接上 [`CUT_MARK`]。
+#[derive(Clone, Copy)]
+struct Capped(usize);
+
+impl<'de> serde::de::DeserializeSeed<'de> for Capped {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for Capped {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+    fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+        Ok(Value::Bool(v))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+        Ok(Value::from(v))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+        Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+        if v.len() <= self.0 {
+            return Ok(Value::String(v.to_string()));
+        }
+        let mut end = self.0;
+        while !v.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(Value::String(format!("{}{CUT_MARK}", &v[..end])))
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+        d.deserialize_any(self)
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut out = Vec::new();
+        while let Some(v) = seq.next_element_seed(self)? {
+            out.push(v);
+        }
+        Ok(Value::Array(out))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(k) = map.next_key::<String>()? {
+            let v = map.next_value_seed(self)?;
+            out.insert(k, v);
+        }
+        Ok(Value::Object(out))
     }
 }
 
@@ -164,6 +276,8 @@ pub struct TailOptions {
     pub poll_every: Duration,
     /// 關掉時只靠輪詢（測試用，也是 notify 建立失敗時的退路）。
     pub use_notify: bool,
+    /// 這個 tail 的編號（serve 遞增發號）；Degraded／Recovered 帶著它，merge 用來忽略已被取代的 tail（#684 R20）
+    pub tail: u64,
 }
 
 impl Default for TailOptions {
@@ -171,6 +285,7 @@ impl Default for TailOptions {
         TailOptions {
             poll_every: Duration::from_millis(500),
             use_notify: true,
+            tail: 0,
         }
     }
 }
@@ -269,6 +384,7 @@ async fn run(
         tx,
         session,
         file,
+        tail: opts.tail,
         degraded: false,
     };
 
@@ -307,6 +423,7 @@ struct Sender {
     tx: mpsc::Sender<Input>,
     session: String,
     file: String,
+    tail: u64,
     degraded: bool,
 }
 
@@ -337,6 +454,7 @@ impl Sender {
                         session,
                         file,
                         error: format!("第 {no} 行：{error}"),
+                        tail: self.tail,
                         ts_seen,
                     }
                 }
@@ -347,6 +465,7 @@ impl Sender {
                         let recovered = Input::Recovered {
                             session: session.clone(),
                             file: file.clone(),
+                            tail: self.tail,
                             ts_seen,
                         };
                         if self.tx.send(recovered).await.is_err() {
@@ -427,7 +546,8 @@ pub enum TailAction {
 
 impl TailAction {
     /// 執行這個動作時要交給 merge 的 [`Input::TailReset`]：被停掉或重開的 tail 不會再送 Recovered。
-    pub fn reset(&self, ts_seen: u64) -> Input {
+    /// `tail` 是新開的 tail 的編號（停掉時是比現有的都大的編號），比它舊的 tail 送來的降級訊號 merge 不再理會。
+    pub fn reset(&self, ts_seen: u64, tail: u64) -> Input {
         let (session, file) = match self {
             TailAction::Start { session, file, .. } | TailAction::Stop { session, file } => {
                 (session, Some(file.clone()))
@@ -437,6 +557,7 @@ impl TailAction {
         Input::TailReset {
             session: session.clone(),
             file,
+            tail,
             ts_seen,
         }
     }
@@ -447,14 +568,62 @@ impl TailAction {
 /// - 主 transcript：`SessionStart(startup／clear)` 從檔頭；resume／compact 或沒收到 SessionStart 就先看到
 ///   其他事件時從檔尾。實測 compact 與 resume 沿用同一個檔，所以已在 tail 的 session 不重開。
 /// - subagent：`SubagentStart` 開 `<transcript 去掉 .jsonl>/subagents/agent-<id>.jsonl`，`SubagentStop` 關。
+///   collector 重啟時還在跑的 subagent 沒有 SubagentStart：第一個帶 `agent_id`（有 `agent_type`，不是背景 agent）
+///   的 hook 補開它的 tail（#684 N1）。
 /// - `SessionEnd` 關掉該 session 的全部 tail；之後若 resume 會再開。
+/// - 讀過的檔（[`TailPlanner::seed`] 交入的 store 記錄、或這一輪 [`TailPlanner::saw_line`] 看到的）再開時
+///   從記錄的行之後接著讀（#684 R11）；startup／clear 是新檔，一律從檔頭。
 #[derive(Default)]
 pub struct TailPlanner {
     main: std::collections::HashMap<String, PathBuf>,
     agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// 這一輪結束過的 subagent：晚到的 hook 不再重開
+    stopped: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// (session, file) → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)
+    read: std::collections::HashMap<(String, String), (Option<String>, u64)>,
+}
+
+fn slash(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// subagent 的 transcript：`<主檔去掉 .jsonl>/subagents/<file>.jsonl`
+fn subagent_path(main: &Path, file: &str) -> PathBuf {
+    subagent_file(main, file.strip_prefix("agent-").unwrap_or(file), "jsonl")
 }
 
 impl TailPlanner {
+    /// collector 重啟時交入 store 記的行號（`tails` 表）；`path` 是記錄時的檔案路徑（`/` 分隔，不知道時 None）。
+    pub fn seed(&mut self, session: &str, file: &str, path: Option<&str>, line_no: u64) {
+        self.read.insert(
+            (session.to_string(), file.to_string()),
+            (path.map(|p| p.replace('\\', "/")), line_no),
+        );
+    }
+
+    /// tail 讀到第 `no` 行（serve 每收到一行就告訴 planner），之後重開同一個檔時從這裡接著讀。
+    pub fn saw_line(&mut self, session: &str, file: &str, no: u64) {
+        let path = self.main.get(session).map(|m| {
+            if file == "main" {
+                slash(m)
+            } else {
+                slash(&subagent_path(m, file))
+            }
+        });
+        self.read
+            .insert((session.to_string(), file.to_string()), (path, no));
+    }
+
+    /// 重開 `file` 時從哪裡讀：有這個檔的記錄（路徑相同或記錄沒有路徑）就接著讀，否則用 `default`。
+    fn resume_from(&self, session: &str, file: &str, path: &Path, default: Start) -> Start {
+        match self.read.get(&(session.to_string(), file.to_string())) {
+            Some((recorded, n)) if recorded.as_deref().is_none_or(|r| r == slash(path)) => {
+                Start::After(*n)
+            }
+            _ => default,
+        }
+    }
+
     pub fn on_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
         let sid = h.session_id().to_string();
         let event = h.event_name();
@@ -463,6 +632,7 @@ impl TailPlanner {
         if event == "SessionEnd" {
             let had_main = self.main.remove(&sid).is_some();
             let had_agents = self.agents.remove(&sid).is_some_and(|a| !a.is_empty());
+            self.stopped.remove(&sid);
             if had_main || had_agents {
                 out.push(TailAction::StopSession { session: sid });
             }
@@ -486,7 +656,11 @@ impl TailPlanner {
                     // startup 與 clear 都是新的 session、新的檔（`/clear` 換 session id，#688 實測），從檔頭讀
                     let fresh = event == "SessionStart"
                         && matches!(h.str_field("source"), Some("startup" | "clear"));
-                    let start = if fresh { Start::Beginning } else { Start::End };
+                    let start = if fresh {
+                        Start::Beginning
+                    } else {
+                        self.resume_from(&sid, "main", path, Start::End)
+                    };
                     out.push(TailAction::Start {
                         session: sid.clone(),
                         file: "main".into(),
@@ -508,19 +682,44 @@ impl TailPlanner {
                     .or_default()
                     .insert(file.clone())
                 {
-                    let sub = subagent_file(path, id, "jsonl");
                     out.push(TailAction::Start {
                         session: sid,
+                        path: subagent_path(path, &file),
                         file,
-                        path: sub,
                         start: Start::Beginning,
                     });
                 }
             }
             ("SubagentStop", Some(id), _) => {
                 let file = format!("agent-{id}");
+                self.stopped
+                    .entry(sid.clone())
+                    .or_default()
+                    .insert(file.clone());
                 if self.agents.get_mut(&sid).is_some_and(|a| a.remove(&file)) {
                     out.push(TailAction::Stop { session: sid, file });
+                }
+            }
+            // 重啟前就在跑的 subagent（N1）：背景 agent 的 agent_type 是空字串或沒有，不開 lane 也不 tail
+            (_, Some(id), Some(path))
+                if h.str_field("agent_type").is_some_and(|t| !t.is_empty()) =>
+            {
+                let file = format!("agent-{id}");
+                let known = self.agents.get(&sid).is_some_and(|a| a.contains(&file))
+                    || self.stopped.get(&sid).is_some_and(|a| a.contains(&file));
+                if !known {
+                    self.agents
+                        .entry(sid.clone())
+                        .or_default()
+                        .insert(file.clone());
+                    let sub = subagent_path(path, &file);
+                    let start = self.resume_from(&sid, &file, &sub, Start::Beginning);
+                    out.push(TailAction::Start {
+                        session: sid,
+                        file,
+                        path: sub,
+                        start,
+                    });
                 }
             }
             _ => {}

@@ -192,7 +192,18 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         merger.seed_cost(sid, *at, *usd);
     }
     let mut planner = TailPlanner::default();
+    // 重啟後從 store 記的行號接著讀（#684）：停機期間寫進 transcript 的行不漏
+    match store.lock().unwrap_or_else(|e| e.into_inner()).tail_lines() {
+        Ok(rows) => {
+            for t in rows {
+                planner.seed(&t.session, &t.file, t.path.as_deref(), t.line_no);
+            }
+        }
+        Err(e) => log(&format!("讀取 tail 行號失敗，照舊從檔尾讀：{e}")),
+    }
     let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
+    // 每個 tail 一個編號：TailReset 帶新的編號，merge 不理會被取代的舊 tail 送來的降級（#684 R20）
+    let mut next_tail: u64 = 1;
     let mut tick = tokio::time::interval(TICK);
     let mut flush = tokio::time::interval(STORE_FLUSH);
     let mut rescore = tokio::time::interval(SCORE_EVERY);
@@ -222,6 +233,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     loop {
         tokio::select! {
             Some(input) = rx.recv() => {
+                if let Input::Line { session, file, no, .. } = &input {
+                    planner.saw_line(session, file, *no);
+                }
                 if let Input::Hook { hook, .. } = &input {
                     last_hook = Instant::now();
                     if hook.event_name() == "SessionEnd" {
@@ -235,8 +249,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     let actions = planner.on_hook(hook);
                     if !actions.is_empty() {
                         for action in actions {
-                            sink(merger.handle(action.reset(crate::now_ms())));
-                            apply_tail(action, &mut tails, &tx);
+                            let id = next_tail;
+                            next_tail += 1;
+                            sink(merger.handle(action.reset(crate::now_ms(), id)));
+                            apply_tail(action, id, &mut tails, &tx);
                         }
                         web.set_health(json!({ "tails": tails.len(), "schedLagMs": 0 }));
                     }
@@ -387,6 +403,7 @@ fn resume_attention(merger: &mut Merger, rows: &[crate::store::AttentionRow], re
 
 fn apply_tail(
     action: TailAction,
+    id: u64,
     tails: &mut HashMap<(String, String), TailHandle>,
     tx: &mpsc::Sender<Input>,
 ) {
@@ -409,7 +426,10 @@ fn apply_tail(
                 file.clone(),
                 start,
                 tx.clone(),
-                TailOptions::default(),
+                TailOptions {
+                    tail: id,
+                    ..TailOptions::default()
+                },
             );
             tails.insert((session, file), h);
         }

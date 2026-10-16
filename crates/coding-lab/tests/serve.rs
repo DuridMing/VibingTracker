@@ -907,3 +907,61 @@ fn a_hook_during_closing_cancels_the_idle_exit() {
         "取消後 ensure 轉送照常收"
     );
 }
+
+fn text_line(uuid: &str, msg: &str, text: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"type": "assistant", "uuid": uuid, "timestamp": "2026-10-17T00:00:00Z",
+               "message": {"id": msg, "model": "claude-opus-5-5",
+                           "content": [{"type": "text", "text": text}]}})
+    )
+}
+
+/// #684 驗收：collector 停掉期間 transcript 寫進的行，重啟後從 store 記的行號接著讀，進串流且不重複。
+#[test]
+fn lines_written_while_the_collector_was_down_are_read_after_restart() {
+    let e = env(0);
+    let transcript = e.home.join("t5.jsonl");
+    std::fs::write(
+        &transcript,
+        text_line("u1", "m1", "一") + &text_line("u2", "m2", "二"),
+    )
+    .unwrap();
+    let jsonl = e.home.join("events/s5.jsonl");
+    let texts = || -> Vec<String> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "assistant.text")
+            .map(|v| {
+                v["payload"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+    {
+        let _first = start_serve(&e);
+        let start = json!({"session_id": "s5", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": transcript, "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &start.to_string());
+        wait_for("前兩行進 store", || texts().len() == 2);
+    } // Kill：collector 停掉
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    f.write_all((text_line("u3", "m3", "三") + &text_line("u4", "m4", "四")).as_bytes())
+        .unwrap();
+    drop(f);
+
+    let _second = start_serve(&e);
+    let prompt = json!({"session_id": "s5", "hook_event_name": "UserPromptSubmit", "prompt": "繼續",
+                        "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &prompt.to_string());
+    wait_for("停機期間的兩行補進來", || texts().len() >= 4);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(texts(), ["一", "二", "三", "四"], "不漏、不重複");
+}

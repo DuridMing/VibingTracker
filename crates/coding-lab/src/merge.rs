@@ -63,11 +63,14 @@ pub enum Input {
         session: String,
         file: String,
         error: String,
+        /// 送出的 tail 的編號（[`crate::transcript::TailOptions::tail`]）
+        tail: u64,
         ts_seen: u64,
     },
     Recovered {
         session: String,
         file: String,
+        tail: u64,
         ts_seen: u64,
     },
     /// serve 在 SubagentStart 後讀 subagent 目錄的 `agent-<id>.meta.json` 的結果（#680）。
@@ -82,6 +85,8 @@ pub enum Input {
     TailReset {
         session: String,
         file: Option<String>,
+        /// 之後有效的 tail 編號下限
+        tail: u64,
         ts_seen: u64,
     },
 }
@@ -115,6 +120,9 @@ struct Session {
     cards: HashMap<String, Card>,
     seen_uuids: HashSet<String>,
     degraded: HashSet<String>,
+    /// TailReset 之後有效的 tail 編號下限（每個檔、整個 session）：比它舊的 tail 送來的降級訊號不理（#684 R20）
+    tail_floor: HashMap<String, u64>,
+    tail_floor_all: u64,
     /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片：id → (transcript 檔, 開始等的時間)。
     /// 背景 agent 的卡片沒有 transcript 行，不記。
     fallback_waiting: HashMap<String, (String, u64)>,
@@ -142,6 +150,19 @@ struct Session {
     ended_at: Option<u64>,
     /// session.status 與注意佇列（#645）
     status: Tracker,
+}
+
+impl Session {
+    /// 這個 tail 已經被 TailReset 取代（編號比下限舊）
+    fn replaced(&self, file: &str, tail: u64) -> bool {
+        let floor = self
+            .tail_floor
+            .get(file)
+            .copied()
+            .unwrap_or(0)
+            .max(self.tail_floor_all);
+        tail < floor
+    }
 }
 
 struct HeldTool {
@@ -341,9 +362,13 @@ impl Merger {
                 file,
                 error,
                 ts_seen,
+                tail,
             } => {
                 let mut out = Vec::new();
                 let s = self.session(&session);
+                if s.replaced(&file, tail) {
+                    return out;
+                }
                 s.degraded.insert(file.clone());
                 let file_name = file.clone();
                 let payload = Payload::TranscriptDegraded(TranscriptHealth {
@@ -366,8 +391,13 @@ impl Merger {
                 session,
                 file,
                 ts_seen,
+                tail,
             } => {
-                self.session(&session).degraded.remove(&file);
+                let s = self.session(&session);
+                if s.replaced(&file, tail) {
+                    return Vec::new();
+                }
+                s.degraded.remove(&file);
                 vec![self.recovered(&session, file, ts_seen)]
             }
             Input::AgentMeta {
@@ -384,10 +414,17 @@ impl Merger {
                 session,
                 file,
                 ts_seen,
+                tail,
             } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return Vec::new();
-                };
+                // 第一個 hook 的 TailReset 排在 hook 本身之前：session 還沒建立也要記下限
+                let s = self.session(&session);
+                match &file {
+                    Some(f) => {
+                        let floor = s.tail_floor.entry(f.clone()).or_default();
+                        *floor = (*floor).max(tail);
+                    }
+                    None => s.tail_floor_all = s.tail_floor_all.max(tail),
+                }
                 // 重開的 tail 從檔尾讀，降級卡片的 tool_use 行不會再來
                 s.fallback_waiting
                     .retain(|_, (f, _)| file.as_ref().is_some_and(|reset| reset != f));
@@ -708,7 +745,7 @@ impl Merger {
                     cwd,
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
-                    transcript_path: s("transcript_path"),
+                    transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),
                     branch: None,
                 };
                 out.push(self.emit(&sid, Payload::SessionStarted(p), meta()));
@@ -884,7 +921,7 @@ impl Merger {
                     agent_id,
                     last_message: s("last_assistant_message")
                         .map(|m| truncate(&m, MESSAGE_LIMIT).0),
-                    transcript_path: s("agent_transcript_path"),
+                    transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
                 out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));

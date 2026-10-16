@@ -371,7 +371,7 @@ fn cleared_danger_stays_open_until_ack() {
     assert!(s.open_attention().unwrap().is_empty());
 }
 
-/// v1 的資料庫開啟時升到 v2：換掉 attention_open 索引，資料不動（不變式 9）。
+/// v1 的資料庫開啟時升級：v2 換掉 attention_open 索引，資料不動（不變式 9）。
 #[test]
 fn v1_database_is_migrated_to_v2() {
     let h = home();
@@ -391,8 +391,11 @@ fn v1_database_is_migrated_to_v2() {
     drop(db);
 
     let s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(
+        s.schema_version().unwrap(),
+        SCHEMA_VERSION,
+        "v1 一路升到最新"
+    );
     assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p", "資料不動");
     drop(s);
     let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
@@ -928,4 +931,115 @@ fn old_data_directory_is_queryable_after_upgrade() {
     assert_eq!(s.sessions(Some("/p"), 10).unwrap().len(), 1);
     assert_eq!(s.events_by_seq("s1", 1, 3).unwrap().len(), 3);
     assert_eq!(s.open_attention().unwrap().len(), 1);
+}
+
+fn at_line(session: &str, seq: u64, file: &str, no: u64) -> Event {
+    Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": "assistant.text", "agent": "main",
+            "line": {"file": file, "no": no}, "pos": seq, "ts_model": null, "ts_exec": null,
+            "ts_seen": 1000 + seq, "host": "local",
+            "payload": {"text": "t", "messageId": "m", "model": "claude-opus-5-5"},
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn started_at(session: &str, path: &str) -> Event {
+    ev(
+        session,
+        1,
+        "session.started",
+        None,
+        1000,
+        json!({"cwd": "/p", "source": "startup", "transcriptPath": path}),
+    )
+}
+
+/// #684 D4：tails 記每個 transcript 檔已產生 Event 的最大行號，重開後還在。
+#[test]
+fn tails_record_the_last_line_of_each_transcript_file() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 3));
+        s.append(at_line("s1", 3, "agent-a1", 2));
+        s.append(at_line("s1", 4, "main", 5));
+        s.flush().unwrap();
+    }
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    let mut rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.session, t.file, t.path, t.line_no))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            ("s1".into(), "agent-a1".into(), None, 2),
+            ("s1".into(), "main".into(), Some("/t/s1.jsonl".into()), 5),
+        ]
+    );
+}
+
+/// #684 D4：v2 的資料庫升到 v3 時掃一次 JSONL 回填 tails；prune 一起清掉。
+#[test]
+fn v2_database_is_backfilled_with_tails_and_prune_clears_them() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 4));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE IF EXISTS tails; UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.line_no))
+        .collect();
+    assert_eq!(rows, [("main".to_string(), 4)], "升級時從 JSONL 回填");
+
+    s.prune(u64::MAX).unwrap();
+    assert!(s.tail_lines().unwrap().is_empty(), "prune 一起清掉 tails");
+}
+
+/// #684：index.sqlite 整個刪掉重建時，tails 也從 JSONL 重建。
+#[test]
+fn tails_are_rebuilt_with_the_index() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 6));
+        s.flush().unwrap();
+    }
+    for f in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        let _ = std::fs::remove_file(h.join(f));
+    }
+    let s = Store::open(&h).unwrap();
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.path, t.line_no))
+        .collect();
+    assert_eq!(
+        rows,
+        [("main".to_string(), Some("/t/s1.jsonl".to_string()), 6)]
+    );
 }
