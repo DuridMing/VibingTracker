@@ -284,6 +284,19 @@ impl Tracker {
         let _ = self.recompute(item.raised_at);
     }
 
+    /// 種回 session 是否已結束、是否中斷（D3：重啟或移出記憶體後回來）。不發 Event：live 與 store
+    /// 已經是這個狀態；之後狀態一變（例如新的 prompt 回到 run）才會照常送 `session.status`。
+    pub fn seed_state(&mut self, ended: bool, idle: bool) {
+        self.ended = ended;
+        self.idle = idle;
+        let _ = self.recompute(0);
+    }
+
+    /// 是否中斷中（使用者按 Esc 之後、下一個 prompt 之前）。
+    pub fn is_idle(&self) -> bool {
+        self.idle
+    }
+
     /// 還開著的注意項目，交給下一次 [`Tracker::seed_open`]。
     pub fn open_items(&self) -> Vec<OpenItem> {
         self.open

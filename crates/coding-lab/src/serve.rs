@@ -150,6 +150,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             .map_err(|e| io::Error::other(e.to_string()))?;
         for (sid, c) in counters {
             merger.resume(&sid, c.seq, c.pos, &c.cwd);
+            // 結束、中斷的狀態也種回（D3）：否則 idle 的 session 下一個 prompt 不送 run、
+            // 已結束的被補花費建回記憶體後會被當成丟棄
+            merger.resume_state(&sid, c.ended_at, c.status == "idle", c.last_seen);
         }
     }
     // 還沒解除的注意項目種回 merge（#679）：否則之後的 prompt、工具結束解不掉重啟前的列

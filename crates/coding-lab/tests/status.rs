@@ -1130,3 +1130,68 @@ fn ended_session_is_not_abandoned_again() {
         .count();
     assert_eq!(ended, 1, "已經結束的 session 不再補一次");
 }
+
+// ── 重啟後種回 session 的結束／中斷狀態（D3 的 seed_status，#679 驗證缺口）
+
+const DAY: u64 = 24 * 60 * 60 * 1000;
+
+/// 重啟前已正常結束的 session，重啟時因為補回花費被建回記憶體，不能在 24 小時後被當成丟棄。
+#[test]
+fn restart_ended_session_seeded_by_cost_is_not_abandoned() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, Some(900), false, 1_000);
+    r.m.seed_cost(S, 1_000, 1.0);
+    r.tick(1_000 + DAY);
+    let ended = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "session.ended")
+        .count();
+    assert_eq!(
+        ended,
+        0,
+        "已結束的 session 被補 abandoned：{:?}",
+        r.statuses()
+    );
+    assert!(r.statuses().is_empty());
+}
+
+/// 重啟前按了 Esc（status idle、沒有注意列可種）：下一個 prompt 要送 run，不能停在 idle。
+#[test]
+fn idle_before_restart_prompt_reports_run() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, true, 1_000);
+    r.feed(prompt("again", 21_000));
+    assert_eq!(r.statuses(), ["run"]);
+}
+
+/// 重啟前就沒有 SessionEnd、之後也沒再回來的 session：沒有輸入滿 24 小時後一樣補 abandoned。
+#[test]
+fn session_abandoned_before_restart_is_ended_later() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.tick(1_000 + DAY - 1);
+    assert!(r.evs.is_empty(), "還沒滿 24 小時");
+    r.tick(1_000 + DAY);
+    let ended: Vec<&Event> = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "session.ended")
+        .collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].payload["reason"], "abandoned");
+    assert_eq!(r.statuses(), ["ended"]);
+    assert!(r.evs.iter().all(|e| e.seq > 40), "seq 接著 store 的編號");
+    // 已經結束的不再補第二次
+    r.tick(1_000 + 3 * DAY);
+    assert_eq!(
+        r.evs
+            .iter()
+            .filter(|e| e.type_name() == "session.ended")
+            .count(),
+        1
+    );
+}

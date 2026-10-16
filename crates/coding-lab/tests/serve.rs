@@ -658,4 +658,79 @@ fn done_from_before_a_restart_is_cleared_by_the_next_prompt() {
         json!({"prompt": "二", "prompt_id": "p2"}),
     );
     wait_for("新的 prompt 撤回 done", || status() == "run");
+    // D3：merge 發出解除、store 記下解除與 run，和 live 的 run 一致
+    wait_for("store 記下解除 done 與 run", || {
+        let lines: Vec<Value> = std::fs::read_to_string(e.home.join("events/sd.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let cleared = lines.iter().any(|v| {
+            v["type"] == "attention.cleared"
+                && v["payload"]["kind"] == "done"
+                && v["payload"]["ref"] == "p1"
+        });
+        let last = lines
+            .iter()
+            .rfind(|v| v["type"] == "session.status")
+            .map(|v| v["payload"]["status"].clone());
+        cleared && last == Some(json!("run"))
+    });
+}
+
+/// D3（#679）：重啟前按 Esc 的 session（idle）重啟後下 prompt 要回到 run；store、live 的 status
+/// 與注意佇列三方一致。
+#[test]
+fn idle_from_before_a_restart_returns_to_run_on_the_next_prompt() {
+    let e = env(31);
+    let hook = |name: &str, extra: Value| {
+        let mut body = json!({"session_id": "si", "hook_event_name": name,
+                              "transcript_path": e.home.join("ti.jsonl"), "cwd": "/p"});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        http(e.hook, "POST", "/hook", &body.to_string());
+    };
+    let status = || {
+        json_body(&http(e.web, "GET", "/api/sessions", ""))["sessions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["id"] == "si").cloned())
+            .map_or(Value::Null, |r| r["status"].clone())
+    };
+    let stored_status = || {
+        std::fs::read_to_string(e.home.join("events/si.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .rfind(|v| v["type"] == "session.status")
+            .map_or(Value::Null, |v| v["payload"]["status"].clone())
+    };
+    // Esc 中斷：transcript 的 `[Request interrupted by user]` 行
+    let transcript = e.home.join("ti.jsonl");
+    {
+        let _first = start_serve(&e);
+        hook("SessionStart", json!({"source": "startup"}));
+        hook(
+            "UserPromptSubmit",
+            json!({"prompt": "一", "prompt_id": "p1"}),
+        );
+        std::fs::write(
+            &transcript,
+            json!({"type": "user", "uuid": "u1", "message": {"role": "user",
+                   "content": [{"type": "text", "text": "[Request interrupted by user]"}]}})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        wait_for("Esc 後是 idle", || status() == "idle");
+        wait_for("idle 寫進 store", || stored_status() == "idle");
+    }
+    let _second = start_serve(&e);
+    assert_eq!(status(), "idle", "前提：重啟後重放出 idle");
+    hook(
+        "UserPromptSubmit",
+        json!({"prompt": "二", "prompt_id": "p2"}),
+    );
+    wait_for("新的 prompt 讓 live 回到 run", || status() == "run");
+    wait_for("store 也回到 run", || stored_status() == "run");
 }

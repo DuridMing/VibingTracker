@@ -172,6 +172,10 @@ struct Resumed {
     cwd: Option<String>,
     /// 還開著的注意項目（#679）
     open: Vec<OpenItem>,
+    /// 結束時間與是否中斷（D3）；`last_seen` 有值才會在沒回來時補 abandoned（見 [`Merger::resume_state`]）
+    ended_at: Option<u64>,
+    idle: bool,
+    last_seen: Option<u64>,
 }
 
 impl Merger {
@@ -193,6 +197,16 @@ impl Merger {
         let r = self.resumed.entry(sid.to_string()).or_default();
         (r.seq, r.pos) = (seq, pos);
         r.cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+    }
+
+    /// collector 重啟時，把 store 裡 session 的結束時間、是否中斷（status idle）與最後一筆 Event 的時間
+    /// 交給 merge（D3，#679）：session 回到記憶體時種回 Tracker，下一個 prompt 才會送 run；
+    /// 已結束的不會被當成丟棄；沒結束、之後也沒再回來的，沒有輸入滿 [`SESSION_IDLE_EVICT_MS`] 時補 abandoned。
+    pub fn resume_state(&mut self, sid: &str, ended_at: Option<u64>, idle: bool, last_seen: u64) {
+        let r = self.resumed.entry(sid.to_string()).or_default();
+        r.ended_at = ended_at;
+        r.idle = idle;
+        r.last_seen = Some(last_seen);
     }
 
     /// collector 重啟時，把 store 裡還開著（未解除、未確認）的注意項目交給 merge，session 回到記憶體時
@@ -226,9 +240,12 @@ impl Merger {
             let mut s = Session::default();
             if let Some(r) = resumed.remove(sid) {
                 (s.seq, s.pos, s.cwd) = (r.seq, r.pos, r.cwd);
+                s.ended_at = r.ended_at;
+                s.last_seen = r.last_seen.unwrap_or(0);
                 for item in r.open {
                     s.status.seed_open(item);
                 }
+                s.status.seed_state(r.ended_at.is_some(), r.idle);
             }
             s
         })
@@ -336,6 +353,21 @@ impl Merger {
     /// seq／pos、路徑基準與還開著的注意項目留在 `resumed`，resume 回來時接著用。
     /// 沒有 SessionEnd 就被丟棄的 session 先結束它（`reason: "abandoned"`），否則 live 與 store 永遠是 run。
     fn evict(&mut self, now: u64) -> Vec<Event> {
+        let mut out = Vec::new();
+        // 重啟前就沒有 SessionEnd、之後也沒再回到記憶體的 session（只在 resumed 裡）
+        let stale: Vec<String> = self
+            .resumed
+            .iter()
+            .filter(|(_, r)| {
+                r.ended_at.is_none()
+                    && r.last_seen
+                        .is_some_and(|t| t + SESSION_IDLE_EVICT_MS <= now)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            out.extend(self.end_session(&id, Some("abandoned".into()), now, None));
+        }
         let gone: Vec<String> = self
             .sessions
             .iter()
@@ -346,7 +378,6 @@ impl Merger {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        let mut out = Vec::new();
         for id in gone {
             let abandoned = self
                 .sessions
@@ -363,6 +394,9 @@ impl Merger {
                     pos: s.pos,
                     open: s.status.open_items(),
                     cwd: s.cwd,
+                    ended_at: s.ended_at,
+                    idle: s.status.is_idle(),
+                    last_seen: None,
                 };
                 self.resumed.insert(id, r);
             }

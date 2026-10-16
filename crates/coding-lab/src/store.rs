@@ -79,6 +79,10 @@ pub struct Counters {
     pub pos: u64,
     /// 路徑基準（session 第一次 `session.started` 的 cwd）；不知道時是空字串
     pub cwd: String,
+    /// sessions 列的結束時間與狀態、最後一筆 Event 的 ts_seen（重啟時種回 merge，#679 D3）
+    pub ended_at: Option<u64>,
+    pub status: String,
+    pub last_seen: u64,
 }
 
 /// session 最後一個 prompt 的文字與串流最後一個 `pos`（見 [`Store::last_prompt_and_pos`]）。
@@ -481,7 +485,8 @@ impl Store {
     /// 每個 session 已用到的最大 seq、pos（沒進過串流的是 0）與路徑基準 cwd。
     pub fn counters(&self) -> Result<HashMap<String, Counters>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT e.session, MAX(e.seq), COALESCE(MAX(e.pos), 0), COALESCE(s.cwd, '')
+            "SELECT e.session, MAX(e.seq), COALESCE(MAX(e.pos), 0), COALESCE(s.cwd, ''),
+                    s.ended_at, COALESCE(s.status, ''), MAX(e.ts_seen)
              FROM events e LEFT JOIN sessions s ON s.id = e.session GROUP BY e.session",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -491,6 +496,9 @@ impl Store {
                     seq: r.get::<_, i64>(1)? as u64,
                     pos: r.get::<_, i64>(2)? as u64,
                     cwd: r.get(3)?,
+                    ended_at: r.get::<_, Option<i64>>(4)?.map(|t| t as u64),
+                    status: r.get(5)?,
+                    last_seen: r.get::<_, i64>(6)? as u64,
                 },
             ))
         })?;
