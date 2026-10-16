@@ -18,3 +18,6 @@
 
 # 本機開發資料（CODING_LAB_HOME 指到這裡）
 /.coding-lab/
+
+# 在這個 repo 自我追蹤用的 Claude Code hook 設定（掛本機 coding-lab）
+/.claude/settings.local.json
