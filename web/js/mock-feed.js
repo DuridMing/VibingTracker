@@ -384,6 +384,12 @@ function createWorld(n) {
         }
         tick(s, events, rows);
         finishAgents(s, rows, events);
+        // §6 doing（#648）：collector 從這一輪的文字／思考／工具動作取一句；mock 偶爾換一句
+        if (s.status === "run" && r() < 0.2) {
+          const d = pick([...TEXTS, "npm test -- users", "edit src/api/users.ts", s.lastPrompt ?? "", "列表 API 加上分頁，page 從 1 開始、size 最多 100，順便補整合測試與 README 的說明段落"]).slice(0, 80);
+          s.doing = d || null;
+          rows.sessions.push({ id: s.id, doing: s.doing });
+        }
         const cost = r() * 0.004;
         const think = Math.floor(r() * 300);
         s.costUsd = +(s.costUsd + cost).toFixed(4);

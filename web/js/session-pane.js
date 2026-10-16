@@ -122,3 +122,11 @@ export function switchTab(client, from, to) {
   if (from !== "all") client.unsubscribe(`session:${from}`);
   if (to !== "all") client.subscribe(`session:${to}`);
 }
+
+// session 的滑過提示（tab、Sessions 列）：完整 id、現在在做什麼（§6 doing，#648）、最近的 prompt
+export function sessionTitle(s) {
+  const lines = [s.id];
+  if (s.doing) lines.push(`▸ ${s.doing}`);
+  if (s.lastPrompt) lines.push(`最近的 prompt：${s.lastPrompt}`);
+  return lines.join("\n");
+}

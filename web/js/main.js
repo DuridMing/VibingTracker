@@ -10,7 +10,7 @@ import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel } from "./agents.js";
-import { createSessionPane, nowOf, switchTab } from "./session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 
@@ -115,11 +115,11 @@ function sessTag(s, cls = "id") {
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions();
-  if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}`).join("|"))) return;
+  if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) =>
-      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: `${s.id}\n${s.lastPrompt ?? ""}`, onclick: () => selectTab(s.id) },
+      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
         h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
         h("span", { class: "dot" }),
         sessTag(s),
@@ -179,14 +179,16 @@ function renderLive() {
 
 function renderSessions() {
   const all = [...store.sessions.values()];
-  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}`).join("|"))) return;
+  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
   $("#sess").replaceChildren(
     ...(all.length
       ? all.map((s) =>
-          h("button", { class: ui.tab === s.id ? "sel" : "", onclick: () => selectTab(s.id) },
+          h("button", { class: ui.tab === s.id ? "sel" : "", title: sessionTitle(s), onclick: () => selectTab(s.id) },
             sessTag(s),
-            h("span", {}, h("span", { class: "pr", title: s.firstPrompt ?? "" }, s.firstPrompt ?? "—"), h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`)),
+            h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
+              s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
+              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`)),
             h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")))
       : [h("div", { class: "none" }, "尚無 session")]),
   );
@@ -241,12 +243,15 @@ function renderAgents() {
     const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model, now: Date.now() });
     if (v.recent.length) lingerRecheck();
     const chips = [v.main, v.bg, ...v.active, ...v.recent].filter(Boolean);
-    const sig = chips.map((a) => `${a.id}:${a.status}:${a.label}:${a.model ?? ""}:${a.current ?? ""}`).join("|") + `|done:${v.done.map((a) => a.id).join(",")}`;
+    const sig = chips.map((a) => `${a.id}:${a.status}:${a.label}:${a.model ?? ""}:${a.current ?? ""}`).join("|") + `|done:${v.done.map((a) => a.id).join(",")}|${s.doing ?? ""}`;
     let row = agentRows.get(s.id);
     if (!row || row.sig !== sig) {
       const parts = chips.map(agentChip);
       if (v.done.length) parts.push(doneChip(v.done));
-      const el = h("div", { class: "agrow" }, sessTag(s, "ss"), h("span", { class: "ags" }, ...(parts.length ? parts : [h("span", { class: "none" }, "—")])));
+      const el = h("div", { class: "agrow", title: sessionTitle(s) }, sessTag(s, "ss"),
+        h("span", { class: "agb" },
+          s.doing ? h("span", { class: "doing" }, `▸ ${s.doing}`) : null,
+          h("span", { class: "ags" }, ...(parts.length ? parts : [h("span", { class: "none" }, "—")]))));
       if (row) row.el.replaceWith(el);
       row = { el, sig };
       agentRows.set(s.id, row);
@@ -534,7 +539,9 @@ function renderPane() {
   const g = pane.git;
   const now = nowOf(v, s);
 
-  if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, model, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
+  if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, s?.doing, model, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
+    $("#spDoing").hidden = !s?.doing;
+    $("#spDoing").textContent = s?.doing ? `▸ ${s.doing}` : "";
     $("#spSid").textContent = shortId(id);
     $("#spSid").style.color = sessionColor(id);
     $("#spSid").title = id;

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSessionPane, nowOf, switchTab } from "../js/session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle } from "../js/session-pane.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 let seq = 0;
@@ -125,4 +125,10 @@ test("檔案彙總不受改動紀錄 60 筆上限影響：同一個 session 改�
   const f = p.files();
   assert.equal(f.length, 5);
   assert.equal(f.reduce((n, x) => n + x.edits, 0), 80);
+});
+
+test("session 的滑過提示：完整 id、現在在做什麼、最近的 prompt；沒有的那行略過", () => {
+  assert.equal(sessionTitle({ id: S, doing: "跑測試中", lastPrompt: "修分頁" }), `${S}\n▸ 跑測試中\n最近的 prompt：修分頁`);
+  assert.equal(sessionTitle({ id: S, doing: null, lastPrompt: "修分頁" }), `${S}\n最近的 prompt：修分頁`);
+  assert.equal(sessionTitle({ id: S, doing: "", lastPrompt: null }), S);
 });

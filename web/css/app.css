@@ -340,3 +340,11 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .agc.done b::before{content:"✓ "}
 @keyframes agdone{from{box-shadow:0 0 0 3px var(--accent-soft)}to{box-shadow:none}}
 @media (prefers-reduced-motion: reduce){.agc.done{animation:none}}
+
+/* 現在在做什麼（§6 doing，#648）：Sessions 列、Agents 列、單 session 標題 */
+.doing{display:block;color:var(--teal);font-style:italic;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.agrow .agb{display:flex;flex-direction:column;gap:3px;min-width:0}
+.spane .ph .doing{grid-column:1/4;font-size:12px}
+.spane .ph .doing[hidden]{display:none}
+.sess button > span:nth-child(2){min-width:0;overflow:hidden}
+.sess button .r{white-space:nowrap}
