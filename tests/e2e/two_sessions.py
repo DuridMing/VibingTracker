@@ -28,7 +28,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BIN = ROOT / "target" / "release" / "coding-lab"
+BIN = ROOT / "target" / "release" / ("coding-lab.exe" if os.name == "nt" else "coding-lab")
 WORK = ROOT / "target" / "tmp" / "e2e-two-sessions"
 
 
@@ -137,7 +137,7 @@ def check_session(name, evs):
 
 def main():
     home = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / ".coding-lab"
-    info = json.loads((home / "collector.json").read_text())
+    info = json.loads((home / "collector.json").read_text(encoding="utf-8"))
     web_port = int(info["web"].rsplit(":", 1)[1])
     WORK.mkdir(parents=True, exist_ok=True)
     if not (WORK / ".git").exists():  # 自己的 git root，避免讀到上層的 .claude/settings.local.json

@@ -16,11 +16,11 @@ class Workdir(unittest.TestCase):
     def test_leftovers_from_a_previous_run_are_removed(self):
         # 上一次留下的 out-*.txt 會讓 Write 被 Claude Code 擋下（要先 Read），PreToolUse 不觸發、驗收誤判
         old = M.workdir(99)
-        (old / "out-2.txt").write_text("a\nb\nc\n")
+        (old / "out-2.txt").write_text("a\nb\nc\n", encoding="utf-8")
         cwd = M.workdir(99)
         self.assertFalse((cwd / "out-2.txt").exists())
         self.assertTrue((cwd / ".git").exists())
-        self.assertEqual(len((cwd / "notes.txt").read_text().splitlines()), M.NOTES_LINES)
+        self.assertEqual(len((cwd / "notes.txt").read_text(encoding="utf-8").splitlines()), M.NOTES_LINES)
 
     def test_git_init_ignores_the_callers_git_dir(self):
         # 從 worktree commit 時 pre-commit hook 帶著 GIT_DIR：git init 不能跑去重新初始化外面那個 repo（#703）

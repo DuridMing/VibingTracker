@@ -88,7 +88,7 @@ def workdir(i):
     shutil.rmtree(cwd, ignore_errors=True)
     cwd.mkdir(parents=True)
     L.git_init(cwd)
-    (cwd / "notes.txt").write_text("".join(f"line {n}\n" for n in range(1, NOTES_LINES + 1)))
+    (cwd / "notes.txt").write_text("".join(f"line {n}\n" for n in range(1, NOTES_LINES + 1)), encoding="utf-8")
     return cwd
 
 
@@ -104,17 +104,17 @@ def session(i, deadline, killed_at):
             prompt = f"用 Bash 執行 echo s{i}-round-{k}，然後只回答 OK"
         elif kind == 1:
             line = random.randint(2, NOTES_LINES - 1)
-            prompt = f"用 Edit 工具把 notes.txt 裡內容是「{notes.read_text().splitlines()[line - 1]}」的那一行改成「edited {k}」，然後只回答 OK"
+            prompt = f"用 Edit 工具把 notes.txt 裡內容是「{notes.read_text(encoding="utf-8").splitlines()[line - 1]}」的那一行改成「edited {k}」，然後只回答 OK"
         elif kind == 2:
             prompt = f"用 Write 工具建立 out-{k}.txt，內容是三行：a、b、c。然後只回答 OK"
         else:
             prompt = "不要用任何工具，用一句話說明你剛才做了什麼"
-        before = notes.read_text()
+        before = notes.read_text(encoding="utf-8")
         start_ms = int(time.time() * 1000)
         code = claude(cwd, sid, k == 0, prompt)
         end_ms = int(time.time() * 1000)
         took = time.time() - t0
-        after = notes.read_text()
+        after = notes.read_text(encoding="utf-8")
         with lock:
             calls.append((sid, t0, took, code, killed_at[0] is not None and t0 > killed_at[0]))
             if kind == 1 and before != after:
@@ -128,14 +128,14 @@ def session(i, deadline, killed_at):
 
 def collector_pid():
     try:
-        return json.loads((L.HOME / "collector.json").read_text())["pid"]
+        return json.loads((L.HOME / "collector.json").read_text(encoding="utf-8"))["pid"]
     except (OSError, ValueError, KeyError):
         return None
 
 
 def cpu_seconds(pid):
     try:
-        f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        f = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
     except (OSError, IndexError, ValueError):
         return None
@@ -199,7 +199,7 @@ def report(results, killed_at):
         evs = L.wait_settled(sid, runs)
         started = next((e for e in evs if e["type"] == "session.started"), None)
         path = started and started["payload"].get("transcriptPath")
-        lines = [json.loads(x) for x in Path(path).read_text().splitlines() if x.strip()] if path else []
+        lines = [json.loads(x) for x in Path(path).read_text(encoding="utf-8").splitlines() if x.strip()] if path else []
         want, missing, twice, extra = L.compare(lines, evs)
         total_lines += len(want)
         total_events += len(evs)

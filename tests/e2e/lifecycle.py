@@ -29,7 +29,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BIN = ROOT / "target" / "release" / "coding-lab"
+BIN = ROOT / "target" / "release" / ("coding-lab.exe" if os.name == "nt" else "coding-lab")
 WORK = ROOT / "target" / "tmp" / "e2e-lifecycle"
 HOME = WORK / "home"
 PLUGIN = WORK / "plugin"
@@ -51,6 +51,17 @@ def free_port():
         return s.getsockname()[1]
 
 
+def config_toml(hook, web):
+    """測試用 collector 的設定。路徑一律寫成 /：Windows 的 E:\\VS\\… 在 TOML 雙引號字串裡是不合法的跳脫（#714）。"""
+    return (
+        f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\n'
+        # 網頁預設找二進位旁的 web/（#656），target/release/ 底下沒有
+        f'root = "{(ROOT / "web").as_posix()}"\n'
+        # 腳本被 SIGKILL、沒跑到 stop_collector 時，collector 閒置一陣子會自己結束（#688）
+        f"[collector]\nidle_exit_seconds = {IDLE_EXIT_SECONDS}\n"
+    )
+
+
 def setup():
     """獨立的資料目錄與埠；plugin 的 hook url 改指到這個埠。回傳 (hook 埠, web 埠)。
     上一次被中斷的腳本可能留下 collector：先依它的 collector.json 停掉，再清資料目錄（清掉就找不到它了）。"""
@@ -59,16 +70,10 @@ def setup():
     shutil.rmtree(PLUGIN, ignore_errors=True)
     HOME.mkdir(parents=True)
     hook, web = free_port(), free_port()
-    (HOME / "config.toml").write_text(
-        f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\n'
-        # 網頁預設找二進位旁的 web/（#656），target/release/ 底下沒有
-        f'root = "{ROOT / "web"}"\n'
-        # 腳本被 SIGKILL、沒跑到 stop_collector 時，collector 閒置一陣子會自己結束（#688）
-        f"[collector]\nidle_exit_seconds = {IDLE_EXIT_SECONDS}\n"
-    )
+    (HOME / "config.toml").write_text(config_toml(hook, web), encoding="utf-8")
     shutil.copytree(ROOT / "plugin", PLUGIN)
     hooks = PLUGIN / "hooks" / "hooks.json"
-    hooks.write_text(hooks.read_text().replace("127.0.0.1:4800", f"127.0.0.1:{hook}"))
+    hooks.write_text(hooks.read_text(encoding="utf-8").replace("127.0.0.1:4800", f"127.0.0.1:{hook}"), encoding="utf-8")
     if not (WORK / ".git").exists():  # 自己的 git root，避免讀到上層的 .claude/settings.local.json
         git_init(WORK)
     return hook, web
@@ -108,7 +113,7 @@ def stop_collector():
     if not info.exists():
         return
     try:
-        meta = json.loads(info.read_text())
+        meta = json.loads(info.read_text(encoding="utf-8"))
         pid = meta["pid"]
     except (ValueError, KeyError):
         return
@@ -177,7 +182,7 @@ def compare(lines, evs):
 
 def events_of(sid):
     p = HOME / "events" / f"{sid}.jsonl"
-    return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
+    return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
 
 
 def wait_settled(sid, runs):
@@ -261,7 +266,7 @@ def run(web):
     if len(paths) != 1:
         problems.append(f"session.started 的 transcriptPath 不是剛好一個：{sorted(paths)}")
     else:
-        lines = [json.loads(l) for l in Path(paths.pop()).read_text().splitlines() if l.strip()]
+        lines = [json.loads(l) for l in Path(paths.pop()).read_text(encoding="utf-8").splitlines() if l.strip()]
     want, missing, twice, extra = compare(lines, evs)
     if missing:
         problems.append(f"transcript 有、collector 沒有：{missing}")

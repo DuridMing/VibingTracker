@@ -74,7 +74,7 @@ class Setup(unittest.TestCase):
         # 上一次被 SIGKILL 的腳本留下的 collector：放到背景脫離這個程序（不是子程序，停掉後由系統回收）
         out = subprocess.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
         pid = int(out.stdout.strip())
-        (L.HOME / "collector.json").write_text(json.dumps({"pid": pid}))
+        (L.HOME / "collector.json").write_text(json.dumps({"pid": pid}), encoding="utf-8")
         try:
             L.setup()
             self.assertFalse(L.alive(pid), "舊的 collector 要先被停掉")
@@ -99,9 +99,7 @@ class Setup(unittest.TestCase):
         shutil.rmtree(L.HOME, ignore_errors=True)
         L.HOME.mkdir(parents=True)
         hook, web = L.free_port(), L.free_port()
-        (L.HOME / "config.toml").write_text(
-            f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\nroot = "{L.ROOT / "web"}"\n'
-        )
+        (L.HOME / "config.toml").write_text(L.config_toml(hook, web), encoding="utf-8")
         env = dict(os.environ, CODING_LAB_HOME=str(L.HOME))
         p = subprocess.Popen([str(L.BIN), "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
@@ -117,10 +115,49 @@ class Setup(unittest.TestCase):
             if p.poll() is None:
                 p.kill()
 
+    def test_config_toml_parses_with_a_windows_root(self):
+        # #714：Windows 的 ROOT 是 E:\VS\…，TOML 雙引號字串裡 \V 是不合法跳脫；路徑要用 / 寫
+        import tomllib
+        from pathlib import PureWindowsPath
+        L = self.L
+        saved = L.ROOT
+        L.ROOT = PureWindowsPath(r"E:\VS\VibingTracker")
+        try:
+            conf = tomllib.loads(L.config_toml(4800, 4801))
+        finally:
+            L.ROOT = saved
+        self.assertEqual(conf["web"]["root"], "E:/VS/VibingTracker/web")
+        self.assertEqual(conf["hook"]["bind"], "127.0.0.1:4800")
+
+    def test_setup_reads_and_writes_utf8_regardless_of_locale(self):
+        # #714：Windows 預設 cp950，hooks.json 的 description 有中文；在非 UTF-8 的 locale 下 setup() 也要成功
+        import subprocess
+        import sys
+        L = self.L
+        script = (
+            f"import sys; sys.path.insert(0, {str(L.ROOT / 'tests' / 'e2e')!r})\n"
+            "import locale, lifecycle as L\n"
+            "assert locale.getpreferredencoding(False).lower() not in ('utf-8', 'utf8'), locale.getpreferredencoding(False)\n"
+            f"L.WORK = L.ROOT / 'target' / 'tmp' / 'e2e-lifecycle-utf8'; L.HOME = L.WORK / 'home'; L.PLUGIN = L.WORK / 'plugin'\n"
+            "L.setup()\n"
+            "assert '拉起本機 collector' in (L.PLUGIN / 'hooks' / 'hooks.json').read_text(encoding='utf-8')\n"
+        )
+        # 腳本寫成檔案：C locale 下命令列本身也解不了中文；Python 原始檔預設 UTF-8，不受 locale 影響
+        L.WORK.mkdir(parents=True, exist_ok=True)
+        path = L.WORK / "utf8_check.py"
+        path.write_text(script, encoding="utf-8")
+        env = dict(os.environ, LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONIOENCODING="utf-8")
+        r = subprocess.run([sys.executable, "-X", "utf8=0", str(path)], cwd=L.ROOT / "tests" / "e2e", env=env,
+                           capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_bin_has_exe_suffix_on_windows(self):
+        self.assertEqual(self.L.BIN.suffix, ".exe" if os.name == "nt" else "")
+
     def test_collector_exits_on_its_own_when_idle(self):
         L = self.L
         L.setup()
-        conf = (L.HOME / "config.toml").read_text()
+        conf = (L.HOME / "config.toml").read_text(encoding="utf-8")
         line = next(l for l in conf.splitlines() if l.startswith("idle_exit_seconds"))
         self.assertGreater(int(line.split("=")[1]), 0, "腳本被中斷時 collector 要能自己結束")
 
@@ -128,5 +165,5 @@ class Setup(unittest.TestCase):
         # #656 之後網頁預設找二進位旁的 web/，target/release/ 底下沒有：測試用的 collector 要指到 repo 的 web/
         L = self.L
         L.setup()
-        conf = (L.HOME / "config.toml").read_text()
+        conf = (L.HOME / "config.toml").read_text(encoding="utf-8")
         self.assertIn(f'root = "{L.ROOT / "web"}"', conf)
