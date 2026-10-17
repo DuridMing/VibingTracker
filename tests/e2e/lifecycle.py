@@ -114,6 +114,7 @@ def claude(args, prompt):
 def compare(lines, evs):
     """transcript 的行與 collector 的 Event 逐行比對：回傳 (want, missing, twice, extra)。
     want 是應該有 Event 的 (type, 行號)；missing／twice／extra 是缺的、重複的、多出來的。
+    tool_use 行在 hook 先到時是 tool.placed，transcript 先到時是帶 pos 的 tool.called，兩種都算放進了串流。
     `<synthetic>` 的行（Claude Code 自己寫的「No response requested.」、用量上限訊息）merge 一樣會發 Event，兩邊都算。"""
     want = {}
     for no, v in enumerate(lines, 1):
@@ -126,8 +127,12 @@ def compare(lines, evs):
     got = {}
     for e in evs:
         line = e.get("line") or {}
-        if e["type"] in ("assistant.thinking", "assistant.text", "tool.placed") and line.get("file") == "main":
-            got[(e["type"], line["no"])] = got.get((e["type"], line["no"]), 0) + 1
+        kind = e["type"]
+        # transcript 先到（hook 沒來）時，tool_use 直接變成帶 pos 的 tool.called，不會有 tool.placed（contracts.md §3）
+        if kind == "tool.called" and e.get("pos") is not None:
+            kind = "tool.placed"
+        if kind in ("assistant.thinking", "assistant.text", "tool.placed") and line.get("file") == "main":
+            got[(kind, line["no"])] = got.get((kind, line["no"]), 0) + 1
     missing = sorted(k for k in want if k not in got)
     twice = sorted(k for k, n in got.items() if n > 1)
     extra = sorted(k for k in got if k not in want)

@@ -30,6 +30,17 @@ class Compare(unittest.TestCase):
         self.assertEqual(missing, [("assistant.thinking", 2)])
         self.assertEqual(twice, [("tool.placed", 1)])
 
+    def test_tool_called_from_transcript_counts_as_placed(self):
+        # hook 沒來（工具在 PreToolUse 前就被 Claude Code 擋下，例如 Write 一個沒讀過的既有檔，或 collector 停機中）：
+        # transcript 先到時直接建帶 pos 的 tool.called，不會有 tool.placed（contracts.md §3）
+        lines = [assistant({"type": "tool_use", "id": "t1"})]
+        called = {"type": "tool.called", "pos": 3, "line": {"file": "main", "no": 1}, "payload": {}}
+        _, missing, twice, extra = compare(lines, [called])
+        self.assertEqual((missing, twice, extra), ([], [], []))
+        staged = {"type": "tool.called", "pos": None, "line": None, "payload": {}}
+        _, missing, _, _ = compare(lines, [staged])
+        self.assertEqual(missing, [("tool.placed", 1)])
+
 
 if __name__ == "__main__":
     unittest.main()
