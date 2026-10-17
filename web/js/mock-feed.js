@@ -18,6 +18,10 @@ const THOUGHTS = [
 ];
 const TEXTS = ["我先讀相關的檔案。", "改好了，接著跑測試。", "測試全過，準備 commit。", "這裡需要你確認要不要同時更新 README。"];
 const ROOT = "/home/me/my-api";
+// 第二個專案（#669）：mock ≥ 6 個 session 時，每第五個 session 在另一個 repo
+const ROOT2 = "/home/me/side-tool";
+const FILES2 = ["README.md", "main.py", "lib/util.py", "lib/cli.py", "tests/test_cli.py"];
+const rootOf = (c) => (c && [ROOT, ROOT2].find((r) => c === r || c.startsWith(`${r}/`))) || null;
 const FILES = ["src/api/users.ts", "src/repo/users.ts", "src/middleware/auth.ts", "tests/users.test.ts", "src/web/useKeyboardInset.ts", "README.md", "src/config.ts"];
 const BASH = [
   { command: "npm test", out: "✓ users list (12 ms)\n✓ users paging (8 ms)\n\nTests: 2 passed", ok: true },
@@ -53,8 +57,8 @@ function createWorld(n, { bigtree = false } = {}) {
     id: uuid(r),
     host: "local",
     // develop 的在 repo 根，其他各開一個 worktree（左欄「相對 main」逐 worktree 合併，#644）
-    cwd: i % 3 === 0 ? ROOT : `${ROOT}/.claude/wt/t${i}`,
-    branch: i % 3 === 0 ? "develop" : `feature/t${i}`,
+    cwd: n >= 6 && i % 5 === 4 ? ROOT2 : i % 3 === 0 ? ROOT : `${ROOT}/.claude/wt/t${i}`,
+    branch: n >= 6 && i % 5 === 4 ? "main" : i % 3 === 0 ? "develop" : `feature/t${i}`,
     model: i % 4 === 0 ? "opus" : "sonnet",
     firstPrompt: PROMPTS[i % PROMPTS.length],
     lastPrompt: PROMPTS[i % PROMPTS.length],
@@ -325,7 +329,9 @@ function createWorld(n, { bigtree = false } = {}) {
   // contracts §7（#671）的 /api/files：worktree 的改動從各 session 的 file.edit／write 算（同一個 worktree 合併）
   function files(q) {
     const cwd = q.get("cwd");
-    if (!cwd || !(cwd === ROOT || cwd.startsWith(`${ROOT}/`))) return err(404, "沒有 session 在這個目錄");
+    const R = rootOf(cwd);
+    if (!R) return err(404, "沒有 session 在這個目錄");
+    const mine = sessions.filter((s) => rootOf(s.cwd) === R);
     const base = q.get("base") ?? "main";
     const sources = new Map(); // key → { by, paths: Map }
     const add = (key, by, sess) => {
@@ -333,7 +339,7 @@ function createWorld(n, { bigtree = false } = {}) {
       for (const [p, st] of edited.get(sess.id) ?? []) if (src.paths.get(p) !== "A") src.paths.set(p, st === "A" ? "?" : st);
       sources.set(key, src);
     };
-    if (base === "main") for (const s of sessions) add(s.cwd, { worktree: s.cwd, branch: s.branch }, s);
+    if (base === "main") for (const s of mine) add(s.cwd, { worktree: s.cwd, branch: s.branch }, s);
     else if (base.startsWith("session:")) {
       const s = sessions.find((x) => x.id === base.slice(8));
       if (!s) return err(404, "沒有這個 session");
@@ -348,7 +354,7 @@ function createWorld(n, { bigtree = false } = {}) {
       byPath.get(p).push({ ...src.by, status });
     }
     const changes = [...byPath].sort(([a], [b]) => (a < b ? -1 : 1)).map(([path, by]) => ({ path, conflict: by.length > 1 && by.some((b) => b.status !== "?"), by }));
-    return { status: 200, body: { root: cwd === ROOT || base === "main" ? ROOT : cwd, base, baseRef: base === "main" ? "main" : base.startsWith("commit:") ? base.slice(7).padEnd(40, "0") : null, tree: [...tree].sort(), treeTruncated: false, changes, worktrees: [...new Map(sessions.map((s) => [s.cwd, { path: s.cwd, branch: s.branch }])).values()] } };
+    return { status: 200, body: { root: cwd === R || base === "main" ? R : cwd, base, baseRef: base === "main" ? (R === ROOT2 ? "main" : "develop") : base.startsWith("commit:") ? base.slice(7).padEnd(40, "0") : null, tree: [...(R === ROOT2 ? FILES2 : tree)].sort(), treeTruncated: false, changes, worktrees: [...new Map(mine.map((s) => [s.cwd, { path: s.cwd, branch: s.branch }])).values()] } };
   }
 
   // 全專案回放（#702）：cwd 底下的 session、範圍內有 pos 的 Event，依 (ts_seen, session, pos) 由新到舊一頁
@@ -377,7 +383,7 @@ function createWorld(n, { bigtree = false } = {}) {
 
   // contracts §7 的 /api/graph、/api/branches、/api/commit（#696）：假的歷史，develop 主線＋每個 worktree 一條 feature 分支
   const hx = (n) => (n * 2654435761 >>> 0).toString(16).padStart(8, "0").repeat(5);
-  const wts = [...new Map(sessions.map((s) => [s.cwd, s.branch])).entries()];
+  const wts = [...new Map(sessions.filter((s) => rootOf(s.cwd) === ROOT).map((s) => [s.cwd, s.branch])).entries()];
   const history = []; // 新到舊（拓撲順序）
   const tips = new Map(); // branch → tip hash
   {
@@ -410,7 +416,12 @@ function createWorld(n, { bigtree = false } = {}) {
 
   function branches(q) {
     const cwd = q.get("cwd");
-    if (!cwd || !(cwd === ROOT || cwd.startsWith(`${ROOT}/`))) return err(404, "沒有 session 在這個目錄");
+    const R = rootOf(cwd);
+    if (!R) return err(404, "沒有 session 在這個目錄");
+    if (R === ROOT2) {
+      const tip = history[0];
+      return { status: 200, body: { root: ROOT2, integration: "main", branches: [{ branch: "main", worktree: ROOT2, head: tip.hash, integration: true, ahead: 0, behind: 0, dirty: 0, changed: 0, last: { hash: tip.hash, message: tip.subject, ts: tip.ts }, sessions: sessions.filter((s) => s.cwd === ROOT2 && s.endedAt == null).map((s) => s.id), shared: [] }] } };
+    }
     const changes = files(new URLSearchParams({ cwd, base: "main" })).body.changes;
     const rows = wts.map(([wt, branch], i) => {
       const mine = changes.filter((c) => c.by.some((b) => b.worktree === wt));

@@ -105,7 +105,8 @@ const SESSION_TEXT = {
   compact: '<span class="st">⇣ 已 compact，之前的對話已摘要</span>',
 };
 
-export function formatRow(row, { agentName } = {}) {
+// projectTag(session) → { label, color, cwd } | null：全部專案時每行先標專案（#669）
+export function formatRow(row, { agentName, projectTag } = {}) {
   const kind = kindOf(row);
   const cls = ["ln", kind];
   const tags = [];
@@ -155,7 +156,9 @@ export function formatRow(row, { agentName } = {}) {
   if (detail != null) cls.push("can-open");
   if (row.expanded) cls.push("open");
 
-  const prefix = `<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
+  const pj = projectTag?.(row.session);
+  const pjHtml = pj ? `<span class="pj" style="color:${esc(pj.color)}" title="${esc(pj.cwd)}">${esc(pj.label)}</span>` : "";
+  const prefix = `${pjHtml}<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
   const tagHtml = tags.map((t) => ` <span class="tag">${esc(t)}</span>`).join("");
   return { cls: cls.join(" "), html: `${prefix}${body}${tagHtml}`, detail };
 }

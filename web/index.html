@@ -11,6 +11,7 @@
 <header class="top">
   <div class="brand"><div><h1>Coding Lab</h1><small id="project">專案即時追蹤，所有 session 合流</small></div></div>
   <div class="ctl">
+    <select class="gproj" id="gProj" title="專案：全部（串流每行標專案、檔案樹與改動紀錄依專案分組）或只看一個" hidden></select>
     <span class="conn connecting" id="conn"><i></i><span id="connText">連線中…</span></span>
     <button class="btn" id="mockDrop" hidden>模擬斷線</button>
   </div>
@@ -39,7 +40,6 @@
       <button class="tab" role="tab" data-t="sess">Sessions<small id="sessCount"></small></button>
     </div>
     <div class="tbar" id="tbar">
-      <select id="tProj" title="專案（session 的 cwd；worktree 與子目錄歸到上層）" hidden></select>
       <select id="tBase" title="檔名顏色依這個基準的 git 狀態">
         <option value="main">相對整合分支</option>
         <option value="since">本次開啟以來</option>

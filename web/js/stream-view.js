@@ -8,7 +8,8 @@ import { formatRow, esc } from "./format.js";
 export const ROW_H = 20;
 const OVERSCAN = 30;
 
-export function createStreamView({ scroller, model, agentName, onNeedMore, onFollow, prof = null }) {
+// projectTag：全部專案時每行的專案色標（#669），不給就沒有
+export function createStreamView({ scroller, model, agentName, projectTag = null, onNeedMore, onFollow, prof = null }) {
   const T = () => (prof ? performance.now() : 0);
   const more = document.createElement("button");
   more.className = "vl-more";
@@ -97,7 +98,7 @@ export function createStreamView({ scroller, model, agentName, onNeedMore, onFol
 
   function paint(nd) {
     const r = nd.row;
-    const f = formatRow(r, { agentName });
+    const f = formatRow(r, { agentName, projectTag });
     nd.el.className = f.cls;
     nd.el.dataset.key = r.key;
     if (f.detail != null) {

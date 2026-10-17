@@ -120,3 +120,14 @@ test("工具輸出（#654）：遠端被剝除的敏感輸出說明原因", () =
   const d = formatRow(tool({ tool: "Read", input: { file_path: ".env" }, result: { ok: true, output: "", redacted: true } })).detail;
   assert.match(d, /敏感輸出/);
 });
+
+import { formatRow as fmtRow } from "../js/format.js";
+test("串流前綴（#669）：全部專案時每行先標專案色標；沒給 projectTag 就和以前一樣", () => {
+  const row = { key: "k", session: "aaaaaaaa-1", agent: "main", type: "text", text: "hi", v: 0, expanded: false, delayed: false };
+  const plain = fmtRow(row, {});
+  assert.ok(!plain.html.includes('class="pj"'));
+  const tagged = fmtRow(row, { projectTag: () => ({ label: "alpha", color: "var(--s3)", cwd: "/home/u/alpha" }) });
+  assert.ok(tagged.html.startsWith('<span class="pj"'), tagged.html);
+  assert.ok(tagged.html.includes("alpha") && tagged.html.includes("var(--s3)"));
+  assert.ok(tagged.html.includes('title="/home/u/alpha"'));
+});
