@@ -10,7 +10,8 @@ const OVERSCAN = 30;
 
 // projectTag：全部專案時每行的專案色標（#669），不給就沒有
 // onExpand(row)：一行被展開時呼叫（遠端未載入的思考在這時去載，#668）
-export function createStreamView({ scroller, model, agentName, projectTag = null, onNeedMore, onFollow, onExpand = null, prof = null }) {
+// hostTag：hub 時每行的 [host]（#663），不給就沒有
+export function createStreamView({ scroller, model, agentName, projectTag = null, hostTag = null, onNeedMore, onFollow, onExpand = null, prof = null }) {
   const T = () => (prof ? performance.now() : 0);
   const more = document.createElement("button");
   more.className = "vl-more";
@@ -100,7 +101,7 @@ export function createStreamView({ scroller, model, agentName, projectTag = null
 
   function paint(nd) {
     const r = nd.row;
-    const f = formatRow(r, { agentName, projectTag });
+    const f = formatRow(r, { agentName, projectTag, hostTag });
     nd.el.className = f.cls;
     nd.el.dataset.key = r.key;
     if (f.detail != null) {

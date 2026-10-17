@@ -475,7 +475,8 @@ async fn auth_logout(headers: HeaderMap) -> Response {
         .into_response()
 }
 
-fn host_is_loopback(headers: &HeaderMap) -> bool {
+/// `Host` 是 loopback 名稱（hub 的 web 入口也用，#663）。
+pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -849,8 +850,13 @@ async fn healthz(State(state): State<Arc<WebState>>) -> Response {
 }
 
 async fn static_file(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    static_response(state.web_root.as_deref(), &uri).await
+}
+
+/// 前端靜態檔（hub 的 web 入口也用同一份 `web/`，#663）。
+pub(crate) async fn static_response(root: Option<&Path>, uri: &Uri) -> Response {
     let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
-    let Some(root) = &state.web_root else {
+    let Some(root) = root else {
         return not_found();
     };
     let rel = Path::new(uri.path().trim_start_matches('/'));

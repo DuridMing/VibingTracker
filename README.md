@@ -198,7 +198,15 @@ coding-lab service uninstall
 
 服務用 `serve --idle-exit-seconds 0` 跑、不會閒置結束，設定仍讀 `~/.coding-lab/config.toml`。Linux 要在沒人登入時就起來，再執行一次 `loginctl enable-linger $USER`。`install --dry-run` 只印出會寫的檔與會跑的指令。TLS 不內建：需要 https 時前置 Caddy 或 nginx 反向代理到 127.0.0.1:4801。
 
-規劃中：一次看多台伺服器的 `coding-lab hub`。
+**一次看多台伺服器（hub）**：每台伺服器各跑自己的 collector（上面的形態），本機跑 `coding-lab hub` 把它們合成一頁：
+
+```bash
+coding-lab hub add build-01 http://100.64.0.5:4801      # 會問金鑰（在那台 key create 的 clk_…），不進 shell 歷史
+coding-lab hub add tunnel http://127.0.0.1:14801 --no-key   # SSH 通道（ssh -N -L 14801:127.0.0.1:4801 <伺服器>）的不用金鑰
+coding-lab hub                                           # 本機開 http://127.0.0.1:4802
+```
+
+串流每行前面多一個 `[主機]`，Sessions、Agents 也標主機；某台斷線時它的 session 標「離線」、hub 自動重連，其他台照常。hub 只轉發不存資料；要「載入更多」、看 thinking 全文、按「已確認」都轉給對應的那台（那台的金鑰是 `view` 就不能確認）。上游列在 `~/.coding-lab/config.toml` 的 `[[hub.upstream]]`（`name`、`url`、`key`；檔案權限 600），hub 的埠用 `[hub] bind` 或 `--bind` 改（只能是本機位址）。上游網址只接受 `http://`：遠端一律走 tailnet 或 SSH 通道。
 
 ## 子命令
 
@@ -214,6 +222,7 @@ coding-lab service uninstall
 | `coding-lab key list`、`coding-lab key revoke <id>` | 列出金鑰（不含 secret）、撤銷（立即失效，不必重啟 collector） |
 | `coding-lab key login-link [--key <id>]` | 印一個 5 分鐘內只能用一次的登入網址（金鑰不經過網址列與瀏覽紀錄） |
 | `coding-lab service install [--dry-run]`、`service uninstall`、`service status` | 裝成開機（登入）自動啟動、不閒置結束的常駐服務：Linux systemd user unit、macOS LaunchAgent、Windows 工作排程器；`uninstall` 只刪 `install` 寫的檔 |
+| `coding-lab hub [--bind 127.0.0.1:4802]`、`hub add <名稱> <http://主機:4801> [--no-key]` | 多機總覽：對 `[[hub.upstream]]` 的每台開 WS 合流，在本機開 web；`add` 互動輸入金鑰並寫進 config.toml |
 
 ## 卸載
 

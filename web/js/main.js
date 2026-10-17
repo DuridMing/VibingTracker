@@ -131,6 +131,17 @@ function projectTag(id) {
   const p = projectOf(cwdOf(id), proj.rootCwds);
   return p ? { label: proj.labels.get(p) ?? p, color: projectColor(proj.colors, p), cwd: p } : null;
 }
+// hub（多機總覽，#663）：welcome.host 是 hub 時每行標 [host]（sessions 列的 host 是上游名稱）
+function hostTag(id) {
+  if (ui.welcome?.host !== "hub") return null;
+  return store.sessions.get(id)?.host ?? fetchedIndex.get(id)?.host ?? null;
+}
+function hostChip(id) {
+  const t = hostTag(id);
+  return t ? h("span", { class: "hst", title: t }, `[${t}]`) : null;
+}
+const statusText = (s) => (s.offline ? "離線" : STATUS_TEXT[s.status] ?? s.status ?? "");
+
 function pjChip(id) {
   const t = projectTag(id);
   return t ? h("span", { class: "pj", style: `color:${t.color}`, title: t.cwd }, t.label) : null;
@@ -151,9 +162,11 @@ function renderProjectSwitch() {
 }
 
 function sessionTab(s, extra = {}) {
-  return h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id), ...extra },
+  const host = hostTag(s.id);
+  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`, onclick: () => selectTab(s.id), ...extra },
     h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
     h("span", { class: "dot" }),
+    host ? h("small", { class: "hst" }, host) : null,
     sessTag(s),
     h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
 }
@@ -163,7 +176,7 @@ let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions().filter((s) => inProject(s.id));
-  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
+  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
@@ -263,7 +276,7 @@ function renderLive() {
   list.replaceChildren(
     ...(cards.length
       ? cards.map((c) => {
-          const f = formatRow({ key: c.toolUseId, session: c.session, agent: c.agent, type: "tool", card: c, v: 0, expanded: false, delayed: false }, { agentName, projectTag });
+          const f = formatRow({ key: c.toolUseId, session: c.session, agent: c.agent, type: "tool", card: c, v: 0, expanded: false, delayed: false }, { agentName, projectTag, hostTag });
           const el = h("div", { class: f.cls });
           el.innerHTML = `<div class="hd">${f.html}</div>`;
           return el;
@@ -276,7 +289,7 @@ function renderLive() {
 const SESS_SHOWN = 200;
 function renderSessions() {
   const all = allSessions().filter((s) => inProject(s.id));
-  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|` + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
+  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
   $("#sess").replaceChildren(
     ...(all.length
@@ -286,8 +299,8 @@ function renderSessions() {
               sessTag(s),
               h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
                 s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
-                h("small", {}, pjChip(s.id), `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
-              h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")),
+                h("small", {}, hostChip(s.id), pjChip(s.id), `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
+              h("span", { class: `r ${s.offline ? "offline" : s.status}` }, statusText(s))),
             canReplay(s) ? h("button", { class: "btn sm rp", title: "從存下來的紀錄重新讀回這個 session", onclick: () => replaySession(s.id) }, "▶ 回放") : null))
       : [h("div", { class: "none" }, proj.cur && store.sessions.size ? "這個專案沒有 session" : "尚無 session")]),
     ...(all.length > SESS_SHOWN ? [h("div", { class: "more" }, `只列最近 ${SESS_SHOWN} 個（共 ${all.length}）`)] : []),
@@ -348,7 +361,7 @@ function renderAgents() {
     if (!row || row.sig !== sig) {
       const parts = chips.map(agentChip);
       if (v.done.length) parts.push(doneChip(v.done));
-      const el = h("div", { class: "agrow", title: sessionTitle(s) }, sessTag(s, "ss"),
+      const el = h("div", { class: `agrow${s.offline ? " offline" : ""}`, title: sessionTitle(s) }, hostChip(s.id), sessTag(s, "ss"),
         h("span", { class: "agb" },
           s.doing ? h("span", { class: "doing" }, `▸ ${s.doing}`) : null,
           h("span", { class: "ags" }, ...(parts.length ? parts : [h("span", { class: "none" }, "—")]))));
@@ -1575,6 +1588,7 @@ const view = createStreamView({
   model: stream,
   agentName,
   projectTag,
+  hostTag,
   onExpand: (row) => loadThinking(row, view),
   onNeedMore: requestMore,
   onFollow: (on) => {

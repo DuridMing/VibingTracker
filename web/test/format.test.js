@@ -144,3 +144,11 @@ test("遠端未載入的思考：佔位帶字數，展開前的 detail 是提示
   assert.doesNotMatch(loaded.html, /點開載入/);
   assert.equal(loaded.detail, "一\n二");
 });
+
+test("串流前綴（#663）：hub 時每行最前面標 [host]；沒給 hostTag 就沒有", () => {
+  const row = { key: "k", session: "aaaaaaaa-1", agent: "main", type: "text", text: "hi", v: 0, expanded: false, delayed: false };
+  assert.ok(!fmtRow(row, {}).html.includes('class="hst"'));
+  const tagged = fmtRow(row, { hostTag: () => "build-01", projectTag: () => ({ label: "p", color: "var(--s1)", cwd: "/p" }) });
+  assert.ok(tagged.html.startsWith('<span class="hst" title="build-01">[build-01]</span><span class="pj"'), tagged.html);
+  assert.equal(fmtRow(row, { hostTag: () => null }).html.includes("hst"), false);
+});

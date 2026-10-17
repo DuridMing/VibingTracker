@@ -106,7 +106,8 @@ const SESSION_TEXT = {
 };
 
 // projectTag(session) → { label, color, cwd } | null：全部專案時每行先標專案（#669）
-export function formatRow(row, { agentName, projectTag } = {}) {
+// hostTag(session) → string | null：hub（多機總覽，#663）時每行先標 [host]
+export function formatRow(row, { agentName, projectTag, hostTag } = {}) {
   const kind = kindOf(row);
   const cls = ["ln", kind];
   const tags = [];
@@ -165,7 +166,9 @@ export function formatRow(row, { agentName, projectTag } = {}) {
 
   const pj = projectTag?.(row.session);
   const pjHtml = pj ? `<span class="pj" style="color:${esc(pj.color)}" title="${esc(pj.cwd)}">${esc(pj.label)}</span>` : "";
-  const prefix = `${pjHtml}<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
+  const ht = hostTag?.(row.session);
+  const htHtml = ht ? `<span class="hst" title="${esc(ht)}">[${esc(ht)}]</span>` : "";
+  const prefix = `${htHtml}${pjHtml}<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
   const tagHtml = tags.map((t) => ` <span class="tag">${esc(t)}</span>`).join("");
   return { cls: cls.join(" "), html: `${prefix}${body}${tagHtml}`, detail };
 }

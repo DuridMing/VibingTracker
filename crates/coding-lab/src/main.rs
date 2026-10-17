@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -35,6 +35,31 @@ enum Command {
     Service(ServiceArgs),
     /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
     Key(KeyArgs),
+    /// 多機總覽（#663）：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
+    Hub(HubArgs),
+}
+
+#[derive(Args)]
+struct HubArgs {
+    #[command(subcommand)]
+    command: Option<HubCommand>,
+    /// hub 的 web 入口（預設 [hub].bind 或 127.0.0.1:4802；只能是本機位址）
+    #[arg(long)]
+    bind: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum HubCommand {
+    /// 在 config.toml 加一台上游；金鑰從終端機互動輸入（不出現在 shell 歷史），本機或 SSH 通道的上游可以不給
+    Add {
+        /// 顯示名稱（串流前綴的 [host]）
+        name: String,
+        /// 那台的 web 入口，例如 http://100.64.0.5:4801 或 http://127.0.0.1:14801
+        url: String,
+        /// 不問金鑰（那台是 local-open 且走 SSH 通道）
+        #[arg(long)]
+        no_key: bool,
+    },
 }
 
 #[derive(Args)]
@@ -149,7 +174,116 @@ fn main() -> ExitCode {
         Command::Prune => prune(),
         Command::Service(args) => service(args.command),
         Command::Key(args) => key(args.command),
+        Command::Hub(args) => hub(args),
     }
+}
+
+/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
+fn hub(args: HubArgs) -> ExitCode {
+    match hub_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn hub_inner(args: HubArgs) -> Result<(), String> {
+    let cfg = Config::load(&Overrides::default())?;
+    match args.command {
+        Some(HubCommand::Add { name, url, no_key }) => {
+            let key = if no_key {
+                None
+            } else {
+                let k = read_secret(&format!(
+                    "{name} 的金鑰（在那台用 coding-lab key create 建立的 clk_…；本機或 SSH 通道的上游直接按 Enter）："
+                ))?;
+                let k = k.trim().to_string();
+                (!k.is_empty()).then_some(k)
+            };
+            let path = cfg.home.join("config.toml");
+            coding_lab::hub::append_upstream(&path, &name, &url, key.as_deref())?;
+            println!(
+                "已加入 {name}（{url}{}）到 {}；執行 coding-lab hub 開始看",
+                if key.is_some() {
+                    "，有金鑰"
+                } else {
+                    "，不用金鑰"
+                },
+                path.display()
+            );
+            Ok(())
+        }
+        None => {
+            if cfg.hub_upstreams.is_empty() {
+                return Err(format!(
+                    "config.toml 裡沒有 [[hub.upstream]]；先 coding-lab hub add <名稱> <http://主機:4801>（{}）",
+                    cfg.home.join("config.toml").display()
+                ));
+            }
+            let bind: SocketAddr = match args.bind {
+                Some(b) => b
+                    .parse()
+                    .map_err(|_| format!("--bind 不是合法的位址：{b}"))?,
+                None => cfg.hub_bind,
+            };
+            if !bind.ip().is_loopback() {
+                return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("無法建立 runtime：{e}"))?;
+            rt.block_on(async {
+                let (addr, task) =
+                    coding_lab::hub::serve(bind, cfg.hub_upstreams.clone(), cfg.web_root.clone())
+                        .await
+                        .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
+                eprintln!(
+                    "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
+                    cfg.hub_upstreams
+                        .iter()
+                        .map(|u| format!("{} {}", u.name, u.url))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = task => {}
+                }
+                Ok::<(), String>(())
+            })
+        }
+    }
+}
+
+/// 從終端機讀一行機密（unix 用 stty 關回顯；其他平台照常讀，先提醒會顯示）
+fn read_secret(prompt: &str) -> Result<String, String> {
+    let stdin = std::io::stdin();
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let tty = stdin.is_terminal();
+    #[cfg(unix)]
+    let echo_off = tty
+        && std::process::Command::new("stty")
+            .arg("-echo")
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(not(unix))]
+    let echo_off = false;
+    if tty && !echo_off {
+        eprintln!("（輸入會顯示在畫面上）");
+    }
+    let mut line = String::new();
+    let read = stdin.lock().read_line(&mut line);
+    #[cfg(unix)]
+    if echo_off {
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        eprintln!();
+    }
+    read.map_err(|e| format!("讀不到輸入：{e}"))?;
+    Ok(line)
 }
 
 /// `coding-lab service …`（#662）：Plan 由 service.rs 算，這裡只負責環境、印出與執行。

@@ -94,6 +94,10 @@ pub struct Config {
     pub remote_thinking: RemoteThinking,
     /// 公開 IP 又沒有 TLS 時也照綁（使用者自己承擔明文風險）
     pub allow_insecure: bool,
+    /// `coding-lab hub` 的 web 入口（#663）；只能是 loopback（hub 免金鑰）
+    pub hub_bind: SocketAddr,
+    /// `[[hub.upstream]]`：hub 要看的每台 collector
+    pub hub_upstreams: Vec<crate::hub::Upstream>,
 }
 
 #[derive(Default, Deserialize)]
@@ -104,6 +108,15 @@ struct FileConfig {
     web: WebSection,
     #[serde(default)]
     collector: CollectorSection,
+    #[serde(default)]
+    hub: HubSection,
+}
+
+#[derive(Default, Deserialize)]
+struct HubSection {
+    bind: Option<String>,
+    #[serde(default)]
+    upstream: Vec<crate::hub::Upstream>,
 }
 
 #[derive(Default, Deserialize)]
@@ -259,6 +272,28 @@ impl Config {
                  前面有 TLS（Caddy）或接受風險時設 [web].allow_insecure = true"
             ));
         }
+        let hub_bind = addr(
+            pick(
+                &None,
+                "CODING_LAB_HUB_BIND",
+                &f.hub.bind,
+                crate::hub::DEFAULT_HUB_BIND,
+            ),
+            "[hub].bind",
+        )?;
+        if !hub_bind.ip().is_loopback() {
+            return Err(format!(
+                "[hub].bind 只能是本機位址（hub 的 web 免金鑰；要從別台看 hub 請走 SSH 通道），收到 {hub_bind}"
+            ));
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for u in &f.hub.upstream {
+            if names.contains(&u.name.as_str()) {
+                return Err(format!("[[hub.upstream]] 的 name 重複：{}", u.name));
+            }
+            names.push(&u.name);
+            crate::hub::ws_url(&u.url).map_err(|e| format!("[[hub.upstream]] {}：{e}", u.name))?;
+        }
         Ok(Config {
             home,
             hook_bind,
@@ -269,6 +304,8 @@ impl Config {
             auth,
             remote_thinking,
             allow_insecure,
+            hub_bind,
+            hub_upstreams: f.hub.upstream,
         })
     }
 }

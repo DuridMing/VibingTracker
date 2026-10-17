@@ -11,11 +11,12 @@
 3. [安裝 plugin](#安裝-plugin)
 4. [確認有在追蹤](#確認有在追蹤)
 5. [讓 collector 常駐（伺服器重開機後自己起來）](#讓-collector-常駐伺服器重開機後自己起來)
-6. [同一台機器上有好幾個專案](#同一台機器上有好幾個專案)
-7. [看過去的 session（回放）](#看過去的-session回放)
-8. [更新](#更新)
-9. [疑難排解](#疑難排解)
-10. [卸載](#卸載)
+6. [一次看多台伺服器（hub）](#一次看多台伺服器hub)
+7. [同一台機器上有好幾個專案](#同一台機器上有好幾個專案)
+8. [看過去的 session（回放）](#看過去的-session回放)
+9. [更新](#更新)
+10. [疑難排解](#疑難排解)
+11. [卸載](#卸載)
 
 ## 需要的東西
 
@@ -137,6 +138,24 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 - 更新執行檔時先 `service uninstall` 或停掉服務再覆蓋，覆蓋完再 `service install`（Windows 不能覆蓋執行中的 .exe）。
 
 https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801，或走 tailnet、SSH 通道（見上一節）。
+
+## 一次看多台伺服器（hub）
+
+幾台伺服器各自跑 Claude Code 與 collector，想在自己的電腦上一頁看完：每台照上一節設成常駐、給本機一把金鑰（tailnet）或開 SSH 通道，然後在本機：
+
+```bash
+~/.coding-lab/bin/coding-lab hub add build-01 http://100.64.0.5:4801   # 問金鑰：貼上在 build-01 上 key create 印出的 clk_…
+~/.coding-lab/bin/coding-lab hub add build-02 http://127.0.0.1:14801 --no-key   # 走 SSH 通道的那台不用金鑰
+~/.coding-lab/bin/coding-lab hub
+```
+
+打開 <http://127.0.0.1:4802>：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
+
+- 某台斷線（網路斷、重開機）：它的 session 標「離線」、分頁變淡，其他台照常；hub 每 1～30 秒重連，連回來會整頁重載那台的內容。
+- 「載入更多」、thinking 點開、檔案樹、分支視窗、回放、「已確認」都由 hub 轉給對應的那台；那台給 hub 的金鑰是 `view` 時按「已確認」會提示要 `operate` 金鑰。
+- hub 自己不存資料、只綁本機、不需要金鑰；要從別台看 hub，請對 hub 這台開 SSH 通道。
+- 上游寫在 `~/.coding-lab/config.toml`（`[[hub.upstream]]`，含金鑰，檔案權限 600）；改埠用 `[hub] bind = "127.0.0.1:4802"` 或 `coding-lab hub --bind …`。上游網址只接受 `http://`：遠端一律走 tailnet（WireGuard 加密）或 SSH 通道。
+- `curl 127.0.0.1:4802/healthz` 看每台連上了沒。
 
 ## 同一台機器上有好幾個專案
 
