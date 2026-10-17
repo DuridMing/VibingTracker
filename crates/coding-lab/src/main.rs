@@ -307,6 +307,9 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
         )
     })?;
     let ctx = service::Ctx::detect(&cfg.home)?;
+    // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）
+    let _ = std::fs::create_dir_all(&cfg.home);
+    let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
     let describe = |plan: &service::Plan| {
         for (p, _) in &plan.files {
             println!("寫入 {}", p.display());
@@ -386,16 +389,21 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
             if dry_run {
                 return Ok(());
             }
+            let registered =
+                service::query_installed(platform, &ctx, &mut service::run_command_capture_quiet);
             if !service::installed(platform, &ctx) {
                 println!(
                     "沒有裝過常駐服務（{}）",
                     service::files_for(platform, &ctx)[0].display()
                 );
             }
-            // 停掉／取消註冊失敗（例如早就被手動移除）不該擋住刪檔：指令錯誤只印出來
+            // 停掉／取消註冊失敗（例如早就被手動移除）不該擋住刪檔：有登記才把失敗印出來，沒登記時停掉／刪除
+            // 本來就會失敗，安靜略過（#724）
             let mut warn = Vec::new();
             service::apply(&plan, &mut |c| {
-                if let Err(e) = service::run_command(c) {
+                if let Err(e) = service::run_command_capture_quiet(c)
+                    && registered
+                {
                     warn.push(format!("{} 失敗：{e}", c.join(" ")));
                 }
                 Ok(())
@@ -412,7 +420,7 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
             let files = service::files_for(platform, &ctx);
             // 以系統的登記為準（#719）：install 失敗後 unit／XML 檔可能還在
             let registered =
-                service::query_installed(platform, &ctx, &mut service::run_command_capture);
+                service::query_installed(platform, &ctx, &mut service::run_command_capture_quiet);
             let file = service::installed(platform, &ctx);
             println!(
                 "常駐服務：{}（{}：{}）",

@@ -316,3 +316,59 @@ fn non_utf8_command_output_is_flagged_instead_of_shown_as_garbage() {
     assert!(lossy);
     assert!(!text.is_empty());
 }
+
+/// #724：Windows 的 schtasks 用 OEM code page 輸出，要解成可讀文字（實機拿到的 cp950 位元組）
+#[test]
+fn oem_code_page_bytes_decode_to_readable_text() {
+    // 「錯誤: 存取被拒。\r\n」的 cp950 位元組（#715 Windows 側實機紀錄）
+    let denied = [
+        0xbf, 0xf9, 0xbb, 0x7e, 0x3a, 0x20, 0xa6, 0x73, 0xa8, 0xfa, 0xb3, 0x51, 0xa9, 0xda, 0xa1,
+        0x43, 0x0d, 0x0a,
+    ];
+    assert_eq!(
+        service::decode_with_code_page(&denied, 950).as_deref(),
+        Some("錯誤: 存取被拒。")
+    );
+    // 「錯誤: 系統找不到指定的檔案。」
+    let not_found = [
+        0xbf, 0xf9, 0xbb, 0x7e, 0x3a, 0x20, 0xa8, 0x74, 0xb2, 0xce, 0xa7, 0xe4, 0xa4, 0xa3, 0xa8,
+        0xec, 0xab, 0xfc, 0xa9, 0x77, 0xaa, 0xba, 0xc0, 0xc9, 0xae, 0xd7, 0xa1, 0x43, 0x0d, 0x0a,
+    ];
+    assert_eq!(
+        service::decode_with_code_page(&not_found, 950).as_deref(),
+        Some("錯誤: 系統找不到指定的檔案。")
+    );
+    assert_eq!(service::code_page_label(936), Some("gbk"));
+    assert_eq!(service::code_page_label(1252), Some("windows-1252"));
+    assert_eq!(service::code_page_label(12345), None);
+    assert!(service::decode_with_code_page(&denied, 12345).is_none());
+    // UTF-8 照舊直接用
+    assert_eq!(
+        service::decode_output("ok\n".as_bytes()),
+        ("ok".to_string(), false)
+    );
+}
+
+/// #724：查詢「沒裝」是預期結果，quiet 版不寫 log 也不印十六進位，但錯誤訊息照樣帶回
+#[cfg(unix)]
+#[test]
+fn quiet_capture_returns_the_error_text_without_decorating_it() {
+    let cmd: Vec<String> = ["sh", "-c", "echo not-installed >&2; exit 1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let err = service::run_command_capture_quiet(&cmd).unwrap_err();
+    assert_eq!(err, "not-installed");
+    let ok: Vec<String> = ["sh", "-c", "echo enabled"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(service::run_command_capture_quiet(&ok).unwrap(), "enabled");
+    // query_installed 用 quiet 版：查不到就是 false，不會 panic
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    assert!(!service::query_installed(
+        Platform::Linux,
+        &c,
+        &mut |_| Err("not found".into())
+    ));
+}

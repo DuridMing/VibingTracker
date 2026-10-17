@@ -11,7 +11,7 @@ const OVERSCAN = 30;
 // projectTag：全部專案時每行的專案色標（#669），不給就沒有
 // onExpand(row)：一行被展開時呼叫（遠端未載入的思考在這時去載，#668）
 // hostTag：hub 時每行的 [host]（#663），不給就沒有
-// thinkingMode()：這條連線的 welcome.thinking，給 formatRow 決定佔位文案（#721）
+// thinkingMode(row)：這一列所屬 collector 對遠端的 thinking 模式（hub 時每台不同，#724），給 formatRow 決定佔位文案（#721）
 export function createStreamView({ scroller, model, agentName, projectTag = null, hostTag = null, onNeedMore, onFollow, onExpand = null, thinkingMode = null, prof = null }) {
   const T = () => (prof ? performance.now() : 0);
   const more = document.createElement("button");
@@ -102,7 +102,7 @@ export function createStreamView({ scroller, model, agentName, projectTag = null
 
   function paint(nd) {
     const r = nd.row;
-    const f = formatRow(r, { agentName, projectTag, hostTag, thinkingMode: thinkingMode?.() ?? null });
+    const f = formatRow(r, { agentName, projectTag, hostTag, thinkingMode: thinkingMode?.(r) ?? null });
     nd.el.className = f.cls;
     nd.el.dataset.key = r.key;
     if (f.detail != null) {

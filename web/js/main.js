@@ -1347,6 +1347,9 @@ $("#tree").addEventListener("scroll", () => {
 // ---------- 單 session 畫面（#649）：tab 切到某個 session 時取代全部串流那一塊 ----------
 // 資料只來自 `session:<id>` 頻道（session-pane.js）；NOW 與 lanes 用 collector 的 agents 列，跟 Agents 面板同一份。
 const pane = createSessionPane();
+// 這個 session 那台 collector 對遠端的 thinking 模式：hub 會在 sessions 列帶 thinking（#724），直連時用 welcome 的
+const thinkingModeOf = (sessionId) => store.sessions.get(sessionId)?.thinking ?? ui.welcome?.thinking ?? null;
+pane.thinkingMode = thinkingModeOf;
 let paneMoreReq = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
 const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
@@ -1571,7 +1574,7 @@ const benchProf = new URLSearchParams(location.search).has("bench") ? [] : null;
 async function loadThinking(row, v) {
   if (row.type !== "thinking" || !row.deferred || row.loading) return;
   const repaint = () => { row.h = 0; row.v++; v.update({ updated: new Set([row.key]) }); };
-  if (ui.welcome?.thinking === "hide") {
+  if (thinkingModeOf(row.session) === "hide") {
     row.loadError = "這個 collector 不對遠端提供思考內容（remote_thinking = hide）";
     repaint();
     return;
@@ -1600,7 +1603,7 @@ const view = createStreamView({
   agentName,
   projectTag,
   hostTag,
-  thinkingMode: () => ui.welcome?.thinking ?? null,
+  thinkingMode: (row) => thinkingModeOf(row.session),
   onExpand: (row) => loadThinking(row, view),
   onNeedMore: requestMore,
   onFollow: (on) => {
@@ -1613,7 +1616,7 @@ const paneView = createStreamView({
   scroller: $("#spStream"),
   model: pane.stream,
   agentName,
-  thinkingMode: () => ui.welcome?.thinking ?? null,
+  thinkingMode: (row) => thinkingModeOf(row.session),
   onExpand: (row) => loadThinking(row, paneView),
   onNeedMore: paneMore,
   onFollow: (on) => {
@@ -1753,7 +1756,7 @@ function benchFrame(m) {
 // ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
 const rp = createReplay();
 let rpReq = 0; // 換範圍後，舊的回應丟掉
-const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, thinkingMode: () => ui.welcome?.thinking ?? null, onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
+const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, thinkingMode: (row) => thinkingModeOf(row.session), onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
 const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
 function fillReplayProjects() {

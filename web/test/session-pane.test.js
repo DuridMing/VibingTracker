@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay, snapshotLoad } from "../js/session-pane.js";
+import { thinkingText, createSessionPane, nowOf, switchTab, sessionTitle, needsReplay, snapshotLoad } from "../js/session-pane.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 let seq = 0;
@@ -228,4 +228,15 @@ test("按 ▶ 回放（#690）：snapshot 已有串流也不用它，清空後�
   assert.deepEqual(snapshotLoad(S, m), { load: { staged: m.staged, stream: m.stream }, replay: false });
   const gone = { staged: [], stream: [] };
   assert.deepEqual(snapshotLoad(S, gone), { load: { staged: [], stream: [] }, replay: true });
+});
+
+test("思考條的佔位文案依模式：hide 寫不提供、0 字只寫（思考）、on_demand 寫未載入（#724）", () => {
+  assert.equal(thinkingText({ text: "原文" }), "原文");
+  assert.equal(thinkingText({ deferred: true, chars: 227, text: "" }, "on_demand"), "（思考 227 字，遠端未載入；在串流裡點開那一行可載入）");
+  assert.equal(thinkingText({ deferred: true, chars: 227, text: "" }, "hide"), "（思考 227 字，這個 collector 不對遠端提供）");
+  assert.equal(thinkingText({ deferred: true, chars: 0, text: "" }, "hide"), "（思考）");
+  const p = createSessionPane("s1");
+  p.thinkingMode = () => "hide";
+  p.load({ staged: [], stream: [{ type: "assistant.thinking", session: "s1", agent: "main", pos: 1, seq: 1, payload: { deferred: true, chars: 9, text: "" } }] });
+  assert.equal(p.thinking.text, "（思考 9 字，這個 collector 不對遠端提供）");
 });

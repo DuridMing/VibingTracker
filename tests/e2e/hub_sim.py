@@ -100,6 +100,13 @@ class Collector:
     def resume(self):
         self.proc.send_signal(signal.SIGCONT)
 
+    def reset_home(self):
+        """換一個全新的資料目錄（埠不變）：模擬上游那台重灌、session 全部不同"""
+        cfg = (self.home / "config.toml").read_text()
+        subprocess.run(["rm", "-rf", str(self.home)], check=True)
+        self.home.mkdir(parents=True)
+        (self.home / "config.toml").write_text(cfg)
+
     def kill(self):
         self.proc.send_signal(signal.SIGKILL)
         self.proc.wait(timeout=10)
@@ -142,6 +149,8 @@ class HubListener:
     def __init__(self, port, utc_offset_min=None):
         self.ws = WS(port)
         self.msgs = []
+        # 模擬前端 store.js 的 sessions 彙總列：snapshot 整批取代、frame 依 id upsert、deleted 移除（#723）
+        self.store = {}
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.ws.s.settimeout(1)
@@ -162,6 +171,23 @@ class HubListener:
                 break
             with self.lock:
                 self.msgs.append(m)
+                self._apply(m)
+
+    def _apply(self, m):
+        if m.get("t") == "snapshot" and m.get("ch") == "*":
+            self.store = {r["id"]: dict(r) for r in m.get("sessions") or [] if isinstance(r, dict) and r.get("id")}
+        elif m.get("t") == "frame" and m.get("ch") == "*":
+            for r in (m.get("rows") or {}).get("sessions") or []:
+                if not isinstance(r, dict) or not r.get("id"):
+                    continue
+                if r.get("deleted") is True:
+                    self.store.pop(r["id"], None)
+                else:
+                    self.store.setdefault(r["id"], {}).update(r)
+
+    def offline_ids(self):
+        with self.lock:
+            return sorted(k for k, v in self.store.items() if v.get("offline") is True)
 
     def take(self):
         with self.lock:
@@ -322,6 +348,26 @@ def main():
         time.sleep(0.5)
         rows = listener.session_rows(listener.take())
         check(sid_b in rows and not rows[sid_b].get("offline"), "重連後 beta 的列不再 offline")
+
+        check(not listener.offline_ids(), f"重連後前端 store 裡沒有任何 offline 列：{listener.offline_ids()}")
+
+        # #723：上游在離線期間換了一批 session（kill 後用全新的資料目錄重開），重連後舊的列不能留著標離線
+        old_ids = set(listener.store)
+        beta.kill()
+        wait_until(lambda: not [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 30, "beta kill 後標 offline")
+        time.sleep(0.5)
+        check(listener.offline_ids(), f"beta 掛掉：store 裡 beta 的列標 offline：{listener.offline_ids()}")
+        beta.reset_home()
+        beta.start()
+        wait_until(lambda: [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "全新 beta 回到 online")
+        time.sleep(1.0)
+        sid_b2 = str(uuid.uuid4())
+        pre, post = tool_pair(sid_b2, cwd_b, "echo beta-fresh")
+        assert post_hook(beta.hook_port, pre) == 200 and post_hook(beta.hook_port, post) == 200
+        time.sleep(1.0)
+        check(sid_b2 in listener.store, "全新 beta 的新 session 進了 store")
+        check(sid_b not in listener.store, f"不在新 snapshot 的舊 session（{sid_b[:8]}）要從 store 消失")
+        check(not listener.offline_ids(), f"重連後沒有任何列還標 offline：{listener.offline_ids()}")
 
         # 時區（#718）：帶 +480 與不帶 offset 的客戶端輪流連，上游不該重連
         before = {u["name"]: u.get("connects") for u in http_get(hub_port, "/healthz")[1]["upstreams"]}

@@ -304,11 +304,21 @@ fn session_channel_messages_are_forwarded_to_that_sessions_subscribers_only() {
 #[test]
 fn offline_upstream_marks_its_sessions_and_a_view_key_cannot_ack() {
     let mut h = Hub::new(vec!["a".into(), "b".into()]);
-    h.on_welcome("a", &json!({"t": "welcome", "scope": "view"}));
-    h.on_welcome("b", &json!({"t": "welcome", "scope": "operate"}));
-    h.on_message(
+    h.on_welcome(
+        "a",
+        &json!({"t": "welcome", "scope": "view", "thinking": "hide"}),
+    );
+    h.on_welcome(
+        "b",
+        &json!({"t": "welcome", "scope": "operate", "thinking": "on_demand"}),
+    );
+    let first = h.on_message(
         "a",
         &snapshot_of(&[("s1", "/a"), ("s3", "/a")], vec![], json!({"live": 2})),
+    );
+    assert!(
+        matches!(first.as_slice(), [Out::Resnapshot]),
+        "第一次連上沒有消失的列，只重送 snapshot：{first:?}"
     );
     h.on_message(
         "b",
@@ -327,6 +337,23 @@ fn offline_upstream_marks_its_sessions_and_a_view_key_cannot_ack() {
             .all(|r| r["offline"] == true && r["host"] == "a")
     );
     assert_eq!(f["rows"]["kpi"]["live"], 1, "離線那台的 KPI 不再加總");
+    // #724：每台上游的 remote_thinking 隨 sessions 列帶給前端，前端才知道 hide 的上游點不開
+    let snap0 = h.snapshot_all();
+    let th = |snap: &Value, id: &str| {
+        snap["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .map(|s| s["thinking"].clone())
+            .unwrap_or(Value::Null)
+    };
+    assert_eq!(
+        th(&snap0, "s1"),
+        "hide",
+        "a 的 session 帶 a 的 thinking 模式"
+    );
+    assert_eq!(th(&snap0, "s2"), "on_demand");
     assert_eq!(
         h.online(),
         vec![("a".to_string(), false), ("b".to_string(), true)]
@@ -342,11 +369,20 @@ fn offline_upstream_marks_its_sessions_and_a_view_key_cannot_ack() {
         s1["offline"], true,
         "離線期間 snapshot 仍列出它的 session、標離線"
     );
-    // 重連後的 snapshot 把 offline 拿掉
-    h.on_message(
+    // 重連後的 snapshot 把 offline 拿掉；不在新 snapshot 裡的 s3 要明確送 deleted（已開著的客戶端才會清掉，#723），
+    // 然後才重送合併的 snapshot
+    let outs = h.on_message(
         "a",
         &snapshot_of(&[("s1", "/a")], vec![], json!({"live": 1})),
     );
+    let [Out::All(gone), Out::Resnapshot] = outs.as_slice() else {
+        panic!("重連的 snapshot 要先送消失的列再 Resnapshot：{outs:?}")
+    };
+    let rows = gone["rows"]["sessions"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["id"], "s3");
+    assert_eq!(rows[0]["host"], "a");
+    assert_eq!(rows[0]["deleted"], true);
     let snap = h.snapshot_all();
     let s1 = snap["sessions"]
         .as_array()

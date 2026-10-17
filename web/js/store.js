@@ -12,6 +12,8 @@ function upsert(map, rows) {
   for (const row of rows) {
     if (row == null || row.id == null) continue;
     if (row.deleted === true) map.delete(row.id);
+    // hub 標離線的列只會帶 id／host／offline（#663）：沒看過的 id 不能因此變成一列空的 session（#723）
+    else if (row.offline === true && !map.has(row.id)) continue;
     else map.set(row.id, { ...map.get(row.id), ...row });
   }
 }
