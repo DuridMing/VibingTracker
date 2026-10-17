@@ -3,6 +3,7 @@
 
 import { sessionColor, shortId } from "./color.js";
 import { kindOf } from "./stream.js";
+import { agentWho } from "./agents.js";
 
 export function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -11,11 +12,6 @@ export function esc(s) {
 const firstLine = (s) => String(s ?? "").split("\n", 1)[0];
 const LONG = 160; // 超過這個長度就可以展開看全文
 
-function agentLabel(row, agentName) {
-  if (row.agent === "main") return "main";
-  if (row.agent === "bg") return "背景";
-  return agentName?.(row.session, row.agent) ?? shortId(row.agent);
-}
 
 function duration(ms) {
   if (ms == null) return "";
@@ -159,7 +155,7 @@ export function formatRow(row, { agentName } = {}) {
   if (detail != null) cls.push("can-open");
   if (row.expanded) cls.push("open");
 
-  const prefix = `<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentLabel(row, agentName))}]</span>`;
+  const prefix = `<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
   const tagHtml = tags.map((t) => ` <span class="tag">${esc(t)}</span>`).join("");
   return { cls: cls.join(" "), html: `${prefix}${body}${tagHtml}`, detail };
 }

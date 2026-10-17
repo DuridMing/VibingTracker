@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { agentView } from "../js/agents.js";
+import { agentView, agentWho } from "../js/agents.js";
 import { createStore, applySnapshot, applyFrame } from "../js/store.js";
 
 const S = "s1";
@@ -67,4 +67,13 @@ test("剛完成的 subagent 先留在標籤列 5 秒（recent），之後才收�
   const noClock = agentView(rows, S);
   assert.deepEqual(noClock.recent, []);
   assert.equal(noClock.done.length, 2);
+});
+
+test("agentWho：main、背景固定名稱；subagent 用 agentName，查不到時用 id 前 8 碼", () => {
+  const names = (session, id) => (session === S && id === "a1" ? "查呼叫點" : null);
+  assert.equal(agentWho(S, "main", names), "main");
+  assert.equal(agentWho(S, "bg", names), "背景");
+  assert.equal(agentWho(S, "a1", names), "查呼叫點");
+  assert.equal(agentWho(S, "abcdef0123456789", names), "abcdef01");
+  assert.equal(agentWho(S, "abcdef0123456789"), "abcdef01");
 });

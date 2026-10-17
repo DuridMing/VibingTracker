@@ -1,12 +1,21 @@
 // 一個 session 的 agents 整理成畫面要的樣子（contracts.md §6 `agents`）。
 // Agents 面板現在用，P4 單 session 畫面的 lanes 也用同一份，狀態只有 store 裡的 rows。
 
+import { shortId } from "./color.js";
+
 const oneLine = (s) => (typeof s === "string" ? s.replace(/\s+/g, " ").trim() : "");
 
 export function agentLabel(a) {
   if (a.agentId === "main") return "main";
   if (a.agentId === "bg") return "背景";
   return oneLine(a.name) || oneLine(a.agentType) || String(a.agentId).slice(0, 8);
+}
+
+// 只有 agent id 時（串流前綴、改動紀錄、單 session 畫面）的名稱；agentName 查 store 的 agents 列（用 agentLabel）
+export function agentWho(session, agentId, agentName) {
+  if (agentId === "main") return "main";
+  if (agentId === "bg") return "背景";
+  return agentName?.(session, agentId) ?? shortId(agentId);
 }
 
 export const LINGER_MS = 5000;

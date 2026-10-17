@@ -3,7 +3,7 @@
 // NOW 與 lanes 用 collector 算好的 agents 列（agents.js），與 Agents 面板同一份狀態。
 
 import { createStream } from "./stream.js";
-import { createChanges } from "./changes.js";
+import { createChanges, countHunk } from "./changes.js";
 
 export function createSessionPane(session = null) {
   const p = {
@@ -24,12 +24,7 @@ export function createSessionPane(session = null) {
     if (seen.has(key)) return;
     seen.add(key);
     const pl = e.payload ?? {};
-    let added = 0;
-    let removed = 0;
-    for (const l of pl.hunk?.lines ?? []) {
-      if (l.startsWith("+")) added++;
-      else if (l.startsWith("-")) removed++;
-    }
+    const { added, removed } = countHunk(pl.hunk?.lines);
     touches.push({ path: pl.path ?? "", edit: e.type === "file.edit", isNew: e.type === "file.write" && !!pl.isNew, added, removed, agent: e.agent, ts: e.ts_seen, seq: e.seq, toolUseId: pl.toolUseId ?? null });
   }
 

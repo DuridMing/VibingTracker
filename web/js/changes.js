@@ -6,17 +6,22 @@
 
 export const CAP = 60;
 
+// hunk 的 +／− 行數；串流卡片、改動紀錄、單 session 的檔案清單共用
+export function countHunk(lines) {
+  let added = 0;
+  let removed = 0;
+  for (const l of lines ?? []) {
+    if (l.startsWith("+")) added++;
+    else if (l.startsWith("-")) removed++;
+  }
+  return { added, removed };
+}
+
 function entryOf(ev) {
   const p = ev.payload ?? {};
   const base = { key: `${ev.session}:${ev.seq}`, session: ev.session, agent: ev.agent, ts: ev.ts_seen, toolUseId: p.toolUseId, path: p.path ?? "" };
   if (ev.type === "file.edit") {
-    let added = 0;
-    let removed = 0;
-    for (const l of p.hunk?.lines ?? []) {
-      if (l.startsWith("+")) added++;
-      else if (l.startsWith("-")) removed++;
-    }
-    return { ...base, kind: "edit", hunk: p.hunk ?? null, hunkSource: p.hunkSource ?? "none", added, removed };
+    return { ...base, kind: "edit", hunk: p.hunk ?? null, hunkSource: p.hunkSource ?? "none", ...countHunk(p.hunk?.lines) };
   }
   if (ev.type === "file.write") {
     return { ...base, kind: "write", isNew: !!p.isNew, content: p.content ?? "", truncated: !!p.truncated };

@@ -4,6 +4,8 @@
 // - 超過上限從最舊的丟；往上「載入更多」時暫時保留（holding），回到底部再 trim。
 // - 篩選只影響可見性，不改順序。
 
+import { countHunk } from "./changes.js";
+
 export const CAP = 3000;
 
 // 串流裡的狀態行：prompt 與 session.status（run 不出現，避免太吵；idle＝使用者按 Esc 中斷，只標示、不通知）
@@ -32,15 +34,6 @@ function compareRows(a, b) {
   return a.ts - b.ts || (a.session < b.session ? -1 : a.session > b.session ? 1 : 0) || (a.pos ?? -1) - (b.pos ?? -1) || a.seq - b.seq;
 }
 
-function countHunk(lines) {
-  let added = 0;
-  let removed = 0;
-  for (const l of lines ?? []) {
-    if (l.startsWith("+")) added++;
-    else if (l.startsWith("-")) removed++;
-  }
-  return { added, removed };
-}
 
 export function createStream({ cap = CAP } = {}) {
   const st = {

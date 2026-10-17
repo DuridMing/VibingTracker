@@ -9,7 +9,7 @@ import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
-import { agentView, agentLabel } from "./agents.js";
+import { agentView, agentLabel, agentWho } from "./agents.js";
 import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
@@ -965,7 +965,7 @@ function renderPane() {
     $("#spCwd").textContent = s?.cwd ?? "—";
     $("#spCommits").textContent = String(Math.max(s?.commits ?? 0, g.commits.length)); // collector 的計數為準，看到的 commit 比它多時不倒退
     $("#spLast").textContent = g.last
-      ? `最後 ${String(g.last.hash ?? "").slice(0, 7)} ${g.last.message ?? ""}（${g.last.agent === "main" ? "main" : agentName(id, g.last.agent) ?? shortId(g.last.agent)}）`
+      ? `最後 ${String(g.last.hash ?? "").slice(0, 7)} ${g.last.message ?? ""}（${agentWho(id, g.last.agent, agentName)}）`
       : s?.commits ? "commit 在目前載入的範圍之前" : "尚無 commit";
     $("#spLast").classList.toggle("pick", !!g.last?.hash);
     $("#spLast").title = g.last?.hash ? "點一下：左欄的改動改成相對這個 commit" : "";
@@ -986,7 +986,7 @@ function renderPane() {
     if (th) {
       $("#spThinkText").textContent = th.text.replace(/\s+/g, " ");
       $("#spThinkText").title = th.text;
-      $("#spThinkTag").textContent = `${th.agent === "main" ? "main" : agentName(id, th.agent) ?? shortId(th.agent)}${th.summarized ? " · 摘要" : ""}`;
+      $("#spThinkTag").textContent = `${agentWho(id, th.agent, agentName)}${th.summarized ? " · 摘要" : ""}`;
     }
   }
   renderPaneDanger(id);
@@ -1026,7 +1026,7 @@ function renderPaneFiles(id) {
   if (ch.following && files.length) ch.selectedKey = `${id}:${files[0].lastSeq}`;
   const sel = ch.selected();
   if (!changed("spFiles", `${id}|${sel?.key ?? ""}|` + files.map((f) => `${f.path}:${f.edits}:${f.writes}:${f.running}:${f.lastSeq}`).join(","))) return;
-  const who = (a) => (a === "main" ? "main" : a === "bg" ? "背景" : agentName(id, a) ?? shortId(a));
+  const who = (a) => agentWho(id, a, agentName);
   $("#spFilesN").textContent = files.length ? `${files.length} 個檔案${files.some((f) => f.running) ? "，正在改的在最上面" : ""}` : "這個 session 碰過的檔案";
   $("#spFiles").replaceChildren(...(files.length ? files.map((f) => h("button", {
     class: `${f.running ? "run" : ""}${sel?.path === f.path ? " sel" : ""}`, title: `${f.path}\n${f.agents.map(who).join("、")}`,
@@ -1070,7 +1070,7 @@ function renderChanges() {
         h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
         h("span", { class: "pth" }, c.path),
         n,
-        h("span", { class: "ag" }, c.agent === "main" ? "main" : c.agent === "bg" ? "背景" : agentName(c.session, c.agent) ?? shortId(c.agent)));
+        h("span", { class: "ag" }, agentWho(c.session, c.agent, agentName)));
     }),
   );
 }
@@ -1082,7 +1082,7 @@ function renderDiff() {
   $("#gfb").hidden = !c;
   $("#gfbNone").hidden = !!c;
   if (!c) return;
-  const who = `${shortId(c.session)} · ${c.agent === "main" ? "main" : c.agent === "bg" ? "背景" : agentName(c.session, c.agent) ?? shortId(c.agent)}`;
+  const who = `${shortId(c.session)} · ${agentWho(c.session, c.agent, agentName)}`;
   $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
   $("#fbPath").textContent = c.path;
   $("#fbPath").title = c.path;

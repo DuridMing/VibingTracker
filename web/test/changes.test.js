@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createChanges, diffRows, writeRows } from "../js/changes.js";
+import { createChanges, diffRows, writeRows, countHunk } from "../js/changes.js";
 
 // file.edit／file.write Event 照 contracts.md §4
 const A = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -109,4 +109,10 @@ test("被拒或失敗的 Edit／Write 從改動紀錄拿掉；失敗先到的也
   const w = write(B, "c.ts");
   ch.load([failed(B, w.payload.toolUseId), w, e2]);
   assert.deepEqual(paths(ch), ["b.ts"]);
+});
+
+test("countHunk：只數 +／- 開頭的行，context 與空 hunk 不算（串流、改動紀錄、單 session 共用）", () => {
+  assert.deepEqual(countHunk([" a", "-b", "+c", "+d"]), { added: 2, removed: 1 });
+  assert.deepEqual(countHunk([]), { added: 0, removed: 0 });
+  assert.deepEqual(countHunk(undefined), { added: 0, removed: 0 });
 });
