@@ -166,4 +166,5 @@ class Setup(unittest.TestCase):
         L = self.L
         L.setup()
         conf = (L.HOME / "config.toml").read_text(encoding="utf-8")
-        self.assertIn(f'root = "{L.ROOT / "web"}"', conf)
+        # 路徑一律寫成 /（#714）：Windows 的反斜線在 TOML 雙引號字串裡是不合法跳脫
+        self.assertIn(f'root = "{(L.ROOT / "web").as_posix()}"', conf)
