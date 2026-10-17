@@ -476,6 +476,23 @@ async fn static_files_and_healthz() {
     );
 }
 
+/// #716：`sessions` 是 live 裡所有 session（含 2 小時內結束的），另給 `open`＝還沒結束的，免得看數字以為還有 session 開著。
+#[tokio::test]
+async fn healthz_counts_open_sessions_separately() {
+    let state = WebState::new(None, None, 8);
+    state.apply(&[
+        text("s1", 1, 1),
+        text("s2", 1, 1),
+        ev("s2", 2, "session.ended", None, json!({"reason": "exit"})),
+    ]);
+    state.flush(2_000);
+    let addr = start(state).await;
+    let health = http_get(addr, "/healthz").await;
+    let body: Value = serde_json::from_str(health.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap();
+    assert_eq!(body["sessions"], 2, "{body}");
+    assert_eq!(body["open"], 1, "{body}");
+}
+
 /// 綁定位址能不能用由 config 把關（tests/config.rs）；serve_web 本身不再拒絕非 loopback（#667）。
 #[tokio::test]
 async fn non_loopback_bind_is_allowed_by_serve_web() {

@@ -216,7 +216,7 @@ coding-lab hub                                           # 本機開 http://127.
 | --- | --- |
 | `coding-lab serve` | 前景執行 collector（hook 入口 4800、網頁 4801）；平常由 `ensure` 在背景拉起，不必手動執行 |
 | `coding-lab ensure` | 沒在跑就拉起 collector，並轉送 stdin 的 SessionStart；由 plugin 的 `SessionStart` hook 呼叫，失敗也 exit 0 |
-| `coding-lab healthz` | 查詢執行中 collector 的版本、session 數與事件迴圈延遲 |
+| `coding-lab healthz` | 查詢執行中 collector 的版本、session 數（`open` 是還開著的，`sessions` 含 2 小時內結束的）與事件迴圈延遲 |
 | `coding-lab config` | 印出合併後的設定 |
 | `coding-lab prune` | 立刻清掉 30 天前的資料（collector 在跑時不動資料，它自己每天會清） |
 | `coding-lab stop` | 請背景的 collector 正常結束（寫完紀錄才回來） |

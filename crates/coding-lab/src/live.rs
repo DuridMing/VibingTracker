@@ -396,6 +396,14 @@ impl Live {
         self.sessions.len()
     }
 
+    /// 還沒結束的 session 數（/healthz 的 `open`，#716）；`session_count` 含 2 小時內結束的。
+    pub fn open_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| s.status != "ended")
+            .count()
+    }
+
     /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
     pub fn kpi_computations(&self) -> u64 {
         self.kpi_computes

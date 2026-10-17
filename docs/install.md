@@ -95,7 +95,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 ~/.coding-lab/bin/coding-lab healthz
 ```
 
-會印出版本、`sessions`（正在追蹤幾個 session）等資訊。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
+會印出版本、`open`（還開著的 session 數）、`sessions`（記憶體裡的 session 數，含 2 小時內結束的）等資訊。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
 
 collector 不用自己啟動：每個 session 開始時，plugin 會在它沒在跑時把它拉起來；所有 session 都結束、再閒置 10 分鐘後它會自己退出。
 

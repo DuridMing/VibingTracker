@@ -847,7 +847,8 @@ async fn healthz(State(state): State<Arc<WebState>>) -> Response {
         let live = state.live();
         json!({
             "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL,
-            "sessions": live.session_count(), "frame": live.frame_no(),
+            "sessions": live.session_count(), "open": live.open_session_count(),
+            "frame": live.frame_no(),
         })
     };
     let extra = state
