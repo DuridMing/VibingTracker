@@ -120,8 +120,11 @@ Windows 上另外兩種情況也會看到這些提示：`SessionStart` 超過 5 
 bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，只能是 127.0.0.1；plugin 的 hook 固定送到 4800，改埠只適合測試
 
 [web]
-bind = "127.0.0.1:4801"   # 金鑰驗證做好之前只能綁 127.0.0.1；從別台看請用 SSH 通道（見下方）
+bind = "127.0.0.1:4801"   # 從別台看：改成 tailnet IP（100.x.x.x）並用金鑰登入，或維持 127.0.0.1 走 SSH 通道（見下方）
 root = "/path/to/VibingTracker/web"   # 網頁位置；不設時用二進位旁邊的 web/
+auth = "local-open"       # local-open：127.0.0.1 連進來免金鑰（含 SSH 通道）；always：連本機也要金鑰（多人共用的伺服器）
+remote_thinking = "on_demand"   # 遠端連線的 thinking：on_demand 點開才載入（預設）| hide | show；本機永遠完整
+# allow_insecure = true   # bind 是公開 IP 又沒有 TLS 時才需要（明文 http 會被竊聽；建議前面放 Caddy）
 
 [collector]
 idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出；0＝不退出
@@ -130,7 +133,7 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 | 環境變數 | 對應 |
 | --- | --- |
 | `CODING_LAB_HOME` | 資料目錄（預設 `~/.coding-lab`） |
-| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS` | 同上表的設定 |
+| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS`、`CODING_LAB_WEB_AUTH`、`CODING_LAB_REMOTE_THINKING`、`CODING_LAB_ALLOW_INSECURE` | 同上表的設定 |
 | `CODING_LAB_BIN` | wrapper 要用的二進位（優先於 `~/.coding-lab/bin`） |
 | `CODING_LAB_RELEASE_URL` | wrapper 自動下載的來源（見「從 Release 自動下載」） |
 
@@ -162,15 +165,30 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 
 ### 從本機看伺服器上的 session
 
-在伺服器上開發、從自己的電腦看，目前用 SSH 通道：
+在伺服器上開發、從自己的電腦看，有兩種連法。
+
+**SSH 通道**（不用改設定）：
 
 ```bash
 ssh -N -L 4801:127.0.0.1:4801 <server>
 ```
 
-然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要另外開防火牆。
+然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要防火牆也不需要金鑰（通道進來的連線就是本機）。
 
-規劃中（P6）：用金鑰登入的 tailnet 直連、遠端的 thinking 點開才載入、一次看多台伺服器的 `coding-lab hub`。
+**tailnet 直連**（Tailscale／ZeroTier；手機也能看）：在伺服器上把 `[web].bind` 改成它的 tailnet IP，再建一把金鑰：
+
+```bash
+coding-lab key create --name laptop --scope view --expires 90d   # 明文只印這一次
+coding-lab stop                                                   # 讓下一個 session 用新設定重新拉起 collector
+```
+
+本機開 `http://100.x.x.x:4801`，第一次會出現登入頁，貼上金鑰；之後 30 天不必再貼。不想在手機上打一長串，可以在伺服器終端機上執行 `coding-lab key login-link`，它印出一個 5 分鐘內只能用一次的網址，點開就登入。
+
+遠端連線一律要金鑰，而且看不到命中敏感規則的工具輸出（例如讀 `.env`）；thinking 預設點開才載入（`remote_thinking`）。`view` 金鑰只能看，`operate` 才能按注意佇列的「已確認」。撤銷：`coding-lab key revoke <id>`，持有它的瀏覽器下一個請求起就要重新登入。金鑰與 cookie 走明文 http，所以只建議 tailnet（WireGuard 加密）、SSH 通道或自己前置 TLS（Caddy）；綁公開 IP 時 collector 會拒絕啟動，除非設 `allow_insecure = true`。
+
+多人共用的伺服器上，其他使用者也連得到 127.0.0.1，這時設 `auth = "always"`，連本機（含 SSH 通道）都要金鑰。
+
+規劃中：一次看多台伺服器的 `coding-lab hub`。
 
 ## 子命令
 
@@ -184,6 +202,7 @@ ssh -N -L 4801:127.0.0.1:4801 <server>
 | `coding-lab stop` | 請背景的 collector 正常結束（寫完紀錄才回來） |
 | `coding-lab key create --name <名稱> [--scope view\|operate] [--expires 90d\|12h\|30m\|never]` | 建一把遠端查看用的金鑰，明文只印這一次；`view` 只能看，`operate` 另外可按「已確認」、改通知設定 |
 | `coding-lab key list`、`coding-lab key revoke <id>` | 列出金鑰（不含 secret）、撤銷（立即失效，不必重啟 collector） |
+| `coding-lab key login-link [--key <id>]` | 印一個 5 分鐘內只能用一次的登入網址（金鑰不經過網址列與瀏覽紀錄） |
 
 `coding-lab service`（安裝成常駐服務）還沒有實作。
 

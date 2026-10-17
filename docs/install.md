@@ -104,6 +104,24 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 
 再在本機開 <http://127.0.0.1:4801>。用 VS Code Remote 連線的話，也可以在「連接埠（Ports）」面板轉送 4801。
 
+不想每次開通道、或想用手機看，可以改走 Tailscale／ZeroTier 直連：
+
+1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。
+2. 建一把金鑰：`~/.coding-lab/bin/coding-lab key create --name laptop --scope view --expires 90d`。印出來的 `clk_…` 只會出現這一次，先複製。
+3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
+4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
+
+遠端看不到命中敏感規則的工具輸出，thinking 預設點開才載入。撤銷金鑰：`coding-lab key revoke <id>`（`key list` 看 id）。綁公開 IP 會被拒絕啟動，除非自己前置 TLS 並設 `allow_insecure = true`——明文 http 上的金鑰會被同網段竊聽。
+
+## 同一台機器上有好幾個專案
+
+collector 收這台機器上所有 Claude Code 的事件，不分專案。頁面最上方的 **專案** 選單（只有一個專案時不顯示）決定怎麼看：
+
+- **全部專案**（預設）：串流每行在 session id 前多一個專案標籤（專案名＝目錄的最後一段），檔案樹每個專案一段、點標題列可以收起，改動紀錄依專案分組；標題列右邊的 **⎇** 開那個專案的分支視窗。
+- **單一專案**：只看這個專案的 session、串流、檔案樹、改動與注意佇列；其他專案的內容只是隱藏，切回「全部專案」就回來（注意佇列會提示其他專案還有幾件）。選擇會記在瀏覽器裡。
+
+專案的歸類跟左欄一樣：session 的 cwd 在另一個 session 的 cwd 底下（worktree、子目錄）就算同一個專案。
+
 ## 看過去的 session（回放）
 
 **回放一個 session**：
@@ -159,7 +177,18 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 **網頁打不開（<http://127.0.0.1:4801> 連不上）**
 
 - 先跑 `coding-lab healthz`。連不上代表 collector 沒在跑：開一個**新的** session 讓 plugin 拉起它，或直接在終端機執行 `~/.coding-lab/bin/coding-lab serve`（前景執行，關掉終端機就停），看它印出什麼錯誤。
-- 瀏覽器不在跑 Claude Code 的那台電腦上：見上面的 SSH 通道。
+- 瀏覽器不在跑 Claude Code 的那台電腦上：見上面的 SSH 通道或 tailnet 直連。
+
+**登入頁一直說金鑰不對**
+
+- 金鑰只在 `key create` 時印一次，之後 `key list` 看到的是 id，不是金鑰；忘了就 `key revoke` 舊的再 `key create` 一把。
+- `coding-lab key list` 的狀態是不是「已撤銷」或「已到期」。
+- 連續失敗 10 次會被擋一分鐘（每個來源 IP 各算）。
+- 伺服器的 `~/.coding-lab/collector.log` 會寫被拒的原因；`keys.json` 權限不是 600 時所有金鑰都會失效，照 log 裡的 `chmod 600` 修。
+
+**SSH 通道進來也被要求登入**
+
+伺服器的設定是 `[web] auth = "always"`（多人共用的伺服器）。這是刻意的：用金鑰登入一次即可。
 
 **網頁顯示 404 或空白**
 

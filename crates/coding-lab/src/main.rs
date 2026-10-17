@@ -64,6 +64,12 @@ enum KeyCommand {
         /// `key list` 顯示的 8 碼 id
         id: String,
     },
+    /// 印一個 5 分鐘內、只能用一次的登入連結（在伺服器終端機上點一下就在本機登入，金鑰不經過網址列）
+    LoginLink {
+        /// 用哪一把金鑰（只有一把有效金鑰時可省略）
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -188,6 +194,61 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
                         .map_or("—".to_string(), coding_lab::keys::fmt_utc),
                     k.expires_ms
                         .map_or("永不".to_string(), coding_lab::keys::fmt_utc),
+                );
+            }
+            Ok(())
+        }
+        KeyCommand::LoginLink { key } => {
+            let usable: Vec<&coding_lab::keys::KeyRecord> = store
+                .list()
+                .iter()
+                .filter(|k| k.usable_at(now).is_ok())
+                .collect();
+            let id = match key {
+                Some(id) => {
+                    let k = store.get(&id).ok_or_else(|| {
+                        format!("沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的")
+                    })?;
+                    k.usable_at(now).map_err(|e| format!("金鑰 {id}：{e}"))?;
+                    id
+                }
+                None => match usable.as_slice() {
+                    [] => {
+                        return Err(
+                            "還沒有有效的金鑰；先 coding-lab key create --name <名稱>".into()
+                        );
+                    }
+                    [one] => one.id.clone(),
+                    many => {
+                        return Err(format!(
+                            "有 {} 把有效金鑰，請用 --key <id> 指定：{}",
+                            many.len(),
+                            many.iter()
+                                .map(|k| format!("{}（{}）", k.id, k.name))
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        ));
+                    }
+                },
+            };
+            let code = coding_lab::auth::create_once_link(&cfg.home, &id, now, &mut rng)?;
+            let ip = cfg.web_bind.ip();
+            let host = if ip.is_unspecified() {
+                "<這台的位址>".to_string()
+            } else if ip.is_ipv6() {
+                format!("[{ip}]")
+            } else {
+                ip.to_string()
+            };
+            println!("http://{host}:{}/auth/once/{code}", cfg.web_bind.port());
+            println!(
+                "{} 分鐘內有效、只能用一次；用金鑰 {id}。",
+                coding_lab::auth::ONCE_TTL_MS / 60_000
+            );
+            if ip.is_loopback() {
+                println!(
+                    "web 入口綁在 {ip}：請先在本機開 SSH 通道（ssh -N -L {0}:127.0.0.1:{0} <伺服器>）再打開這個網址。",
+                    cfg.web_bind.port()
                 );
             }
             Ok(())

@@ -196,9 +196,7 @@ impl KeyStore {
                 break id;
             }
         };
-        let mut secret_bytes = [0u8; 32];
-        rng.fill(&mut secret_bytes);
-        let secret = base62_fixed(&secret_bytes);
+        let secret = random_base62(rng);
         self.keys.push(KeyRecord {
             id: id.clone(),
             name: name.to_string(),
@@ -274,20 +272,31 @@ impl KeyStore {
     pub fn save(&self, home: &Path) -> Result<(), String> {
         std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
         let path = KeyStore::path(home);
-        let tmp = home.join(format!("{FILE_NAME}.tmp"));
         let f = FileFormat {
             version: FILE_VERSION,
             server_secret: hex_encode(&self.server_secret),
             keys: self.keys.clone(),
         };
         let text = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
-        write_private(&tmp, text.as_bytes())
-            .map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
-        std::fs::rename(&tmp, &path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            format!("寫不了 {}：{e}", path.display())
-        })
+        save_private_json(&path, &text)
     }
+}
+
+/// 寫一個只有自己能讀的 JSON 檔：先寫 `<path>.tmp`（unix 600）再 rename，不會留下半個檔。
+pub(crate) fn save_private_json(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    write_private(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("寫不了 {}：{e}", path.display())
+    })
+}
+
+/// 32 bytes 的亂數，以 43 碼 base62 表示（金鑰的 secret、一次性登入連結的 code）。
+pub(crate) fn random_base62(rng: &mut dyn Rng) -> String {
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes);
+    base62_fixed(&bytes)
 }
 
 /// 拆 `clk_<id>_<secret>`；形狀不對回 None（不修剪空白）。

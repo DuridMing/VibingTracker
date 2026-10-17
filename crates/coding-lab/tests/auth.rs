@@ -1,0 +1,559 @@
+//! web 驗證（#667，contracts.md §6–§7）：cookie 簽章與竄改、一次性登入連結、速率限制、
+//! `auth` 兩種模式 × Bearer／cookie／Origin、WS 握手與 scope。時間注入（假時鐘），不 sleep。
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use coding_lab::auth::{self, CookieError, RateLimiter};
+use coding_lab::config::AuthMode;
+use coding_lab::keys::{self, KeyStore, Scope};
+use coding_lab::ws::{WebState, serve_web};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+static N: AtomicU32 = AtomicU32::new(0);
+const NOW: u64 = 1_760_000_000_000;
+const MIN: u64 = 60_000;
+
+fn tmp(name: &str) -> PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "auth-{name}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+// ── HMAC 與 cookie ────────────────────────────────────────────────────────
+
+#[test]
+fn hmac_sha256_matches_the_known_vector() {
+    let mac = auth::hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
+    let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+    );
+}
+
+#[test]
+fn cookie_roundtrip_tamper_expiry_and_wrong_secret() {
+    let secret = [3u8; 32];
+    let value = auth::sign_cookie(&secret, "abcdefgh", NOW + 1000);
+    assert_eq!(
+        auth::parse_cookie(&secret, &value, NOW),
+        Ok(("abcdefgh".to_string(), NOW + 1000))
+    );
+    assert_eq!(
+        auth::parse_cookie(&secret, &value, NOW + 1000),
+        Err(CookieError::Expired),
+        "到期那一刻就不算"
+    );
+    // 改 key id
+    let tampered = value.replacen("abcdefgh", "abcdefgX", 1);
+    assert_eq!(
+        auth::parse_cookie(&secret, &tampered, NOW),
+        Err(CookieError::BadSignature)
+    );
+    // 改簽章最後一個字
+    let mut t = value.clone();
+    let last = t.pop().unwrap();
+    t.push(if last == '0' { '1' } else { '0' });
+    assert_eq!(
+        auth::parse_cookie(&secret, &t, NOW),
+        Err(CookieError::BadSignature)
+    );
+    // 改到期時間
+    let parts: Vec<&str> = value.split('.').collect();
+    let later = format!("{}.{}.{}", parts[0], NOW + 999_999, parts[2]);
+    assert_eq!(
+        auth::parse_cookie(&secret, &later, NOW),
+        Err(CookieError::BadSignature)
+    );
+    // 別把 server secret
+    assert_eq!(
+        auth::parse_cookie(&[4u8; 32], &value, NOW),
+        Err(CookieError::BadSignature)
+    );
+    assert_eq!(
+        auth::parse_cookie(&secret, "garbage", NOW),
+        Err(CookieError::Malformed)
+    );
+    assert_eq!(
+        auth::parse_cookie(&secret, "a.b", NOW),
+        Err(CookieError::Malformed)
+    );
+}
+
+// ── 一次性登入連結 ────────────────────────────────────────────────────────
+
+#[test]
+fn once_link_is_single_use_and_expires() {
+    let home = tmp("once");
+    let mut rng = keys::test_rng(5);
+    let code = auth::create_once_link(&home, "abcdefgh", NOW, &mut rng).unwrap();
+    assert!(code.len() >= 32 && code.chars().all(|c| c.is_ascii_alphanumeric()));
+    let text = std::fs::read_to_string(home.join(auth::LINKS_FILE)).unwrap();
+    assert!(!text.contains(&code), "檔裡只有雜湊");
+
+    assert_eq!(
+        auth::consume_once_link(&home, &code, NOW + 1000).unwrap(),
+        Some("abcdefgh".to_string())
+    );
+    assert_eq!(
+        auth::consume_once_link(&home, &code, NOW + 2000).unwrap(),
+        None,
+        "第二次就沒有了"
+    );
+
+    let code2 = auth::create_once_link(&home, "abcdefgh", NOW, &mut rng).unwrap();
+    assert_eq!(
+        auth::consume_once_link(&home, &code2, NOW + auth::ONCE_TTL_MS).unwrap(),
+        None,
+        "5 分鐘到就失效"
+    );
+    assert_eq!(auth::consume_once_link(&home, "nope", NOW).unwrap(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn once_link_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp("once-mode");
+    auth::create_once_link(&home, "abcdefgh", NOW, &mut keys::test_rng(1)).unwrap();
+    let mode = std::fs::metadata(home.join(auth::LINKS_FILE))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+// ── 速率限制 ──────────────────────────────────────────────────────────────
+
+#[test]
+fn rate_limiter_allows_ten_failures_per_minute_per_ip() {
+    let mut rl = RateLimiter::new(auth::LOGIN_FAILS_PER_MINUTE, MIN);
+    let a: std::net::IpAddr = "100.64.0.7".parse().unwrap();
+    let b: std::net::IpAddr = "100.64.0.8".parse().unwrap();
+    for i in 0..10 {
+        assert!(rl.allowed(a, NOW + i), "第 {i} 次失敗前還能試");
+        rl.record_failure(a, NOW + i);
+    }
+    assert!(!rl.allowed(a, NOW + 10), "10 次失敗後擋");
+    assert!(rl.allowed(b, NOW + 10), "別的 IP 不受影響");
+    assert!(rl.allowed(a, NOW + MIN + 1), "一分鐘後解除");
+}
+
+// ── 整合：auth = always 在 loopback 上（和遠端走同一條路） ───────────────────
+
+struct Server {
+    addr: SocketAddr,
+    home: PathBuf,
+    store: KeyStore,
+    view: String,
+    operate: String,
+}
+
+async fn start(mode: AuthMode) -> Server {
+    let home = tmp("srv");
+    let mut store = KeyStore::new_with_secret([9u8; 32]);
+    let mut rng = keys::test_rng(42);
+    let view = store.create("view", Scope::View, None, NOW, &mut rng);
+    let operate = store.create("op", Scope::Operate, None, NOW, &mut rng);
+    store.save(&home).unwrap();
+    let state = WebState::new_with_auth(None, None, 8, home.clone(), mode);
+    let (addr, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    Server {
+        addr,
+        home,
+        store,
+        view,
+        operate,
+    }
+}
+
+async fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String, String) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if !body.is_empty() {
+        req.push_str(&format!(
+            "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    req.push_str("\r\n");
+    req.push_str(body);
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let code: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap();
+    (code, head.to_string(), body.to_string())
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+fn cookie_of(head: &str) -> String {
+    let sc = header(head, "set-cookie").expect("要有 Set-Cookie");
+    sc.split(';').next().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn always_mode_requires_a_key_except_healthz_and_login() {
+    let s = start(AuthMode::Always).await;
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[], "").await;
+    assert_eq!(code, 401, "API 沒金鑰一律 401");
+    let (code, _, _) = http(s.addr, "GET", "/healthz", &[], "").await;
+    assert_eq!(code, 200, "healthz 不用金鑰");
+    let (code, head, _) = http(s.addr, "GET", "/", &[], "").await;
+    assert_eq!(code, 303, "網頁導去登入");
+    assert_eq!(header(&head, "location"), Some("/auth/login"));
+    let (code, head, body) = http(s.addr, "GET", "/auth/login", &[], "").await;
+    assert_eq!(code, 200);
+    assert!(
+        header(&head, "content-type")
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(
+        body.contains("<form") && body.contains("clk_"),
+        "登入頁有表單與提示：{body}"
+    );
+}
+
+#[tokio::test]
+async fn bearer_works_and_revocation_is_immediate() {
+    let mut s = start(AuthMode::Always).await;
+    let bearer = format!("Bearer {}", s.view);
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Authorization", &bearer)],
+        "",
+    )
+    .await;
+    assert_eq!(code, 200);
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Authorization", "Bearer clk_zzzzzzzz_x")],
+        "",
+    )
+    .await;
+    assert_eq!(code, 401);
+
+    // 撤銷：另一個程序（CLI）改檔，collector 下一次請求就看到
+    let id = keys::parse_token(&s.view).unwrap().0.to_string();
+    assert!(s.store.revoke(&id, NOW));
+    s.store.save(&s.home).unwrap();
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Authorization", &bearer)],
+        "",
+    )
+    .await;
+    assert_eq!(code, 401, "撤銷後立即失效，不必重啟");
+}
+
+#[tokio::test]
+async fn login_sets_a_signed_cookie_that_needs_a_matching_origin() {
+    let s = start(AuthMode::Always).await;
+    let body = format!("key={}", s.operate);
+    let (code, head, _) = http(s.addr, "POST", "/auth/login", &[], &body).await;
+    assert_eq!(code, 303, "{head}");
+    assert_eq!(header(&head, "location"), Some("/"));
+    let sc = header(&head, "set-cookie").unwrap();
+    assert!(
+        sc.contains("HttpOnly") && sc.contains("SameSite=Strict") && sc.contains("Path=/"),
+        "{sc}"
+    );
+    assert!(
+        !sc.contains("Secure"),
+        "http 不加 Secure（X-Forwarded-Proto https 才加）"
+    );
+    let cookie = cookie_of(&head);
+
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[("Cookie", &cookie)], "").await;
+    assert_eq!(code, 200);
+    let same = format!("http://{}", s.addr);
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Cookie", &cookie), ("Origin", &same)],
+        "",
+    )
+    .await;
+    assert_eq!(code, 200);
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Cookie", &cookie), ("Origin", "http://evil.example")],
+        "",
+    )
+    .await;
+    assert_eq!(code, 403, "cookie 要配 Origin == Host");
+
+    let mut bad = cookie.clone();
+    let last = bad.pop().unwrap();
+    bad.push(if last == '0' { '1' } else { '0' });
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[("Cookie", &bad)], "").await;
+    assert_eq!(code, 401, "竄改的 cookie");
+
+    let (code, head, _) = http(s.addr, "POST", "/auth/login", &[], "key=clk_zzzzzzzz_wrong").await;
+    assert_eq!(code, 401, "{head}");
+    assert!(header(&head, "set-cookie").is_none());
+
+    let (code, head, _) = http(s.addr, "POST", "/auth/logout", &[("Cookie", &cookie)], "").await;
+    assert_eq!(code, 303);
+    assert!(header(&head, "set-cookie").unwrap().contains("Max-Age=0"));
+}
+
+#[tokio::test]
+async fn forwarded_https_marks_the_cookie_secure() {
+    let s = start(AuthMode::Always).await;
+    let body = format!("key={}", s.view);
+    let (code, head, _) = http(
+        s.addr,
+        "POST",
+        "/auth/login",
+        &[("X-Forwarded-Proto", "https")],
+        &body,
+    )
+    .await;
+    assert_eq!(code, 303);
+    assert!(header(&head, "set-cookie").unwrap().contains("Secure"));
+}
+
+#[tokio::test]
+async fn cookie_survives_restart_and_dies_with_the_key() {
+    let mut s = start(AuthMode::Always).await;
+    let body = format!("key={}", s.view);
+    let (_, head, _) = http(s.addr, "POST", "/auth/login", &[], &body).await;
+    let cookie = cookie_of(&head);
+
+    // 「重啟」：同一個 keys.json 開第二個 server
+    let state = WebState::new_with_auth(None, None, 8, s.home.clone(), AuthMode::Always);
+    let (addr2, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    let (code, _, _) = http(addr2, "GET", "/api/sessions", &[("Cookie", &cookie)], "").await;
+    assert_eq!(code, 200, "server secret 在檔裡，重啟不必重登");
+
+    let id = keys::parse_token(&s.view).unwrap().0.to_string();
+    s.store.revoke(&id, NOW);
+    s.store.save(&s.home).unwrap();
+    let (code, _, _) = http(addr2, "GET", "/api/sessions", &[("Cookie", &cookie)], "").await;
+    assert_eq!(code, 401, "撤銷金鑰，cookie 立即失效");
+}
+
+#[tokio::test]
+async fn ten_failed_logins_per_minute_then_429() {
+    let s = start(AuthMode::Always).await;
+    for _ in 0..10 {
+        let (code, _, _) = http(s.addr, "POST", "/auth/login", &[], "key=clk_zzzzzzzz_wrong").await;
+        assert_eq!(code, 401);
+    }
+    let (code, _, _) = http(s.addr, "POST", "/auth/login", &[], "key=clk_zzzzzzzz_wrong").await;
+    assert_eq!(code, 429);
+    let body = format!("key={}", s.view);
+    let (code, _, _) = http(s.addr, "POST", "/auth/login", &[], &body).await;
+    assert_eq!(code, 429, "被擋期間對的也不收");
+}
+
+#[tokio::test]
+async fn once_link_logs_in_exactly_once() {
+    let s = start(AuthMode::Always).await;
+    let id = keys::parse_token(&s.operate).unwrap().0.to_string();
+    let code =
+        auth::create_once_link(&s.home, &id, coding_lab::now_ms(), &mut keys::test_rng(3)).unwrap();
+    let (status, head, _) = http(s.addr, "GET", &format!("/auth/once/{code}"), &[], "").await;
+    assert_eq!(status, 303, "{head}");
+    let cookie = cookie_of(&head);
+    let (status, _, _) = http(s.addr, "GET", "/api/sessions", &[("Cookie", &cookie)], "").await;
+    assert_eq!(status, 200);
+    let (status, _, _) = http(s.addr, "GET", &format!("/auth/once/{code}"), &[], "").await;
+    assert_eq!(status, 404, "用過就沒了");
+}
+
+async fn ws_with(
+    addr: SocketAddr,
+    headers: &[(&str, &str)],
+) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    for (k, v) in headers {
+        let name: tokio_tungstenite::tungstenite::http::HeaderName = k.parse().unwrap();
+        req.headers_mut().insert(name, v.parse().unwrap());
+    }
+    tokio_tungstenite::connect_async(req)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+async fn hello(ws: &mut Ws) -> Value {
+    ws.send(Message::Text(
+        json!({"op": "hello", "protocol": 1}).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        if let Some(Ok(Message::Text(t))) = ws.next().await {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["t"] == "welcome" {
+                return v;
+            }
+        } else {
+            panic!("沒等到 welcome");
+        }
+    }
+}
+
+async fn recv(ws: &mut Ws) -> Value {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str(&t).unwrap(),
+        other => panic!("沒等到訊息：{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ws_handshake_needs_a_key_and_view_cannot_ack() {
+    let s = start(AuthMode::Always).await;
+    assert!(ws_with(s.addr, &[]).await.is_err(), "沒金鑰不建立連線");
+
+    let bearer = format!("Bearer {}", s.view);
+    let mut ws = ws_with(s.addr, &[("Authorization", &bearer)])
+        .await
+        .unwrap();
+    let w = hello(&mut ws).await;
+    assert_eq!(w["scope"], "view");
+    ws.send(Message::Text(
+        json!({"op": "ack", "session": "s", "kind": "done", "ref": "r"})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    let r = recv(&mut ws).await;
+    assert_eq!(r["t"], "error", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("operate"), "{r}");
+
+    let bearer = format!("Bearer {}", s.operate);
+    let mut ws = ws_with(s.addr, &[("Authorization", &bearer)])
+        .await
+        .unwrap();
+    let w = hello(&mut ws).await;
+    assert_eq!(w["scope"], "operate");
+
+    // cookie 也能握手，但 Origin 要對
+    let body = format!("key={}", s.view);
+    let (_, head, _) = http(s.addr, "POST", "/auth/login", &[], &body).await;
+    let cookie = cookie_of(&head);
+    assert!(
+        ws_with(
+            s.addr,
+            &[("Cookie", &cookie), ("Origin", "http://evil.example")]
+        )
+        .await
+        .is_err()
+    );
+    let same = format!("http://{}", s.addr);
+    assert!(
+        ws_with(s.addr, &[("Cookie", &cookie), ("Origin", &same)])
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn local_open_on_loopback_needs_nothing_and_is_scope_local() {
+    let s = start(AuthMode::LocalOpen).await;
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[], "").await;
+    assert_eq!(code, 200, "SSH 通道進來也是 localhost，等同信任");
+    let mut ws = ws_with(s.addr, &[]).await.unwrap();
+    let w = hello(&mut ws).await;
+    assert_eq!(w["scope"], "local");
+    // 帶了金鑰也不會變成 view（本機永遠完整）
+    let bearer = format!("Bearer {}", s.view);
+    let mut ws = ws_with(s.addr, &[("Authorization", &bearer)])
+        .await
+        .unwrap();
+    assert_eq!(hello(&mut ws).await["scope"], "local");
+}
+
+#[tokio::test]
+async fn without_keys_file_remote_style_auth_always_fails_but_login_page_explains() {
+    let home = tmp("nokeys");
+    let state = WebState::new_with_auth(None, None, 8, home, AuthMode::Always);
+    let (addr, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    let (code, _, _) = http(
+        addr,
+        "GET",
+        "/api/sessions",
+        &[("Authorization", "Bearer clk_abcdefgh_x")],
+        "",
+    )
+    .await;
+    assert_eq!(code, 401);
+    let (code, _, body) = http(addr, "GET", "/auth/login", &[], "").await;
+    assert_eq!(code, 200);
+    assert!(body.contains("key create"), "沒有金鑰時提示怎麼建：{body}");
+}
+
+/// 成功驗證會寫回 last_used（最多每分鐘一次），失敗不寫。
+#[tokio::test]
+async fn successful_auth_records_last_used() {
+    let s = start(AuthMode::Always).await;
+    let bearer = format!("Bearer {}", s.view);
+    let (code, _, _) = http(
+        s.addr,
+        "GET",
+        "/api/sessions",
+        &[("Authorization", &bearer)],
+        "",
+    )
+    .await;
+    assert_eq!(code, 200);
+    let id = keys::parse_token(&s.view).unwrap().0;
+    let store = KeyStore::load(&s.home).unwrap().unwrap();
+    assert!(store.get(id).unwrap().last_used_ms.is_some());
+    let op = keys::parse_token(&s.operate).unwrap().0;
+    assert!(store.get(op).unwrap().last_used_ms.is_none());
+}

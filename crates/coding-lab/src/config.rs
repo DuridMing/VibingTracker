@@ -1,9 +1,9 @@
 //! 設定（#629）：命令列 > `CODING_LAB_*` 環境變數 > `<home>/config.toml` > 預設。
 //!
-//! P6 才用的鍵（`[web].auth`、`remote_thinking` 等）先接受、不使用，README 的範例可以直接用。
-//! P6 金鑰驗證完成前，hook 與 web 入口都只能綁 loopback。
+//! `[web].auth`、`remote_thinking`、`allow_insecure` 是遠端查看（P6，PLAN「網路綁定」第 4 點）的設定。
+//! hook 入口永遠只能綁 loopback（不變式 6）；web 入口可以綁私有／tailnet 網段，公開 IP 要明確 `allow_insecure`。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -13,6 +13,61 @@ pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:4801";
 pub const DEFAULT_IDLE_EXIT_SECONDS: u64 = 600;
 /// store 批次 flush 的間隔（transcript 行的 Event；hook 事件不等批次，#713）
 pub const DEFAULT_STORE_FLUSH_MS: u64 = 100;
+
+/// web 入口什麼時候要金鑰：`local-open`（預設）localhost 免金鑰；`always` 連 localhost 也要（多人共用的伺服器）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthMode {
+    LocalOpen,
+    Always,
+}
+
+impl std::str::FromStr for AuthMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "local-open" => Ok(AuthMode::LocalOpen),
+            "always" => Ok(AuthMode::Always),
+            _ => Err(format!("[web].auth 只能是 local-open 或 always，收到 {s}")),
+        }
+    }
+}
+
+/// 遠端連線看到的 thinking：`on_demand`（預設）點開才載入、`hide` 只有佔位、`show` 和本機一樣。只影響遠端連線。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteThinking {
+    OnDemand,
+    Hide,
+    Show,
+}
+
+impl std::str::FromStr for RemoteThinking {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "on_demand" => Ok(RemoteThinking::OnDemand),
+            "hide" => Ok(RemoteThinking::Hide),
+            "show" => Ok(RemoteThinking::Show),
+            _ => Err(format!(
+                "[web].remote_thinking 只能是 on_demand、hide 或 show，收到 {s}"
+            )),
+        }
+    }
+}
+
+/// 私有網段（RFC 1918）、tailnet／CGNAT（100.64/10）、link-local、IPv6 ULA：不會被網際網路上的人直接連到，
+/// 明文 http 的風險只剩同網段竊聽（tailnet 本身有 WireGuard 加密）。
+pub fn is_private_network(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let o = v.octets();
+            v.is_private() || v.is_link_local() || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        IpAddr::V6(v) => {
+            let s = v.segments()[0];
+            (s & 0xfe00) == 0xfc00 || (s & 0xffc0) == 0xfe80
+        }
+    }
+}
 
 /// 命令列給的值（沒給就是 None）。
 #[derive(Clone, Debug, Default)]
@@ -35,6 +90,10 @@ pub struct Config {
     pub idle_exit_seconds: u64,
     /// store 的批次 flush 間隔（毫秒，≥ 1）；只影響 transcript 行的 Event，hook 事件處理完就寫（#713）
     pub store_flush_ms: u64,
+    pub auth: AuthMode,
+    pub remote_thinking: RemoteThinking,
+    /// 公開 IP 又沒有 TLS 時也照綁（使用者自己承擔明文風險）
+    pub allow_insecure: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -56,6 +115,9 @@ struct HookSection {
 struct WebSection {
     bind: Option<String>,
     root: Option<PathBuf>,
+    auth: Option<String>,
+    remote_thinking: Option<String>,
+    allow_insecure: Option<bool>,
 }
 
 #[derive(Default, Deserialize)]
@@ -162,15 +224,39 @@ impl Config {
         if store_flush_ms == 0 {
             return Err("[collector].store_flush_ms 要大於 0".into());
         }
+        let auth: AuthMode =
+            pick(&None, "CODING_LAB_WEB_AUTH", &f.web.auth, "local-open").parse()?;
+        let remote_thinking: RemoteThinking = pick(
+            &None,
+            "CODING_LAB_REMOTE_THINKING",
+            &f.web.remote_thinking,
+            "on_demand",
+        )
+        .parse()?;
+        let allow_insecure = match env("CODING_LAB_ALLOW_INSECURE") {
+            Some(v) => match v.as_str() {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                _ => {
+                    return Err(format!(
+                        "CODING_LAB_ALLOW_INSECURE 要是 true 或 false，收到 {v}"
+                    ));
+                }
+            },
+            None => f.web.allow_insecure.unwrap_or(false),
+        };
 
         if !hook_bind.ip().is_loopback() {
             return Err(format!(
                 "[hook].bind 只能是 127.0.0.1（只給同機的 Claude Code），收到 {hook_bind}"
             ));
         }
-        if !web_bind.ip().is_loopback() {
+        let ip = web_bind.ip();
+        if !ip.is_loopback() && !is_private_network(ip) && !allow_insecure {
             return Err(format!(
-                "[web].bind 在金鑰驗證（P6）完成前只能是 127.0.0.1，收到 {web_bind}；要從別台看請用 SSH 通道：ssh -N -L 4801:127.0.0.1:4801 <伺服器>"
+                "[web].bind 是 {web_bind}：不是本機也不是私有／tailnet 網段，金鑰與 cookie 走明文 http 會被竊聽。\
+                 建議綁 tailnet IP（100.x.x.x）或維持 127.0.0.1 走 SSH 通道：ssh -N -L 4801:127.0.0.1:4801 <伺服器>；\
+                 前面有 TLS（Caddy）或接受風險時設 [web].allow_insecure = true"
             ));
         }
         Ok(Config {
@@ -180,6 +266,9 @@ impl Config {
             web_root,
             idle_exit_seconds,
             store_flush_ms,
+            auth,
+            remote_thinking,
+            allow_insecure,
         })
     }
 }

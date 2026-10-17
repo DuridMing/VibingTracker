@@ -126,7 +126,18 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         log(&w);
     }
 
-    let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
+    let web = WebState::new_with_auth(
+        Some(store.clone()),
+        cfg.web_root.clone(),
+        FRAME_QUEUE,
+        cfg.home.clone(),
+        cfg.auth,
+    );
+    if !cfg.web_bind.ip().is_loopback() && !web.auth().has_keys() {
+        log(
+            "web 入口綁在非本機位址，但還沒有任何金鑰：遠端連線都會被拒，請先 coding-lab key create --name <名稱>",
+        );
+    }
     web.rebuild(&recent);
     // ack 不是 Event，重放會讓已確認的注意列跑回來：依 store 的佇列對齊
     let open_attention = match store

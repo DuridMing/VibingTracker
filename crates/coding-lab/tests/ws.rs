@@ -476,14 +476,13 @@ async fn static_files_and_healthz() {
     );
 }
 
+/// 綁定位址能不能用由 config 把關（tests/config.rs）；serve_web 本身不再拒絕非 loopback（#667）。
 #[tokio::test]
-async fn non_loopback_bind_is_refused_until_keys_exist() {
+async fn non_loopback_bind_is_allowed_by_serve_web() {
     let state = WebState::new(None, None, 8);
     assert!(
-        serve_web("0.0.0.0:0".parse().unwrap(), state)
-            .await
-            .is_err(),
-        "金鑰驗證（P6）之前不開放遠端"
+        serve_web("0.0.0.0:0".parse().unwrap(), state).await.is_ok(),
+        "config 已經檢查過，serve_web 直接綁"
     );
 }
 
