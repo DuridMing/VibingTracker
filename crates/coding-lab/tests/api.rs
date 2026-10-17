@@ -1045,7 +1045,7 @@ async fn files_main(root: &Path) -> (u16, Value) {
 /// develop 上已 commit 的改動不算；baseRef 回實際用的分支。
 #[tokio::test]
 async fn files_relative_to_main_prefers_develop() {
-    let root = tmp("integ-develop").canonicalize().unwrap();
+    let root = canon(&tmp("integ-develop"));
     git(&root, &["init", "-q", "-b", "main"]);
     write(&root, "a.txt", "a\n");
     git(&root, &["add", "."]);
@@ -1072,7 +1072,7 @@ async fn files_relative_to_main_prefers_develop() {
 /// 沒有 develop、也沒有 main，只有 master：用 master（#693）。
 #[tokio::test]
 async fn files_relative_to_main_falls_back_to_master() {
-    let root = tmp("integ-master").canonicalize().unwrap();
+    let root = canon(&tmp("integ-master"));
     git(&root, &["init", "-q", "-b", "master"]);
     write(&root, "a.txt", "a\n");
     git(&root, &["add", "."]);

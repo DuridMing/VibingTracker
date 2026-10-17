@@ -75,6 +75,8 @@ def setup():
 
 
 def alive(pid):
+    if os.name == "nt":
+        return _alive_windows(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -84,26 +86,52 @@ def alive(pid):
     return True
 
 
+def _alive_windows(pid):
+    """Windows 沒有 kill(pid, 0)（對不存在的 pid 丟 WinError 87，#711）：開 handle 等 0 毫秒，逾時表示還在跑。"""
+    import ctypes
+
+    k32 = ctypes.windll.kernel32
+    synchronize, wait_timeout = 0x0010_0000, 0x102
+    h = k32.OpenProcess(synchronize, False, pid)
+    if not h:
+        return k32.GetLastError() == 5  # ERROR_ACCESS_DENIED：在，只是開不了
+    try:
+        return k32.WaitForSingleObject(h, 0) == wait_timeout
+    finally:
+        k32.CloseHandle(h)
+
+
 def stop_collector():
-    """停掉這個資料目錄的 collector：先 SIGTERM，5 秒內沒結束就 SIGKILL。"""
+    """停掉這個資料目錄的 collector：先 `coding-lab stop`（#700，三平台都通、會 flush 並刪 collector.json），
+    沒有二進位或它沒停時才送 SIGTERM，5 秒內沒結束就 SIGKILL（Windows 兩者都是 TerminateProcess）。"""
     info = HOME / "collector.json"
     if not info.exists():
         return
     try:
-        pid = json.loads(info.read_text())["pid"]
+        meta = json.loads(info.read_text())
+        pid = meta["pid"]
     except (ValueError, KeyError):
         return
+    # stop 子命令依 collector.json 的 hook 位址找 collector；沒有 hook 的（測試造的）不送，免得打到 4800 的正式 collector
+    if BIN.exists() and meta.get("hook"):
+        env = dict(os.environ, CODING_LAB_HOME=str(HOME))
+        try:
+            subprocess.run([str(BIN), "stop"], env=env, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            pass
+        if not alive(pid):
+            return
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except OSError:  # ProcessLookupError；Windows 是 WinError 87
         return
     for _ in range(50):
         if not alive(pid):
             return
         time.sleep(0.1)
     try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
         pass
 
 

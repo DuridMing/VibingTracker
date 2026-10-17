@@ -1,9 +1,14 @@
 """tests/e2e/lifecycle.py 的比對邏輯（#688）：不呼叫模型，用手寫的最小 transcript 行與 Event 驗證。"""
 
 import os
+import shutil
+import time
 import unittest
 
+import lifecycle
 from lifecycle import compare
+
+L_BIN_EXISTS = lifecycle.BIN.exists()
 
 
 def assistant(block, model="claude-opus-5-5"):
@@ -60,6 +65,7 @@ class Setup(unittest.TestCase):
     def tearDown(self):
         self.L.WORK, self.L.HOME, self.L.PLUGIN = self.saved
 
+    @unittest.skipUnless(os.name != "nt", "用 sh 造假的背景程序，Windows 沒有")
     def test_leftover_collector_is_stopped_before_its_home_is_wiped(self):
         import json
         import subprocess
@@ -75,6 +81,41 @@ class Setup(unittest.TestCase):
         finally:
             if L.alive(pid):
                 os.kill(pid, 9)
+
+    def test_alive_is_false_for_an_exited_process(self):
+        # #711：Windows 的 os.kill(pid, 0) 對不存在的 pid 丟 OSError [WinError 87]，不是 ProcessLookupError
+        import subprocess
+        import sys
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertFalse(self.L.alive(p.pid))
+        self.assertTrue(self.L.alive(os.getpid()))
+
+    @unittest.skipUnless(L_BIN_EXISTS, "要有 target/release/coding-lab（tests/scripts/lifecycle.sh 會先建）")
+    def test_stop_collector_stops_a_running_collector_without_signals(self):
+        # #711：stop_collector 走 `coding-lab stop`（#700），三平台都通；Windows 沒有 SIGTERM 可送
+        import subprocess
+        L = self.L
+        shutil.rmtree(L.HOME, ignore_errors=True)
+        L.HOME.mkdir(parents=True)
+        hook, web = L.free_port(), L.free_port()
+        (L.HOME / "config.toml").write_text(
+            f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\nroot = "{L.ROOT / "web"}"\n'
+        )
+        env = dict(os.environ, CODING_LAB_HOME=str(L.HOME))
+        p = subprocess.Popen([str(L.BIN), "serve"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(100):
+                if (L.HOME / "collector.json").exists():
+                    break
+                time.sleep(0.1)
+            self.assertTrue((L.HOME / "collector.json").exists(), "collector 沒起來")
+            L.stop_collector()
+            self.assertFalse((L.HOME / "collector.json").exists(), "stop 之後 collector.json 要被刪掉")
+            self.assertIsNotNone(p.wait(timeout=10))
+        finally:
+            if p.poll() is None:
+                p.kill()
 
     def test_collector_exits_on_its_own_when_idle(self):
         L = self.L
