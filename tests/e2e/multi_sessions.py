@@ -133,12 +133,51 @@ def collector_pid():
         return None
 
 
+PROC = Path("/proc")
+
+
 def cpu_seconds(pid):
+    """collector 用掉的 CPU 秒數（user＋system）。Linux 讀 /proc；Windows 用 GetProcessTimes（沒有 /proc，#717）；
+    取不到回 None，報告標「無 CPU 數據」而不是讓腳本失敗。"""
+    if os.name == "nt":
+        return _cpu_seconds_windows(pid)
     try:
-        f = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        f = (PROC / str(pid) / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         return (int(f[11]) + int(f[12])) / os.sysconf("SC_CLK_TCK")
     except (OSError, IndexError, ValueError):
         return None
+
+
+def _cpu_seconds_windows(pid):
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.windll.kernel32
+    query_limited = 0x1000
+    h = k32.OpenProcess(query_limited, False, pid)
+    if not h:
+        return None
+    try:
+        t = [wintypes.FILETIME() for _ in range(4)]  # creation, exit, kernel, user
+        if not k32.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            return None
+        ticks = sum(((x.dwHighDateTime << 32) | x.dwLowDateTime) for x in t[2:])
+        return ticks / 10_000_000  # 100 ns 一格
+    finally:
+        k32.CloseHandle(h)
+
+
+def hard_kill(pid):
+    """強制結束（模擬 collector 當掉）：Windows 沒有 SIGKILL，os.kill 送 SIGTERM 就是 TerminateProcess（#717）；
+    已結束的 pid 不丟例外。"""
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        return
+    for _ in range(50):
+        if not L.alive(pid):
+            return
+        time.sleep(0.1)
 
 
 def sampler(stop):
@@ -180,9 +219,9 @@ def main():
     time.sleep(minutes * 30)
     pid = collector_pid()
     if pid:
-        os.kill(pid, signal.SIGKILL)
+        hard_kill(pid)
         killed_at[0] = time.time()
-        log(f"SIGKILL collector（pid {pid}）；下一個 SessionStart 會由 ensure 拉起新的")
+        log(f"強制結束 collector（pid {pid}）；下一個 SessionStart 會由 ensure 拉起新的")
     for t in threads:
         t.join()
     stop.set()
@@ -253,6 +292,8 @@ def report(results, killed_at):
         log(f"collector CPU（單核 %）：平均 {avg(vals):.1f}、p95 {vals[max(0, int(len(vals) * 0.95) - 1)]:.1f}、最高 {vals[-1]:.1f}（{len(vals)} 個樣本，每 5 秒）")
         if avg(vals) >= 30:  # PLAN：16 個 session 跑 30 分鐘 CPU < 一核的 30%
             ok = False
+    else:
+        log("collector CPU：無數據（這個平台取不到，或 collector 沒跑滿一個取樣間隔）")
     log("通過" if ok else "未通過")
     sys.exit(0 if ok else 1)
 
