@@ -121,6 +121,7 @@ bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，只能是 127.0.0.1；
 
 [web]
 bind = "127.0.0.1:4801"   # 從別台看：改成 tailnet IP（100.x.x.x）並用金鑰登入，或維持 127.0.0.1 走 SSH 通道（見下方）
+# bind = ["127.0.0.1:4801", "100.x.x.x:4801"]   # 兩個都要：127.0.0.1 給 SSH 通道（免金鑰）、tailnet 給直連（要金鑰）
 root = "/path/to/VibingTracker/web"   # 網頁位置；不設時用二進位旁邊的 web/
 auth = "local-open"       # local-open：127.0.0.1 連進來免金鑰（含 SSH 通道）；always：連本機也要金鑰（多人共用的伺服器）
 remote_thinking = "on_demand"   # 遠端連線的 thinking：on_demand 點開才載入（預設）| hide | show；本機永遠完整
@@ -175,7 +176,7 @@ ssh -N -L 4801:127.0.0.1:4801 <server>
 
 然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要防火牆也不需要金鑰（通道進來的連線就是本機）。
 
-**tailnet 直連**（Tailscale／ZeroTier；手機也能看）：在伺服器上把 `[web].bind` 改成它的 tailnet IP，再建一把金鑰：
+**tailnet 直連**（Tailscale／ZeroTier；手機也能看）：在伺服器上把 `[web].bind` 改成它的 tailnet IP（要同時保留 SSH 通道就寫成陣列 `["127.0.0.1:4801", "100.x.x.x:4801"]`），再建一把金鑰：
 
 ```bash
 coding-lab key create --name laptop --scope view --expires 90d   # 明文只印這一次

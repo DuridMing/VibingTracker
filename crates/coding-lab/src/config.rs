@@ -83,7 +83,10 @@ pub struct Overrides {
 pub struct Config {
     pub home: PathBuf,
     pub hook_bind: SocketAddr,
+    /// 主要的 web 入口（`web_binds` 的第一個）：collector.json 的 `web`、`healthz`／`stop` 子命令用它
     pub web_bind: SocketAddr,
+    /// 所有 web 入口（#722）：`[web].bind` 可以是陣列，例如 127.0.0.1 給 SSH 通道、區網 IP 給直連
+    pub web_binds: Vec<SocketAddr>,
     /// 前端靜態檔；None 時只提供 WebSocket 與 /healthz
     pub web_root: Option<PathBuf>,
     /// 沒有任何 hook 進來多久就自動結束；0 表示不結束（形態 B 常駐）
@@ -119,6 +122,23 @@ struct HubSection {
     upstream: Vec<crate::hub::Upstream>,
 }
 
+/// `[web].bind`：一個位址或多個（#722）。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BindList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl BindList {
+    fn joined(&self) -> String {
+        match self {
+            BindList::One(s) => s.clone(),
+            BindList::Many(v) => v.join(","),
+        }
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct HookSection {
     bind: Option<String>,
@@ -126,7 +146,7 @@ struct HookSection {
 
 #[derive(Default, Deserialize)]
 struct WebSection {
-    bind: Option<String>,
+    bind: Option<BindList>,
     root: Option<PathBuf>,
     auth: Option<String>,
     remote_thinking: Option<String>,
@@ -203,15 +223,24 @@ impl Config {
             ),
             "[hook].bind",
         )?;
-        let web_bind = addr(
-            pick(
-                &cli.web_bind,
-                "CODING_LAB_WEB_BIND",
-                &f.web.bind,
-                DEFAULT_WEB_BIND,
-            ),
-            "[web].bind",
-        )?;
+        // 逗號分隔的清單（檔案的陣列也先串成這個形狀）；重複或空的都報錯
+        let web_list = pick(
+            &cli.web_bind,
+            "CODING_LAB_WEB_BIND",
+            &f.web.bind.as_ref().map(BindList::joined),
+            DEFAULT_WEB_BIND,
+        );
+        let mut web_binds: Vec<SocketAddr> = Vec::new();
+        for part in web_list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let a = addr(part.to_string(), "[web].bind")?;
+            if web_binds.contains(&a) {
+                return Err(format!("[web].bind 重複：{a}"));
+            }
+            web_binds.push(a);
+        }
+        let Some(&web_bind) = web_binds.first() else {
+            return Err("[web].bind 至少要一個位址".into());
+        };
         let web_root = cli
             .web_root
             .clone()
@@ -264,13 +293,15 @@ impl Config {
                 "[hook].bind 只能是 127.0.0.1（只給同機的 Claude Code），收到 {hook_bind}"
             ));
         }
-        let ip = web_bind.ip();
-        if !ip.is_loopback() && !is_private_network(ip) && !allow_insecure {
-            return Err(format!(
-                "[web].bind 是 {web_bind}：不是本機也不是私有／tailnet 網段，金鑰與 cookie 走明文 http 會被竊聽。\
-                 建議綁 tailnet IP（100.x.x.x）或維持 127.0.0.1 走 SSH 通道：ssh -N -L 4801:127.0.0.1:4801 <伺服器>；\
-                 前面有 TLS（Caddy）或接受風險時設 [web].allow_insecure = true"
-            ));
+        for b in &web_binds {
+            let ip = b.ip();
+            if !ip.is_loopback() && !is_private_network(ip) && !allow_insecure {
+                return Err(format!(
+                    "[web].bind 是 {b}：不是本機也不是私有／tailnet 網段，金鑰與 cookie 走明文 http 會被竊聽。\
+                     建議綁 tailnet IP（100.x.x.x）或維持 127.0.0.1 走 SSH 通道：ssh -N -L 4801:127.0.0.1:4801 <伺服器>；\
+                     前面有 TLS（Caddy）或接受風險時設 [web].allow_insecure = true"
+                ));
+            }
         }
         let hub_bind = addr(
             pick(
@@ -298,6 +329,7 @@ impl Config {
             home,
             hook_bind,
             web_bind,
+            web_binds,
             web_root,
             idle_exit_seconds,
             store_flush_ms,

@@ -331,13 +331,15 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 }
                 return Ok(());
             }
-            // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束
-            if std::process::Command::new(&ctx.exe)
-                .arg("stop")
-                .env("CODING_LAB_HOME", &cfg.home)
-                .status()
-                .map(|s| !s.success())
-                .unwrap_or(false)
+            // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束；登記失敗再把它拉回（#719）
+            let was_running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            if was_running
+                && std::process::Command::new(&ctx.exe)
+                    .arg("stop")
+                    .env("CODING_LAB_HOME", &cfg.home)
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(false)
             {
                 eprintln!(
                     "coding-lab：舊的 collector 沒有停下來，服務可能綁不到埠；稍後用 service status 確認"
@@ -347,7 +349,28 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 // 重裝：先卸掉舊的（沒裝過時 bootout 會失敗，所以只在檔案在時做）
                 let _ = service::run_command(&service::plan_uninstall(platform, &ctx).commands[0]);
             }
-            service::apply(&plan, &mut service::run_command)?;
+            let mut restore = || {
+                if !was_running {
+                    return;
+                }
+                // `ensure` 沒有 stdin 時就只是「沒在跑就拉起」
+                let ok = std::process::Command::new(&ctx.exe)
+                    .arg("ensure")
+                    .env("CODING_LAB_HOME", &cfg.home)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                eprintln!(
+                    "coding-lab：常駐服務沒有裝成，{}",
+                    if ok {
+                        "原本在跑的 collector 已重新拉起"
+                    } else {
+                        "而且拉不回原本的 collector；下一個 session 開始時會再拉起"
+                    }
+                );
+            };
+            service::install(&plan, &mut service::run_command, &mut restore)?;
             println!(
                 "已安裝常駐服務；web 入口 {}，hook 入口 {}",
                 cfg.web_bind, cfg.hook_bind
@@ -387,10 +410,20 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
         }
         ServiceCommand::Status => {
             let files = service::files_for(platform, &ctx);
-            let on = service::installed(platform, &ctx);
+            // 以系統的登記為準（#719）：install 失敗後 unit／XML 檔可能還在
+            let registered =
+                service::query_installed(platform, &ctx, &mut service::run_command_capture);
+            let file = service::installed(platform, &ctx);
             println!(
-                "常駐服務：{}（{}）",
-                if on { "已安裝" } else { "未安裝" },
+                "常駐服務：{}（{}：{}）",
+                if registered {
+                    "已安裝"
+                } else if file {
+                    "未登記（檔案還在，請重跑 service install 或 uninstall）"
+                } else {
+                    "未安裝"
+                },
+                service::status_command(platform, &ctx).join(" "),
                 files[0].display()
             );
             let running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
@@ -504,7 +537,14 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
                 },
             };
             let code = coding_lab::auth::create_once_link(&cfg.home, &id, now, &mut rng)?;
-            let ip = cfg.web_bind.ip();
+            // 有綁區網／tailnet 位址就用它組網址（連結是給別台用的）；全是本機時才用 127.0.0.1 並提醒開 SSH 通道
+            let link_bind = cfg
+                .web_binds
+                .iter()
+                .find(|b| !b.ip().is_loopback())
+                .copied()
+                .unwrap_or(cfg.web_bind);
+            let ip = link_bind.ip();
             let host = if ip.is_unspecified() {
                 "<這台的位址>".to_string()
             } else if ip.is_ipv6() {
@@ -512,7 +552,7 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             } else {
                 ip.to_string()
             };
-            println!("http://{host}:{}/auth/once/{code}", cfg.web_bind.port());
+            println!("http://{host}:{}/auth/once/{code}", link_bind.port());
             println!(
                 "{} 分鐘內有效、只能用一次；用金鑰 {id}。",
                 coding_lab::auth::ONCE_TTL_MS / 60_000
@@ -520,7 +560,7 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             if ip.is_loopback() {
                 println!(
                     "web 入口綁在 {ip}：請先在本機開 SSH 通道（ssh -N -L {0}:127.0.0.1:{0} <伺服器>）再打開這個網址。",
-                    cfg.web_bind.port()
+                    link_bind.port()
                 );
             }
             Ok(())

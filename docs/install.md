@@ -85,7 +85,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 
 ## 確認有在追蹤
 
-1. **開一個新的 Claude Code session**。CLI 或 Desktop 的 Code 分頁都可以。裝 plugin 之前就開著的 session：Desktop 會從裝好那一刻開始追蹤（之前的工具呼叫不會補）；CLI 要重開一個。
+1. **開一個新的 Claude Code session**。CLI 或 Desktop 的 Code 分頁都可以。裝 plugin 之前就開著的 session：Desktop 會從裝好那一刻開始追蹤（之前的工具呼叫不會補）；CLI 要重開一個。剛裝好的那一刻，已開著的 session 會開始送事件、但沒有人把 collector 拉起來；網頁連不上就重開一個 session，或在終端機跑一次 `~/.coding-lab/bin/coding-lab ensure`（Windows 在 Git Bash 跑 `sh <plugin 目錄>/bin/coding-lab ensure`）。
 2. 請 Claude 做一件會用到工具的事，例如「讀 README 的第一行」。
 3. 瀏覽器打開 <http://127.0.0.1:4801>，應該會看到這個 session 和它剛剛做的事。
 
@@ -109,7 +109,7 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 
 不想每次開通道、或想用手機看，可以改走 Tailscale／ZeroTier 直連：
 
-1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。
+1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。SSH 通道也要繼續用的話寫成陣列：`bind = ["127.0.0.1:4801", "100.x.x.x:4801"]`，通道進來的仍免金鑰、直連的要金鑰。
 2. 建一把金鑰：`~/.coding-lab/bin/coding-lab key create --name laptop --scope view --expires 90d`。印出來的 `clk_…` 只會出現這一次，先複製。
 3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
 4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
@@ -220,7 +220,8 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 
 **網頁打不開（<http://127.0.0.1:4801> 連不上）**
 
-- 先跑 `coding-lab healthz`。連不上代表 collector 沒在跑：開一個**新的** session 讓 plugin 拉起它，或直接在終端機執行 `~/.coding-lab/bin/coding-lab serve`（前景執行，關掉終端機就停），看它印出什麼錯誤。
+- 先跑 `coding-lab healthz`。連不上代表 collector 沒在跑：開一個**新的** session 讓 plugin 拉起它、跑一次 `coding-lab ensure`，或直接在終端機執行 `~/.coding-lab/bin/coding-lab serve`（前景執行，關掉終端機就停），看它印出什麼錯誤。剛用 `claude plugin install` 裝好的那一刻常見這個狀況：已開的 session 有送事件但沒人拉 collector。
+- `[web].bind` 綁的是區網或 tailnet IP 時，`http://127.0.0.1:4801` 本來就連不上（SSH 通道也會 `Connection refused`）：改開那個 IP，或把 bind 寫成陣列同時綁兩個。
 - 瀏覽器不在跑 Claude Code 的那台電腦上：見上面的 SSH 通道或 tailnet 直連。
 
 **登入頁一直說金鑰不對**

@@ -253,3 +253,68 @@ fn store_flush_interval_is_configurable() {
         "0 會讓 flush 迴圈空轉"
     );
 }
+
+/// #722：`[web].bind` 可以是一個字串或陣列（區網直連與 SSH 通道的 127.0.0.1 並存）；環境變數用逗號分隔。
+#[test]
+fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
+    let one = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = \"127.0.0.1:4801\"\n"),
+    )
+    .unwrap();
+    assert_eq!(one.web_bind.to_string(), "127.0.0.1:4801");
+    assert_eq!(one.web_binds.len(), 1);
+
+    let many = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.77.241:4801\"]\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        many.web_bind.to_string(),
+        "127.0.0.1:4801",
+        "第一個是主要位址"
+    );
+    assert_eq!(
+        many.web_binds
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:4801", "192.168.77.241:4801"]
+    );
+
+    let env = resolve(
+        Overrides::default(),
+        &[("CODING_LAB_WEB_BIND", "127.0.0.1:5001, 10.0.0.2:5001")],
+        Some("[web]\nbind = \"127.0.0.1:4801\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        env.web_binds
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:5001", "10.0.0.2:5001"],
+        "環境變數逗號分隔，蓋過檔案"
+    );
+
+    let err = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"127.0.0.1:4801\"]\n"),
+    )
+    .unwrap_err();
+    assert!(err.contains("重複"), "{err}");
+    let err = resolve(Overrides::default(), &[], Some("[web]\nbind = []\n")).unwrap_err();
+    assert!(err.contains("至少"), "{err}");
+    // 陣列裡有公開 IP 一樣要 allow_insecure
+    let err = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"203.0.113.9:4801\"]\n"),
+    )
+    .unwrap_err();
+    assert!(err.contains("allow_insecure"), "{err}");
+}
