@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use coding_lab::config::{Config, Overrides};
+use coding_lab::keys::{KeyStore, Scope, SystemRng};
 use coding_lab::serve::{self, Outcome};
 
 /// Claude Code 多 session 專案追蹤 collector。
@@ -32,6 +33,37 @@ enum Command {
     Stop,
     /// 安裝或移除常駐服務
     Service,
+    /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
+    Key(KeyArgs),
+}
+
+#[derive(Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// 建一把金鑰；明文只在這裡印一次
+    Create {
+        /// 這把金鑰給誰用（例如 laptop、phone）
+        #[arg(long)]
+        name: String,
+        /// view：只能看；operate：另外可按「已確認」、改通知設定
+        #[arg(long, default_value = "view")]
+        scope: Scope,
+        /// 多久後到期：90d、12h、30m 或 never
+        #[arg(long, default_value = "never")]
+        expires: String,
+    },
+    /// 列出所有金鑰（不含 secret）
+    List,
+    /// 撤銷一把金鑰（立即失效）
+    Revoke {
+        /// `key list` 顯示的 8 碼 id
+        id: String,
+    },
 }
 
 #[derive(Args)]
@@ -89,6 +121,90 @@ fn main() -> ExitCode {
         Command::Service => {
             eprintln!("coding-lab：此子命令尚未實作");
             ExitCode::FAILURE
+        }
+        Command::Key(args) => key(args.command),
+    }
+}
+
+/// `coding-lab key …`（#666）。collector 每次驗證都重讀 keys.json，所以這裡直接改檔就生效，不必重啟。
+fn key(cmd: KeyCommand) -> ExitCode {
+    match key_inner(cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn key_inner(cmd: KeyCommand) -> Result<(), String> {
+    let cfg = Config::load(&Overrides::default())?;
+    let now = coding_lab::now_ms();
+    let mut rng = SystemRng;
+    let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
+    match cmd {
+        KeyCommand::Create {
+            name,
+            scope,
+            expires,
+        } => {
+            let expires_ms = coding_lab::keys::parse_expires(&expires, now)?;
+            let token = store.create(&name, scope, expires_ms, now, &mut rng);
+            store.save(&cfg.home)?;
+            let id = store.list().last().map(|k| k.id.as_str()).unwrap_or("");
+            println!("金鑰（只顯示這一次，請現在複製）：\n\n    {token}\n");
+            println!(
+                "id {id}　name {name}　scope {}　到期 {}",
+                scope.as_str(),
+                expires_ms.map_or("永不".to_string(), coding_lab::keys::fmt_utc)
+            );
+            println!(
+                "瀏覽器：打開 web 入口時貼上；程式：Authorization: Bearer {}…；撤銷：coding-lab key revoke {id}",
+                &token[..12.min(token.len())]
+            );
+            Ok(())
+        }
+        KeyCommand::List => {
+            if store.list().is_empty() {
+                println!("還沒有金鑰；用 coding-lab key create --name <名稱> 建一把");
+                return Ok(());
+            }
+            println!(
+                "{:<8}  {:<16}  {:<7}  {:<16}  {:<16}  {:<16}  狀態",
+                "id", "name", "scope", "建立", "最後使用", "到期"
+            );
+            for k in store.list() {
+                let status = match k.usable_at(now) {
+                    Ok(()) => "有效".to_string(),
+                    Err(e) => format!("{e}（已撤銷／已到期）"),
+                };
+                println!(
+                    "{:<8}  {:<16}  {:<7}  {:<16}  {:<16}  {:<16}  {status}",
+                    k.id,
+                    k.name,
+                    k.scope.as_str(),
+                    coding_lab::keys::fmt_utc(k.created_ms),
+                    k.last_used_ms
+                        .map_or("—".to_string(), coding_lab::keys::fmt_utc),
+                    k.expires_ms
+                        .map_or("永不".to_string(), coding_lab::keys::fmt_utc),
+                );
+            }
+            Ok(())
+        }
+        KeyCommand::Revoke { id } => {
+            if store.get(&id).is_none() {
+                return Err(format!(
+                    "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
+                ));
+            }
+            if store.revoke(&id, now) {
+                store.save(&cfg.home)?;
+                println!("已撤銷 {id}，持有這把金鑰的連線下一次請求起失效");
+            } else {
+                println!("{id} 先前已撤銷");
+            }
+            Ok(())
         }
     }
 }

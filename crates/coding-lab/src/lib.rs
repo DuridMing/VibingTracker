@@ -7,6 +7,7 @@ pub mod doing;
 pub mod event;
 pub mod hook;
 pub mod hooks;
+pub mod keys;
 pub mod live;
 pub mod logging;
 pub mod merge;

@@ -138,6 +138,7 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 | --- | --- |
 | `~/.coding-lab/rules.json` | 覆寫危險指令規則（格式見下方） |
 | `~/.coding-lab/prices.json` | 覆寫模型單價表 |
+| `~/.coding-lab/keys.json` | 遠端查看用的金鑰（只存雜湊，權限必須是 600）；用 `coding-lab key` 管理，不要手改 |
 | `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替（`collector.log.1`…`.5`）；前景執行 `coding-lab serve` 時改印在終端機 |
 
 `prices.json` 只要列出想改的模型，單位是 USD／每百萬 tokens，改完重啟 collector 才生效；格式有錯時整個改用內建單價，並在日誌寫一行警告：
@@ -180,6 +181,9 @@ ssh -N -L 4801:127.0.0.1:4801 <server>
 | `coding-lab healthz` | 查詢執行中 collector 的版本、session 數與事件迴圈延遲 |
 | `coding-lab config` | 印出合併後的設定 |
 | `coding-lab prune` | 立刻清掉 30 天前的資料（collector 在跑時不動資料，它自己每天會清） |
+| `coding-lab stop` | 請背景的 collector 正常結束（寫完紀錄才回來） |
+| `coding-lab key create --name <名稱> [--scope view\|operate] [--expires 90d\|12h\|30m\|never]` | 建一把遠端查看用的金鑰，明文只印這一次；`view` 只能看，`operate` 另外可按「已確認」、改通知設定 |
+| `coding-lab key list`、`coding-lab key revoke <id>` | 列出金鑰（不含 secret）、撤銷（立即失效，不必重啟 collector） |
 
 `coding-lab service`（安裝成常駐服務）還沒有實作。
 
