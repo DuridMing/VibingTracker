@@ -31,14 +31,21 @@ Claude Code ── http hook（127.0.0.1:4800）──┐
 
 ## 安裝
 
-需要 Rust stable（`cargo`）與 Claude Code。支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行。
+需要 Rust stable（`cargo`）與 Claude Code。支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行，所以 Windows 要先裝 [Git for Windows](https://git-scm.com/download/win)。
+
+Claude Code CLI 的安裝（`plugin` 指令要用到）：
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash        # Linux、macOS
+irm https://claude.ai/install.ps1 | iex               # Windows PowerShell
+```
 
 ### 1. 編譯並放好二進位與網頁
 
-二進位和 `web/` 要放在同一個資料夾：collector 沒有另外設定網頁位置時，會用二進位旁邊的 `web/`。
+二進位和 `web/` 要放在同一個資料夾：collector 沒有另外設定網頁位置時，會用二進位旁邊的 `web/`。Windows 在 Git Bash 執行下面的指令（`~` 是 `%USERPROFILE%`）。
 
 ```bash
-git clone <repo> VibingTracker && cd VibingTracker
+git clone -b develop https://github.com/DuridMing/VibingTracker.git && cd VibingTracker
 cargo build --release -p coding-lab
 mkdir -p ~/.coding-lab/bin
 cp target/release/coding-lab ~/.coding-lab/bin/     # Windows：target/release/coding-lab.exe
@@ -53,6 +60,10 @@ cp -r web ~/.coding-lab/bin/
 claude plugin marketplace add /path/to/VibingTracker
 claude plugin install coding-lab@coding-lab
 ```
+
+`/path/to/VibingTracker` 是上一步 clone 下來的資料夾（Windows 例如 `C:\src\VibingTracker`）。目前程式碼在 `develop` 分支，`main` 還沒有發佈的版本，所以 marketplace 要用本機的 clone，不要直接給 GitHub 的 `DuridMing/VibingTracker`（會讀到 `main`）。也可以在 Claude Code 裡輸入 `/plugin` 用選單安裝。
+
+plugin 裝在使用者層級（`~/.claude/`），Claude Desktop 的 Code 分頁開的本機 session 也會載入，一樣會被追蹤（Windows 上實測過）。
 
 只想試一次、不安裝的話，可以用 `claude --plugin-dir /path/to/VibingTracker/plugin`。
 
