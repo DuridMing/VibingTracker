@@ -82,3 +82,10 @@ class Setup(unittest.TestCase):
         conf = (L.HOME / "config.toml").read_text()
         line = next(l for l in conf.splitlines() if l.startswith("idle_exit_seconds"))
         self.assertGreater(int(line.split("=")[1]), 0, "腳本被中斷時 collector 要能自己結束")
+
+    def test_collector_serves_the_repo_web(self):
+        # #656 之後網頁預設找二進位旁的 web/，target/release/ 底下沒有：測試用的 collector 要指到 repo 的 web/
+        L = self.L
+        L.setup()
+        conf = (L.HOME / "config.toml").read_text()
+        self.assertIn(f'root = "{L.ROOT / "web"}"', conf)

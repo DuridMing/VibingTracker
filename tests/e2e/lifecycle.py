@@ -55,6 +55,8 @@ def setup():
     hook, web = free_port(), free_port()
     (HOME / "config.toml").write_text(
         f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\n'
+        # 網頁預設找二進位旁的 web/（#656），target/release/ 底下沒有
+        f'root = "{ROOT / "web"}"\n'
         # 腳本被 SIGKILL、沒跑到 stop_collector 時，collector 閒置一陣子會自己結束（#688）
         f"[collector]\nidle_exit_seconds = {IDLE_EXIT_SECONDS}\n"
     )
