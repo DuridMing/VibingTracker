@@ -12,6 +12,7 @@ fn ctx(home: &Path) -> Ctx {
         config_home: PathBuf::from("/home/u/.config"),
         user_home: PathBuf::from("/home/u"),
         uid: Some(1000),
+        user: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
         config_home: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
         user_home: PathBuf::from(r"C:\Users\u"),
         uid: None,
+        user: Some(r"DESKTOP-1\u".into()),
     };
     let plan = service::plan_install(Platform::Windows, &c);
     let xml = file_of(&plan, "coding-lab-task.xml");
@@ -111,6 +113,18 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
         "{xml}"
     );
     assert!(xml.contains("<Hidden>true</Hidden>"), "{xml}");
+    // #719：沒有 UserId 等於「任何使用者登入時」，一般使用者建不了（Access is denied）：trigger 與 principal 都要有目前使用者
+    assert_eq!(
+        xml.matches(r"<UserId>DESKTOP-1\u</UserId>").count(),
+        2,
+        "{xml}"
+    );
+    assert!(
+        xml.contains(
+            "<LogonTrigger>\r\n      <Enabled>true</Enabled>\r\n      <UserId>DESKTOP-1\\u</UserId>"
+        ),
+        "{xml}"
+    );
     let cmds: Vec<String> = plan.commands.iter().map(|c| c.join(" ")).collect();
     assert!(
         cmds.iter()
@@ -183,6 +197,7 @@ fn apply_writes_files_then_runs_commands_and_uninstall_leaves_nothing_behind() {
         config_home: dir.join("config"),
         user_home: dir.join("user"),
         uid: Some(1000),
+        user: None,
     };
     let install = service::plan_install(Platform::Linux, &c);
     let mut ran: Vec<Step> = Vec::new();
@@ -215,6 +230,7 @@ fn status_reports_whether_the_unit_file_is_installed() {
         config_home: dir.join("config"),
         user_home: dir.join("user"),
         uid: Some(1000),
+        user: None,
     };
     assert!(!service::installed(Platform::Linux, &c));
     service::apply(&service::plan_install(Platform::Linux, &c), &mut |_| Ok(())).unwrap();
@@ -228,4 +244,75 @@ fn current_platform_is_known_on_the_three_supported_oses() {
         p,
         Some(Platform::Linux | Platform::Macos | Platform::Windows)
     ));
+}
+
+// ---------- #719：status 以系統查詢為準、install 失敗把 collector 拉回、非 UTF-8 輸出 ----------
+
+#[test]
+fn status_asks_the_service_manager_not_just_the_file() {
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    let cmds = |p: Platform| service::status_command(p, &c).join(" ");
+    assert_eq!(
+        cmds(Platform::Linux),
+        "systemctl --user is-enabled coding-lab.service"
+    );
+    assert_eq!(
+        cmds(Platform::Macos),
+        "launchctl print gui/1000/io.coding-lab.collector"
+    );
+    assert_eq!(cmds(Platform::Windows), "schtasks /Query /TN CodingLab");
+    for p in [Platform::Linux, Platform::Macos, Platform::Windows] {
+        assert!(
+            service::query_installed(p, &c, &mut |_| Ok("enabled\n".into())),
+            "{p:?} 查得到就是已安裝"
+        );
+        assert!(
+            !service::query_installed(p, &c, &mut |_| Err("not found".into())),
+            "{p:?} 查不到就是未安裝，不管 XML／unit 檔在不在"
+        );
+    }
+    assert!(
+        !service::query_installed(Platform::Linux, &c, &mut |_| Ok("disabled\n".into())),
+        "Linux 的 unit 在但沒 enable 不算已安裝"
+    );
+}
+
+#[test]
+fn install_restores_the_collector_when_registration_fails() {
+    let dir = tmp("restore");
+    let c = Ctx {
+        exe: PathBuf::from("/opt/coding-lab/bin/coding-lab"),
+        home: dir.join("home"),
+        config_home: dir.join("config"),
+        user_home: dir.join("user"),
+        uid: Some(1000),
+        user: None,
+    };
+    let plan = service::plan_install(Platform::Linux, &c);
+    let mut restored = 0;
+    let err = service::install(
+        &plan,
+        &mut |cmd| Err(format!("{} 被拒", cmd[0])),
+        &mut || restored += 1,
+    )
+    .unwrap_err();
+    assert!(err.contains("systemctl") && err.contains("被拒"), "{err}");
+    assert_eq!(restored, 1, "註冊失敗要把先前停掉的 collector 拉回來");
+    assert!(
+        !dir.join("config/systemd/user/coding-lab.service").exists(),
+        "失敗時不留下半套：unit 檔要收回"
+    );
+    let mut restored = 0;
+    service::install(&plan, &mut |_| Ok(()), &mut || restored += 1).unwrap();
+    assert_eq!(restored, 0, "成功就不用拉回");
+}
+
+#[test]
+fn non_utf8_command_output_is_flagged_instead_of_shown_as_garbage() {
+    let (text, lossy) = service::decode_output(b"ERROR: Access is denied.\r\n");
+    assert_eq!((text.as_str(), lossy), ("ERROR: Access is denied.", false));
+    // cp950 的「錯誤: 存取被拒。」不是合法 UTF-8
+    let (text, lossy) = service::decode_output(b"\xbf\xf9\xbb~: \xa6s\xa8\xfa\xb3Q\xa9\xda\xa1C");
+    assert!(lossy);
+    assert!(!text.is_empty());
 }

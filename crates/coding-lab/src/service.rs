@@ -42,6 +42,8 @@ pub struct Ctx {
     pub config_home: PathBuf,
     pub user_home: PathBuf,
     pub uid: Option<u32>,
+    /// Windows：`DOMAIN\\user`（工作排程器的 `<UserId>`，#719）；其他平台 None
+    pub user: Option<String>,
 }
 
 impl Ctx {
@@ -63,12 +65,26 @@ impl Ctx {
             .filter(|o| o.status.success())
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .and_then(|s| s.trim().parse().ok());
+        let user = if cfg!(windows) {
+            std::env::var("USERNAME")
+                .ok()
+                .filter(|u| !u.is_empty())
+                .map(
+                    |u| match std::env::var("USERDOMAIN").ok().filter(|d| !d.is_empty()) {
+                        Some(d) => format!("{d}\\{u}"),
+                        None => u,
+                    },
+                )
+        } else {
+            None
+        };
         Ok(Ctx {
             exe,
             home: home.to_path_buf(),
             config_home,
             user_home,
             uid,
+            user,
         })
     }
 }
@@ -236,10 +252,12 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  \x20 <Triggers>\r\n\
                  \x20   <LogonTrigger>\r\n\
                  \x20     <Enabled>true</Enabled>\r\n\
+                 {user_trigger}\
                  \x20   </LogonTrigger>\r\n\
                  \x20 </Triggers>\r\n\
                  \x20 <Principals>\r\n\
                  \x20   <Principal id=\"Author\">\r\n\
+                 {user_principal}\
                  \x20     <LogonType>InteractiveToken</LogonType>\r\n\
                  \x20     <RunLevel>LeastPrivilege</RunLevel>\r\n\
                  \x20   </Principal>\r\n\
@@ -267,6 +285,17 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  </Task>\r\n",
                 exe = xml_escape(&ctx.exe.to_string_lossy()),
                 home = xml_escape(&home),
+                // 一般使用者只能建「自己登入時、以自己身分跑」的工作：trigger 與 principal 都要填目前使用者（#719）
+                user_trigger = ctx
+                    .user
+                    .as_deref()
+                    .map(|u| format!("      <UserId>{}</UserId>\r\n", xml_escape(u)))
+                    .unwrap_or_default(),
+                user_principal = ctx
+                    .user
+                    .as_deref()
+                    .map(|u| format!("      <UserId>{}</UserId>\r\n", xml_escape(u)))
+                    .unwrap_or_default(),
             );
             let path = task_xml_path(ctx);
             Plan {
@@ -347,21 +376,92 @@ pub fn apply(
     Ok(())
 }
 
+/// 問系統「這個服務有沒有登記」的指令（#719）：install 失敗後檔案可能還在，所以 status 以這個為準
+pub fn status_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
+    match platform {
+        Platform::Linux => s(&["systemctl", "--user", "is-enabled", LINUX_UNIT]),
+        Platform::Macos => s(&[
+            "launchctl",
+            "print",
+            &format!("gui/{}/{MACOS_LABEL}", ctx.uid.unwrap_or(501)),
+        ]),
+        Platform::Windows => s(&["schtasks", "/Query", "/TN", WINDOWS_TASK]),
+    }
+}
+
+/// `run` 執行 [`status_command`]（成功回 stdout）：查得到就是已安裝；Linux 另外要 `enabled`
+pub fn query_installed(
+    platform: Platform,
+    ctx: &Ctx,
+    run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+) -> bool {
+    match run(&status_command(platform, ctx)) {
+        Ok(out) => platform != Platform::Linux || out.trim().starts_with("enabled"),
+        Err(_) => false,
+    }
+}
+
+/// install：寫檔、登記；登記失敗就把剛寫的檔收回，並呼叫 `restore`（把先前為了讓出埠而停掉的 collector 拉回來，#719）
+pub fn install(
+    plan: &Plan,
+    run: &mut dyn FnMut(&[String]) -> Result<(), String>,
+    restore: &mut dyn FnMut(),
+) -> Result<(), String> {
+    match apply(plan, run) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            for (p, _) in &plan.files {
+                let _ = std::fs::remove_file(p);
+            }
+            restore();
+            Err(e)
+        }
+    }
+}
+
+/// 子程序輸出轉成文字：合法 UTF-8 照用；不是（Windows 的 schtasks 用 OEM code page，例如 cp950）就 lossy，並回報 `true`
+pub fn decode_output(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(t) => (t.trim().to_string(), false),
+        Err(_) => (String::from_utf8_lossy(bytes).trim().to_string(), true),
+    }
+}
+
+fn output_error(prog: &str, out: &std::process::Output) -> String {
+    let raw = if out.stderr.is_empty() {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    let (text, lossy) = decode_output(raw);
+    if text.is_empty() {
+        return format!("exit {}", out.status.code().unwrap_or(-1));
+    }
+    if lossy {
+        // 不是 UTF-8（Windows 主控台的 OEM code page）：畫面給 lossy 版，原始位元組寫進 log 讓人用對的編碼看
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        crate::logging::log(&format!(
+            "service：{prog} 的輸出不是 UTF-8（原始十六進位）：{hex}"
+        ));
+        return format!("{text}（原始訊息不是 UTF-8，原文已寫進 collector.log）");
+    }
+    text
+}
+
 /// 真的執行一條指令：成功要 exit 0，否則把 stderr 帶回來
 pub fn run_command(cmd: &[String]) -> Result<(), String> {
+    run_command_capture(cmd).map(|_| ())
+}
+
+/// 同 [`run_command`]，成功時回 stdout（status 查詢用）
+pub fn run_command_capture(cmd: &[String]) -> Result<String, String> {
     let (prog, args) = cmd.split_first().ok_or("空的指令")?;
     let out = std::process::Command::new(prog)
         .args(args)
         .output()
         .map_err(|e| format!("執行不了 {prog}：{e}"))?;
     if out.status.success() {
-        return Ok(());
+        return Ok(decode_output(&out.stdout).0);
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    let err = err.trim();
-    Err(if err.is_empty() {
-        format!("exit {}", out.status.code().unwrap_or(-1))
-    } else {
-        err.to_string()
-    })
+    Err(output_error(prog, &out))
 }
