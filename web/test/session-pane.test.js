@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSessionPane, nowOf, switchTab, sessionTitle } from "../js/session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay } from "../js/session-pane.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 let seq = 0;
@@ -143,4 +143,74 @@ test("被拒或失敗的 Edit／Write 不算進碰過的檔案（#682）", () =>
   p.apply([called("e3", "Edit"), edit("e3", "src/b.ts", ["+z"]), updated("e3", "failed")]);
   const b = p.files().find((x) => x.path === "src/b.ts");
   assert.deepEqual([b.edits, b.added], [1, 1]);
+});
+
+// ---------- 回放歷史 session（#653） ----------
+// 一個已結束的 session：兩輪各有思考、文字、改檔、commit；回放時 collector 依 pos 從最新一頁往前給
+function history() {
+  const T = "cccccccc-0000-0000-0000-000000000003";
+  const mk = (type, payload, opts) => ({ ...ev(type, payload, opts), session: T });
+  const list = [
+    mk("assistant.thinking", { text: "先看結構", summarized: false }, { pos: 1 }),
+    mk("assistant.text", { text: "我先改 a.ts" }, { pos: 2 }),
+    mk("tool.called", { toolUseId: "e1", tool: "Edit", input: {}, status: "running", placement: "staged", danger: null }),
+    mk("tool.placed", { toolUseId: "e1", placement: "stream" }, { pos: 3 }),
+    mk("tool.updated", { toolUseId: "e1", status: "done" }),
+    mk("file.edit", { toolUseId: "e1", path: "src/a.ts", hunk: { start: 1, oldLines: 1, newLines: 2, lines: ["-a", "+b", "+c"] }, hunkSource: "pre" }),
+    mk("git.op", { toolUseId: "g1", op: "commit", branch: "feature/x", hash: "aaa111", message: "第一筆", ok: true }),
+    mk("assistant.thinking", { text: "第二輪：補測試", summarized: true }, { pos: 4 }),
+    mk("assistant.text", { text: "新增測試檔" }, { pos: 5 }),
+    mk("tool.called", { toolUseId: "w1", tool: "Write", input: {}, status: "running", placement: "staged", danger: null }),
+    mk("tool.placed", { toolUseId: "w1", placement: "stream" }, { pos: 6 }),
+    mk("tool.updated", { toolUseId: "w1", status: "done" }),
+    mk("file.write", { toolUseId: "w1", path: "test/a.test.ts", isNew: true, content: "x\n", truncated: false }),
+    mk("git.op", { toolUseId: "g2", op: "commit", branch: "feature/x", hash: "bbb222", message: "補測試", ok: true }),
+    mk("assistant.text", { text: "完成" }, { pos: 7 }),
+  ];
+  return { T, list };
+}
+
+const view = (p) => ({
+  rows: p.stream.rows.map((r) => [r.pos, r.seq ?? null, r.kind ?? r.type ?? null]),
+  commits: p.git.commits.map((c) => c.hash),
+  last: p.git.last?.hash ?? null,
+  thinking: p.thinking,
+  files: p.files().map((f) => [f.path, f.edits, f.writes, f.added, f.removed, f.isNew, f.running]),
+  changes: p.changes.list.map((c) => c.key),
+});
+
+test("回放：session 已不在 live（snapshot 沒有它的串流）時要從 JSONL 讀；即時的 session 不用", () => {
+  const { T, list } = history();
+  assert.equal(needsReplay(T, { staged: [], stream: [] }), true);
+  assert.equal(needsReplay(T, { staged: [], stream: list.filter((e) => e.pos == null) }), true, "只有狀態行、沒有任何 pos");
+  assert.equal(needsReplay(T, { staged: [], stream: list }), false);
+  assert.equal(needsReplay(T, { staged: [], stream: [{ ...list[0], session: S }] }), true, "別的 session 的不算");
+});
+
+test("回放：從最新一頁往前 prepend，串流、git 列、碰過的檔案、改動、思考條都和即時收到（snapshot＋frame）的一樣", () => {
+  const { T, list } = history();
+  const live = createSessionPane(T);
+  live.load({ staged: [], stream: list.slice(0, 5) });
+  live.apply(list.slice(5, 10));
+  live.apply(list.slice(10));
+
+  const replay = createSessionPane(T);
+  replay.load({ staged: [], stream: [] });
+  replay.prepend(list.slice(8)); // 最新一頁：pos 5 之後
+  replay.prepend(list.slice(3, 8)); // 再往前
+  replay.prepend(list.slice(0, 3));
+
+  assert.deepEqual(view(replay), view(live));
+  assert.deepEqual(replay.git.commits.map((c) => c.hash), ["aaa111", "bbb222"], "較舊的 commit 排在前面，最後一筆不被舊的蓋掉");
+  assert.equal(replay.thinking.text, "第二輪：補測試", "思考條是最新一段，不被往前翻到的舊思考蓋掉");
+  assert.equal(replay.stream.minPos().get(T), 1);
+});
+
+test("回放：舊的一頁裡工具還在 running，不能蓋掉之後已知的 done", () => {
+  const { T, list } = history();
+  const p = createSessionPane(T);
+  p.load({ staged: [], stream: [] });
+  p.prepend(list.slice(4)); // 有 e1 的 done
+  p.prepend(list.slice(0, 4)); // 只有 e1 的 running
+  assert.equal(p.files().find((f) => f.path === "src/a.ts").running, false);
 });

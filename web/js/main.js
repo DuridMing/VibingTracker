@@ -10,7 +10,7 @@ import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel } from "./agents.js";
-import { createSessionPane, nowOf, switchTab, sessionTitle } from "./session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
@@ -909,17 +909,18 @@ let paneMoreReq = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
 const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
 
-function paneMore() {
+// replay：session 已不在 live（#653），從最新的往前讀（beforePos 不帶）
+function paneMore(replay = false) {
   if (paneMoreReq || ui.tab === "all") return;
-  const beforePos = pane.stream.minPos().get(pane.session);
-  if (!(beforePos > 1)) return;
+  const beforePos = replay ? null : pane.stream.minPos().get(pane.session);
+  if (!replay && !(beforePos > 1)) return;
   paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
   client.more({ session: pane.session, beforePos, limit: 200 });
 }
 function onPaneMore(m) {
   clearTimeout(paneMoreReq.timer);
   paneMoreReq = null;
-  paneView.prepended(pane.stream.prepend([m.events ?? []]));
+  paneView.prepended(pane.prepend(m.events));
   paneHasMore();
 }
 function paneHasMore() {
@@ -941,7 +942,8 @@ function renderPane() {
   $("#spane").hidden = !on;
   if (!on) return;
   const id = pane.session;
-  const s = store.sessions.get(id);
+  // 已從 live 移除的 session（回放）只有 /api/sessions 補進來的列
+  const s = store.sessions.get(id) ?? left.fetched.find((r) => r.id === id);
   const v = agentView([...store.agents.values()], id, { sessionModel: s?.model ?? null });
   const main = store.agents.get(`${id}/main`);
   const model = s?.model ?? main?.model ?? null; // sessions.model 還沒有值時先用 main agent 的
@@ -1291,6 +1293,7 @@ const client = createClient({
         paneMoreReq = null;
         paneView.reset();
         paneHasMore();
+        if (needsReplay(pane.session, m)) paneMore(true);
       }
       if (m.ch === "*") {
         applySnapshot(store, m);
