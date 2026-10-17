@@ -741,11 +741,32 @@ struct HubState {
     offset_fixed: std::sync::atomic::AtomicBool,
     /// 每個 session 頻道有幾條客戶端連線在訂（最後一條退訂才對上游退訂）
     subs: Mutex<HashMap<String, usize>>,
+    /// snapshot 快取以外的 session 屬於哪台（#726）：`/api/sessions` 合併時與逐台試出來時記下。
+    /// 已結束、被移出 live 的 session 只有這裡找得到
+    known: Mutex<HashMap<String, String>>,
 }
 
 static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
 impl HubState {
+    /// 不發網路請求就知道的擁有者：live 快取，再來是記下的對照表
+    fn owner_known(&self, sid: &str) -> Option<String> {
+        self.hub().owner_of_session(sid).or_else(|| {
+            self.known
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(sid)
+                .cloned()
+        })
+    }
+
+    fn remember(&self, sid: &str, up: &str) {
+        self.known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sid.to_string(), up.to_string());
+    }
+
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
         self.hub.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -803,6 +824,7 @@ pub async fn serve_with_backoff(
         offset: AtomicI32::new(0),
         offset_fixed: std::sync::atomic::AtomicBool::new(false),
         subs: Mutex::new(HashMap::new()),
+        known: Mutex::new(HashMap::new()),
     });
     let mut tasks = Vec::new();
     for (up, rx) in rxs {
@@ -860,10 +882,15 @@ async fn upstream_loop(
                 let mut first = vec![hello, json!({ "op": "subscribe", "channel": "*" })];
                 // 客戶端還訂著的 session 頻道：重連後補訂
                 {
-                    let subs = state.subs.lock().unwrap_or_else(|e| e.into_inner());
-                    let hub = state.hub();
-                    for sid in subs.keys() {
-                        if hub.owner_of_session(sid).as_deref() == Some(up.name.as_str()) {
+                    let sids: Vec<String> = state
+                        .subs
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .keys()
+                        .cloned()
+                        .collect();
+                    for sid in &sids {
+                        if state.owner_known(sid).as_deref() == Some(up.name.as_str()) {
                             first.push(
                                 json!({ "op": "subscribe", "channel": format!("session:{sid}") }),
                             );
@@ -1034,6 +1061,43 @@ async fn client(mut socket: WebSocket, state: Arc<HubState>) {
     }
 }
 
+/// 這個 session 屬於哪台：先查快取與對照表；都沒有就逐台（只問 online 的）打 `/api/sessions/<id>/events?limit=1`，
+/// 第一個回 200 的就是，記下來（collector 對不認得的 session 回 404）。哪台都沒有回 None（#726）
+async fn resolve_owner(state: &HubState, sid: &str) -> Option<String> {
+    if let Some(o) = state.owner_known(sid) {
+        return Some(o);
+    }
+    if sid.is_empty() {
+        return None;
+    }
+    let online = state.hub().online();
+    let path = format!("/api/sessions/{}/events?limit=1", percent_encode(sid));
+    for u in &state.ups {
+        if !online.iter().any(|(n, on)| *n == u.up.name && *on) {
+            continue;
+        }
+        if let Ok(r) = http_get(&u.up.url, &path, u.up.key.as_deref()).await
+            && r.status == 200
+        {
+            state.remember(sid, &u.up.name);
+            return Some(u.up.name.clone());
+        }
+    }
+    None
+}
+
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
 fn forward(state: &HubState, up: &str, msg: Value) -> bool {
     state.handle(up).is_some_and(|h| h.tx.send(msg).is_ok())
 }
@@ -1053,7 +1117,7 @@ fn unsubscribe_session(state: &HubState, sid: &str) {
             None => false,
         }
     };
-    if last && let Some(owner) = state.hub().owner_of_session(sid) {
+    if last && let Some(owner) = state.owner_known(sid) {
         forward(
             state,
             &owner,
@@ -1103,7 +1167,7 @@ async fn on_client_message(
             let Some(sid) = ch.strip_prefix("session:").filter(|s| !s.is_empty()) else {
                 return send(socket, &err("不認得的頻道")).await;
             };
-            let Some(owner) = state.hub().owner_of_session(sid) else {
+            let Some(owner) = resolve_owner(state, sid).await else {
                 return send(socket, &err("hub 不認得這個 session（它的那台可能離線）")).await;
             };
             if !subs.sessions.iter().any(|s| s == sid) {
@@ -1133,7 +1197,7 @@ async fn on_client_message(
         }
         "ack" => {
             let sid = msg["session"].as_str().unwrap_or_default();
-            let Some(owner) = state.hub().owner_of_session(sid) else {
+            let Some(owner) = resolve_owner(state, sid).await else {
                 return send(socket, &err("hub 不認得這個 session")).await;
             };
             if !state.hub().can_ack(&owner) {
@@ -1150,7 +1214,7 @@ async fn on_client_message(
         }
         "more" => {
             let sid = msg["session"].as_str().unwrap_or_default();
-            let owner = state.hub().owner_of_session(sid);
+            let owner = resolve_owner(state, sid).await;
             match owner {
                 Some(owner) => {
                     forward(state, &owner, msg.clone());
@@ -1270,6 +1334,9 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
                 Ok(r) if r.status == 200 => {
                     if let Ok(v) = serde_json::from_slice::<Value>(&r.body) {
                         for s in v["sessions"].as_array().into_iter().flatten() {
+                            if let Some(id) = s["id"].as_str() {
+                                state.remember(id, &u.up.name);
+                            }
                             let mut s = s.clone();
                             set_host(&mut s, &u.up.name);
                             rows.push(s);
@@ -1287,7 +1354,7 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
     }
     let owner = if let Some(rest) = path.strip_prefix("/api/sessions/") {
         let id = rest.split('/').next().unwrap_or_default();
-        state.hub().owner_of_session(&percent_decode(id))
+        resolve_owner(&state, &percent_decode(id)).await
     } else {
         match query_param(&uri, "cwd") {
             Some(c) => state.hub().owner_of_cwd(&c),
