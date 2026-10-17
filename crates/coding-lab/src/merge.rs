@@ -28,6 +28,10 @@ pub const FALLBACK_WAIT_MS: u64 = 60_000;
 pub const SESSION_EVICT_AFTER_MS: u64 = 10 * 60 * 1000;
 /// 沒有 SessionEnd（終端機被直接關掉）的 session，多久沒有任何事件就移除。
 pub const SESSION_IDLE_EVICT_MS: u64 = 24 * 60 * 60 * 1000;
+/// SubagentStart 有好幾個候選呼叫時，等 meta.json／PostToolUse 的 agentId 的上限；過了依呼叫順序配對（#680）。
+pub const AGENT_PAIR_WAIT_MS: u64 = 1_500;
+/// 還沒配到 subagent 的 Agent／Task 呼叫最多留多久（背景 agent 的呼叫在 PostToolUse 就有 agentId，前景的在 SubagentStart 配走）。
+const AGENT_CALL_KEEP_MS: u64 = 60 * 60 * 1000;
 /// 背景 agent 的 PreToolUse 等執行結果的上限，過了就丟掉。
 pub const BG_HOLD_MS: u64 = 60_000;
 /// 工具輸出存前截斷的上限（contracts.md §4）。
@@ -66,6 +70,13 @@ pub enum Input {
         file: String,
         ts_seen: u64,
     },
+    /// serve 在 SubagentStart 後讀 subagent 目錄的 `agent-<id>.meta.json` 的結果（#680）。
+    AgentMeta {
+        session: String,
+        agent_id: String,
+        meta: AgentMetaRead,
+        ts_seen: u64,
+    },
     /// serve 停掉或重開了 tail（`file` 為 None 表示整個 session）。新的 tail 從健康狀態開始、
     /// 舊的不會再送 Recovered，所以由這裡清掉降級。
     TailReset {
@@ -73,6 +84,17 @@ pub enum Input {
         file: Option<String>,
         ts_seen: u64,
     },
+}
+
+/// `agent-<id>.meta.json` 讀到什麼（#680）。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentMetaRead {
+    /// 有 `toolUseId`：這個 subagent 由那個 Agent／Task 呼叫開出來
+    ToolUse(String),
+    /// 檔案在但沒有 `toolUseId`：不是 Agent／Task 開的（例如 Skill 的 fork），沒有 parent
+    NoToolUse,
+    /// 重試到上限都讀不到：退回呼叫順序
+    Unreadable,
 }
 
 struct Card {
@@ -101,6 +123,14 @@ struct Session {
     last_model: HashMap<String, String>,
     seen_messages: HashSet<String>,
     pending_agents: Vec<PendingAgent>,
+    /// 已知的 agent_id → 呼叫的 tool_use_id：PostToolUse 的 `tool_response.agentId`、meta.json 的 `toolUseId`（#680）
+    known_agents: HashMap<String, String>,
+    /// 還在等確定對應的 SubagentStart
+    waiting_starts: Vec<WaitingStart>,
+    /// 已發過 agent.spawned 的 agent_id（重複的 SubagentStart 不再處理）
+    spawned_agents: HashSet<String>,
+    /// 每個 Agent／Task 呼叫的名稱與 prompt：呼叫被別的 agent 依順序配走後，確定的對應晚到時仍補得回來
+    call_info: HashMap<String, PendingAgent>,
     /// 有 SubagentStart 的 agent_id（真的 subagent）
     started_agents: HashSet<String>,
     /// 已發過 agent.finished 的 agent_id：SubagentStop 與 task-notification 只結束一次（#677）
@@ -121,11 +151,23 @@ struct HeldTool {
 }
 
 /// 已呼叫 Agent／Task 工具、還沒對到 SubagentStart 的 subagent。
+#[derive(Clone)]
 struct PendingAgent {
     tool_use_id: String,
     subagent_type: Option<String>,
     description: Option<String>,
     prompt: Option<String>,
+    /// PreToolUse 的到達時間
+    at: u64,
+}
+
+/// 有候選呼叫、還在等確定對應的 SubagentStart。
+struct WaitingStart {
+    agent_id: String,
+    agent_type: Option<String>,
+    since: u64,
+    /// SubagentStart 的原始 hook，延後發出的 agent.spawned 照樣帶上
+    raw: Option<Map<String, Value>>,
 }
 
 /// agent 對應的 transcript 檔（[`Input::Line`] 的 `file`）。
@@ -275,6 +317,9 @@ impl Merger {
             }
             | Input::Recovered {
                 session, ts_seen, ..
+            }
+            | Input::AgentMeta {
+                session, ts_seen, ..
             } => Some((session.as_str(), *ts_seen)),
             Input::TailReset { .. } => None,
         };
@@ -325,6 +370,16 @@ impl Merger {
                 self.session(&session).degraded.remove(&file);
                 vec![self.recovered(&session, file, ts_seen)]
             }
+            Input::AgentMeta {
+                session,
+                agent_id,
+                meta,
+                ts_seen,
+            } => match meta {
+                AgentMetaRead::ToolUse(tool) => self.agent_known(&session, agent_id, tool, ts_seen),
+                AgentMetaRead::NoToolUse => self.agent_without_call(&session, &agent_id, ts_seen),
+                AgentMetaRead::Unreadable => self.agent_by_order(&session, &agent_id, ts_seen),
+            },
             Input::TailReset {
                 session,
                 file,
@@ -412,6 +467,17 @@ impl Merger {
         ts_seen: u64,
         raw: Option<Map<String, Value>>,
     ) -> Vec<Event> {
+        // 還在等配對的 subagent 先發出 spawn：session.ended 之後 live 會清掉這個 session 的 agents 列
+        let waiting: Vec<String> = self
+            .session(sid)
+            .waiting_starts
+            .iter()
+            .map(|w| w.agent_id.clone())
+            .collect();
+        let mut out: Vec<Event> = waiting
+            .iter()
+            .flat_map(|a| self.agent_by_order(sid, a, ts_seen))
+            .collect();
         self.session(sid).ended_at = Some(ts_seen);
         let meta = Meta {
             agent: "main".into(),
@@ -419,7 +485,7 @@ impl Merger {
             raw,
             ..Meta::default()
         };
-        let mut out = vec![self.emit(sid, Payload::SessionEnded(SessionEnded { reason }), meta)];
+        out.push(self.emit(sid, Payload::SessionEnded(SessionEnded { reason }), meta));
         let changes = self.tracker(sid).session_end(ts_seen);
         out.extend(self.apply(sid, changes, "main", ts_seen));
         out
@@ -484,6 +550,7 @@ impl Merger {
                 now,
             ));
             out.extend(self.apply(&sid, changes, "main", now));
+            out.extend(self.agents_tick(&sid, now));
         }
         out
     }
@@ -670,6 +737,10 @@ impl Merger {
                 {
                     self.tracker(&sid).signal(Signal::SubagentFail, ts_seen);
                 }
+                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
+                if let Some(n) = &notice {
+                    out.extend(self.agent_by_order(&sid, &n.task_id, ts_seen));
+                }
                 if let Some(n) = notice
                     && let Some(ss) = self.sessions.get_mut(&sid)
                     && ss.finished_agents.insert(n.task_id.clone())
@@ -704,6 +775,15 @@ impl Merger {
                 let output = response_text(h.field("tool_response"));
                 out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
                 out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                // Agent／Task 的結果帶 agentId（背景 agent 啟動時、前景 agent 結束時）：subagent 對應哪個呼叫（#680）
+                if matches!(h.str_field("tool_name"), Some("Agent" | "Task"))
+                    && let Some(a) = h
+                        .field("tool_response")
+                        .and_then(|r| r["agentId"].as_str())
+                        .filter(|a| !a.is_empty())
+                {
+                    out.extend(self.agent_known(&sid, a.to_string(), id.clone(), ts_seen));
+                }
                 out.extend(self.tool_ended(h, &sid, &id, &agent, Some(true), ts_seen));
             }
             "PostToolUseFailure" => {
@@ -787,33 +867,14 @@ impl Merger {
                 };
                 self.session(&sid).started_agents.insert(agent_id.clone());
                 let agent_type = s("agent_type").filter(|t| !t.is_empty());
-                // 對到最近一次、subagent_type 相同（或沒指定）的 Agent／Task 工具呼叫：實測（#680）每個呼叫的
-                // SubagentStart 緊接在它的 PreToolUse 之後、下一個呼叫之前，所以取最近的；結束的呼叫已從清單移除
-                let pending = self.sessions.get_mut(&sid).and_then(|ss| {
-                    let i = ss.pending_agents.iter().rposition(|p| {
-                        p.subagent_type.is_none() || p.subagent_type == agent_type
-                    })?;
-                    Some(ss.pending_agents.remove(i))
-                });
-                let p = AgentSpawned {
-                    agent_id,
-                    agent_type,
-                    name: pending.as_ref().and_then(|p| p.description.clone()),
-                    task: pending
-                        .as_ref()
-                        .and_then(|p| p.prompt.as_ref().map(|t| truncate(t, MESSAGE_LIMIT).0)),
-                    parent_tool_use_id: pending.map(|p| p.tool_use_id),
-                };
-                let m = Meta {
-                    agent: "main".into(),
-                    ..meta()
-                };
-                out.push(self.emit(&sid, Payload::AgentSpawned(p), m));
+                out.extend(self.agent_started(&sid, agent_id, agent_type, ts_seen, raw.clone()));
             }
             "SubagentStop" => {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
+                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
+                out.extend(self.agent_by_order(&sid, &agent_id, ts_seen));
                 let ss = self.session(&sid);
                 ss.held_bg.retain(|_, h| h.agent_id != agent_id);
                 if !ss.finished_agents.insert(agent_id.clone()) {
@@ -844,6 +905,143 @@ impl Merger {
         out
     }
 
+    // ── subagent 與 Agent／Task 呼叫的配對（#680）
+    //
+    // SubagentStart 沒有 tool_use_id，到達順序也不可靠。確定的對應有兩個，都可能晚到：PostToolUse 的
+    // `tool_response.agentId`（背景 agent 和 SubagentStart 同一毫秒、先後都有；前景 agent 結束時才到），與
+    // meta.json 的 `toolUseId`（SubagentStart 後 40–60 ms 才寫好，serve 讀到送 Input::AgentMeta）。Skill 開的
+    // fork 也有 SubagentStart，但不是 Agent／Task 開的（meta.json 沒有 toolUseId），所以只要還有候選呼叫、
+    // 又還不知道對應，就一律等：meta 有 toolUseId 就配它、沒有就當沒有 parent、讀不到或等太久才依呼叫順序。
+    // agent.spawned 每個 agent 只發一次；它的 SubagentStop 先到時先配對再發。
+
+    fn agent_started(
+        &mut self,
+        sid: &str,
+        agent_id: String,
+        agent_type: Option<String>,
+        ts_seen: u64,
+        raw: Option<Map<String, Value>>,
+    ) -> Vec<Event> {
+        let s = self.session(sid);
+        // 同一個 SubagentStart 收到兩次（plugin 和 settings 都掛了）：已經發過或已經在等就不再處理
+        if s.spawned_agents.contains(&agent_id)
+            || s.waiting_starts.iter().any(|w| w.agent_id == agent_id)
+        {
+            return Vec::new();
+        }
+        if let Some(tool) = s.known_agents.get(&agent_id).cloned() {
+            return vec![self.spawn_for(sid, agent_id, agent_type, Some(tool), ts_seen, raw)];
+        }
+        let ty = agent_type.clone();
+        let candidates = s.pending_agents.iter().filter(|p| fits(s, p, &ty)).count();
+        if candidates == 0 {
+            return vec![self.spawn_for(sid, agent_id, agent_type, None, ts_seen, raw)];
+        }
+        let ended = s.ended_at.is_some();
+        let id = agent_id.clone();
+        s.waiting_starts.push(WaitingStart {
+            agent_id,
+            agent_type,
+            since: ts_seen,
+            raw,
+        });
+        // session 已經結束：不再等，否則 agent.spawned 會落在 session.ended 之後
+        if ended {
+            return self.agent_by_order(sid, &id, ts_seen);
+        }
+        Vec::new()
+    }
+
+    /// 知道了某個 agent 對應哪個呼叫；它的 SubagentStart 還在等的話現在配對。
+    fn agent_known(
+        &mut self,
+        sid: &str,
+        agent_id: String,
+        tool: String,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let s = self.session(sid);
+        s.known_agents.insert(agent_id.clone(), tool.clone());
+        let Some(w) = take_waiting(s, &agent_id) else {
+            return Vec::new();
+        };
+        // 就算這個呼叫已經被別的 agent 依順序配走，parent 也是確定的
+        vec![self.spawn_for(sid, w.agent_id, w.agent_type, Some(tool), ts_seen, w.raw)]
+    }
+
+    /// meta.json 在但沒有 toolUseId：不是 Agent／Task 開的（Skill 的 fork），沒有 parent。
+    fn agent_without_call(&mut self, sid: &str, agent_id: &str, ts_seen: u64) -> Vec<Event> {
+        let Some(w) = take_waiting(self.session(sid), agent_id) else {
+            return Vec::new();
+        };
+        vec![self.spawn_for(sid, w.agent_id, w.agent_type, None, ts_seen, w.raw)]
+    }
+
+    /// 等不到確定的對應（meta.json 讀不到、等太久、或 SubagentStop 已經到了）：依呼叫順序配對。
+    fn agent_by_order(&mut self, sid: &str, agent_id: &str, ts_seen: u64) -> Vec<Event> {
+        let s = self.session(sid);
+        let Some(w) = take_waiting(s, agent_id) else {
+            return Vec::new();
+        };
+        let ty = w.agent_type.clone();
+        let tool = s
+            .pending_agents
+            .iter()
+            .find(|p| fits(s, p, &ty))
+            .map(|p| p.tool_use_id.clone());
+        vec![self.spawn_for(sid, w.agent_id, w.agent_type, tool, ts_seen, w.raw)]
+    }
+
+    /// 等太久的 SubagentStart 依呼叫順序配對；太舊、一直沒配到的呼叫丟掉。
+    fn agents_tick(&mut self, sid: &str, now: u64) -> Vec<Event> {
+        let s = self.session(sid);
+        s.pending_agents.retain(|p| p.at + AGENT_CALL_KEEP_MS > now);
+        s.call_info.retain(|_, p| p.at + AGENT_CALL_KEEP_MS > now);
+        let due: Vec<String> = s
+            .waiting_starts
+            .iter()
+            .filter(|w| w.since + AGENT_PAIR_WAIT_MS <= now)
+            .map(|w| w.agent_id.clone())
+            .collect();
+        due.iter()
+            .flat_map(|a| self.agent_by_order(sid, a, now))
+            .collect()
+    }
+
+    /// 發出 agent.spawned：`tool` 是配到的呼叫（沒有就是 None），名稱與 prompt 從那個呼叫取，並把它移出候選。
+    fn spawn_for(
+        &mut self,
+        sid: &str,
+        agent_id: String,
+        agent_type: Option<String>,
+        tool: Option<String>,
+        ts_seen: u64,
+        raw: Option<Map<String, Value>>,
+    ) -> Event {
+        let s = self.session(sid);
+        s.spawned_agents.insert(agent_id.clone());
+        if let Some(t) = &tool {
+            s.pending_agents.retain(|p| p.tool_use_id != *t);
+        }
+        let info = tool.as_ref().and_then(|t| s.call_info.get(t)).cloned();
+        let p = AgentSpawned {
+            agent_id,
+            agent_type,
+            name: info.as_ref().and_then(|p| p.description.clone()),
+            task: info
+                .as_ref()
+                .and_then(|p| p.prompt.as_ref().map(|t| truncate(t, MESSAGE_LIMIT).0)),
+            parent_tool_use_id: tool,
+        };
+        let meta = Meta {
+            agent: "main".into(),
+            ts_seen,
+            raw,
+            ..Meta::default()
+        };
+        self.emit(sid, Payload::AgentSpawned(p), meta)
+    }
+
     /// hook 回報工具結束：解除這張卡片的 wait／danger；Bash 的成敗算進該 agent 的連續失敗。
     /// `ok` 為 None 表示不算（PermissionDenied、is_interrupt）。
     fn tool_ended(
@@ -855,7 +1053,10 @@ impl Merger {
         ok: Option<bool>,
         ts_seen: u64,
     ) -> Vec<Event> {
-        self.drop_pending_agent(sid, id);
+        // 成功的呼叫不移除：背景 agent 的 PostToolUse 常比 SubagentStart 先到（同一毫秒，#680）
+        if ok != Some(true) {
+            self.drop_pending_agent(sid, id);
+        }
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
         match (ok, h.str_field("tool_name")) {
@@ -867,8 +1068,7 @@ impl Merger {
         self.apply(sid, changes, agent, ts_seen)
     }
 
-    /// Agent／Task 呼叫結束了還沒配到 SubagentStart（失敗、被拒、不存在的 subagent_type）：從待配對清單移除，
-    /// 免得之後的 subagent 配到它（#680）。實測 SubagentStart 緊接在自己的 PreToolUse 之後，配對看最近一個呼叫。
+    /// Agent／Task 呼叫失敗、被拒或 Esc 中斷（不會有 subagent）：從待配對清單移除，免得之後的 subagent 配到它（#680）。
     fn drop_pending_agent(&mut self, sid: &str, id: &str) {
         self.session(sid)
             .pending_agents
@@ -1103,8 +1303,12 @@ impl Merger {
                     subagent_type: s("subagent_type"),
                     description: s("description"),
                     prompt: s("prompt"),
+                    at: ts_seen,
                 };
-                self.session(sid).pending_agents.push(pending);
+                let s = self.session(sid);
+                s.call_info
+                    .insert(pending.tool_use_id.clone(), pending.clone());
+                s.pending_agents.push(pending);
                 None
             }
             _ => None,
@@ -1383,7 +1587,9 @@ impl Merger {
                 }
                 evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
                 // Esc 拒絕或中斷時這是唯一的結束訊號；只解除 wait／danger，不算失敗
-                self.drop_pending_agent(sid, id);
+                if !ok {
+                    self.drop_pending_agent(sid, id);
+                }
                 let changes = self.tracker(sid).tool_finished(id, ts_seen);
                 evs.extend(self.apply(sid, changes, &agent, ts_seen));
                 evs
@@ -1401,6 +1607,20 @@ impl Merger {
         out.extend(main);
         out
     }
+}
+
+/// 這個呼叫可以是這種 subagent 的候選：類型相同（或呼叫沒指定），而且不是已知屬於別的 agent 的呼叫。
+fn fits(s: &Session, p: &PendingAgent, agent_type: &Option<String>) -> bool {
+    !s.known_agents.values().any(|t| *t == p.tool_use_id)
+        && (p.subagent_type.is_none() || p.subagent_type == *agent_type)
+}
+
+fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
+    let i = s
+        .waiting_starts
+        .iter()
+        .position(|w| w.agent_id == agent_id)?;
+    Some(s.waiting_starts.remove(i))
 }
 
 /// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。

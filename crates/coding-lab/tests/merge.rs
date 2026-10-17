@@ -10,8 +10,8 @@ use common::{arrivals, read_jsonl, sample_sessions};
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{
-    DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger, SESSION_EVICT_AFTER_MS,
-    SESSION_IDLE_EVICT_MS,
+    AgentMetaRead, DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger,
+    SESSION_EVICT_AFTER_MS, SESSION_IDLE_EVICT_MS,
 };
 use serde_json::{Value, json};
 
@@ -989,8 +989,8 @@ fn spawned(evs: &[Event]) -> Vec<(String, Value, Value)> {
         .collect()
 }
 
-/// 實測（2026-10-17，一則回覆平行呼叫三次 Agent，兩次都一樣）：每個呼叫的 PreToolUse 之後約 20 ms 就是
-/// 它自己的 SubagentStart，下一個 PreToolUse 再隔約 800 ms；配對時待配對的只有最近一個呼叫。
+/// 實測（2026-10-17，`claude -p` 一則回覆平行呼叫三次 Agent）：每個呼叫的 PreToolUse 之後約 20 ms 就是
+/// 它自己的 SubagentStart，meta.json 再晚 40–60 ms；有候選時一律等 meta（Skill 的 fork 也會有 SubagentStart）。
 #[test]
 fn parallel_agent_calls_pair_in_the_measured_hook_order() {
     let mut m = merger();
@@ -1006,6 +1006,7 @@ fn parallel_agent_calls_pair_in_the_measured_hook_order() {
         let t = 1_000 + i as u64 * 800;
         evs.extend(m.handle(agent_call(id, desc, t)));
         evs.extend(m.handle(subagent_start(agent, t + 20)));
+        evs.extend(m.handle(agent_meta(agent, id, t + 70)));
     }
     assert_eq!(
         spawned(&evs),
@@ -1037,4 +1038,338 @@ fn failed_agent_call_is_not_paired_later() {
     });
     let evs = m.handle(subagent_start("x", 5_000));
     assert_eq!(spawned(&evs), [("x".into(), Value::Null, Value::Null)]);
+}
+
+/// Agent 工具的 PostToolUse：背景 agent 啟動時（`async_launched`）、前景 agent 結束時都帶 `tool_response.agentId`。
+fn agent_post(id: &str, agent: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                          "tool_use_id": id, "tool_response": {"agentId": agent, "status": "async_launched"}}),
+        ),
+        ts_seen: ts,
+    }
+}
+
+fn agent_meta(agent: &str, tool: &str, ts: u64) -> Input {
+    meta_read(agent, AgentMetaRead::ToolUse(tool.into()), ts)
+}
+
+fn meta_read(agent: &str, meta: AgentMetaRead, ts: u64) -> Input {
+    Input::AgentMeta {
+        session: S.into(),
+        agent_id: agent.into(),
+        meta,
+        ts_seen: ts,
+    }
+}
+
+/// 背景 agent：PostToolUse（帶 agentId）和 SubagentStart 同一毫秒到、先後都有（samples dba6a637、cc94acff）。
+/// 兩種順序都要配對到對的呼叫；Post 先到時不能把呼叫從待配對清單拿掉。
+#[test]
+fn background_agent_pairs_whether_post_or_start_comes_first() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("t1", "py", 1_000));
+    evs.extend(m.handle(agent_post("t1", "a1", 1_025)));
+    evs.extend(m.handle(subagent_start("a1", 1_025)));
+    evs.extend(m.handle(agent_call("t2", "md", 2_000)));
+    evs.extend(m.handle(subagent_start("a2", 2_022)));
+    evs.extend(m.handle(agent_post("t2", "a2", 2_022)));
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("a1".into(), json!("py"), json!("t1")),
+            ("a2".into(), json!("md"), json!("t2")),
+        ]
+    );
+}
+
+/// 兩個背景 agent，第二個呼叫在第一個啟動前就到（本機自我追蹤實錄的 hook 順序，2026-10-17）：
+/// Pre T1 → Pre T2 → Post T1(A1) → Start A1 → Post T2(A2) → Start A2。
+#[test]
+fn background_agents_pair_by_agent_id_not_by_order() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    for i in [
+        agent_call("t1", "first", 179_256),
+        agent_call("t2", "second", 189_856),
+        agent_post("t1", "a1", 191_226),
+        subagent_start("a1", 191_232),
+        agent_post("t2", "a2", 191_238),
+        subagent_start("a2", 191_238),
+    ] {
+        evs.extend(m.handle(i));
+    }
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("a1".into(), json!("first"), json!("t1")),
+            ("a2".into(), json!("second"), json!("t2")),
+        ]
+    );
+}
+
+/// 前景平行派出：PreToolUse 全部先到，再來三個 SubagentStart。有好幾個候選時等 meta.json 的 toolUseId
+/// （serve 在 SubagentStart 後 40–60 ms 讀到）再配對；meta 到達的順序和呼叫順序無關。
+#[test]
+fn parallel_foreground_agents_wait_for_meta() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    for (i, (id, desc)) in [("ta", "alpha"), ("tb", "beta"), ("tc", "gamma")]
+        .iter()
+        .enumerate()
+    {
+        evs.extend(m.handle(agent_call(id, desc, 1_000 + i as u64)));
+    }
+    for (i, a) in ["x", "y", "z"].iter().enumerate() {
+        evs.extend(m.handle(subagent_start(a, 1_100 + i as u64)));
+    }
+    evs.extend(m.handle(agent_meta("z", "tc", 1_150)));
+    evs.extend(m.handle(agent_meta("x", "ta", 1_160)));
+    evs.extend(m.handle(agent_meta("y", "tb", 1_170)));
+    let mut got = spawned(&evs);
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        [
+            ("x".into(), json!("alpha"), json!("ta")),
+            ("y".into(), json!("beta"), json!("tb")),
+            ("z".into(), json!("gamma"), json!("tc")),
+        ]
+    );
+}
+
+/// 等不到 meta.json（舊版 Claude Code、讀檔失敗）：過了等待上限就依呼叫順序配對，不會一直不發 agent.spawned。
+#[test]
+fn ambiguous_start_falls_back_to_call_order_after_a_while() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    for (i, (id, desc)) in [("ta", "alpha"), ("tb", "beta"), ("tc", "gamma")]
+        .iter()
+        .enumerate()
+    {
+        evs.extend(m.handle(agent_call(id, desc, 1_000 + i as u64)));
+    }
+    for (i, a) in ["x", "y", "z"].iter().enumerate() {
+        evs.extend(m.handle(subagent_start(a, 1_100 + i as u64)));
+    }
+    evs.extend(m.tick(1_100 + 5_000));
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("x".into(), json!("alpha"), json!("ta")),
+            ("y".into(), json!("beta"), json!("tb")),
+            ("z".into(), json!("gamma"), json!("tc")),
+        ]
+    );
+}
+
+fn subagent_typed(agent: &str, ty: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStart",
+                          "agent_id": agent, "agent_type": ty})),
+        ts_seen: ts,
+    }
+}
+
+fn untyped_call(id: &str, ts: u64) -> Input {
+    pre(id, "Agent", json!({"description": id, "prompt": id}), ts)
+}
+
+/// Skill 開的 fork 也有 SubagentStart，但不是 Agent 呼叫開的（meta.json 沒有 toolUseId）：
+/// 不能因為「只有一個候選」就配走真正 agent 的呼叫（9f 驗證，本機 12／51 個 meta.json 沒有 toolUseId）。
+#[test]
+fn skill_fork_does_not_steal_the_agent_call() {
+    let mut m = merger();
+    let mut evs = m.handle(untyped_call("ta", 1_000));
+    evs.extend(m.handle(subagent_typed("fork", "general-purpose", 1_050)));
+    evs.extend(m.handle(subagent_typed("a", "general-purpose", 1_060)));
+    evs.extend(m.handle(meta_read("fork", AgentMetaRead::NoToolUse, 1_100)));
+    evs.extend(m.handle(agent_meta("a", "ta", 1_110)));
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("fork".into(), Value::Null, Value::Null),
+            ("a".into(), json!("ta"), json!("ta")),
+        ]
+    );
+}
+
+/// 同一個 SubagentStart 收到兩次（plugin 和 settings 都掛了，samples 每個 hook 都兩份）：只發一次 spawn，
+/// 第二筆不能留在等待清單、到期時搶走別的呼叫。
+#[test]
+fn duplicate_start_is_handled_once() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("ta", "a", 1_000));
+    evs.extend(m.handle(agent_call("tb", "b", 1_001)));
+    evs.extend(m.handle(subagent_start("x", 1_100)));
+    evs.extend(m.handle(subagent_start("x", 1_100)));
+    evs.extend(m.handle(agent_meta("x", "ta", 1_150)));
+    evs.extend(m.tick(3_000));
+    evs.extend(m.handle(subagent_start("x", 3_050)));
+    evs.extend(m.handle(subagent_start("y", 3_100)));
+    evs.extend(m.handle(agent_meta("y", "tb", 3_150)));
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("x".into(), json!("a"), json!("ta")),
+            ("y".into(), json!("b"), json!("tb")),
+        ]
+    );
+}
+
+/// meta.json 讀不到（serve 送 Unreadable）：不必等滿上限，直接依呼叫順序配對。
+#[test]
+fn unreadable_meta_pairs_by_call_order_right_away() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("ta", "a", 1_000));
+    evs.extend(m.handle(agent_call("tb", "b", 1_001)));
+    evs.extend(m.handle(subagent_start("x", 1_100)));
+    evs.extend(m.handle(meta_read("x", AgentMetaRead::Unreadable, 2_100)));
+    assert_eq!(spawned(&evs), [("x".into(), json!("a"), json!("ta"))]);
+}
+
+/// 延後發的 agent.spawned：等待期間它的工具事件已經開了 agents 列、而且 SubagentStop 已經到了。
+/// spawn 要在 agent.finished 之前發出，live 的列合併、不歸零，最後是 done（9f 驗證）。
+#[test]
+fn delayed_spawn_keeps_the_agent_row_and_ends_done() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    evs.extend(m.handle(agent_call("ta", "a", 1_000)));
+    evs.extend(m.handle(agent_call("tb", "b", 1_001)));
+    // 真實的 SubagentStart 帶契約沒用到的欄位（scratchpad_dir 等），會進 Event 的 raw
+    evs.extend(m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStart",
+                          "agent_id": "x", "agent_type": "Explore", "scratchpad_dir": "/s"})),
+        ts_seen: 1_100,
+    }));
+    evs.extend(m.handle(sub_pre("tx1", "x", 1_200)));
+    evs.extend(m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SubagentStop",
+                          "agent_id": "x", "agent_type": "Explore"})),
+        ts_seen: 1_300,
+    }));
+    evs.extend(m.tick(3_000));
+    let order: Vec<&str> = evs
+        .iter()
+        .filter(|e| e.kind == "agent.spawned" || e.kind == "agent.finished")
+        .map(|e| e.kind.as_str())
+        .collect();
+    assert_eq!(order, ["agent.spawned", "agent.finished"]);
+    let spawn = evs.iter().find(|e| e.kind == "agent.spawned").unwrap();
+    assert!(
+        spawn.raw.is_some(),
+        "延後發的 spawn 也帶 SubagentStart 的 raw"
+    );
+    let mut l = coding_lab::live::Live::new();
+    for e in &evs {
+        l.apply(e);
+    }
+    let snap = l.snapshot(&coding_lab::live::Channel::All, 0, 3_000);
+    let row = snap["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == format!("{S}/x"))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        (row["status"].as_str(), row["toolCount"].as_u64()),
+        (Some("done"), Some(1)),
+        "{row}"
+    );
+}
+
+/// 背景：兩個候選，Start 比 Post 先到（9f 驗證的順序）。
+#[test]
+fn background_start_before_post_with_two_candidates() {
+    let mut m = merger();
+    let mut evs = Vec::new();
+    for i in [
+        agent_call("t1", "one", 1),
+        agent_call("t2", "two", 2),
+        subagent_start("a1", 10),
+        agent_post("t1", "a1", 10),
+        subagent_start("a2", 20),
+        agent_post("t2", "a2", 20),
+    ] {
+        evs.extend(m.handle(i));
+    }
+    assert_eq!(
+        spawned(&evs),
+        [
+            ("a1".into(), json!("one"), json!("t1")),
+            ("a2".into(), json!("two"), json!("t2")),
+        ]
+    );
+}
+
+/// 等配對期間收到 SessionEnd（9f 整體驗證）：spawn 要在 session.ended 之前發；live 清掉這個 session 的
+/// agents 列之後，不能又插回一列永遠是 run 的 agent。
+#[test]
+fn session_end_pairs_waiting_starts_first() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("ta", "a", 1_000));
+    evs.extend(m.handle(subagent_start("x", 1_020)));
+    evs.extend(m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SessionEnd", "reason": "other"})),
+        ts_seen: 1_030,
+    }));
+    evs.extend(m.tick(3_000));
+    let order: Vec<&str> = evs
+        .iter()
+        .map(|e| e.kind.as_str())
+        .filter(|k| *k == "agent.spawned" || *k == "session.ended")
+        .collect();
+    assert_eq!(order, ["agent.spawned", "session.ended"]);
+    let mut l = coding_lab::live::Live::new();
+    for e in &evs {
+        l.apply(e);
+    }
+    let snap = l.snapshot(&coding_lab::live::Channel::All, 0, 3_000);
+    assert!(
+        snap["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] != "run"),
+        "{}",
+        snap["agents"]
+    );
+}
+
+/// 等配對期間收到 task-notification（背景 agent 被 TaskStop）：一樣先配對再發 agent.finished。
+#[test]
+fn task_notification_pairs_a_waiting_start_first() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("ta", "a", 1_000));
+    evs.extend(m.handle(agent_call("tb", "b", 1_001)));
+    evs.extend(m.handle(subagent_start("x", 1_020)));
+    evs.extend(m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "UserPromptSubmit",
+            "prompt": "<task-notification>\n<task-id>x</task-id>\n<status>killed</status>\n</task-notification>"})),
+        ts_seen: 1_100,
+    }));
+    evs.extend(m.tick(3_000));
+    let order: Vec<&str> = evs
+        .iter()
+        .map(|e| e.kind.as_str())
+        .filter(|k| k.starts_with("agent."))
+        .collect();
+    assert_eq!(order, ["agent.spawned", "agent.finished"]);
+}
+
+/// meta 說 ToolUse(ta)，但 ta 已經被另一個讀不到 meta 的 agent 依順序配走：parent 仍然是確定的 ta，不能丟掉。
+#[test]
+fn known_parent_survives_a_call_taken_by_order() {
+    let mut m = merger();
+    let mut evs = m.handle(agent_call("ta", "a", 1_000));
+    evs.extend(m.handle(agent_call("tb", "b", 1_001)));
+    evs.extend(m.handle(subagent_start("x", 1_020)));
+    evs.extend(m.handle(subagent_start("y", 1_021)));
+    evs.extend(m.handle(meta_read("x", AgentMetaRead::Unreadable, 1_100)));
+    evs.extend(m.handle(agent_meta("y", "ta", 1_110)));
+    let got = spawned(&evs);
+    assert_eq!(got[1].0, "y");
+    assert_eq!(got[1].2, json!("ta"), "{got:?}");
 }

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use coding_lab::merge::Input;
+use coding_lab::merge::{AgentMetaRead, Input};
 use coding_lab::transcript::{Start, TailOptions, TailReader, spawn_tail, stop_all};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -349,4 +349,59 @@ fn start_at_end_on_a_large_file_counts_lines_across_chunks() {
     let nos: Vec<u64> = got.lines.iter().map(|l| l.no).collect();
     assert_eq!(nos, [n + 1, n + 2]);
     assert_eq!(got.lines[1].value["uuid"], "next");
+}
+
+// ── subagent 的 meta.json（#680）
+
+/// SubagentStart 送達時 meta.json 通常還沒寫好（實測晚 40–60 ms）：重試到讀到為止。等待由呼叫端注入，測試不 sleep。
+#[tokio::test]
+async fn agent_meta_is_read_once_it_appears() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("meta-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let transcript = dir.join("s1.jsonl");
+    let meta = coding_lab::transcript::subagent_file(&transcript, "a1", "meta.json");
+    assert_eq!(meta, dir.join("s1/subagents/agent-a1.meta.json"));
+    // 第 2 次等待時檔案才出現
+    let waits = std::cell::Cell::new(0);
+    let got = coding_lab::transcript::read_agent_meta(meta.clone(), 10, || {
+        waits.set(waits.get() + 1);
+        if waits.get() == 2 {
+            std::fs::create_dir_all(meta.parent().unwrap()).unwrap();
+            std::fs::write(
+                &meta,
+                r#"{"agentType":"Explore","description":"d","toolUseId":"toolu_1"}"#,
+            )
+            .unwrap();
+        }
+        async {}
+    })
+    .await;
+    assert_eq!(got, AgentMetaRead::ToolUse("toolu_1".into()));
+    assert_eq!(waits.get(), 2);
+}
+
+/// Skill 開的 fork：meta.json 在但沒有 toolUseId。
+#[tokio::test]
+async fn agent_meta_without_tool_use_id_is_a_fork() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("meta-fork-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let meta = dir.join("agent-f.meta.json");
+    std::fs::write(&meta, r#"{"agentType":"general-purpose"}"#).unwrap();
+    let got = coding_lab::transcript::read_agent_meta(meta, 3, || async {}).await;
+    assert_eq!(got, AgentMetaRead::NoToolUse);
+}
+
+#[tokio::test]
+async fn missing_agent_meta_gives_up_after_the_tries() {
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("meta-none-{}", std::process::id()));
+    let waits = std::cell::Cell::new(0);
+    let got = coding_lab::transcript::read_agent_meta(dir.join("agent-x.meta.json"), 3, || {
+        waits.set(waits.get() + 1);
+        async {}
+    })
+    .await;
+    assert_eq!(got, AgentMetaRead::Unreadable);
+    assert_eq!(waits.get(), 2, "試 3 次、中間等 2 次");
 }

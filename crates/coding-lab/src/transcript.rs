@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::merge::Input;
+use crate::merge::{AgentMetaRead, Input};
 
 /// 從哪裡開始讀。`startup` 的 session 從檔頭；resume／compact 或 collector 中途才看到的 session
 /// 從檔尾（只數行號），避免 collector 重啟後把整份 transcript 再寫一次進 store。
@@ -369,6 +369,45 @@ impl Sender {
     }
 }
 
+/// subagent 的檔案：`<transcript 去掉 .jsonl>/subagents/agent-<id>.<ext>`（transcript 是 `jsonl`、meta 是 `meta.json`）。
+pub fn subagent_file(transcript: &Path, agent_id: &str, ext: &str) -> PathBuf {
+    let stem = transcript
+        .file_stem()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    transcript
+        .with_file_name(stem)
+        .join("subagents")
+        .join(format!("agent-{agent_id}.{ext}"))
+}
+
+/// 讀 subagent 的 `meta.json`（#680）。SubagentStart 送達後 40–60 ms 才寫好（實測），所以最多試 `tries` 次，
+/// 兩次之間呼叫 `wait`（serve 傳 sleep；測試傳不等待的版本，測試不 sleep）。
+/// 檔案在但沒有 `toolUseId`（Skill 的 fork）回 NoToolUse；試完都讀不到回 Unreadable。
+pub async fn read_agent_meta<W, F>(path: PathBuf, tries: u32, mut wait: W) -> AgentMetaRead
+where
+    W: FnMut() -> F,
+    F: std::future::Future<Output = ()>,
+{
+    for i in 0..tries {
+        if i > 0 {
+            wait().await;
+        }
+        // 檔案很小（< 1 KB），直接讀；寫到一半解析失敗就下次再讀
+        let Ok(text) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        return match v["toolUseId"].as_str().filter(|s| !s.is_empty()) {
+            Some(id) => AgentMetaRead::ToolUse(id.to_string()),
+            None => AgentMetaRead::NoToolUse,
+        };
+    }
+    AgentMetaRead::Unreadable
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TailAction {
     Start {
@@ -469,14 +508,7 @@ impl TailPlanner {
                     .or_default()
                     .insert(file.clone())
                 {
-                    let stem = path
-                        .file_stem()
-                        .map(|s| s.to_os_string())
-                        .unwrap_or_default();
-                    let sub = path
-                        .with_file_name(stem)
-                        .join("subagents")
-                        .join(format!("{file}.jsonl"));
+                    let sub = subagent_file(path, id, "jsonl");
                     out.push(TailAction::Start {
                         session: sid,
                         file,
