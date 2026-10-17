@@ -129,6 +129,8 @@ pub enum Out {
 #[derive(Default)]
 struct UpCache {
     online: bool,
+    /// 上游 welcome 的 `thinking`（遠端連線拿到的是哪一種佔位），隨 sessions 列帶給前端（#724）
+    thinking: String,
     /// `welcome.scope`（view 不能 ack）
     scope: String,
     sessions: BTreeMap<String, Value>,
@@ -274,7 +276,13 @@ impl Hub {
 
     pub fn on_welcome(&mut self, up: &str, welcome: &Value) {
         let scope = welcome["scope"].as_str().unwrap_or("operate").to_string();
-        self.up(up).scope = scope;
+        let thinking = welcome["thinking"]
+            .as_str()
+            .unwrap_or("on_demand")
+            .to_string();
+        let u = self.up(up);
+        u.scope = scope;
+        u.thinking = thinking;
     }
 
     pub fn can_ack(&self, up: &str) -> bool {
@@ -298,8 +306,23 @@ impl Hub {
                 Vec::new()
             }
             "snapshot" if ch == "*" => {
-                self.on_all_snapshot(up, msg);
-                vec![Out::Resnapshot]
+                // （重）連上：快取裡有、新 snapshot 沒有的 session 先明確送 deleted，已開著的客戶端才不會留著
+                // 只有 offline 旗標的舊列（#723）；然後重送合併的 snapshot
+                let gone = self.on_all_snapshot(up, msg);
+                let mut outs = Vec::new();
+                if !gone.is_empty() {
+                    let no = self.next_no();
+                    let rows: Vec<Value> = gone
+                        .into_iter()
+                        .map(|id| json!({ "id": id, "host": up, "deleted": true }))
+                        .collect();
+                    outs.push(Out::All(json!({
+                        "t": "frame", "frame": no, "ch": "*", "events": [],
+                        "rows": { "sessions": rows },
+                    })));
+                }
+                outs.push(Out::Resnapshot);
+                outs
             }
             "snapshot" => {
                 let mut v = msg.clone();
@@ -339,6 +362,11 @@ impl Hub {
                 set_host(e, up);
             }
         }
+        let thinking = self
+            .ups
+            .get(up)
+            .map(|u| u.thinking.clone())
+            .filter(|t| !t.is_empty());
         for s in v
             .get_mut("sessions")
             .and_then(Value::as_array_mut)
@@ -346,6 +374,10 @@ impl Hub {
             .flatten()
         {
             set_host(s, up);
+            if let (Some(t), Some(o)) = (&thinking, s.as_object_mut()) {
+                // 這台上游對遠端的 thinking 模式（#724）：前端依列的 host 決定佔位能不能點開
+                o.insert("thinking".into(), Value::String(t.clone()));
+            }
         }
         for s in v
             .get_mut("rows")
@@ -358,12 +390,14 @@ impl Hub {
         }
     }
 
-    fn on_all_snapshot(&mut self, up: &str, snap: &Value) {
+    /// 回傳快取裡有、新 snapshot 沒有的 session id（這台重連前後消失的列）
+    fn on_all_snapshot(&mut self, up: &str, snap: &Value) -> Vec<String> {
         let mut v = snap.clone();
         self.rewrite(up, &mut v);
         self.since.retain(|(n, _)| n != up);
         let cache = self.up(up);
         cache.online = true;
+        let old_ids: Vec<String> = cache.sessions.keys().cloned().collect();
         cache.sessions.clear();
         cache.agents.clear();
         cache.attention.clear();
@@ -379,6 +413,10 @@ impl Hub {
             .flatten()
             .filter_map(|e| serde_json::from_value(e.clone()).ok())
             .collect();
+        old_ids
+            .into_iter()
+            .filter(|id| !cache.sessions.contains_key(id))
+            .collect()
     }
 
     fn on_all_frame(&mut self, up: &str, frame: &Value) -> Value {

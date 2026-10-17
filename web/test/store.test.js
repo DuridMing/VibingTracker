@@ -80,3 +80,19 @@ test("agents 與 attention 也照 snapshot 取代、frame upsert／刪除", () =
   assert.ok(st.agents.has("a/bg"));
   assert.equal(st.attention.size, 0);
 });
+
+test("offline 列只標既有的 session，不為沒看過的 id 建空列（#723）", () => {
+  const st = createStore();
+  applySnapshot(st, snap);
+  applyFrame(st, { t: "frame", frame: 11, ch: "*", rows: { sessions: [
+    { id: "a", host: "linux", offline: true },
+    { id: "ghost", host: "linux", offline: true },
+  ] } });
+  assert.equal(st.sessions.get("a").offline, true);
+  assert.equal(st.sessions.get("a").status, "run", "其他欄位保留");
+  assert.equal(st.sessions.has("ghost"), false, "沒看過的 id 不能變成只有 offline 的空列");
+  // 重連後的 snapshot 整批取代：a 不再 offline
+  applySnapshot(st, { ...snap, sessions: [{ id: "a", status: "run", prompt: "p1" }] });
+  assert.equal(st.sessions.get("a").offline, undefined);
+  assert.deepEqual([...st.sessions.keys()], ["a"]);
+});
