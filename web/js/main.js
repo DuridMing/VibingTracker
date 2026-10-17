@@ -15,8 +15,9 @@ import { REPLAY_TAB, rangeFor, replayUrl, createReplay } from "./replay.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
-import { mergeSessions, projectRoots, pickProject, canReplay } from "./sessions.js";
+import { mergeSessions, projectRoots, pickProject, canReplay, fitTabs } from "./sessions.js";
 import { degradedNotice } from "./degraded.js";
+import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, layoutGraph, withWip } from "./branches.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -116,21 +117,76 @@ function sessTag(s, cls = "id") {
   return h("span", { class: cls, style: `color:${sessionColor(s.id)}`, title: s.id }, shortId(s.id));
 }
 
+function sessionTab(s, extra = {}) {
+  return h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id), ...extra },
+    h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
+    h("span", { class: "dot" }),
+    sessTag(s),
+    h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
+}
+
+// 放不下的 session tab 收進「+N」（#704）：先全部畫出來量寬，再依 fitTabs 收起來；寬度變了重算
+let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions();
   if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
-    ...live.map((s) =>
-      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
-        h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
-        h("span", { class: "dot" }),
-        sessTag(s),
-        h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"))),
+    ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
+    h("button", { class: "stab more", id: "stMore", "aria-haspopup": "true", "aria-expanded": "false", onclick: (e) => { e.stopPropagation(); toggleTabMenu(); } }, "+99"),
     h("button", { class: `stab rp${ui.tab === REPLAY_TAB ? " on" : ""}`, title: "選專案與時間範圍，回放所有 session（含已結束）合成的串流", onclick: () => selectTab(REPLAY_TAB) }, "⟲ 專案回放"),
   );
+  fitTabRow();
 }
+
+function fitTabRow() {
+  const box = $("#stabs");
+  const tabs = [...box.querySelectorAll(".stab[data-sid]")];
+  const more = $("#stMore");
+  if (!more) return;
+  for (const t of tabs) t.hidden = false;
+  more.hidden = false;
+  more.textContent = "+99";
+  const gap = 4;
+  const first = box.firstElementChild;
+  const replay = box.querySelector(".stab.rp"); // 「⟲ 專案回放」（#702）永遠留在最後
+  const avail = box.clientWidth - first.offsetWidth - gap - (replay ? replay.offsetWidth + gap : 0);
+  const sel = tabs.findIndex((t) => t.dataset.sid === ui.tab);
+  const { hidden } = fitTabs(tabs.map((t) => t.offsetWidth + gap), avail, more.offsetWidth + gap, sel);
+  for (const i of hidden) tabs[i].hidden = true;
+  tabsHidden = hidden.map((i) => tabs[i].dataset.sid);
+  more.hidden = !hidden.length;
+  more.textContent = `+${hidden.length}`;
+  more.title = `還有 ${hidden.length} 個 session，點一下列出來`;
+  if (!hidden.length) closeTabMenu();
+  else if (!$("#tabMenu").hidden) renderTabMenu();
+}
+if (typeof ResizeObserver === "function") new ResizeObserver(() => fitTabRow()).observe($("#stabs"));
+
+function renderTabMenu() {
+  const byId = new Map(liveSessions().map((s) => [s.id, s]));
+  const menu = $("#tabMenu");
+  menu.replaceChildren(
+    h("div", { class: "tmh" }, `收起來的 session（${tabsHidden.length}）`),
+    ...tabsHidden.map((id) => byId.get(id)).filter(Boolean).map((s) => sessionTab(s, { onclick: () => { closeTabMenu(); selectTab(s.id); } })),
+  );
+  const b = $("#stMore").getBoundingClientRect();
+  menu.style.top = `${b.bottom + 4}px`;
+  menu.style.left = `${Math.max(8, Math.min(b.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
+}
+function toggleTabMenu() {
+  if (!$("#tabMenu").hidden) return closeTabMenu();
+  $("#tabMenu").hidden = false;
+  $("#stMore")?.setAttribute("aria-expanded", "true");
+  renderTabMenu();
+}
+function closeTabMenu() {
+  $("#tabMenu").hidden = true;
+  $("#stMore")?.setAttribute("aria-expanded", "false");
+}
+document.addEventListener("click", (e) => { if (!$("#tabMenu").hidden && !$("#tabMenu").contains(e.target)) closeTabMenu(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeTabMenu(); });
 
 function openMonitor(id) {
   window.open(monitorUrl(location, id), `coding-lab-monitor-${id}`, "popup,width=980,height=760");
@@ -330,6 +386,7 @@ function render(urgent = false) {
     renderChanges();
     renderDiff();
     renderAttention();
+    renderBranches();
     renderNotifySwitches();
     renderPane();
   });
@@ -538,7 +595,7 @@ setInterval(() => render(), 30_000); // 佇列的「幾分前」
 // 專案：session 的 cwd 歸組（sessions.js），一次看一個；每個專案一棵樹，Event 先收在 fileEvents，開新樹時重放。
 const ROW_H = 22;
 const FILE_EVENTS_MAX = 50_000;
-const BASE_TEXT = { main: "相對 main", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
+const BASE_TEXT = { main: "相對整合分支", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
 const pref = {
   get: (k) => { try { return storage?.getItem(`coding-lab.tree.${k}`) ?? null; } catch { return null; } },
   set: (k, v) => { try { storage?.setItem(`coding-lab.tree.${k}`, v); } catch { /* 無痕模式等 */ } },
@@ -689,6 +746,7 @@ async function loadFiles() {
     ent.info += trunc;
     ent.error = null;
     left.dirty = true;
+    if (brWin.isOpen || br.cwd !== cwd) loadBranches();
   } catch (e) {
     if (req !== left.req) return;
     ent.error = `檔案樹載入失敗：${e.message}`;
@@ -700,6 +758,244 @@ async function loadFiles() {
   }
 }
 setInterval(() => { if (left.tab === "tree" && !document.hidden && left.base !== "since") loadFiles(); }, 60_000);
+
+// ---------- 分支視窗（#696） ----------
+// 檔案樹標題列「⎇ 分支（N）」打開，像 VS Code 的 Git Graph：上半是 commit 圖（/api/graph）＋分支標籤（/api/branches），
+// 點一列看完整 message 與改到的檔（/api/commit），點檔看 diff（/api/commit-diff）；分支標籤的 ⚠ 看衝突候選（/api/branch-diff 並排）。
+// 視窗開著才跟著 file.*／git.op 重抓；關著只在換專案與每 60 秒抓 /api/branches（更新 N）。
+const br = { cwd: null, body: null, graph: null, error: null, req: 0, sel: null, detail: null, file: null, detailReq: 0 };
+const LANE_COLORS = ["var(--accent)", "var(--teal)", "var(--violet)", "var(--amber)", "var(--rose)", "#3B82F6", "#16A34A", "#DB2777"];
+const ROW_PX = 24;
+const COL_PX = 14;
+
+async function getJson(url) {
+  const res = await apiFetch(url);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  return body;
+}
+
+async function loadBranches() {
+  const cwd = left.project;
+  if (!cwd || isMonitor) return;
+  const req = ++br.req;
+  const withGraph = brWin.isOpen;
+  try {
+    const [body, graph] = await Promise.all([getJson(branchesUrl(cwd)), withGraph ? getJson(graphUrl(cwd)) : null]);
+    if (req !== br.req) return;
+    if (br.cwd !== cwd) Object.assign(br, { sel: null, detail: null, file: null, graph: null });
+    Object.assign(br, { cwd, body, error: null });
+    if (graph) br.graph = graph;
+  } catch (e) {
+    if (req !== br.req) return;
+    Object.assign(br, { cwd, body: null, graph: null, error: `分支載入失敗：${e.message}` });
+  }
+  render(true);
+}
+setInterval(() => { if (!document.hidden && !brWin.isOpen) loadBranches(); }, 60_000);
+
+const branchOf = (name) => br.body?.branches.find((b) => (b.branch ?? b.worktree) === name);
+const branchName = (r) => r.branch ?? worktreeLabel(br.body.root, r.worktree);
+
+// 點一列：commit 或未 commit 的改動 → 完整 message 與改到的檔
+async function selectGraphRow(row) {
+  const key = row.hash;
+  if (br.sel?.key === key) return;
+  const req = ++br.detailReq;
+  br.sel = { key, kind: row.wip ? "wip" : "commit", row };
+  br.detail = { loading: true };
+  br.file = null;
+  render(true);
+  try {
+    const d = await getJson(commitUrl(br.cwd, row.wip ? { worktree: row.wip.worktree } : { hash: row.hash }));
+    if (req === br.detailReq) br.detail = d;
+  } catch (e) {
+    if (req === br.detailReq) br.detail = { error: e.message };
+  }
+  render(true);
+}
+
+async function openCommitFile(path) {
+  const sel = br.sel;
+  if (!sel) return;
+  const req = ++br.detailReq;
+  const label = sel.kind === "wip" ? `未 commit・${branchName(sel.row.wip)}` : sel.row.hash.slice(0, 7);
+  br.file = { path, diffs: [{ branch: label, loading: true }] };
+  render(true);
+  let d;
+  try {
+    const body = await getJson(commitDiffUrl(br.cwd, sel.kind === "wip" ? { worktree: sel.row.wip.worktree } : { hash: sel.row.hash }, path));
+    d = { branch: label, diff: body.diff, truncated: body.truncated };
+  } catch (e) {
+    d = { branch: label, error: e.message };
+  }
+  if (req !== br.detailReq) return;
+  br.file = { path, diffs: [d] };
+  render(true);
+}
+
+// 分支標籤的 ⚠：這條分支和其他分支同時改到的檔
+function selectShared(r) {
+  ++br.detailReq;
+  br.sel = { key: `shared:${r.worktree}`, kind: "shared", row: r };
+  br.detail = null;
+  br.file = null;
+  render(true);
+}
+
+// 衝突候選的檔：這條分支和同時改到它的分支，各自對 merge-base 的 diff 並排
+async function openBranchDiff(row, file) {
+  const rows = [row, ...file.with.map(branchOf)].filter(Boolean);
+  const req = ++br.detailReq;
+  br.file = { path: file.path, conflict: file.conflict, diffs: rows.map((r) => ({ branch: branchName(r), loading: true })) };
+  render(true);
+  const got = await Promise.all(rows.map(async (r) => {
+    try {
+      const body = await getJson(branchDiffUrl(br.cwd, r.worktree, file.path));
+      return { branch: branchName(r), diff: body.diff, truncated: body.truncated };
+    } catch (e) {
+      return { branch: branchName(r), error: e.message };
+    }
+  }));
+  if (req !== br.detailReq) return;
+  br.file = { ...br.file, diffs: got };
+  render(true);
+}
+
+function sessChip(id) {
+  return h("button", { class: "bss", title: `${id}\n點一下切到這個 session`, onclick: (e) => { e.stopPropagation(); selectTab(id); } },
+    h("i", { style: `background:${sessionColor(id)}` }), h("span", { class: "mono" }, shortId(id)));
+}
+
+// 分支標籤：名字、在上面的 session、↑↓、⚠ 衝突候選數
+function refBadge(name) {
+  const r = branchOf(name);
+  const cf = r?.shared.filter((f) => f.conflict).length ?? 0;
+  return h("span", { class: `ref${r?.integration ? " int" : ""}`, title: r ? `${name}\n${worktreeLabel(br.body.root, r.worktree)}${r.integration ? "\n整合分支" : `\n相對 ${br.body.integration ?? "—"}：領先 ${r.ahead ?? "—"}、落後 ${r.behind ?? "—"}`}` : name },
+    h("b", { class: "mono" }, name),
+    ...(r?.sessions ?? []).map(sessChip),
+    r && !r.integration && r.ahead != null ? h("small", { class: "mono" }, `↑${r.ahead} ↓${r.behind}`) : null,
+    r?.shared.length ? h("button", { class: `shr${cf ? " cf" : ""}`, title: `和其他分支同時改到 ${r.shared.length} 個檔（衝突候選 ${cf}）`, onclick: (e) => { e.stopPropagation(); selectShared(r); } }, `${cf ? "⚠" : "≈"}${r.shared.length}`) : null);
+}
+
+function graphSvg(row, width) {
+  const w = width * COL_PX + 6;
+  const x = (c) => c * COL_PX + COL_PX / 2 + 2;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", ROW_PX);
+  svg.setAttribute("class", "gsvg");
+  const color = (lane) => LANE_COLORS[lane % LANE_COLORS.length];
+  for (const sg of row.segments) {
+    const p = document.createElementNS(svg.namespaceURI, "path");
+    const [x1, y1, x2, y2] = [x(sg.x1), sg.y1 * ROW_PX, x(sg.x2), sg.y2 * ROW_PX];
+    // 斜線用曲線，接近 VS Code 的畫法
+    p.setAttribute("d", x1 === x2 ? `M${x1} ${y1}L${x2} ${y2}` : `M${x1} ${y1}C${x1} ${(y1 + y2) / 2} ${x2} ${(y1 + y2) / 2} ${x2} ${y2}`);
+    p.setAttribute("stroke", color(sg.lane));
+    p.setAttribute("fill", "none");
+    p.setAttribute("stroke-width", "2");
+    if (row.wip) p.setAttribute("stroke-dasharray", "3 2");
+    svg.append(p);
+  }
+  const dot = document.createElementNS(svg.namespaceURI, "circle");
+  dot.setAttribute("cx", x(row.col));
+  dot.setAttribute("cy", ROW_PX / 2);
+  dot.setAttribute("r", row.wip ? 4 : 4.5);
+  dot.setAttribute("stroke", color(row.lane));
+  dot.setAttribute("stroke-width", "2");
+  dot.setAttribute("fill", row.wip ? "var(--panel)" : color(row.lane));
+  svg.append(dot);
+  return svg;
+}
+
+function when(ts) {
+  if (ts == null) return "";
+  const d = Date.now() - ts;
+  if (d < 86_400_000) return ago(d);
+  const t = new Date(ts);
+  return `${t.getMonth() + 1}/${t.getDate()}`;
+}
+
+function diffCols(diffs) {
+  return h("div", { class: "bdc" }, ...diffs.map((d) => h("div", { class: "bdcol" },
+    h("div", { class: "bdt mono" }, d.branch.startsWith("未 commit") || /^[0-9a-f]{7}$/.test(d.branch) ? d.branch : `⎇ ${d.branch}`),
+    d.loading ? h("div", { class: "none" }, "載入中…")
+      : d.error ? h("div", { class: "none" }, `載入失敗：${d.error}`)
+        : !d.diff ? h("div", { class: "none" }, "沒有改動")
+          : h("div", { class: "bdl" }, ...diffLines(d.diff).map((l) => h("div", { class: `l ${l.kind}` }, l.kind === "add" ? "+" : l.kind === "del" ? "−" : " ", l.text)),
+            d.truncated ? h("div", { class: "none" }, "（太長，已截斷）") : null))));
+}
+
+function fileList(files, onPick) {
+  return h("div", { class: "bfl" }, ...(files.length ? files.map((f) => h("button", {
+    class: `bfi${br.file?.path === f.path ? " on" : ""}`, onclick: () => onPick(f),
+    title: f.from ? `${f.from} → ${f.path}` : f.path,
+  }, h("span", { class: `st s-${f.status === "?" ? "U" : f.status}` }, f.status === "?" ? "U" : f.status), h("span", { class: "mono" }, f.path))) : [h("div", { class: "none" }, "沒有改到檔案")]));
+}
+
+function renderDetail() {
+  const pane = $("#brDiff");
+  pane.hidden = !br.sel;
+  if (!br.sel) return;
+  const close = h("button", { class: "fw-x", "aria-label": "關閉", onclick: () => { br.sel = null; br.detail = null; br.file = null; render(true); } }, "×");
+  const { kind, row } = br.sel;
+  let head;
+  let files;
+  if (kind === "shared") {
+    head = h("div", { class: "bdh" }, h("b", { class: "mono" }, `⎇ ${branchName(row)}`), h("small", {}, "和其他分支同時改到的檔・⚠ 是衝突候選（內容不同）；點檔並排看各自對 merge-base 的改動"), close);
+    files = h("div", { class: "bfl" }, ...row.shared.map((f) => h("button", {
+      class: `bfi${f.conflict ? " cf" : ""}${br.file?.path === f.path ? " on" : ""}`, onclick: () => openBranchDiff(row, f),
+    }, f.conflict ? "⚠ " : "", h("span", { class: "mono" }, f.path), h("small", {}, ` ↔ ${f.with.join("、")}`))));
+  } else {
+    const d = br.detail ?? {};
+    const title = kind === "wip" ? `未 commit 的改動・${branchName(row.wip)}` : (d.subject ?? row.subject ?? "");
+    head = h("div", { class: "bdh" },
+      h("b", {}, title),
+      h("small", { class: "mono" }, kind === "wip" ? worktreeLabel(br.body.root, row.wip.worktree) : `${row.hash.slice(0, 10)} · ${d.author ?? row.author ?? ""} · ${when(d.ts ?? row.ts)}`),
+      close);
+    files = d.loading ? h("div", { class: "none" }, "載入中…")
+      : d.error ? h("div", { class: "none" }, `載入失敗：${d.error}`)
+        : h("div", {}, d.body ? h("pre", { class: "bmsg" }, d.body) : null, fileList(d.files ?? [], (f) => openCommitFile(f.path)));
+  }
+  pane.replaceChildren(head, h("div", { class: "bdb" }, files, br.file ? diffCols(br.file.diffs) : null));
+}
+
+function renderBranches() {
+  const n = changedBranches(br.body);
+  if (changed("brBtn", `${left.project}|${br.body ? n : "x"}`)) {
+    const btn = $("#brToggle");
+    btn.hidden = !left.project || isMonitor;
+    btn.textContent = br.body ? `⎇ 分支（${n}）` : "⎇ 分支";
+  }
+  if (!brWin.isOpen) return;
+  const sig = JSON.stringify([br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)]);
+  if (!changed("brList", sig)) return;
+  const body = br.body;
+  $("#brWinSub").textContent = body?.integration ? `相對 ${body.integration}・點一列看檔案・拖標題列移動、右下角縮放` : "拖標題列移動、右下角縮放";
+  $("#brWinTitle").textContent = body ? `分支（${body.branches.length}）` : "分支";
+  const list = $("#brList");
+  if (br.error || !body || !br.graph) {
+    list.replaceChildren(h("div", { class: "none" }, br.error ?? "載入中…"));
+  } else if (!br.graph.commits.length) {
+    list.replaceChildren(h("div", { class: "none" }, "這個專案不是 git repo，或還沒有 commit"));
+  } else {
+    const g = layoutGraph(withWip(br.graph.commits, body.branches));
+    list.replaceChildren(...g.rows.map((r) => h("div", {
+      class: `grow${r.wip ? " wip" : ""}${br.sel?.key === r.hash ? " on" : ""}`, role: "button", tabindex: "0",
+      onclick: () => selectGraphRow(r),
+      onkeydown: (e) => { if (e.key === "Enter") selectGraphRow(r); },
+    },
+    graphSvg(r, g.width),
+    h("span", { class: "gm" },
+      ...(r.wip ? [h("span", { class: "ref wipb" }, h("b", { class: "mono" }, branchName(r.wip)), ...r.wip.sessions.map(sessChip))] : (r.refs ?? []).map(refBadge)),
+      h("span", { class: "gs" }, r.wip ? `未 commit 的改動（${r.wip.dirty} 個檔）` : r.subject)),
+    h("span", { class: "ga" }, r.wip ? "" : r.author ?? ""),
+    h("span", { class: "gt" }, r.wip ? "" : when(r.ts)),
+    h("span", { class: "gh mono" }, r.wip ? "" : r.hash.slice(0, 7)))),
+    br.graph.truncated ? h("div", { class: "none" }, `只列最近 ${br.graph.commits.length} 個 commit`) : null);
+  }
+  renderDetail();
+}
 
 async function loadSessions() {
   if (isMonitor) return;
@@ -1190,6 +1486,23 @@ const liveWin = makeFloating($("#liveWin"), {
 });
 $("#liveToggle").addEventListener("click", () => liveWin.toggle());
 $("#liveWinClose").addEventListener("click", () => liveWin.close());
+
+const brWin = makeFloating($("#brWin"), {
+  handle: $("#brWinHandle"),
+  key: "coding-lab.brWin",
+  initial: () => {
+    const b = $("#brToggle").getBoundingClientRect();
+    return { x: b.left, y: b.bottom + 6, w: 820, h: 560 };
+  },
+  onToggle: (open) => {
+    $("#brToggle").setAttribute("aria-expanded", String(open));
+    lastSig.delete("brList");
+    if (open) loadBranches();
+    render(true);
+  },
+});
+$("#brToggle").addEventListener("click", () => brWin.toggle());
+$("#brWinClose").addEventListener("click", () => brWin.close());
 
 // 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
 const MORE_LIMIT = 200;

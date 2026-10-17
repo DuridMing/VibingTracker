@@ -41,13 +41,14 @@
     <div class="tbar" id="tbar">
       <select id="tProj" title="專案（session 的 cwd；worktree 與子目錄歸到上層）" hidden></select>
       <select id="tBase" title="檔名顏色依這個基準的 git 狀態">
-        <option value="main">相對 main</option>
+        <option value="main">相對整合分支</option>
         <option value="since">本次開啟以來</option>
         <option value="session">單一 session</option>
         <option value="commit">相對某個 commit</option>
       </select>
       <select id="tBaseSess" title="只看這個 session 的改動" hidden></select>
       <input id="tBaseHash" class="hash" placeholder="commit hash" spellcheck="false" autocomplete="off" maxlength="64" hidden>
+      <button class="btn sm brbtn" id="brToggle" aria-expanded="false" aria-controls="brWin" title="各分支的 session、領先落後、未 commit 的檔、和其他分支同時改到的檔" hidden>⎇ 分支</button>
       <small class="tinfo" id="tInfo"></small>
     </div>
     <div class="tree pane" id="tree"><div class="none">尚無 session</div></div>
@@ -149,6 +150,16 @@
   </div>
   <div class="fw-b livelist" id="liveList"></div>
 </dialog>
+<dialog class="floatwin" id="brWin" aria-labelledby="brWinTitle">
+  <div class="fw-h" id="brWinHandle">
+    <b id="brWinTitle">分支</b>
+    <small id="brWinSub">相對整合分支・拖標題列移動、右下角縮放</small>
+    <button class="fw-x" id="brWinClose" aria-label="關閉">×</button>
+  </div>
+  <div class="fw-b brlist" id="brList"></div>
+  <div class="brdiff" id="brDiff" hidden></div>
+</dialog>
+<div class="tabmenu" id="tabMenu" role="menu" hidden></div>
 <pre id="benchOut" hidden></pre>
 </body>
 </html>

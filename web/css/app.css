@@ -141,7 +141,14 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .sess button .r.run{color:var(--teal)}.sess button .r.danger,.sess button .r.fail{color:var(--rose)}.sess button .r.wait{color:var(--amber)}.sess button .r.done{color:var(--accent)}
 
 /* session tab 列 */
-.stabs{display:flex;gap:4px;overflow-x:auto;padding-bottom:2px;align-items:center}
+.stabs{display:flex;gap:4px;overflow:hidden;padding-bottom:2px;align-items:center}
+.stab[hidden]{display:none}
+.stab.more{color:var(--accent);font-weight:600;flex:none}
+.stab.more[aria-expanded="true"]{background:var(--accent-soft)}
+.tabmenu{position:fixed;z-index:30;display:flex;flex-direction:column;gap:2px;min-width:220px;max-width:min(420px,90vw);max-height:60vh;overflow:auto;padding:6px;border:1px solid var(--line);border-radius:10px;background:var(--panel);box-shadow:0 12px 32px rgba(16,24,40,.18)}
+.tabmenu[hidden]{display:none}
+.tabmenu .tmh{font-size:11px;color:var(--dim);padding:2px 6px 4px}
+.tabmenu .stab{justify-content:flex-start;width:100%}
 .stab{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;font-size:12px;color:var(--muted);white-space:nowrap;border:1px solid transparent}
 .stab:hover{background:var(--panel-2)}
 .stab.on{background:var(--panel);color:var(--ink);border-color:var(--line)}
@@ -400,3 +407,58 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .sess button .r{white-space:nowrap}
 .glast.pick{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
 .glast.pick:hover{color:var(--accent)}
+
+/* 分支浮動視窗（#696）：像 VS Code 的 Git Graph */
+#brWin{min-width:420px}
+.brlist{padding:0}
+.grow{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto auto;align-items:center;gap:8px;height:24px;padding-right:8px;font-size:12px;cursor:pointer;border-bottom:1px solid transparent}
+.grow:hover{background:var(--panel-2)}
+.grow.on{background:var(--accent-soft)}
+.grow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.grow.wip .gs{color:var(--muted);font-style:italic}
+.gsvg{display:block;flex:none}
+.grow .gm{display:flex;align-items:center;gap:5px;min-width:0;overflow:hidden;white-space:nowrap}
+.grow .gs{overflow:hidden;text-overflow:ellipsis;min-width:0}
+.grow .ga{color:var(--muted);font-size:11px;max-width:9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.grow .gt{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums;min-width:3em;text-align:right}
+.grow .gh{color:var(--dim);font-size:11px}
+.ref{display:inline-flex;align-items:center;gap:4px;flex:none;border:1px solid var(--line);border-radius:5px;padding:0 5px;background:var(--panel);font-size:11px;line-height:18px}
+.ref.int{border-color:var(--accent);color:var(--accent)}
+.ref.wipb{border-style:dashed}
+.ref small{color:var(--muted)}
+.ref .shr{border:0;background:none;padding:0 2px;font-size:11px;color:var(--muted);cursor:pointer}
+.ref .shr.cf{color:var(--amber);font-weight:600}
+.bss{display:inline-flex;align-items:center;gap:3px;padding:0 4px;border:0;border-radius:8px;background:var(--panel-2);font-size:10.5px;cursor:pointer}
+.bss i{width:7px;height:7px;border-radius:50%;display:inline-block}
+.brdiff{flex:none;height:50%;display:flex;flex-direction:column;border-top:1px solid var(--line);min-height:0}
+.brdiff[hidden]{display:none}
+.brdiff .bdh{display:flex;align-items:baseline;gap:8px;padding:4px 8px;background:var(--panel-2);min-width:0}
+.brdiff .bdh b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.brdiff .bdh small{color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brdiff .bdb{display:grid;grid-template-columns:minmax(160px,32%) minmax(0,1fr);min-height:0;flex:1}
+.brdiff .bdb > :first-child{overflow:auto;border-right:1px solid var(--line-soft)}
+.brdiff .bmsg{margin:0;padding:6px 8px;font-size:11.5px;white-space:pre-wrap;color:var(--muted);border-bottom:1px solid var(--line-soft)}
+.bfl{display:flex;flex-direction:column}
+.bfi{display:flex;align-items:center;gap:6px;text-align:left;border:0;background:none;padding:2px 8px;font-size:11.5px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bfi:hover{background:var(--panel-2)}
+.bfi.on{background:var(--accent-soft)}
+.bfi.cf{color:var(--amber)}
+.bfi small{color:var(--dim)}
+.bfi .st{font-family:var(--mono);font-size:10.5px;width:1.2em;text-align:center;font-weight:600}
+.bfi .s-A,.bfi .s-U{color:var(--teal)}.bfi .s-M{color:var(--amber)}.bfi .s-D{color:var(--rose)}.bfi .s-R,.bfi .s-C{color:var(--violet)}
+.brdiff .bdc{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:1px;background:var(--line);overflow:auto;min-height:0}
+.brdiff .bdcol{background:var(--panel);min-width:0}
+.brdiff .bdt{position:sticky;top:0;background:var(--panel-2);padding:2px 8px;font-size:11.5px;border-bottom:1px solid var(--line-soft)}
+.brdiff .bdl{font-family:var(--mono);font-size:11.5px}
+.brdiff .l{white-space:pre-wrap;word-break:break-all;padding:0 8px}
+.brdiff .l.add{background:var(--teal-soft);color:var(--teal)}
+.brdiff .l.del{background:var(--rose-soft);color:var(--rose)}
+.brdiff .l.hunk{color:var(--accent);background:var(--accent-soft)}
+.brdiff .l.meta{color:var(--dim)}
+
+/* 捲軸（#705）：細、圓角、顏色跟色票（深色模式跟著換）。新版 Chrome 設了 scrollbar-color 會忽略 webkit 樣式，所以標準屬性只給 Firefox */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background-color:var(--line);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:var(--dim)}
+@supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}}

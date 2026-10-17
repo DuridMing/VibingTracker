@@ -375,12 +375,97 @@ function createWorld(n, { bigtree = false } = {}) {
     return { status: 200, body: { cwd, from, to, events: [...bySession.values()].flat(), next: last && { ts: last.ts_seen, session: last.session, pos: last.pos } } };
   }
 
+  // contracts §7 的 /api/graph、/api/branches、/api/commit（#696）：假的歷史，develop 主線＋每個 worktree 一條 feature 分支
+  const hx = (n) => (n * 2654435761 >>> 0).toString(16).padStart(8, "0").repeat(5);
+  const wts = [...new Map(sessions.map((s) => [s.cwd, s.branch])).entries()];
+  const history = []; // 新到舊（拓撲順序）
+  const tips = new Map(); // branch → tip hash
+  {
+    let id = 1;
+    const mk = (subject, parents, ago) => ({ hash: hx(id++), parents, subject, author: "Claude", ts: now - ago * 60_000, refs: [] });
+    const dev = [];
+    for (let i = 0; i < 8; i++) dev.push(mk(PROMPTS[i % PROMPTS.length], [], (8 - i) * 90 + 300));
+    for (let i = 1; i < dev.length; i++) dev[i].parents = [dev[i - 1].hash];
+    const feats = wts.filter(([, b]) => b !== "develop").map(([, b], k) => {
+      const from = dev[2 + (k % 5)];
+      const n = 1 + (k % 3);
+      const cs = [];
+      for (let i = 0; i < n; i++) cs.push(mk(`${b}：${PROMPTS[(k + i) % PROMPTS.length]}`, [i ? cs[i - 1].hash : from.hash], (n - i) * 20 + k * 7));
+      return { b, cs };
+    });
+    // 一條已經合回 develop 的分支
+    const merged = mk("feature/old：舊功能", [dev[3].hash], 500);
+    const merge = mk("Merge branch 'feature/old' into develop", [dev[7].hash, merged.hash], 250);
+    tips.set("develop", merge.hash);
+    for (const f of feats) tips.set(f.b, f.cs[f.cs.length - 1].hash);
+    const all = [merge, ...dev, merged, ...feats.flatMap((f) => f.cs)];
+    for (const [b, t] of tips) all.find((c) => c.hash === t).refs.push(b);
+    // 拓撲順序：時間新到舊，parent 一定在 child 之後
+    const byHash = new Map(all.map((c) => [c.hash, c]));
+    const seen = new Set();
+    const visit = (c) => { if (seen.has(c.hash)) return; seen.add(c.hash); for (const p of c.parents) visit(byHash.get(p)); history.push(c); };
+    for (const c of [...all].sort((x, y) => x.ts - y.ts)) visit(c);
+    history.reverse();
+  }
+
+  function branches(q) {
+    const cwd = q.get("cwd");
+    if (!cwd || !(cwd === ROOT || cwd.startsWith(`${ROOT}/`))) return err(404, "沒有 session 在這個目錄");
+    const changes = files(new URLSearchParams({ cwd, base: "main" })).body.changes;
+    const rows = wts.map(([wt, branch], i) => {
+      const mine = changes.filter((c) => c.by.some((b) => b.worktree === wt));
+      const tip = history.find((c) => c.hash === tips.get(branch));
+      return {
+        branch, worktree: wt, head: tip.hash, integration: branch === "develop",
+        ahead: branch === "develop" ? 0 : 1 + (i % 3), behind: branch === "develop" ? 0 : i % 4,
+        dirty: mine.filter((c) => c.by.some((b) => b.worktree === wt && b.status === "?")).length || mine.length,
+        changed: branch === "develop" ? 0 : mine.length,
+        last: { hash: tip.hash, message: tip.subject, ts: tip.ts },
+        sessions: sessions.filter((s) => s.cwd === wt && s.endedAt == null).map((s) => s.id),
+        shared: mine.filter((c) => c.by.length > 1).map((c) => ({ path: c.path, conflict: c.conflict, with: c.by.filter((b) => b.worktree !== wt).map((b) => b.branch) })),
+      };
+    });
+    return { status: 200, body: { root: ROOT, integration: "develop", branches: rows } };
+  }
+
+  const mockDiff = (path, who) => `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,3 +1,3 @@\n context\n-old line\n+${who} 改的\n tail\n`;
+
+  function branchDiff(q) {
+    const wt = q.get("worktree");
+    const path = q.get("path");
+    const s = sessions.find((x) => x.cwd === wt);
+    if (!s || !path) return err(404, "不是這個 repo 的 worktree");
+    return { status: 200, body: { worktree: wt, branch: s.branch, base: "0".repeat(40), integration: "develop", path, diff: mockDiff(path, s.branch), truncated: false } };
+  }
+
+  function commit(q, diff) {
+    const path = q.get("path");
+    if (q.get("worktree")) {
+      const wt = q.get("worktree");
+      const s = sessions.find((x) => x.cwd === wt);
+      if (!s) return err(404, "不是這個 repo 的 worktree");
+      if (diff) return { status: 200, body: { path, diff: mockDiff(path, "未 commit"), truncated: false } };
+      const fs = [...new Set(sessions.filter((x) => x.cwd === wt).flatMap((x) => [...(edited.get(x.id) ?? [])]).map(([p, st]) => `${st === "A" ? "?" : st}\t${p}`))];
+      return { status: 200, body: { worktree: wt, branch: s.branch, files: fs.map((l) => ({ status: l.split("\t")[0], path: l.split("\t")[1] })) } };
+    }
+    const c = history.find((x) => x.hash.startsWith(q.get("hash") ?? "-"));
+    if (!c) return err(404, "找不到這個 commit");
+    if (diff) return { status: 200, body: { path, diff: mockDiff(path, c.hash.slice(0, 7)), truncated: false } };
+    const n = 1 + (parseInt(c.hash.slice(0, 2), 16) % 4);
+    return { status: 200, body: { hash: c.hash, parents: c.parents, author: c.author, ts: c.ts, subject: c.subject, body: c.parents.length > 1 ? "" : "（mock）說明第二段", files: FILES.slice(0, n).map((p, i) => ({ status: ["M", "A", "M", "D"][i], path: p })) } };
+  }
+
   return {
     // GET /api/*：{ status, body }
     api(url) {
       const u = new URL(url, "http://mock");
       if (u.pathname === "/api/files") return files(u.searchParams);
       if (u.pathname === "/api/projects/events") return projectEvents(u.searchParams);
+      if (u.pathname === "/api/branches") return branches(u.searchParams);
+      if (u.pathname === "/api/branch-diff") return branchDiff(u.searchParams);
+      if (u.pathname === "/api/graph") return { status: 200, body: { root: ROOT, integration: "develop", commits: history, truncated: false } };
+      if (u.pathname === "/api/commit") return commit(u.searchParams, false);
+      if (u.pathname === "/api/commit-diff") return commit(u.searchParams, true);
       if (u.pathname === "/api/sessions") return { status: 200, body: { sessions: [...sessions.map((s) => ({ ...s })), ...ended.map((s) => ({ ...s, model: s.model }))] } };
       return err(404, "not found");
     },

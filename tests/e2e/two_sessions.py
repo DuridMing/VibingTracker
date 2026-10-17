@@ -141,7 +141,8 @@ def main():
     web_port = int(info["web"].rsplit(":", 1)[1])
     WORK.mkdir(parents=True, exist_ok=True)
     if not (WORK / ".git").exists():  # 自己的 git root，避免讀到上層的 .claude/settings.local.json
-        subprocess.run(["git", "init", "-q", str(WORK)], check=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # 同 lifecycle.git_init（#703）
+        subprocess.run(["git", "init", "-q", str(WORK)], check=True, env=env)
 
     a, b = str(uuid.uuid4()), str(uuid.uuid4())
     all_events, ch_a, ch_b = [], [], []

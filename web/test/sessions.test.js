@@ -46,3 +46,19 @@ test("▶ 回放按鍵只給已結束的 session（#690）", () => {
   for (const status of ["run", "wait", "done", "fail", "danger", "idle"]) assert.equal(canReplay(row("a", { status })), false, status);
   assert.equal(canReplay(null), false);
 });
+
+import { fitTabs } from "../js/sessions.js";
+
+test("tab 列（#704）：全部放得下時不收、沒有「+N」", () => {
+  assert.deepEqual(fitTabs([100, 100, 100], 300, 40, -1), { shown: [0, 1, 2], hidden: [] });
+});
+
+test("tab 列：放不下時留出「+N」的寬度，後面的收起來", () => {
+  assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, -1), { shown: [0, 1], hidden: [2, 3] });
+});
+
+test("tab 列：選中的被收起來時換到列上，擠掉最後一個看得到的（太寬就再多擠一個）", () => {
+  assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, 3), { shown: [0, 3], hidden: [1, 2] });
+  assert.deepEqual(fitTabs([100, 100, 100, 250], 330, 40, 3), { shown: [3], hidden: [0, 1, 2] });
+  assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, 1), { shown: [0, 1], hidden: [2, 3] }, "選中的本來就看得到：不動");
+});
