@@ -40,6 +40,17 @@ fn free_port() -> u16 {
     }
 }
 
+/// 綁住的空埠：測試自己要先佔著 hook 埠時用。free_port 探完就放掉，並行的別的測試程序
+/// 可能在測試綁上去之前先綁走同一個埠（#725）。
+fn bound_free_port() -> (TcpListener, u16) {
+    loop {
+        let p = free_port();
+        if let Ok(l) = TcpListener::bind(("127.0.0.1", p)) {
+            return (l, p);
+        }
+    }
+}
+
 fn env(idle_secs: u64) -> Env {
     env_on(idle_secs, free_port())
 }
@@ -80,8 +91,12 @@ impl Drop for Kill {
     }
 }
 
+/// 等 collector 起停的上限（#725）。collector 開、關 store 時 SQLite 會做 WAL 復原、checkpoint 與 fsync，
+/// 機器 I/O 很忙時（workspace 測試並行、cargo 在連結）實測要 2～8 秒以上；測的是「會不會」，不是「多快」。
+const DEADLINE: Duration = Duration::from_secs(30);
+
 fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + DEADLINE;
     while !cond() {
         assert!(Instant::now() < deadline, "等不到：{what}");
         std::thread::sleep(Duration::from_millis(30));
@@ -179,7 +194,7 @@ fn stale_collector_json_is_taken_over() {
 fn idle_collector_exits_by_itself() {
     let e = env(1);
     let mut s = start_serve(&e);
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + DEADLINE;
     loop {
         if let Some(status) = s.0.try_wait().unwrap() {
             assert!(status.success());
@@ -208,7 +223,7 @@ fn idle_exit_waits_until_every_session_has_ended() {
 
     let end = json!({"session_id": "s1", "hook_event_name": "SessionEnd", "reason": "exit"});
     http(e.hook, "POST", "/hook", &end.to_string());
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + DEADLINE;
     while s.0.try_wait().unwrap().is_none() {
         assert!(
             Instant::now() < deadline,
@@ -753,8 +768,8 @@ fn serve_waits_for_the_store_lock_before_opening_the_store() {
 /// #685：ensure 轉送時拿到 503（舊的 collector 正在閒置結束），要等埠放掉後拉起新的再轉送一次。
 #[test]
 fn ensure_retries_on_a_new_collector_when_the_old_one_is_exiting() {
-    let e = env(5);
-    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let (old, port) = bound_free_port();
+    let e = env_on(5, port);
     let exiting = std::thread::spawn(move || {
         // probe 只連線不送資料；轉送的那一條回 503，然後放掉埠（模擬舊 collector 結束）
         for conn in old.incoming() {
@@ -860,8 +875,8 @@ fn detached_serve_writes_its_own_log() {
 /// ensure 要在預算內改拉新的 collector，不能直接放棄（SessionStart 會掉）。
 #[test]
 fn ensure_retries_when_the_port_closes_between_probe_and_forward() {
-    let e = env(5);
-    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let (old, port) = bound_free_port();
+    let e = env_on(5, port);
     let exiting = std::thread::spawn(move || {
         // 只接 probe 那一條，接著放掉埠（還在 backlog 的轉送連線會被 RST）
         let probe = old.accept();
@@ -1028,7 +1043,7 @@ fn stop_subcommand_shuts_the_collector_down_cleanly() {
 
     let out = cmd(&e, &["stop"]).output().unwrap();
     assert!(out.status.success(), "stop 要 exit 0");
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + DEADLINE;
     let status = loop {
         if let Some(st) = s.0.try_wait().unwrap() {
             break st;
@@ -1116,6 +1131,10 @@ fn assert_pipes_released(
         err.is_some(),
         "stderr 3 秒內要收到 EOF：collector 握著 stderr 的寫入端"
     );
+    // ensure 只等 hook 埠就結束，collector.json 是 collector 開好 store、綁好 web 之後才寫的（#725）
+    wait_for("ensure 拉起的 collector 寫好 collector.json", || {
+        collector(e).is_some()
+    });
     let c = collector(e).expect("ensure 拉起的 collector 要還在跑");
     assert!(
         http(e.web, "GET", "/healthz", "").starts_with("HTTP/1.1 200"),
@@ -1141,6 +1160,34 @@ fn ensure_releases_the_callers_std_pipes_while_the_collector_keeps_running() {
     let mut c = Command::new(env!("CARGO_BIN_EXE_coding-lab"));
     c.arg("ensure").env("CODING_LAB_HOME", &e.home);
     let (status, out, err) = run_piped(c, &start);
+    assert_pipes_released(&e, status, out, err);
+}
+
+/// ensure 只等 hook 埠綁好就結束，collector 開 store、綁 web、寫 collector.json 是之後的事（#725）：
+/// 機器負載高時 ensure 結束那一刻 collector.json 可能還不在。這裡用 store 鎖把那段空檔撐開——
+/// collector 綁好 hook 埠後停在等鎖，ensure 照樣結束；放掉鎖後 collector 要接著起來。
+#[test]
+fn ensure_returns_before_the_collector_has_written_its_info() {
+    let e = env(30);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.home.join("collector.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let start =
+        json!({"session_id": "s725", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t725.jsonl"), "cwd": "/p"})
+        .to_string();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_coding-lab"));
+    c.arg("ensure").env("CODING_LAB_HOME", &e.home);
+    let (status, out, err) = run_piped(c, &start);
+    assert!(
+        collector(&e).is_none(),
+        "還拿不到 store 鎖時不會有 collector.json"
+    );
+    drop(lock);
     assert_pipes_released(&e, status, out, err);
 }
 

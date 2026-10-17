@@ -425,13 +425,29 @@ async fn closing_hook_server_refuses_ensure_forwards_but_keeps_other_hooks() {
     assert!(resp.starts_with("HTTP/1.1 200"), "取消結束後照常收：{resp}");
 }
 
+/// 綁在各平台 ephemeral 範圍（Linux 32768 起、macOS／Windows 49152 起）以下的 hook 入口（#725）。
+/// 綁 0 拿到的埠放掉後，並行測試再綁 0 可能又拿到同一個，「close 之後連不上」就會偶發失敗。
+async fn hook_server_below_ephemeral(tx: mpsc::Sender<Input>) -> coding_lab::hooks::HookServer {
+    const LOW: u32 = 20_000;
+    const SPAN: u32 = 12_000;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let start = (std::process::id() ^ nanos).wrapping_mul(2_654_435_761);
+    for i in 0..SPAN {
+        let port = (LOW + start.wrapping_add(i) % SPAN) as u16;
+        if let Ok(s) = serve_hooks(SocketAddr::from(([127, 0, 0, 1], port)), tx.clone()).await {
+            return s;
+        }
+    }
+    panic!("{LOW} 起 {SPAN} 個埠都綁不上");
+}
+
 /// #685：close() 回來時埠已經放掉，ensure 的 probe 會失敗而重新拉起 collector。
 #[tokio::test]
 async fn closed_hook_server_releases_the_port() {
     let (tx, _rx) = mpsc::channel(8);
-    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
-        .await
-        .unwrap();
+    let server = hook_server_below_ephemeral(tx).await;
     let addr = server.addr;
     assert!(TcpStream::connect(addr).await.is_ok());
     tokio::time::timeout(Duration::from_secs(5), server.close())
