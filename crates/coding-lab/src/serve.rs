@@ -36,6 +36,9 @@ const INPUT_QUEUE: usize = 8192;
 /// 進行中的 session 沒送 SessionEnd（終端機被直接關掉）時，最多再撐這麼久沒有 hook 才結束。
 const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const FRAME_QUEUE: usize = 256;
+/// SubagentStart 後讀 meta.json 的重試間隔與次數（實測晚 40–60 ms 寫好；merge 最多等 1.5 秒）
+const AGENT_META_EVERY: Duration = Duration::from_millis(25);
+const AGENT_META_TRIES: u32 = 40;
 
 pub enum Outcome {
     Stopped,
@@ -199,6 +202,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     } else {
                         open_sessions.insert(hook.session_id().to_string());
                     }
+                    if hook.event_name() == "SubagentStart" {
+                        read_agent_meta(hook, &tx);
+                    }
                     let actions = planner.on_hook(hook);
                     if !actions.is_empty() {
                         for action in actions {
@@ -328,6 +334,32 @@ fn apply_tail(
             }
         }
     }
+}
+
+/// subagent 對應哪個 Agent／Task 呼叫：背景讀 meta.json，結果交給 merge（#680）。不擋主迴圈。
+fn read_agent_meta(hook: &crate::hook::HookInput, tx: &mpsc::Sender<Input>) {
+    let (Some(transcript), Some(agent)) = (
+        hook.str_field("transcript_path").filter(|p| !p.is_empty()),
+        hook.str_field("agent_id").filter(|a| !a.is_empty()),
+    ) else {
+        return;
+    };
+    let path = crate::transcript::subagent_file(Path::new(transcript), agent, "meta.json");
+    let (session, agent, tx) = (hook.session_id().to_string(), agent.to_string(), tx.clone());
+    tokio::spawn(async move {
+        let meta = crate::transcript::read_agent_meta(path, AGENT_META_TRIES, || {
+            tokio::time::sleep(AGENT_META_EVERY)
+        })
+        .await;
+        // 讀不到也要說：merge 收到 Unreadable 就依呼叫順序配對，不必等滿上限
+        let input = Input::AgentMeta {
+            session,
+            agent_id: agent,
+            meta,
+            ts_seen: crate::now_ms(),
+        };
+        let _ = tx.send(input).await;
+    });
 }
 
 /// 只刪自己寫的 collector.json（另一個 collector 可能已經接手）。

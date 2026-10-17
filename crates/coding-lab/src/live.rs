@@ -673,23 +673,24 @@ impl Live {
                 }
                 Some(t) => {
                     let id = format!("{sid}/{}", a.agent_id);
-                    self.agents.insert(
-                        id.clone(),
-                        AgentLive {
-                            session: sid.clone(),
-                            agent_id: a.agent_id.clone(),
-                            name: a.name.clone().unwrap_or_else(|| t.clone()),
-                            agent_type: Some(t),
-                            model: None,
-                            task: a.task.as_deref().map(clip),
-                            status: "run",
-                            current: None,
-                            tool_count: 0,
-                            parent: a.parent_tool_use_id,
-                            spawned_at: Some(ts),
-                            finished_at: None,
-                        },
-                    );
+                    // agent.spawned 可能延後發（等配對，#680）：這段期間它的工具事件已經開了列、甚至已經結束，
+                    // 合併進去，保留工具次數、目前動作、模型與結束狀態
+                    let prev = self.agents.remove(&id);
+                    let row = AgentLive {
+                        session: sid.clone(),
+                        agent_id: a.agent_id.clone(),
+                        name: a.name.clone().unwrap_or_else(|| t.clone()),
+                        agent_type: Some(t),
+                        model: prev.as_ref().and_then(|p| p.model.clone()),
+                        task: a.task.as_deref().map(clip),
+                        status: prev.as_ref().map_or("run", |p| p.status),
+                        current: prev.as_ref().and_then(|p| p.current.clone()),
+                        tool_count: prev.as_ref().map_or(0, |p| p.tool_count),
+                        parent: a.parent_tool_use_id,
+                        spawned_at: prev.as_ref().and_then(|p| p.spawned_at).or(Some(ts)),
+                        finished_at: prev.as_ref().and_then(|p| p.finished_at),
+                    };
+                    self.agents.insert(id.clone(), row);
                     self.dirty_agents.insert(id, false);
                 }
             },

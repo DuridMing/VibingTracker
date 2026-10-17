@@ -399,6 +399,17 @@ fn agent_spawned_takes_name_from_the_agent_tool_call() {
                                   "agent_id": "a1", "agent_type": "Explore"}),
         2,
     );
+    assert!(
+        of(&a, "agent.spawned").is_empty(),
+        "有候選呼叫時等 meta.json（#680）"
+    );
+    // serve 讀到 meta.json 的 toolUseId 後送進來
+    let a = m.handle(Input::AgentMeta {
+        session: "s1".into(),
+        agent_id: "a1".into(),
+        meta: coding_lab::merge::AgentMetaRead::ToolUse("t1".into()),
+        ts_seen: 3,
+    });
     let s = of(&a, "agent.spawned")[0];
     assert_eq!(s.payload["name"], "找 .md 檔");
     assert_eq!(s.payload["task"], "列出所有 .md");
@@ -408,7 +419,7 @@ fn agent_spawned_takes_name_from_the_agent_tool_call() {
         json!({"session_id": "s1", "hook_event_name": "SubagentStop", "agent_id": "a1",
                                   "agent_type": "Explore", "last_assistant_message": "只有 notes.md",
                                   "agent_transcript_path": "/t/s1/subagents/agent-a1.jsonl"}),
-        3,
+        4,
     );
     let f = of(&b, "agent.finished")[0];
     assert_eq!(f.payload["agentId"], "a1");
