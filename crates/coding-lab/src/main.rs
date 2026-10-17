@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Read, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use coding_lab::config::{Config, Overrides};
+use coding_lab::keys::{KeyStore, Scope, SystemRng};
 use coding_lab::serve::{self, Outcome};
 
 /// Claude Code 多 session 專案追蹤 collector。
@@ -30,8 +31,93 @@ enum Command {
     Healthz,
     /// 請執行中的 collector 正常結束（放掉埠、寫完紀錄）；沒在跑也 exit 0
     Stop,
-    /// 安裝或移除常駐服務
-    Service,
+    /// 常駐服務（#662）：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
+    Service(ServiceArgs),
+    /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
+    Key(KeyArgs),
+    /// 多機總覽（#663）：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
+    Hub(HubArgs),
+}
+
+#[derive(Args)]
+struct HubArgs {
+    #[command(subcommand)]
+    command: Option<HubCommand>,
+    /// hub 的 web 入口（預設 [hub].bind 或 127.0.0.1:4802；只能是本機位址）
+    #[arg(long)]
+    bind: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum HubCommand {
+    /// 在 config.toml 加一台上游；金鑰從終端機互動輸入（不出現在 shell 歷史），本機或 SSH 通道的上游可以不給
+    Add {
+        /// 顯示名稱（串流前綴的 [host]）
+        name: String,
+        /// 那台的 web 入口，例如 http://100.64.0.5:4801 或 http://127.0.0.1:14801
+        url: String,
+        /// 不問金鑰（那台是 local-open 且走 SSH 通道）
+        #[arg(long)]
+        no_key: bool,
+    },
+}
+
+#[derive(Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// 寫 unit 檔並啟用：開機（登入）後 collector 自動起來、不會閒置結束
+    Install {
+        /// 只印出會寫的檔與會跑的指令，不執行
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 停掉並移除常駐服務（只刪 install 寫的檔）
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 有沒有裝、collector 現在有沒有在跑
+    Status,
+}
+
+#[derive(Args)]
+struct KeyArgs {
+    #[command(subcommand)]
+    command: KeyCommand,
+}
+
+#[derive(Subcommand)]
+enum KeyCommand {
+    /// 建一把金鑰；明文只在這裡印一次
+    Create {
+        /// 這把金鑰給誰用（例如 laptop、phone）
+        #[arg(long)]
+        name: String,
+        /// view：只能看；operate：另外可按「已確認」、改通知設定
+        #[arg(long, default_value = "view")]
+        scope: Scope,
+        /// 多久後到期：90d、12h、30m 或 never
+        #[arg(long, default_value = "never")]
+        expires: String,
+    },
+    /// 列出所有金鑰（不含 secret）
+    List,
+    /// 撤銷一把金鑰（立即失效）
+    Revoke {
+        /// `key list` 顯示的 8 碼 id
+        id: String,
+    },
+    /// 印一個 5 分鐘內、只能用一次的登入連結（在伺服器終端機上點一下就在本機登入，金鑰不經過網址列）
+    LoginLink {
+        /// 用哪一把金鑰（只有一把有效金鑰時可省略）
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -86,9 +172,412 @@ fn main() -> ExitCode {
         Command::Healthz => healthz(),
         Command::Stop => stop(),
         Command::Prune => prune(),
-        Command::Service => {
-            eprintln!("coding-lab：此子命令尚未實作");
+        Command::Service(args) => service(args.command),
+        Command::Key(args) => key(args.command),
+        Command::Hub(args) => hub(args),
+    }
+}
+
+/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
+fn hub(args: HubArgs) -> ExitCode {
+    match hub_inner(args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn hub_inner(args: HubArgs) -> Result<(), String> {
+    let cfg = Config::load(&Overrides::default())?;
+    match args.command {
+        Some(HubCommand::Add { name, url, no_key }) => {
+            let key = if no_key {
+                None
+            } else {
+                let k = read_secret(&format!(
+                    "{name} 的金鑰（在那台用 coding-lab key create 建立的 clk_…；本機或 SSH 通道的上游直接按 Enter）："
+                ))?;
+                let k = k.trim().to_string();
+                (!k.is_empty()).then_some(k)
+            };
+            let path = cfg.home.join("config.toml");
+            coding_lab::hub::append_upstream(&path, &name, &url, key.as_deref())?;
+            println!(
+                "已加入 {name}（{url}{}）到 {}；執行 coding-lab hub 開始看",
+                if key.is_some() {
+                    "，有金鑰"
+                } else {
+                    "，不用金鑰"
+                },
+                path.display()
+            );
+            Ok(())
+        }
+        None => {
+            if cfg.hub_upstreams.is_empty() {
+                return Err(format!(
+                    "config.toml 裡沒有 [[hub.upstream]]；先 coding-lab hub add <名稱> <http://主機:4801>（{}）",
+                    cfg.home.join("config.toml").display()
+                ));
+            }
+            let bind: SocketAddr = match args.bind {
+                Some(b) => b
+                    .parse()
+                    .map_err(|_| format!("--bind 不是合法的位址：{b}"))?,
+                None => cfg.hub_bind,
+            };
+            if !bind.ip().is_loopback() {
+                return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("無法建立 runtime：{e}"))?;
+            rt.block_on(async {
+                let (addr, task) =
+                    coding_lab::hub::serve(bind, cfg.hub_upstreams.clone(), cfg.web_root.clone())
+                        .await
+                        .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
+                eprintln!(
+                    "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
+                    cfg.hub_upstreams
+                        .iter()
+                        .map(|u| format!("{} {}", u.name, u.url))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                );
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = task => {}
+                }
+                Ok::<(), String>(())
+            })
+        }
+    }
+}
+
+/// 從終端機讀一行機密（unix 用 stty 關回顯；其他平台照常讀，先提醒會顯示）
+fn read_secret(prompt: &str) -> Result<String, String> {
+    let stdin = std::io::stdin();
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let tty = stdin.is_terminal();
+    #[cfg(unix)]
+    let echo_off = tty
+        && std::process::Command::new("stty")
+            .arg("-echo")
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(not(unix))]
+    let echo_off = false;
+    if tty && !echo_off {
+        eprintln!("（輸入會顯示在畫面上）");
+    }
+    let mut line = String::new();
+    let read = stdin.lock().read_line(&mut line);
+    #[cfg(unix)]
+    if echo_off {
+        let _ = std::process::Command::new("stty").arg("echo").status();
+        eprintln!();
+    }
+    read.map_err(|e| format!("讀不到輸入：{e}"))?;
+    Ok(line)
+}
+
+/// `coding-lab service …`（#662）：Plan 由 service.rs 算，這裡只負責環境、印出與執行。
+fn service(cmd: ServiceCommand) -> ExitCode {
+    match service_inner(cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
+    use coding_lab::service::{self, Platform};
+    let cfg = Config::load(&Overrides::default())?;
+    let platform = Platform::current().ok_or_else(|| {
+        format!(
+            "{} 沒有常駐服務的做法；請自己用系統的方式跑 coding-lab serve --idle-exit-seconds 0",
+            std::env::consts::OS
+        )
+    })?;
+    let ctx = service::Ctx::detect(&cfg.home)?;
+    let describe = |plan: &service::Plan| {
+        for (p, _) in &plan.files {
+            println!("寫入 {}", p.display());
+        }
+        for p in &plan.removes {
+            println!("刪除 {}", p.display());
+        }
+        for c in &plan.commands {
+            println!("執行 {}", c.join(" "));
+        }
+    };
+    match cmd {
+        ServiceCommand::Install { dry_run } => {
+            if let Some(w) = cfg.plugin_warning() {
+                eprintln!("coding-lab：{w}");
+            }
+            let plan = service::plan_install(platform, &ctx);
+            describe(&plan);
+            if dry_run {
+                for (p, c) in &plan.files {
+                    println!("\n--- {} ---\n{c}", p.display());
+                }
+                return Ok(());
+            }
+            // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束；登記失敗再把它拉回（#719）
+            let was_running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            if was_running
+                && std::process::Command::new(&ctx.exe)
+                    .arg("stop")
+                    .env("CODING_LAB_HOME", &cfg.home)
+                    .status()
+                    .map(|s| !s.success())
+                    .unwrap_or(false)
+            {
+                eprintln!(
+                    "coding-lab：舊的 collector 沒有停下來，服務可能綁不到埠；稍後用 service status 確認"
+                );
+            }
+            if platform == Platform::Macos && service::installed(platform, &ctx) {
+                // 重裝：先卸掉舊的（沒裝過時 bootout 會失敗，所以只在檔案在時做）
+                let _ = service::run_command(&service::plan_uninstall(platform, &ctx).commands[0]);
+            }
+            let mut restore = || {
+                if !was_running {
+                    return;
+                }
+                // `ensure` 沒有 stdin 時就只是「沒在跑就拉起」
+                let ok = std::process::Command::new(&ctx.exe)
+                    .arg("ensure")
+                    .env("CODING_LAB_HOME", &cfg.home)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success());
+                eprintln!(
+                    "coding-lab：常駐服務沒有裝成，{}",
+                    if ok {
+                        "原本在跑的 collector 已重新拉起"
+                    } else {
+                        "而且拉不回原本的 collector；下一個 session 開始時會再拉起"
+                    }
+                );
+            };
+            service::install(&plan, &mut service::run_command, &mut restore)?;
+            println!(
+                "已安裝常駐服務；web 入口 {}，hook 入口 {}",
+                cfg.web_bind, cfg.hook_bind
+            );
+            for n in &plan.notes {
+                println!("・{n}");
+            }
+            Ok(())
+        }
+        ServiceCommand::Uninstall { dry_run } => {
+            let plan = service::plan_uninstall(platform, &ctx);
+            describe(&plan);
+            if dry_run {
+                return Ok(());
+            }
+            if !service::installed(platform, &ctx) {
+                println!(
+                    "沒有裝過常駐服務（{}）",
+                    service::files_for(platform, &ctx)[0].display()
+                );
+            }
+            // 停掉／取消註冊失敗（例如早就被手動移除）不該擋住刪檔：指令錯誤只印出來
+            let mut warn = Vec::new();
+            service::apply(&plan, &mut |c| {
+                if let Err(e) = service::run_command(c) {
+                    warn.push(format!("{} 失敗：{e}", c.join(" ")));
+                }
+                Ok(())
+            })?;
+            for w in warn {
+                eprintln!("coding-lab：{w}（略過）");
+            }
+            for n in &plan.notes {
+                println!("・{n}");
+            }
+            Ok(())
+        }
+        ServiceCommand::Status => {
+            let files = service::files_for(platform, &ctx);
+            // 以系統的登記為準（#719）：install 失敗後 unit／XML 檔可能還在
+            let registered =
+                service::query_installed(platform, &ctx, &mut service::run_command_capture);
+            let file = service::installed(platform, &ctx);
+            println!(
+                "常駐服務：{}（{}：{}）",
+                if registered {
+                    "已安裝"
+                } else if file {
+                    "未登記（檔案還在，請重跑 service install 或 uninstall）"
+                } else {
+                    "未安裝"
+                },
+                service::status_command(platform, &ctx).join(" "),
+                files[0].display()
+            );
+            let running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            println!(
+                "collector：{}（hook 入口 {}）",
+                if running { "執行中" } else { "沒有在跑" },
+                cfg.hook_bind
+            );
+            Ok(())
+        }
+    }
+}
+
+/// `coding-lab key …`（#666）。collector 每次驗證都重讀 keys.json，所以這裡直接改檔就生效，不必重啟。
+fn key(cmd: KeyCommand) -> ExitCode {
+    match key_inner(cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn key_inner(cmd: KeyCommand) -> Result<(), String> {
+    let cfg = Config::load(&Overrides::default())?;
+    let now = coding_lab::now_ms();
+    let mut rng = SystemRng;
+    let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
+    match cmd {
+        KeyCommand::Create {
+            name,
+            scope,
+            expires,
+        } => {
+            let expires_ms = coding_lab::keys::parse_expires(&expires, now)?;
+            let token = store.create(&name, scope, expires_ms, now, &mut rng);
+            store.save(&cfg.home)?;
+            let id = store.list().last().map(|k| k.id.as_str()).unwrap_or("");
+            println!("金鑰（只顯示這一次，請現在複製）：\n\n    {token}\n");
+            println!(
+                "id {id}　name {name}　scope {}　到期 {}",
+                scope.as_str(),
+                expires_ms.map_or("永不".to_string(), coding_lab::keys::fmt_utc)
+            );
+            println!(
+                "瀏覽器：打開 web 入口時貼上；程式：Authorization: Bearer {}…；撤銷：coding-lab key revoke {id}",
+                &token[..12.min(token.len())]
+            );
+            Ok(())
+        }
+        KeyCommand::List => {
+            if store.list().is_empty() {
+                println!("還沒有金鑰；用 coding-lab key create --name <名稱> 建一把");
+                return Ok(());
+            }
+            println!(
+                "{:<8}  {:<16}  {:<7}  {:<16}  {:<16}  {:<16}  狀態",
+                "id", "name", "scope", "建立", "最後使用", "到期"
+            );
+            for k in store.list() {
+                let status = match k.usable_at(now) {
+                    Ok(()) => "有效".to_string(),
+                    Err(e) => format!("{e}（已撤銷／已到期）"),
+                };
+                println!(
+                    "{:<8}  {:<16}  {:<7}  {:<16}  {:<16}  {:<16}  {status}",
+                    k.id,
+                    k.name,
+                    k.scope.as_str(),
+                    coding_lab::keys::fmt_utc(k.created_ms),
+                    k.last_used_ms
+                        .map_or("—".to_string(), coding_lab::keys::fmt_utc),
+                    k.expires_ms
+                        .map_or("永不".to_string(), coding_lab::keys::fmt_utc),
+                );
+            }
+            Ok(())
+        }
+        KeyCommand::LoginLink { key } => {
+            let usable: Vec<&coding_lab::keys::KeyRecord> = store
+                .list()
+                .iter()
+                .filter(|k| k.usable_at(now).is_ok())
+                .collect();
+            let id = match key {
+                Some(id) => {
+                    let k = store.get(&id).ok_or_else(|| {
+                        format!("沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的")
+                    })?;
+                    k.usable_at(now).map_err(|e| format!("金鑰 {id}：{e}"))?;
+                    id
+                }
+                None => match usable.as_slice() {
+                    [] => {
+                        return Err(
+                            "還沒有有效的金鑰；先 coding-lab key create --name <名稱>".into()
+                        );
+                    }
+                    [one] => one.id.clone(),
+                    many => {
+                        return Err(format!(
+                            "有 {} 把有效金鑰，請用 --key <id> 指定：{}",
+                            many.len(),
+                            many.iter()
+                                .map(|k| format!("{}（{}）", k.id, k.name))
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        ));
+                    }
+                },
+            };
+            let code = coding_lab::auth::create_once_link(&cfg.home, &id, now, &mut rng)?;
+            // 有綁區網／tailnet 位址就用它組網址（連結是給別台用的）；全是本機時才用 127.0.0.1 並提醒開 SSH 通道
+            let link_bind = cfg
+                .web_binds
+                .iter()
+                .find(|b| !b.ip().is_loopback())
+                .copied()
+                .unwrap_or(cfg.web_bind);
+            let ip = link_bind.ip();
+            let host = if ip.is_unspecified() {
+                "<這台的位址>".to_string()
+            } else if ip.is_ipv6() {
+                format!("[{ip}]")
+            } else {
+                ip.to_string()
+            };
+            println!("http://{host}:{}/auth/once/{code}", link_bind.port());
+            println!(
+                "{} 分鐘內有效、只能用一次；用金鑰 {id}。",
+                coding_lab::auth::ONCE_TTL_MS / 60_000
+            );
+            if ip.is_loopback() {
+                println!(
+                    "web 入口綁在 {ip}：請先在本機開 SSH 通道（ssh -N -L {0}:127.0.0.1:{0} <伺服器>）再打開這個網址。",
+                    link_bind.port()
+                );
+            }
+            Ok(())
+        }
+        KeyCommand::Revoke { id } => {
+            if store.get(&id).is_none() {
+                return Err(format!(
+                    "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
+                ));
+            }
+            if store.revoke(&id, now) {
+                store.save(&cfg.home)?;
+                println!("已撤銷 {id}，持有這把金鑰的連線下一次請求起失效");
+            } else {
+                println!("{id} 先前已撤銷");
+            }
+            Ok(())
         }
     }
 }

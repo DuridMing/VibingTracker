@@ -82,23 +82,76 @@ fn home_comes_from_cli_then_env() {
 }
 
 #[test]
-fn keys_planned_for_p6_are_accepted_but_unused() {
-    let file = "[web]\nbind = \"127.0.0.1:4801\"\nauth = \"local-open\"\nremote_thinking = \"on_demand\"\n";
-    assert!(
-        resolve(Overrides::default(), &[], Some(file)).is_ok(),
-        "README 的設定範例要能直接用"
-    );
-}
+fn web_auth_keys_parse_with_defaults() {
+    use coding_lab::config::{AuthMode, RemoteThinking};
+    let c = resolve(Overrides::default(), &[], None).unwrap();
+    assert_eq!(c.auth, AuthMode::LocalOpen);
+    assert_eq!(c.remote_thinking, RemoteThinking::OnDemand);
+    assert!(!c.allow_insecure);
 
-#[test]
-fn non_loopback_web_is_refused_until_keys_exist() {
+    let file = "[web]\nbind = \"127.0.0.1:4801\"\nauth = \"always\"\nremote_thinking = \"hide\"\nallow_insecure = true\n";
+    let c = resolve(Overrides::default(), &[], Some(file)).unwrap();
+    assert_eq!(c.auth, AuthMode::Always);
+    assert_eq!(c.remote_thinking, RemoteThinking::Hide);
+    assert!(c.allow_insecure);
+
+    // 環境變數蓋過檔案
+    let c = resolve(
+        Overrides::default(),
+        &[
+            ("CODING_LAB_WEB_AUTH", "local-open"),
+            ("CODING_LAB_REMOTE_THINKING", "show"),
+        ],
+        Some(file),
+    )
+    .unwrap();
+    assert_eq!(c.auth, AuthMode::LocalOpen);
+    assert_eq!(c.remote_thinking, RemoteThinking::Show);
+
+    let err = resolve(Overrides::default(), &[], Some("[web]\nauth = \"open\"\n")).unwrap_err();
+    assert!(err.contains("auth"), "{err}");
     let err = resolve(
         Overrides::default(),
-        &[("CODING_LAB_WEB_BIND", "0.0.0.0:4801")],
-        None,
+        &[],
+        Some("[web]\nremote_thinking = \"full\"\n"),
     )
     .unwrap_err();
-    assert!(err.contains("SSH"), "{err}");
+    assert!(err.contains("remote_thinking"), "{err}");
+}
+
+/// PLAN「網路綁定」第 4 點：tailnet／私有網段可以直接綁；公開 IP 或 0.0.0.0 沒有 TLS 時拒絕，除非 allow_insecure。
+#[test]
+fn non_loopback_web_bind_private_ok_public_needs_allow_insecure() {
+    for bind in [
+        "100.64.0.1:4801",
+        "192.168.1.5:4801",
+        "10.0.0.2:4801",
+        "172.16.3.4:4801",
+        "[fd7a:115c:a1e0::1]:4801",
+    ] {
+        let c = resolve(Overrides::default(), &[("CODING_LAB_WEB_BIND", bind)], None)
+            .unwrap_or_else(|e| panic!("{bind}：{e}"));
+        assert_eq!(c.web_bind.to_string(), bind);
+    }
+    for bind in ["0.0.0.0:4801", "[::]:4801", "203.0.113.9:4801"] {
+        let err =
+            resolve(Overrides::default(), &[("CODING_LAB_WEB_BIND", bind)], None).unwrap_err();
+        assert!(
+            err.contains("allow_insecure") && err.contains("SSH"),
+            "{bind}：{err}"
+        );
+        let c = resolve(
+            Overrides::default(),
+            &[
+                ("CODING_LAB_WEB_BIND", bind),
+                ("CODING_LAB_ALLOW_INSECURE", "true"),
+            ],
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{bind} + allow_insecure：{e}"));
+        assert_eq!(c.web_bind.to_string(), bind);
+    }
+    // hook 入口永遠只能 loopback（不變式 6）
     let err = resolve(
         Overrides::default(),
         &[("CODING_LAB_HOOK_BIND", "100.64.0.1:4800")],
@@ -199,4 +252,69 @@ fn store_flush_interval_is_configurable() {
         .is_err(),
         "0 會讓 flush 迴圈空轉"
     );
+}
+
+/// #722：`[web].bind` 可以是一個字串或陣列（區網直連與 SSH 通道的 127.0.0.1 並存）；環境變數用逗號分隔。
+#[test]
+fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
+    let one = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = \"127.0.0.1:4801\"\n"),
+    )
+    .unwrap();
+    assert_eq!(one.web_bind.to_string(), "127.0.0.1:4801");
+    assert_eq!(one.web_binds.len(), 1);
+
+    let many = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.77.241:4801\"]\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        many.web_bind.to_string(),
+        "127.0.0.1:4801",
+        "第一個是主要位址"
+    );
+    assert_eq!(
+        many.web_binds
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:4801", "192.168.77.241:4801"]
+    );
+
+    let env = resolve(
+        Overrides::default(),
+        &[("CODING_LAB_WEB_BIND", "127.0.0.1:5001, 10.0.0.2:5001")],
+        Some("[web]\nbind = \"127.0.0.1:4801\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        env.web_binds
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>(),
+        ["127.0.0.1:5001", "10.0.0.2:5001"],
+        "環境變數逗號分隔，蓋過檔案"
+    );
+
+    let err = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"127.0.0.1:4801\"]\n"),
+    )
+    .unwrap_err();
+    assert!(err.contains("重複"), "{err}");
+    let err = resolve(Overrides::default(), &[], Some("[web]\nbind = []\n")).unwrap_err();
+    assert!(err.contains("至少"), "{err}");
+    // 陣列裡有公開 IP 一樣要 allow_insecure
+    let err = resolve(
+        Overrides::default(),
+        &[],
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"203.0.113.9:4801\"]\n"),
+    )
+    .unwrap_err();
+    assert!(err.contains("allow_insecure"), "{err}");
 }

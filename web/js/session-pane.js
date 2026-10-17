@@ -74,7 +74,9 @@ export function createSessionPane(session = null) {
         const id = e.payload?.toolUseId;
         if (id && e.payload?.status) status.set(id, e.payload.status);
       } else if (e.type === "assistant.thinking") {
-        thinking = { text: e.payload?.text ?? "", agent: e.agent, summarized: !!e.payload?.summarized };
+        // 遠端連線只拿到佔位（#668）：思考條顯示字數，不假裝有內容
+        const text = e.payload?.deferred ? `（思考 ${e.payload?.chars ?? "?"} 字，遠端未載入；在串流裡點開那一行可載入）` : e.payload?.text ?? "";
+        thinking = { text, agent: e.agent, summarized: !!e.payload?.summarized };
       }
     }
     for (const [id, st] of status) if (!older || !toolStatus.has(id)) toolStatus.set(id, st);

@@ -126,7 +126,19 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         log(&w);
     }
 
-    let web = WebState::new(Some(store.clone()), cfg.web_root.clone(), FRAME_QUEUE);
+    let web = WebState::new_with_auth(
+        Some(store.clone()),
+        cfg.web_root.clone(),
+        FRAME_QUEUE,
+        cfg.home.clone(),
+        cfg.auth,
+    );
+    web.set_remote_thinking(cfg.remote_thinking);
+    if cfg.web_binds.iter().any(|b| !b.ip().is_loopback()) && !web.auth().has_keys() {
+        log(
+            "web 入口綁在非本機位址，但還沒有任何金鑰：遠端連線都會被拒，請先 coding-lab key create --name <名稱>",
+        );
+    }
     web.rebuild(&recent);
     // ack 不是 Event，重放會讓已確認的注意列跑回來：依 store 的佇列對齊
     let open_attention = match store
@@ -147,7 +159,15 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             .collect(),
     );
     web.flush(crate::now_ms());
+    // 每個 [web].bind 各一個 listener，共用同一個 WebState（#722）；第一個是主要位址
     let (web_addr, web_task) = serve_web(cfg.web_bind, web.clone()).await?;
+    let mut web_addrs = vec![web_addr];
+    let mut extra_tasks = Vec::new();
+    for b in cfg.web_binds.iter().skip(1) {
+        let (a, t) = serve_web(*b, web.clone()).await?;
+        web_addrs.push(a);
+        extra_tasks.push(t);
+    }
     let flusher = web.spawn_flusher();
 
     let info = cfg.home.join("collector.json");
@@ -156,12 +176,18 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         &info,
         json!({
             "pid": me, "hook": hook_addr.to_string(), "web": web_addr.to_string(),
+            "webs": web_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(),
         })
         .to_string(),
     )?;
     log(&format!(
-        "hook {hook_addr}、web http://{web_addr}、資料 {}",
+        "hook {hook_addr}、web {}、資料 {}",
+        web_addrs
+            .iter()
+            .map(|a| format!("http://{a}"))
+            .collect::<Vec<_>>()
+            .join(" "),
         cfg.home.display()
     ));
 
@@ -344,7 +370,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
         log(&format!("寫入 store 失敗：{e}"));
     }
-    for task in [web_task, flusher] {
+    for task in [web_task, flusher].into_iter().chain(extra_tasks) {
         task.abort();
         let _ = task.await;
     }

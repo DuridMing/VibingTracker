@@ -1333,3 +1333,36 @@ fn transcript_lines_lost_in_a_crash_are_reread_after_a_restart() {
         assert_eq!(after[k], before[k], "{k}：重啟前 {before}\n重啟後 {after}");
     }
 }
+
+/// #722：`[web].bind` 是陣列時每個位址都提供服務，collector.json 的 `web` 是第一個、`webs` 全部。
+#[test]
+fn web_bind_list_serves_every_address() {
+    let e = env(0);
+    let second = free_port();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "[hook]\nbind = \"127.0.0.1:{}\"\n[web]\nbind = [\"127.0.0.1:{}\", \"127.0.0.1:{second}\"]\n[collector]\nidle_exit_seconds = 0\n",
+            e.hook, e.web
+        ),
+    )
+    .unwrap();
+    let _serve = start_serve(&e);
+    assert!(
+        http(e.web, "GET", "/healthz", "").starts_with("HTTP/1.1 200"),
+        "第一個位址"
+    );
+    assert!(
+        http(second, "GET", "/healthz", "").starts_with("HTTP/1.1 200"),
+        "第二個位址"
+    );
+    let c = collector(&e).unwrap();
+    assert_eq!(c["web"], format!("127.0.0.1:{}", e.web));
+    assert_eq!(
+        c["webs"],
+        json!([
+            format!("127.0.0.1:{}", e.web),
+            format!("127.0.0.1:{second}")
+        ])
+    );
+}

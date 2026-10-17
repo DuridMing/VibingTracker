@@ -27,13 +27,14 @@ function harness(opts = {}) {
     clearTimeout(t) { const i = timers.indexOf(t); if (i >= 0) timers.splice(i, 1); },
     fire() { const t = timers.shift(); assert.ok(t, "沒有排程的計時器"); t.fn(); return t.ms; },
   };
-  const got = { welcome: [], snapshot: [], frame: [], more: [], error: [], status: [], incompatible: [] };
+  const got = { welcome: [], snapshot: [], frame: [], more: [], error: [], serverError: [], status: [], incompatible: [] };
   const handlers = {
     welcome: (m) => got.welcome.push(m),
     snapshot: (m) => got.snapshot.push(m),
     frame: (m) => got.frame.push(m),
     more: (m) => got.more.push(m),
     onError: (e) => got.error.push(e),
+    error: (m) => got.serverError.push(m),
     onStatus: (s) => got.status.push(s),
     onIncompatible: (m) => got.incompatible.push(m),
   };
@@ -231,4 +232,16 @@ test("新 instance 的 welcome 後、snapshot 前斷線：resume 不能把舊 in
   clock.fire();
   at(2).open();
   assert.equal(at(2).sent[0].resume, undefined);
+});
+
+test("server 的 error 訊息交給 handlers.error（#721）", () => {
+  const { at, client, got } = harness();
+  client.connect();
+  const ws = at(0);
+  ws.open();
+  ws.recv(welcome);
+  ws.recv({ t: "error", message: "linux 的金鑰只能看（view）" });
+  assert.equal(got.serverError.length, 1);
+  assert.equal(got.serverError[0].message, "linux 的金鑰只能看（view）");
+  assert.equal(got.error.length, 0, "不是解析錯誤");
 });

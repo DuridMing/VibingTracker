@@ -5,7 +5,8 @@ export const PROTOCOL = 1;
 const BACKOFF_START_MS = 500;
 const BACKOFF_MAX_MS = 10_000;
 const MORE_LIMIT_MAX = 500;
-const DISPATCH = ["welcome", "snapshot", "frame", "more"];
+// error：server 拒絕某個 op（例如 view 金鑰按「已確認」），交給 handlers.error 顯示（#721）
+const DISPATCH = ["welcome", "snapshot", "frame", "more", "error"];
 
 export function createClient({ url, WebSocket, setTimeout, clearTimeout, handlers = {}, utcOffsetMin = null }) {
   const channels = new Set();

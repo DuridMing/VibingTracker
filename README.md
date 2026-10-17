@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、多機總覽（hub）與常駐服務還在規劃中（P6）。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
+> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務已完成（P6），等實機驗收。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
 
 ## 它做什麼
 
@@ -120,8 +120,12 @@ Windows 上另外兩種情況也會看到這些提示：`SessionStart` 超過 5 
 bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，只能是 127.0.0.1；plugin 的 hook 固定送到 4800，改埠只適合測試
 
 [web]
-bind = "127.0.0.1:4801"   # 金鑰驗證做好之前只能綁 127.0.0.1；從別台看請用 SSH 通道（見下方）
+bind = "127.0.0.1:4801"   # 從別台看：改成 tailnet IP（100.x.x.x）並用金鑰登入，或維持 127.0.0.1 走 SSH 通道（見下方）
+# bind = ["127.0.0.1:4801", "100.x.x.x:4801"]   # 兩個都要：127.0.0.1 給 SSH 通道（免金鑰）、tailnet 給直連（要金鑰）
 root = "/path/to/VibingTracker/web"   # 網頁位置；不設時用二進位旁邊的 web/
+auth = "local-open"       # local-open：127.0.0.1 連進來免金鑰（含 SSH 通道）；always：連本機也要金鑰（多人共用的伺服器）
+remote_thinking = "on_demand"   # 遠端連線的 thinking：on_demand 點開才載入（預設）| hide | show；本機永遠完整
+# allow_insecure = true   # bind 是公開 IP 又沒有 TLS 時才需要（明文 http 會被竊聽；建議前面放 Caddy）
 
 [collector]
 idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出；0＝不退出
@@ -130,7 +134,7 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 | 環境變數 | 對應 |
 | --- | --- |
 | `CODING_LAB_HOME` | 資料目錄（預設 `~/.coding-lab`） |
-| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS` | 同上表的設定 |
+| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS`、`CODING_LAB_WEB_AUTH`、`CODING_LAB_REMOTE_THINKING`、`CODING_LAB_ALLOW_INSECURE` | 同上表的設定 |
 | `CODING_LAB_BIN` | wrapper 要用的二進位（優先於 `~/.coding-lab/bin`） |
 | `CODING_LAB_RELEASE_URL` | wrapper 自動下載的來源（見「從 Release 自動下載」） |
 
@@ -138,6 +142,7 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 | --- | --- |
 | `~/.coding-lab/rules.json` | 覆寫危險指令規則（格式見下方） |
 | `~/.coding-lab/prices.json` | 覆寫模型單價表 |
+| `~/.coding-lab/keys.json` | 遠端查看用的金鑰（只存雜湊，權限必須是 600）；用 `coding-lab key` 管理，不要手改 |
 | `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替（`collector.log.1`…`.5`）；前景執行 `coding-lab serve` 時改印在終端機 |
 
 `prices.json` 只要列出想改的模型，單位是 USD／每百萬 tokens，改完重啟 collector 才生效；格式有錯時整個改用內建單價，並在日誌寫一行警告：
@@ -161,15 +166,48 @@ idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出�
 
 ### 從本機看伺服器上的 session
 
-在伺服器上開發、從自己的電腦看，目前用 SSH 通道：
+在伺服器上開發、從自己的電腦看，有兩種連法。
+
+**SSH 通道**（不用改設定）：
 
 ```bash
 ssh -N -L 4801:127.0.0.1:4801 <server>
 ```
 
-然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要另外開防火牆。
+然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要防火牆也不需要金鑰（通道進來的連線就是本機）。
 
-規劃中（P6）：用金鑰登入的 tailnet 直連、遠端的 thinking 點開才載入、一次看多台伺服器的 `coding-lab hub`。
+**tailnet 直連**（Tailscale／ZeroTier；手機也能看）：在伺服器上把 `[web].bind` 改成它的 tailnet IP（要同時保留 SSH 通道就寫成陣列 `["127.0.0.1:4801", "100.x.x.x:4801"]`），再建一把金鑰：
+
+```bash
+coding-lab key create --name laptop --scope view --expires 90d   # 明文只印這一次
+coding-lab stop                                                   # 讓下一個 session 用新設定重新拉起 collector
+```
+
+本機開 `http://100.x.x.x:4801`，第一次會出現登入頁，貼上金鑰；之後 30 天不必再貼。不想在手機上打一長串，可以在伺服器終端機上執行 `coding-lab key login-link`，它印出一個 5 分鐘內只能用一次的網址，點開就登入。
+
+遠端連線一律要金鑰，而且看不到命中敏感規則的工具輸出（例如讀 `.env`）；thinking 預設點開才載入（`remote_thinking`）。`view` 金鑰只能看，`operate` 才能按注意佇列的「已確認」。撤銷：`coding-lab key revoke <id>`，持有它的瀏覽器下一個請求起就要重新登入。金鑰與 cookie 走明文 http，所以只建議 tailnet（WireGuard 加密）、SSH 通道或自己前置 TLS（Caddy）；綁公開 IP 時 collector 會拒絕啟動，除非設 `allow_insecure = true`。
+
+多人共用的伺服器上，其他使用者也連得到 127.0.0.1，這時設 `auth = "always"`，連本機（含 SSH 通道）都要金鑰。
+
+**讓伺服器重開機後 collector 自己起來**：平常 collector 由第一個 session 的 `ensure` 拉起、閒置 10 分鐘退出；伺服器上想隨時都看得到（含沒有 session 在跑的時候），裝成常駐服務：
+
+```bash
+coding-lab service install      # Linux：systemd user unit；macOS：LaunchAgent；Windows：工作排程器（登入時啟動）
+coding-lab service status
+coding-lab service uninstall
+```
+
+服務用 `serve --idle-exit-seconds 0` 跑、不會閒置結束，設定仍讀 `~/.coding-lab/config.toml`。Linux 要在沒人登入時就起來，再執行一次 `loginctl enable-linger $USER`。`install --dry-run` 只印出會寫的檔與會跑的指令。TLS 不內建：需要 https 時前置 Caddy 或 nginx 反向代理到 127.0.0.1:4801。
+
+**一次看多台伺服器（hub）**：每台伺服器各跑自己的 collector（上面的形態），本機跑 `coding-lab hub` 把它們合成一頁：
+
+```bash
+coding-lab hub add build-01 http://100.64.0.5:4801      # 會問金鑰（在那台 key create 的 clk_…），不進 shell 歷史
+coding-lab hub add tunnel http://127.0.0.1:14801 --no-key   # SSH 通道（ssh -N -L 14801:127.0.0.1:4801 <伺服器>）的不用金鑰
+coding-lab hub                                           # 本機開 http://127.0.0.1:4802
+```
+
+串流每行前面多一個 `[主機]`，Sessions、Agents 也標主機；某台斷線時它的 session 標「離線」、hub 自動重連，其他台照常。hub 只轉發不存資料；要「載入更多」、看 thinking 全文、按「已確認」都轉給對應的那台（那台的金鑰是 `view` 就不能確認）。上游列在 `~/.coding-lab/config.toml` 的 `[[hub.upstream]]`（`name`、`url`、`key`；檔案權限 600），hub 的埠用 `[hub] bind` 或 `--bind` 改（只能是本機位址）。上游網址只接受 `http://`：遠端一律走 tailnet 或 SSH 通道。
 
 ## 子命令
 
@@ -180,8 +218,12 @@ ssh -N -L 4801:127.0.0.1:4801 <server>
 | `coding-lab healthz` | 查詢執行中 collector 的版本、session 數與事件迴圈延遲 |
 | `coding-lab config` | 印出合併後的設定 |
 | `coding-lab prune` | 立刻清掉 30 天前的資料（collector 在跑時不動資料，它自己每天會清） |
-
-`coding-lab service`（安裝成常駐服務）還沒有實作。
+| `coding-lab stop` | 請背景的 collector 正常結束（寫完紀錄才回來） |
+| `coding-lab key create --name <名稱> [--scope view\|operate] [--expires 90d\|12h\|30m\|never]` | 建一把遠端查看用的金鑰，明文只印這一次；`view` 只能看，`operate` 另外可按「已確認」、改通知設定 |
+| `coding-lab key list`、`coding-lab key revoke <id>` | 列出金鑰（不含 secret）、撤銷（立即失效，不必重啟 collector） |
+| `coding-lab key login-link [--key <id>]` | 印一個 5 分鐘內只能用一次的登入網址（金鑰不經過網址列與瀏覽紀錄） |
+| `coding-lab service install [--dry-run]`、`service uninstall`、`service status` | 裝成開機（登入）自動啟動、不閒置結束的常駐服務：Linux systemd user unit、macOS LaunchAgent、Windows 工作排程器；`uninstall` 只刪 `install` 寫的檔 |
+| `coding-lab hub [--bind 127.0.0.1:4802]`、`hub add <名稱> <http://主機:4801> [--no-key]` | 多機總覽：對 `[[hub.upstream]]` 的每台開 WS 合流，在本機開 web；`add` 互動輸入金鑰並寫進 config.toml |
 
 ## 卸載
 

@@ -10,10 +10,13 @@
 2. [編譯並放好 collector](#編譯並放好-collector)
 3. [安裝 plugin](#安裝-plugin)
 4. [確認有在追蹤](#確認有在追蹤)
-5. [看過去的 session（回放）](#看過去的-session回放)
-6. [更新](#更新)
-7. [疑難排解](#疑難排解)
-8. [卸載](#卸載)
+5. [讓 collector 常駐（伺服器重開機後自己起來）](#讓-collector-常駐伺服器重開機後自己起來)
+6. [一次看多台伺服器（hub）](#一次看多台伺服器hub)
+7. [同一台機器上有好幾個專案](#同一台機器上有好幾個專案)
+8. [看過去的 session（回放）](#看過去的-session回放)
+9. [更新](#更新)
+10. [疑難排解](#疑難排解)
+11. [卸載](#卸載)
 
 ## 需要的東西
 
@@ -82,7 +85,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 
 ## 確認有在追蹤
 
-1. **開一個新的 Claude Code session**。CLI 或 Desktop 的 Code 分頁都可以。裝 plugin 之前就開著的 session：Desktop 會從裝好那一刻開始追蹤（之前的工具呼叫不會補）；CLI 要重開一個。
+1. **開一個新的 Claude Code session**。CLI 或 Desktop 的 Code 分頁都可以。裝 plugin 之前就開著的 session：Desktop 會從裝好那一刻開始追蹤（之前的工具呼叫不會補）；CLI 要重開一個。剛裝好的那一刻，已開著的 session 會開始送事件、但沒有人把 collector 拉起來；網頁連不上就重開一個 session，或在終端機跑一次 `~/.coding-lab/bin/coding-lab ensure`（Windows 在 Git Bash 跑 `sh <plugin 目錄>/bin/coding-lab ensure`）。
 2. 請 Claude 做一件會用到工具的事，例如「讀 README 的第一行」。
 3. 瀏覽器打開 <http://127.0.0.1:4801>，應該會看到這個 session 和它剛剛做的事。
 
@@ -103,6 +106,65 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 ```
 
 再在本機開 <http://127.0.0.1:4801>。用 VS Code Remote 連線的話，也可以在「連接埠（Ports）」面板轉送 4801。
+
+不想每次開通道、或想用手機看，可以改走 Tailscale／ZeroTier 直連：
+
+1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。SSH 通道也要繼續用的話寫成陣列：`bind = ["127.0.0.1:4801", "100.x.x.x:4801"]`，通道進來的仍免金鑰、直連的要金鑰。
+2. 建一把金鑰：`~/.coding-lab/bin/coding-lab key create --name laptop --scope view --expires 90d`。印出來的 `clk_…` 只會出現這一次，先複製。
+3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
+4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
+
+遠端看不到命中敏感規則的工具輸出，thinking 預設點開才載入。撤銷金鑰：`coding-lab key revoke <id>`（`key list` 看 id）。綁公開 IP 會被拒絕啟動，除非自己前置 TLS 並設 `allow_insecure = true`——明文 http 上的金鑰會被同網段竊聽。
+
+## 讓 collector 常駐（伺服器重開機後自己起來）
+
+平常 collector 由每個 session 的 SessionStart 拉起，沒有 session 再閒置 10 分鐘就退出；要從別台電腦隨時看、或重開機後不必先開一個 session，就把它裝成使用者層級的常駐服務（不需要 root）：
+
+```bash
+~/.coding-lab/bin/coding-lab service install
+```
+
+| 平台 | 寫哪裡 | 怎麼啟動 |
+| --- | --- | --- |
+| Linux | `~/.config/systemd/user/coding-lab.service` | `systemctl --user enable --now`；沒人登入也要跑的話再執行一次 `loginctl enable-linger $USER` |
+| macOS | `~/Library/LaunchAgents/io.coding-lab.collector.plist` | `launchctl bootstrap gui/<uid>`；第一次會跳「允許在背景執行」，允許即可 |
+| Windows | `%USERPROFILE%\.coding-lab\coding-lab-task.xml` | 工作排程器的 `CodingLab` 工作，登入時啟動、隱藏視窗（要在沒人登入時跑，在工作排程器裡改成「不論使用者登入與否均執行」） |
+
+安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0` 跑，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows `schtasks /End /TN CodingLab` 再 `schtasks /Run /TN CodingLab`）。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
+
+- `service status`：有沒有裝、collector 現在有沒有在跑。
+- `service install --dry-run`：只印會寫的檔與會跑的指令。
+- `service uninstall`：停掉、取消註冊、刪掉上面那個檔；之後又回到由 session 拉起的模式。
+- 更新執行檔時先 `service uninstall` 或停掉服務再覆蓋，覆蓋完再 `service install`（Windows 不能覆蓋執行中的 .exe）。
+
+https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801，或走 tailnet、SSH 通道（見上一節）。
+
+## 一次看多台伺服器（hub）
+
+幾台伺服器各自跑 Claude Code 與 collector，想在自己的電腦上一頁看完：每台照上一節設成常駐、給本機一把金鑰（tailnet）或開 SSH 通道，然後在本機：
+
+```bash
+~/.coding-lab/bin/coding-lab hub add build-01 http://100.64.0.5:4801   # 問金鑰：貼上在 build-01 上 key create 印出的 clk_…
+~/.coding-lab/bin/coding-lab hub add build-02 http://127.0.0.1:14801 --no-key   # 走 SSH 通道的那台不用金鑰
+~/.coding-lab/bin/coding-lab hub
+```
+
+打開 <http://127.0.0.1:4802>：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
+
+- 某台斷線（網路斷、重開機）：它的 session 標「離線」、分頁變淡，其他台照常；hub 每 1～30 秒重連，連回來會整頁重載那台的內容。
+- 「載入更多」、thinking 點開、檔案樹、分支視窗、回放、「已確認」都由 hub 轉給對應的那台；那台給 hub 的金鑰是 `view` 時按「已確認」會提示要 `operate` 金鑰。
+- hub 自己不存資料、只綁本機、不需要金鑰；要從別台看 hub，請對 hub 這台開 SSH 通道。
+- 上游寫在 `~/.coding-lab/config.toml`（`[[hub.upstream]]`，含金鑰，檔案權限 600）；改埠用 `[hub] bind = "127.0.0.1:4802"` 或 `coding-lab hub --bind …`。上游網址只接受 `http://`：遠端一律走 tailnet（WireGuard 加密）或 SSH 通道。
+- `curl 127.0.0.1:4802/healthz` 看每台連上了沒。
+
+## 同一台機器上有好幾個專案
+
+collector 收這台機器上所有 Claude Code 的事件，不分專案。頁面最上方的 **專案** 選單（只有一個專案時不顯示）決定怎麼看：
+
+- **全部專案**（預設）：串流每行在 session id 前多一個專案標籤（專案名＝目錄的最後一段），檔案樹每個專案一段、點標題列可以收起，改動紀錄依專案分組；標題列右邊的 **⎇** 開那個專案的分支視窗。
+- **單一專案**：只看這個專案的 session、串流、檔案樹、改動與注意佇列；其他專案的內容只是隱藏，切回「全部專案」就回來（注意佇列會提示其他專案還有幾件）。選擇會記在瀏覽器裡。
+
+專案的歸類跟左欄一樣：session 的 cwd 在另一個 session 的 cwd 底下（worktree、子目錄）就算同一個專案。
 
 ## 看過去的 session（回放）
 
@@ -158,8 +220,20 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 
 **網頁打不開（<http://127.0.0.1:4801> 連不上）**
 
-- 先跑 `coding-lab healthz`。連不上代表 collector 沒在跑：開一個**新的** session 讓 plugin 拉起它，或直接在終端機執行 `~/.coding-lab/bin/coding-lab serve`（前景執行，關掉終端機就停），看它印出什麼錯誤。
-- 瀏覽器不在跑 Claude Code 的那台電腦上：見上面的 SSH 通道。
+- 先跑 `coding-lab healthz`。連不上代表 collector 沒在跑：開一個**新的** session 讓 plugin 拉起它、跑一次 `coding-lab ensure`，或直接在終端機執行 `~/.coding-lab/bin/coding-lab serve`（前景執行，關掉終端機就停），看它印出什麼錯誤。剛用 `claude plugin install` 裝好的那一刻常見這個狀況：已開的 session 有送事件但沒人拉 collector。
+- `[web].bind` 綁的是區網或 tailnet IP 時，`http://127.0.0.1:4801` 本來就連不上（SSH 通道也會 `Connection refused`）：改開那個 IP，或把 bind 寫成陣列同時綁兩個。
+- 瀏覽器不在跑 Claude Code 的那台電腦上：見上面的 SSH 通道或 tailnet 直連。
+
+**登入頁一直說金鑰不對**
+
+- 金鑰只在 `key create` 時印一次，之後 `key list` 看到的是 id，不是金鑰；忘了就 `key revoke` 舊的再 `key create` 一把。
+- `coding-lab key list` 的狀態是不是「已撤銷」或「已到期」。
+- 連續失敗 10 次會被擋一分鐘（每個來源 IP 各算）。
+- 伺服器的 `~/.coding-lab/collector.log` 會寫被拒的原因；`keys.json` 權限不是 600 時所有金鑰都會失效，照 log 裡的 `chmod 600` 修。
+
+**SSH 通道進來也被要求登入**
+
+伺服器的設定是 `[web] auth = "always"`（多人共用的伺服器）。這是刻意的：用金鑰登入一次即可。
 
 **網頁顯示 404 或空白**
 
@@ -216,9 +290,10 @@ claude plugin uninstall coding-lab@coding-lab
 claude plugin marketplace remove coding-lab
 ```
 
-接著結束 collector，再刪掉執行檔、網頁、設定與所有追蹤紀錄：
+接著結束 collector（有裝常駐服務的先移除），再刪掉執行檔、網頁、設定與所有追蹤紀錄：
 
 ```bash
+~/.coding-lab/bin/coding-lab service uninstall   # 只在裝過常駐服務時需要
 ~/.coding-lab/bin/coding-lab stop
 rm -rf ~/.coding-lab
 ```

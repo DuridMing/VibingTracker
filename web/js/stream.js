@@ -43,6 +43,7 @@ export function createStream({ cap = CAP } = {}) {
     cap,
     hiddenSessions: new Set(),
     hiddenKinds: new Set(),
+    sessionFilter: null, // 單一專案（#669）：session id → 是否顯示；null＝全部
   };
   const keys = new Set(); // 已在串流的 row key
   const cards = new Map(); // toolUseId → card（暫存區與串流共用同一個物件）
@@ -148,7 +149,7 @@ export function createStream({ cap = CAP } = {}) {
       case "assistant.thinking":
       case "assistant.text":
         if (ev.pos != null) {
-          newRow(ev, { type: ev.type === "assistant.thinking" ? "thinking" : "text", text: p.text ?? "", summarized: !!p.summarized, delayed: p.delayed === true, deferred: p.deferred === true }, out);
+          newRow(ev, { type: ev.type === "assistant.thinking" ? "thinking" : "text", text: p.text ?? "", summarized: !!p.summarized, delayed: p.delayed === true, deferred: p.deferred === true, chars: p.chars ?? null }, out);
         }
         break;
       case "prompt.submitted":
@@ -275,7 +276,8 @@ export function createStream({ cap = CAP } = {}) {
 
   st.setSessionHidden = (id, hidden) => (hidden ? st.hiddenSessions.add(id) : st.hiddenSessions.delete(id));
   st.setKindHidden = (k, hidden) => (hidden ? st.hiddenKinds.add(k) : st.hiddenKinds.delete(k));
-  st.isVisible = (r) => !st.hiddenSessions.has(r.session) && !st.hiddenKinds.has(kindOf(r));
+  st.setSessionFilter = (fn) => { st.sessionFilter = typeof fn === "function" ? fn : null; };
+  st.isVisible = (r) => !st.hiddenSessions.has(r.session) && !st.hiddenKinds.has(kindOf(r)) && (st.sessionFilter == null || st.sessionFilter(r.session));
 
   return st;
 }

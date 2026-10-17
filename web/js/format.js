@@ -105,7 +105,10 @@ const SESSION_TEXT = {
   compact: '<span class="st">⇣ 已 compact，之前的對話已摘要</span>',
 };
 
-export function formatRow(row, { agentName } = {}) {
+// projectTag(session) → { label, color, cwd } | null：全部專案時每行先標專案（#669）
+// hostTag(session) → string | null：hub（多機總覽，#663）時每行先標 [host]
+// thinkingMode：這條連線的 welcome.thinking（"hide" 時遠端拿不到全文，佔位不寫「點開載入」，#721）
+export function formatRow(row, { agentName, projectTag, hostTag, thinkingMode = null } = {}) {
   const kind = kindOf(row);
   const cls = ["ln", kind];
   const tags = [];
@@ -113,9 +116,23 @@ export function formatRow(row, { agentName } = {}) {
   let detail = null;
 
   if (row.type === "thinking") {
-    body = row.deferred ? '<span class="lbl">think</span> <span class="o">（思考內容未載入）</span>' : `<span class="lbl">think</span> ${esc(firstLine(row.text))}`;
+    if (row.deferred) {
+      // 遠端連線：collector 只送佔位（#668），點開才用 API 載入。
+      // 0 字（claude -p 的 transcript 沒有 thinking 原文）與 hide 模式沒東西可載，不給點（#721）
+      const n = row.chars != null ? ` · ${Number(row.chars).toLocaleString()} 字` : "";
+      if (row.chars === 0) {
+        body = '<span class="lbl">think</span> <span class="o">（思考）</span>';
+      } else if (thinkingMode === "hide") {
+        body = `<span class="lbl">think</span> <span class="o">（思考${n}，這個 collector 不對遠端提供）</span>`;
+      } else {
+        body = `<span class="lbl">think</span> <span class="o">（思考${n}，點開載入）</span>`;
+        detail = row.loadError ?? (row.loading ? "載入中…" : "點一下載入思考內容");
+      }
+    } else {
+      body = `<span class="lbl">think</span> ${esc(firstLine(row.text))}`;
+      detail = row.text || null;
+    }
     if (row.summarized) tags.push("摘要");
-    detail = row.text || null;
   } else if (row.type === "text") {
     body = `<span class="tx">${esc(firstLine(row.text))}</span>`;
     detail = row.text.includes("\n") || row.text.length > LONG ? row.text : null;
@@ -155,7 +172,11 @@ export function formatRow(row, { agentName } = {}) {
   if (detail != null) cls.push("can-open");
   if (row.expanded) cls.push("open");
 
-  const prefix = `<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
+  const pj = projectTag?.(row.session);
+  const pjHtml = pj ? `<span class="pj" style="color:${esc(pj.color)}" title="${esc(pj.cwd)}">${esc(pj.label)}</span>` : "";
+  const ht = hostTag?.(row.session);
+  const htHtml = ht ? `<span class="hst" title="${esc(ht)}">[${esc(ht)}]</span>` : "";
+  const prefix = `${htHtml}${pjHtml}<span class="ss" style="color:${sessionColor(row.session)}" title="${esc(row.session)}">[${esc(shortId(row.session))}]</span><span class="tg">[${esc(agentWho(row.session, row.agent, agentName))}]</span>`;
   const tagHtml = tags.map((t) => ` <span class="tag">${esc(t)}</span>`).join("");
   return { cls: cls.join(" "), html: `${prefix}${body}${tagHtml}`, detail };
 }

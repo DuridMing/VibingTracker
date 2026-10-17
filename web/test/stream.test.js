@@ -276,3 +276,16 @@ test("Write 卡片的行數用 file.write 的 lines（全文），沒有才數�
   st.apply([{ ...w("w1", {}), type: "tool.called", seq: 99, payload: { toolUseId: "w1", tool: "Write", input: {}, status: "running", placement: "staged", danger: null } }]);
   assert.equal(card("w1").write.lines, 5000);
 });
+
+test("專案篩選（#669）：setSessionFilter 只影響可見性，不動 rows；清掉後全部可見", () => {
+  const st = createStream();
+  st.apply([called(A, "p1", "Bash", { command: "a" }), placed(A, "p1", 1), called(B, "p2", "Bash", { command: "b" }), placed(B, "p2", 1)]);
+  st.setSessionFilter((id) => id === A);
+  assert.equal(st.rows.length, 2, "行還在");
+  assert.deepEqual(st.rows.filter((r) => st.isVisible(r)).map((r) => r.session), [A]);
+  st.setSessionHidden(A, true);
+  assert.equal(st.rows.filter((r) => st.isVisible(r)).length, 0, "和 session 篩選疊加");
+  st.setSessionHidden(A, false);
+  st.setSessionFilter(null);
+  assert.ok(st.rows.every((r) => st.isVisible(r)));
+});

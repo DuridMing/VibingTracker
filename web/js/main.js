@@ -15,7 +15,8 @@ import { REPLAY_TAB, rangeFor, replayUrl, createReplay } from "./replay.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
-import { mergeSessions, projectRoots, pickProject, canReplay, fitTabs } from "./sessions.js";
+import { mergeSessions, projectRoots, canReplay, fitTabs } from "./sessions.js";
+import { projectColors, projectColor, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "./projects.js";
 import { degradedNotice } from "./degraded.js";
 import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices, layoutGraph, withWip } from "./branches.js";
 
@@ -39,7 +40,7 @@ const CONN_TEXT = { connecting: "連線中…", open: "已連線", closed: "已�
 const store = createStore();
 // #monitor=<id>：監視器視窗（#650），整頁只看一個 session、自己連 collector
 const monitorId = parseMonitor(location.hash);
-const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null, replayNext: null }; // replayNext：按了 ▶ 回放、等 snapshot 的 session
+const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null, replayNext: null, ackError: null }; // replayNext：按了 ▶ 回放、等 snapshot 的 session；ackError：上一次 ack 被 server 拒絕的原因（#721）
 
 // ---------- render ----------
 // 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
@@ -117,10 +118,55 @@ function sessTag(s, cls = "id") {
   return h("span", { class: cls, style: `color:${sessionColor(s.id)}`, title: s.id }, shortId(s.id));
 }
 
+// 專案（#669）：proj.cur 是單一專案的根 cwd，null＝全部專案。單一專案時其他專案的列只隱藏、不移除
+function inProject(id) {
+  return !proj.cur || inProjectCwd(cwdOf(id));
+}
+// 還不知道 cwd 的 session（WS 列還沒到）不藏，免得漏看
+function inProjectCwd(cwd) {
+  return !proj.cur || !cwd || projectOf(cwd, proj.rootCwds) === proj.cur;
+}
+function projectTag(id) {
+  if (!proj.many) return null;
+  const p = projectOf(cwdOf(id), proj.rootCwds);
+  return p ? { label: proj.labels.get(p) ?? p, color: projectColor(proj.colors, p), cwd: p } : null;
+}
+// hub（多機總覽，#663）：welcome.host 是 hub 時每行標 [host]（sessions 列的 host 是上游名稱）
+function hostTag(id) {
+  if (ui.welcome?.host !== "hub") return null;
+  return store.sessions.get(id)?.host ?? fetchedIndex.get(id)?.host ?? null;
+}
+function hostChip(id) {
+  const t = hostTag(id);
+  return t ? h("span", { class: "hst", title: t }, `[${t}]`) : null;
+}
+const statusText = (s) => (s.offline ? "離線" : STATUS_TEXT[s.status] ?? s.status ?? "");
+
+function pjChip(id) {
+  const t = projectTag(id);
+  return t ? h("span", { class: "pj", style: `color:${t.color}`, title: t.cwd }, t.label) : null;
+}
+
+function renderProjectSwitch() {
+  const sel = $("#gProj");
+  if (!changed("gProj", JSON.stringify([proj.cur, proj.roots.map((r) => [r.cwd, r.live, r.sessions.length])]))) return;
+  sel.hidden = isMonitor || (proj.roots.length < 2 && !proj.cur);
+  const live = proj.roots.reduce((n, r) => n + r.live, 0);
+  sel.replaceChildren(
+    h("option", { value: "" }, `全部專案（${proj.roots.length}）· ${live} 個進行中`),
+    ...proj.roots.map((r) => h("option", { value: r.cwd, title: r.cwd }, `${proj.labels.get(r.cwd) ?? r.cwd}（${r.live}/${r.sessions.length}）`)),
+  );
+  sel.value = proj.cur ?? "";
+  sel.style.color = proj.cur ? projectColor(proj.colors, proj.cur) : "";
+  sel.title = proj.cur ? `只看 ${proj.cur}\n其他專案的 session 只是隱藏，切回「全部專案」就回來` : "專案：全部（串流每行標專案、檔案樹與改動紀錄依專案分組）或只看一個";
+}
+
 function sessionTab(s, extra = {}) {
-  return h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id), ...extra },
+  const host = hostTag(s.id);
+  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`, onclick: () => selectTab(s.id), ...extra },
     h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
     h("span", { class: "dot" }),
+    host ? h("small", { class: "hst" }, host) : null,
     sessTag(s),
     h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
 }
@@ -129,8 +175,8 @@ function sessionTab(s, extra = {}) {
 let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
-  const live = liveSessions();
-  if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
+  const live = liveSessions().filter((s) => inProject(s.id));
+  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
@@ -194,8 +240,8 @@ function openMonitor(id) {
 
 function renderSessFilters() {
   // 進行中的 session，加上被隱藏的（即使已結束，也要能點回來顯示）
-  const live = [...store.sessions.values()].filter((s) => s.status !== "ended" || stream.hiddenSessions.has(s.id));
-  if (!changed("fSess", live.map((s) => `${s.id}:${s.status === "ended"}:${stream.hiddenSessions.has(s.id)}`).join("|"))) return;
+  const live = [...store.sessions.values()].filter((s) => (s.status !== "ended" || stream.hiddenSessions.has(s.id)) && inProject(s.id));
+  if (!changed("fSess", proj.cur + "|" + live.map((s) => `${s.id}:${s.status === "ended"}:${stream.hiddenSessions.has(s.id)}`).join("|"))) return;
   $("#fSess").replaceChildren(
     ...(live.length
       ? live.map((s) => {
@@ -221,15 +267,16 @@ function renderKindFilters() {
 
 // 暫存區：hook 已到、transcript 還沒到的卡片（PLAN「方案 C」），不進串流，只在這裡看
 function renderLive() {
-  if (changed("liveN", String(stream.staged.size))) $("#liveN").textContent = String(stream.staged.size);
+  const staged = [...stream.staged.values()].filter((c) => inProject(c.session));
+  if (changed("liveN", String(staged.length))) $("#liveN").textContent = String(staged.length);
   const list = $("#liveList");
-  if (!liveWin.isOpen || !changed("liveList", [...stream.staged.values()].slice(-100).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
-  $("#liveWinTitle").textContent = `進行中的動作（${stream.staged.size}）`;
-  const cards = [...stream.staged.values()].slice(-100);
+  if (!liveWin.isOpen || !changed("liveList", `${proj.many}|` + staged.slice(-100).map((c) => `${c.toolUseId}:${c.status}`).join("|"))) return;
+  $("#liveWinTitle").textContent = `進行中的動作（${staged.length}）`;
+  const cards = staged.slice(-100);
   list.replaceChildren(
     ...(cards.length
       ? cards.map((c) => {
-          const f = formatRow({ key: c.toolUseId, session: c.session, agent: c.agent, type: "tool", card: c, v: 0, expanded: false, delayed: false }, { agentName });
+          const f = formatRow({ key: c.toolUseId, session: c.session, agent: c.agent, type: "tool", card: c, v: 0, expanded: false, delayed: false }, { agentName, projectTag, hostTag });
           const el = h("div", { class: f.cls });
           el.innerHTML = `<div class="hd">${f.html}</div>`;
           return el;
@@ -241,8 +288,8 @@ function renderLive() {
 // Sessions tab：WS 的列加上 /api/sessions 補的已結束 session（mergeSessions，新到舊）
 const SESS_SHOWN = 200;
 function renderSessions() {
-  const all = allSessions();
-  if (!changed("sess", ui.tab + "|" + all.map((s) => `${s.id}:${s.status}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
+  const all = allSessions().filter((s) => inProject(s.id));
+  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
   $("#sess").replaceChildren(
     ...(all.length
@@ -252,10 +299,10 @@ function renderSessions() {
               sessTag(s),
               h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
                 s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
-                h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
-              h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")),
+                h("small", {}, hostChip(s.id), pjChip(s.id), `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
+              h("span", { class: `r ${s.offline ? "offline" : s.status}` }, statusText(s))),
             canReplay(s) ? h("button", { class: "btn sm rp", title: "從存下來的紀錄重新讀回這個 session", onclick: () => replaySession(s.id) }, "▶ 回放") : null))
-      : [h("div", { class: "none" }, "尚無 session")]),
+      : [h("div", { class: "none" }, proj.cur && store.sessions.size ? "這個專案沒有 session" : "尚無 session")]),
     ...(all.length > SESS_SHOWN ? [h("div", { class: "more" }, `只列最近 ${SESS_SHOWN} 個（共 ${all.length}）`)] : []),
   );
 }
@@ -292,7 +339,7 @@ function renderAgents() {
     if (!bySession.has(a.session)) bySession.set(a.session, []);
     bySession.get(a.session).push(a);
   }
-  const live = liveSessions();
+  const live = liveSessions().filter((s) => inProject(s.id));
   if (bench.freeze.has("agents") && agentRows.size) return;
   const box = $("#agall");
   if (!live.length) {
@@ -314,7 +361,7 @@ function renderAgents() {
     if (!row || row.sig !== sig) {
       const parts = chips.map(agentChip);
       if (v.done.length) parts.push(doneChip(v.done));
-      const el = h("div", { class: "agrow", title: sessionTitle(s) }, sessTag(s, "ss"),
+      const el = h("div", { class: `agrow${s.offline ? " offline" : ""}`, title: sessionTitle(s) }, hostChip(s.id), sessTag(s, "ss"),
         h("span", { class: "agb" },
           s.doing ? h("span", { class: "doing" }, `▸ ${s.doing}`) : null,
           h("span", { class: "ags" }, ...(parts.length ? parts : [h("span", { class: "none" }, "—")]))));
@@ -376,6 +423,7 @@ function render(urgent = false) {
     renderConn();
     renderDegraded();
     renderKpis();
+    renderProjectSwitch();
     renderTabs();
     renderSessFilters();
     renderKindFilters();
@@ -405,20 +453,25 @@ function ago(ms) {
 
 function renderAttention() {
   for (const id of ackPending) if (!store.attention.has(id)) ackPending.delete(id);
-  const rows = sortAttention([...store.attention.values()], scoreOf);
+  const allRows = sortAttention([...store.attention.values()], scoreOf);
+  const rows = allRows.filter((r) => inProject(r.session));
+  const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
   const now = Date.now();
   const canAck = ui.welcome?.scope !== "view";
-  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
   const todo = canAck ? ackAllTargets(rows, ackPending, scoreOf) : [];
   $("#ackAll").hidden = !todo.length;
   $("#ackAll").textContent = `全部確認（${todo.length}）`;
   const box = $("#att");
+  const other = elsewhere ? h("div", { class: "none" }, `其他專案還有 ${elsewhere} 件（切回「全部專案」看）`) : null;
+  // server 拒絕上一次「已確認」（hub 上那台是 view 金鑰）：顯示原因，下一次按就清掉（#721）
+  const err = ui.ackError ? h("div", { class: "none err", role: "alert" }, `⚠ ${ui.ackError}`) : null;
   if (!rows.length) {
-    box.replaceChildren(h("div", { class: "none" }, "目前沒有需要處理的 session"));
+    box.replaceChildren(err ?? "", h("div", { class: "none" }, elsewhere ? "這個專案沒有需要處理的 session" : "目前沒有需要處理的 session"), other ?? "");
     return;
   }
-  box.replaceChildren(...rows.map((r) => {
+  box.replaceChildren(err ?? "", ...rows.map((r) => {
     const s = store.sessions.get(r.session);
     const pend = ackPending.has(r.id);
     const score = scoreOf(r.session);
@@ -436,18 +489,27 @@ function renderAttention() {
     h("span", { class: "at" }, r.clearedAt != null ? "已結束" : ago(now - (r.raisedAt ?? now))),
     h("button", { class: "btn sm", onclick: (e) => { e.stopPropagation(); selectTab(r.session); } }, "查看"),
     canAck ? h("button", ack, pend ? "確認中…" : "已確認") : null);
-  }));
+  }), other ?? "");
 }
 
 function ackRow(r) {
+  ui.ackError = null;
   ackPending.add(r.id);
   client.ack({ session: r.session, kind: r.kind, ref: r.ref });
   render(true);
 }
 
+// server 回 error（目前只有 ack 會被拒：那台上游是 view 金鑰）：解除「確認中…」、把原因放在佇列上方（#721）
+function onServerError(m) {
+  ui.ackError = m?.message || "操作被拒";
+  ackPending.clear();
+  render(true);
+}
+
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
-  for (const r of ackAllTargets([...store.attention.values()], ackPending, scoreOf)) {
+  ui.ackError = null;
+  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending, scoreOf)) {
     ackPending.add(r.id);
     client.ack({ session: r.session, kind: r.kind, ref: r.ref });
   }
@@ -592,7 +654,8 @@ setInterval(() => render(), 30_000); // 佇列的「幾分前」
 // ---------- 左欄：專案檔案（#642）與改動基準（#644） ----------
 // 樹與 git 狀態來自 GET /api/files（tree.js 的 filesUrl）；方塊來自 `*` 頻道的 file.* Event（tree.js 累積）。
 // 「本次開啟以來」不問 collector：用這個頁面收到的 Event 累積（sinceChanges）。
-// 專案：session 的 cwd 歸組（sessions.js），一次看一個；每個專案一棵樹，Event 先收在 fileEvents，開新樹時重放。
+// 專案：session 的 cwd 歸組（sessions.js）；全部專案時每個專案一棵樹疊著看（標題列可收起），單一專案時只看那棵。
+// Event 先收在 fileEvents，開新樹時重放。
 const ROW_H = 22;
 const FILE_EVENTS_MAX = 50_000;
 const BASE_TEXT = { main: "相對整合分支", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
@@ -603,25 +666,28 @@ const pref = {
 const left = {
   tab: "tree",
   fetched: [], // GET /api/sessions 的列
-  project: pref.get("project"),
   base: BASE_TEXT[pref.get("base")] ? pref.get("base") : "main",
   baseSess: null,
   hash: "",
   hashCwd: null, // 從單 session 的 git 列點 commit 時，用那個 session 的 worktree
-  trees: new Map(), // 專案 cwd → { tree, loading, error, info }
+  trees: new Map(), // 專案 cwd → { tree, loading, error, info, req }
   fileEvents: [],
-  req: 0,
   dirty: true,
   rows: [],
-  els: new Map(), // path → { el, sig }
-  flash: new Map(), // path → 閃爍的 class（下次畫時套上）
-  lit: new Set(), // 被點亮的父目錄
+  els: new Map(), // `${cwd}|${path}`（專案標題列是 `#${cwd}`）→ { el, sig }
+  flash: new Map(), // `${cwd}|${path}` → 閃爍的 class（下次畫時套上）
+  lit: new Set(), // 被點亮的父目錄（同樣的鍵）
   refetch: 0,
 };
+// 專案切換（#669）：cur 是單一專案的根 cwd，null＝全部專案（預設）；roots 來自 sessions.js 的 projectRoots
+const proj = { cur: pref.get("project") || null, roots: [], rootCwds: [], colors: new Map(), labels: new Map(), many: false, collapsed: new Set(), sig: "" };
+const activeRoots = () => (proj.cur ? [proj.cur] : proj.rootCwds);
 const fetchedById = () => new Map(left.fetched.map((s) => [s.id, s]));
 let fetchedIndex = new Map();
 const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?? null;
-const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }));
+// 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
+const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
+const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }).then(toLogin));
 const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 function allSessions() {
@@ -634,21 +700,39 @@ function treeFor(cwd) {
     const tree = createFileTree();
     tree.cwdOf = cwdOf;
     tree.apply(left.fileEvents); // 樹還沒載入：先收著，setFiles 時才算
-    ent = { tree, loading: false, error: null, info: "" };
+    ent = { tree, loading: false, error: null, info: "", req: 0 };
     left.trees.set(cwd, ent);
   }
   return ent;
 }
 
-// 專案清單變了（新 session、Sessions 補進來的）：選一個，換了就重抓
+// 專案清單變了（新 session、Sessions 補進來的）：更新色與名稱、串流的專案篩選；選的專案不見了就回到全部；還沒載入的樹去抓
 function syncProjects() {
-  const roots = projectRoots(allSessions());
-  const pick = pickProject(roots, left.project);
-  if (pick && pick !== left.project) {
-    left.project = pick;
+  proj.roots = projectRoots(allSessions());
+  proj.rootCwds = proj.roots.map((r) => r.cwd);
+  if (proj.cur && !proj.rootCwds.includes(proj.cur)) proj.cur = null;
+  proj.many = !proj.cur && proj.rootCwds.length > 1;
+  const sig = `${proj.cur}|${proj.rootCwds.join("|")}`;
+  if (sig !== proj.sig) {
+    proj.sig = sig;
+    proj.colors = projectColors(proj.rootCwds);
+    proj.labels = projectLabels(proj.rootCwds);
+    stream.setSessionFilter(sessionFilterFor(proj.cur, proj.rootCwds, cwdOf));
+    view.filterChanged(); // 專案色標與可見性都變了，整批重畫
     left.dirty = true;
-    loadFiles();
-  } else if (pick && !left.trees.has(pick)) loadFiles();
+  }
+  for (const cwd of activeRoots()) if (!left.trees.has(cwd)) loadFiles(cwd);
+}
+
+function setProject(cwd) {
+  proj.cur = cwd || null;
+  pref.set("project", proj.cur ?? "");
+  br.cwd = null;
+  left.els.clear();
+  $("#tree").replaceChildren();
+  syncProjects();
+  loadBranches();
+  render(true);
 }
 
 const FLASH = { r: "flash", e: "flash-e", w: "flash-w", x: "flash-x" };
@@ -663,19 +747,21 @@ function feedFiles(events) {
   let changedFiles = gitOp;
   for (const [cwd, ent] of left.trees) {
     const hits = ent.tree.apply(mine);
-    if (cwd !== left.project || !hits.length) continue;
+    if (!activeRoots().includes(cwd) || !hits.length) continue;
     left.dirty = true;
     for (const hit of hits) {
-      left.flash.set(hit.path, FLASH[hit.kind]);
+      left.flash.set(`${cwd}|${hit.path}`, FLASH[hit.kind]);
       const parts = hit.path.split("/");
-      for (let i = 1; i < parts.length; i++) left.lit.add(parts.slice(0, i).join("/"));
+      for (let i = 1; i < parts.length; i++) left.lit.add(`${cwd}|${parts.slice(0, i).join("/")}`);
       if (hit.kind === "e" || hit.kind === "w") changedFiles = true;
     }
   }
   if (!changedFiles) return;
   if (left.base === "since") {
-    const ent = left.trees.get(left.project);
-    if (ent?.tree.root != null) setSince(ent);
+    for (const cwd of activeRoots()) {
+      const ent = left.trees.get(cwd);
+      if (ent?.tree.root != null) setSince(ent);
+    }
   } else scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）
 }
 
@@ -700,16 +786,19 @@ function currentBase() {
   return { kind: left.base };
 }
 
+// 目前看的專案（全部或單一）底下的 session
 function projectSessions() {
-  const root = left.project;
-  if (!root) return [];
-  return allSessions().filter((s) => s.cwd && (s.cwd === root || s.cwd.startsWith(`${root}/`)));
+  const roots = activeRoots();
+  return allSessions().filter((s) => s.cwd && roots.includes(projectOf(s.cwd, proj.rootCwds)));
 }
 
-async function loadFiles() {
+// 不帶 cwd：目前看的每個專案都抓一次
+async function loadFiles(cwd = null) {
   clearTimeout(left.refetch);
-  const cwd = left.project;
-  if (!cwd) return;
+  if (cwd == null) {
+    for (const c of activeRoots()) loadFiles(c);
+    return;
+  }
   const ent = treeFor(cwd);
   const base = currentBase();
   // 樹還沒載入時，commit 基準先用專案的 cwd（另一個 worktree 的根不同，樹要以專案為準）
@@ -719,13 +808,13 @@ async function loadFiles() {
     render(true);
     return;
   }
-  const req = ++left.req;
+  const req = ++ent.req;
   ent.loading = true;
   render(true);
   try {
     const res = await apiFetch(url);
     const body = await res.json().catch(() => ({}));
-    if (req !== left.req) return;
+    if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
     // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
     if (ent.tree.root == null || normRoot(body.root) === ent.tree.root) ent.tree.setFiles(body);
@@ -746,12 +835,12 @@ async function loadFiles() {
     ent.info += trunc;
     ent.error = null;
     left.dirty = true;
-    if (brWin.isOpen || br.cwd !== cwd) loadBranches();
+    if (cwd === brTarget()) loadBranches();
   } catch (e) {
-    if (req !== left.req) return;
+    if (req !== ent.req) return;
     ent.error = `檔案樹載入失敗：${e.message}`;
   } finally {
-    if (req === left.req) {
+    if (req === ent.req) {
       ent.loading = false;
       render(true);
     }
@@ -775,8 +864,17 @@ async function getJson(url) {
   return body;
 }
 
-async function loadBranches() {
-  const cwd = left.project;
+// 分支視窗看哪個專案：點過專案標題列的 ⎇ 就是那個；否則單一專案、或唯一的那個專案
+const brTarget = () => br.cwd ?? proj.cur ?? (proj.rootCwds.length === 1 ? proj.rootCwds[0] : null);
+
+function openBranches(cwd) {
+  if (br.cwd !== cwd) Object.assign(br, { cwd, body: null, graph: null, error: null, sel: null, detail: null, file: null });
+  if (brWin.isOpen) loadBranches(cwd);
+  else brWin.toggle();
+  render(true);
+}
+
+async function loadBranches(cwd = brTarget()) {
   if (!cwd || isMonitor) return;
   const req = ++br.req;
   const withGraph = brWin.isOpen;
@@ -962,17 +1060,18 @@ function renderDetail() {
 
 function renderBranches() {
   const n = changedBranches(br.body);
-  if (changed("brBtn", `${left.project}|${br.body ? n : "x"}`)) {
+  const target = brTarget();
+  if (changed("brBtn", `${target}|${proj.many}|${br.body ? n : "x"}`)) {
     const btn = $("#brToggle");
-    btn.hidden = !left.project || isMonitor;
-    btn.textContent = br.body ? `⎇ 分支（${n}）` : "⎇ 分支";
+    btn.hidden = !target || isMonitor;
+    btn.textContent = `${proj.many ? `${proj.labels.get(target) ?? ""} ` : ""}${br.body ? `⎇ 分支（${n}）` : "⎇ 分支"}`;
   }
   if (!brWin.isOpen) return;
   const sig = JSON.stringify([br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)]);
   if (!changed("brList", sig)) return;
   const body = br.body;
   $("#brWinSub").textContent = body?.integration ? `相對 ${body.integration}・點一列看檔案・拖標題列移動、右下角縮放` : "拖標題列移動、右下角縮放";
-  $("#brWinTitle").textContent = body ? `分支（${body.branches.length}）` : "分支";
+  $("#brWinTitle").textContent = `${proj.rootCwds.length > 1 && br.cwd ? `${proj.labels.get(br.cwd) ?? br.cwd} · ` : ""}${body ? `分支（${body.branches.length}）` : "分支"}`;
   const list = $("#brList");
   if (br.error || !body || !br.graph) {
     list.replaceChildren(h("div", { class: "none" }, br.error ?? "載入中…"));
@@ -1014,19 +1113,13 @@ async function loadSessions() {
 setInterval(() => { if (!document.hidden) loadSessions(); }, 60_000);
 
 function renderTreeBar() {
-  const roots = projectRoots(allSessions());
-  const ent = left.project ? left.trees.get(left.project) : null;
+  const roots = activeRoots();
+  const loaded = roots.map((c) => left.trees.get(c)).filter(Boolean);
+  const one = roots.length === 1 ? loaded[0] : null; // 單一專案、或全部專案但只有一個：資訊列照那棵樹
   const sess = left.base === "session" ? projectSessions() : [];
   const base = currentBase();
-  const sig = JSON.stringify([roots.map((r) => [r.cwd, r.live]), left.project, left.base, base?.id, sess.map((s) => s.id), left.hash, ent?.info, ent?.error, ent?.loading]);
+  const sig = JSON.stringify([roots, left.base, base?.id, sess.map((s) => s.id), left.hash, loaded.map((e) => [e.info, e.error, e.loading])]);
   if (!changed("tbar", sig)) return;
-  const proj = $("#tProj");
-  proj.hidden = roots.length < 2;
-  proj.replaceChildren(...roots.map((r) => {
-    const o = h("option", { value: r.cwd, title: r.cwd }, `${r.cwd.split("/").pop() || r.cwd}（${r.live}/${r.sessions.length}）`);
-    if (r.cwd === left.project) o.selected = true;
-    return o;
-  }));
   $("#tBase").value = left.base;
   const bs = $("#tBaseSess");
   bs.hidden = left.base !== "session";
@@ -1040,8 +1133,13 @@ function renderTreeBar() {
   if (document.activeElement !== hash) hash.value = left.hash;
   hash.classList.toggle("bad", left.base === "commit" && !!left.hash && !/^[0-9a-f]{4,64}$/i.test(left.hash));
   const info = $("#tInfo");
-  info.classList.toggle("err", !!ent?.error);
-  info.textContent = ent?.error ?? (ent?.loading && !ent.info ? "載入中…" : left.base === "commit" && !left.hash ? "輸入 commit hash，或在單一 session 的 git 列點最後的 commit" : ent?.info ?? "");
+  const errs = loaded.filter((e) => e.error).length;
+  info.classList.toggle("err", one ? !!one.error : errs > 0 && errs === loaded.length);
+  info.textContent = one
+    ? one.error ?? (one.loading && !one.info ? "載入中…" : left.base === "commit" && !left.hash ? "輸入 commit hash，或在單一 session 的 git 列點最後的 commit" : one.info ?? "")
+    : !roots.length ? ""
+      : left.base === "commit" && !left.hash ? "輸入 commit hash，或在單一 session 的 git 列點最後的 commit"
+        : `全部專案（${roots.length} 個）· ${BASE_TEXT[left.base]}${errs ? ` · ${errs} 個載入失敗` : ""}`;
   info.title = info.textContent;
 }
 
@@ -1049,21 +1147,17 @@ function setBase(kind) {
   left.base = kind;
   pref.set("base", kind);
   if (kind !== "commit") left.hashCwd = null;
-  const ent = left.trees.get(left.project);
-  if (kind === "since" && ent?.tree.root != null) {
-    setSince(ent);
+  if (kind === "since") {
+    for (const cwd of activeRoots()) {
+      const ent = left.trees.get(cwd);
+      if (ent?.tree.root != null) setSince(ent);
+      else loadFiles(cwd);
+    }
     render(true);
   } else if (kind !== "commit" || /^[0-9a-f]{4,64}$/i.test(left.hash)) loadFiles();
   else render(true);
 }
-$("#tProj").addEventListener("change", (e) => {
-  left.project = e.target.value;
-  pref.set("project", left.project);
-  left.dirty = true;
-  left.els.clear();
-  $("#tree").replaceChildren();
-  loadFiles();
-});
+$("#gProj").addEventListener("change", (e) => setProject(e.target.value));
 $("#tBase").addEventListener("change", (e) => setBase(e.target.value));
 $("#tBaseSess").addEventListener("change", (e) => { left.baseSess = e.target.value; loadFiles(); });
 $("#tBaseHash").addEventListener("change", (e) => {
@@ -1103,16 +1197,18 @@ function treePlaceholder(text) {
 function renderTree() {
   if (left.tab !== "tree" || isMonitor) return;
   renderTreeBar();
-  const ent = left.project ? left.trees.get(left.project) : null;
-  if (!ent || ent.tree.root == null) {
-    treePlaceholder(ent?.error ?? (left.project ? "載入檔案樹…" : "尚無 session"));
+  const roots = activeRoots();
+  const entries = roots.map((cwd) => ({ cwd, ent: left.trees.get(cwd) })).filter((e) => e.ent && e.ent.tree.root != null);
+  if (!entries.length) {
+    const one = roots.length === 1 ? left.trees.get(roots[0]) : null;
+    treePlaceholder(one?.error ?? (roots.length ? "載入檔案樹…" : "尚無 session"));
     return;
   }
   lastSig.delete("treeNone");
-  const t = ent.tree;
   const box = $("#tree");
   if (left.dirty) {
-    left.rows = t.visible();
+    // 全部專案：每個專案一段，前面一個標題列（projects.js）；單一專案就是那棵樹
+    left.rows = projectTreeRows(entries.map(({ cwd, ent }) => ({ cwd, rows: ent.tree.visible().map((r) => ({ path: r.path, cwd, r, ent })) })), proj.collapsed);
     left.dirty = false;
   }
   const rows = left.rows;
@@ -1136,26 +1232,39 @@ function renderTree() {
   const running = new Set([...store.sessions.values()].filter((s) => s.status === "run").map((s) => s.id));
   const keep = new Set();
   for (let i = from; i < to; i++) {
-    const r = rows[i];
-    keep.add(r.path);
-    const c = r.dir ? null : t.counts(r.path);
-    const dots = r.dir ? [] : t.touching(r.path, running);
-    const sig = `${i}|${r.pre}|${r.open}|${r.git}|${r.conflict}|${c ? `${c.r},${c.e},${c.w},${c.x},${c.isNew}` : ""}|${dots.join(",")}`;
-    let row = left.els.get(r.path);
+    const x = rows[i];
+    const key = x.hdr ? `#${x.cwd}` : `${x.cwd}|${x.path}`;
+    keep.add(key);
+    let sig;
+    let make;
+    if (x.hdr) {
+      const pr = proj.roots.find((p) => p.cwd === x.cwd);
+      const ent = left.trees.get(x.cwd);
+      sig = `h|${i}|${x.open}|${x.n}|${pr?.live}|${pr?.sessions.length}|${ent?.info}|${ent?.error}|${proj.colors.get(x.cwd)}`;
+      make = () => projectHeader(x, pr, ent, i);
+    } else {
+      const { r, ent } = x;
+      const t = ent.tree;
+      const c = r.dir ? null : t.counts(r.path);
+      const dots = r.dir ? [] : t.touching(r.path, running);
+      sig = `${i}|${r.pre}|${r.open}|${r.git}|${r.conflict}|${c ? `${c.r},${c.e},${c.w},${c.x},${c.isNew}` : ""}|${dots.join(",")}`;
+      make = () => treeRow(r, c, dots, t, i);
+    }
+    let row = left.els.get(key);
     if (!row || row.sig !== sig) {
-      const el = treeRow(r, c, dots, t, i);
+      const el = make();
       if (row) row.el.replaceWith(el);
       else inner.append(el);
       row = { el, sig };
-      left.els.set(r.path, row);
+      left.els.set(key, row);
     }
-    const fl = left.flash.get(r.path);
-    if (fl || left.lit.has(r.path)) {
+    const fl = left.flash.get(key);
+    if (fl || left.lit.has(key)) {
       const el = row.el;
       el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
       void el.offsetWidth; // 重新觸發動畫
       if (fl) el.classList.add(fl);
-      if (left.lit.has(r.path)) el.classList.add("lit");
+      if (left.lit.has(key)) el.classList.add("lit");
     }
   }
   for (const [p, row] of left.els) {
@@ -1166,6 +1275,26 @@ function renderTree() {
   }
   left.flash.clear();
   left.lit.clear();
+}
+
+// 全部專案時每個專案的標題列：專案色、名稱、進行中/全部 session；點一下收起或展開，⎇ 開這個專案的分支視窗
+function projectHeader(x, pr, ent, i) {
+  const color = projectColor(proj.colors, x.cwd);
+  const el = h("div", {
+    class: `node phdr${x.open ? " open" : ""}`, style: `top:${i * ROW_H}px`, role: "button", tabindex: "0", "aria-expanded": String(x.open),
+    title: `${x.cwd}\n${ent?.error ?? ent?.info ?? ""}`.trim(),
+  },
+  h("span", { class: "lbl" }, h("span", { class: "pre" }, x.open ? "▾ " : "▸ "), h("i", { class: "psw", style: `background:${color}` }), h("span", { class: "nm", style: `color:${color}` }, proj.labels.get(x.cwd) ?? x.cwd), h("small", {}, ` ${pr?.live ?? 0}/${pr?.sessions.length ?? 0}${ent?.error ? " · 載入失敗" : ""}`)),
+  h("span", { class: "mk" }, h("span", { class: "pbr", role: "button", tabindex: "0", title: "這個專案的分支", onclick: (e) => { e.stopPropagation(); openBranches(x.cwd); } }, "⎇")));
+  const toggle = () => {
+    if (proj.collapsed.has(x.cwd)) proj.collapsed.delete(x.cwd);
+    else proj.collapsed.add(x.cwd);
+    left.dirty = true;
+    render(true);
+  };
+  el.addEventListener("click", toggle);
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target === el) toggle(); });
+  return el;
 }
 
 function treeRow(r, c, dots, t, i) {
@@ -1371,30 +1500,38 @@ function renderPaneFiles(id) {
 // ---------- 改動紀錄（中欄）與修改情形（右欄） ----------
 const changes = createChanges();
 
+// 單一專案時只列那個專案的（其他的留在 changes 裡，切回來就有）；全部專案且不只一個時依專案分組，組內仍是最新在上
 function renderChanges() {
-  if (!changed("chg", changes.selectedKey + "|" + changes.list.map((c) => c.key).join(","))) return;
+  const list = changes.list.filter((c) => inProject(c.session));
+  if (!changed("chg", `${proj.cur}|${proj.many}|${changes.selectedKey}|` + list.map((c) => c.key).join(","))) return;
   const box = $("#chg");
-  if (!changes.list.length) {
-    box.replaceChildren(h("div", { class: "none" }, "尚無改動"));
+  if (!list.length) {
+    box.replaceChildren(h("div", { class: "none" }, changes.list.length ? "這個專案尚無改動" : "尚無改動"));
     return;
   }
+  const row = (c) => {
+    const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
+    return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
+      h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
+      h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
+      h("span", { class: "pth" }, c.path),
+      n,
+      h("span", { class: "ag" }, agentWho(c.session, c.agent, agentName)));
+  };
+  const groups = proj.many ? groupByProject(list, (c) => projectOf(cwdOf(c.session), proj.rootCwds)) : [{ cwd: null, items: list }];
   box.replaceChildren(
-    ...(changes.following ? [] : [h("button", { class: "hint", onclick: () => selectChange(changes.list[0].key) }, "已停在選中的那筆；點這裡回到最新並恢復自動切換")]),
-    ...changes.list.map((c) => {
-      const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
-      return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
-        h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
-        h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
-        h("span", { class: "pth" }, c.path),
-        n,
-        h("span", { class: "ag" }, agentWho(c.session, c.agent, agentName)));
-    }),
+    ...(changes.following ? [] : [h("button", { class: "hint", onclick: () => selectChange(list[0].key) }, "已停在選中的那筆；點這裡回到最新並恢復自動切換")]),
+    ...groups.flatMap((g) => [
+      proj.many ? h("div", { class: "pjh", title: g.cwd ?? "不在任何專案底下" }, h("span", { class: "pj", style: g.cwd ? `color:${projectColor(proj.colors, g.cwd)}` : "" }, g.cwd ? proj.labels.get(g.cwd) ?? g.cwd : "其他"), h("small", {}, `${g.items.length} 筆`)) : null,
+      ...g.items.map(row),
+    ]).filter(Boolean),
   );
 }
 
 // diff 以資料存，只在選中時才轉成 HTML
 function renderDiff() {
-  const c = changes.selected();
+  const sel = changes.selected();
+  const c = sel && inProject(sel.session) ? sel : null; // 單一專案時不顯示別的專案的改動
   if (!changed("diff", c?.key ?? "")) return;
   $("#gfb").hidden = !c;
   $("#gfbNone").hidden = !!c;
@@ -1430,11 +1567,41 @@ const stream = createStream();
 // 串流前綴、改動紀錄、Agents 面板用同一套名稱（agents.js）
 const agentName = (session, agentId) => { const a = store.agents.get(`${session}/${agentId}`); return a ? agentLabel(a) : null; };
 const benchProf = new URLSearchParams(location.search).has("bench") ? [] : null;
+// 遠端未載入的思考（#668）：展開那一行時用 API 取全文；hide 模式不會給，直接提示
+async function loadThinking(row, v) {
+  if (row.type !== "thinking" || !row.deferred || row.loading) return;
+  const repaint = () => { row.h = 0; row.v++; v.update({ updated: new Set([row.key]) }); };
+  if (ui.welcome?.thinking === "hide") {
+    row.loadError = "這個 collector 不對遠端提供思考內容（remote_thinking = hide）";
+    repaint();
+    return;
+  }
+  row.loading = true;
+  repaint();
+  try {
+    const r = await apiFetch(`/api/sessions/${encodeURIComponent(row.session)}/thinking/${row.seq}`);
+    if (!r.ok) throw new Error(r.status === 403 ? "這個 collector 不對遠端提供思考內容" : `載入失敗（${r.status}）`);
+    const j = await r.json();
+    row.text = j.text ?? "";
+    row.summarized = !!j.summarized;
+    row.deferred = false;
+    row.loadError = null;
+  } catch (e) {
+    row.loadError = e?.message ?? String(e);
+  }
+  row.loading = false;
+  repaint();
+}
+
 const view = createStreamView({
   prof: benchProf,
   scroller: $("#stream"),
   model: stream,
   agentName,
+  projectTag,
+  hostTag,
+  thinkingMode: () => ui.welcome?.thinking ?? null,
+  onExpand: (row) => loadThinking(row, view),
   onNeedMore: requestMore,
   onFollow: (on) => {
     // 回到底部恢復跟隨：載入更多時暫時保留的舊行修剪回上限
@@ -1446,6 +1613,8 @@ const paneView = createStreamView({
   scroller: $("#spStream"),
   model: pane.stream,
   agentName,
+  thinkingMode: () => ui.welcome?.thinking ?? null,
+  onExpand: (row) => loadThinking(row, paneView),
   onNeedMore: paneMore,
   onFollow: (on) => {
     if (on && pane.stream.holding) paneView.update({ ...pane.stream.trim(), appended: 0, updated: new Set() });
@@ -1491,7 +1660,8 @@ const brWin = makeFloating($("#brWin"), {
   handle: $("#brWinHandle"),
   key: "coding-lab.brWin",
   initial: () => {
-    const b = $("#brToggle").getBoundingClientRect();
+    // 全部專案時 ⎇ 在專案標題列、tbar 的按鈕是藏著的（#669）：改靠著 tbar 開
+    const b = ($("#brToggle").hidden ? $("#tbar") : $("#brToggle")).getBoundingClientRect();
     return { x: b.left, y: b.bottom + 6, w: 820, h: 560 };
   },
   onToggle: (open) => {
@@ -1583,14 +1753,14 @@ function benchFrame(m) {
 // ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
 const rp = createReplay();
 let rpReq = 0; // 換範圍後，舊的回應丟掉
-const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, onNeedMore: () => replayMore(), onFollow: () => {} });
+const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, thinkingMode: () => ui.welcome?.thinking ?? null, onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
 const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
 function fillReplayProjects() {
   const roots = projectRoots(allSessions());
   const sel = $("#rpProj");
   if (!changed("rpProj", roots.map((r) => r.cwd).join("|"))) return;
-  const keep = sel.value || rp.cwd || left.project;
+  const keep = sel.value || rp.cwd || proj.cur;
   sel.replaceChildren(...roots.map((r) => h("option", { value: r.cwd }, r.cwd)));
   if (roots.some((r) => r.cwd === keep)) sel.value = keep;
 }
@@ -1774,8 +1944,14 @@ const client = createClient({
       render();
     },
     more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
-    onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(true); },
+    onStatus: (s) => {
+      if (ui.conn !== "incompatible") ui.conn = s;
+      // WS 握手被 401 拒絕（cookie 過期、金鑰被撤銷）在瀏覽器只看得到斷線：用一個 API 請求確認，是就導去登入
+      if (s === "closed" && !mock) fetch("/api/sessions?limit=1", { credentials: "same-origin" }).then(toLogin).catch(() => {});
+      render(true);
+    },
     onIncompatible: () => { ui.conn = "incompatible"; render(true); },
+    error: onServerError,
     onError: (e) => console.warn("ws message", e),
   },
 });

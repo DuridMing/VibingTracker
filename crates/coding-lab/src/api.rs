@@ -197,10 +197,8 @@ pub async fn events(
     ) {
         Ok(events) => {
             let mut body = json!({ "session": id, "beforePos": before, "events": events });
-            // 遠端連線剝除敏感輸出（#654，不變式 6）
-            if crate::ws::is_remote(peer) {
-                crate::sensitive::redact_remote(&mut body);
-            }
+            // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+            state.redact_for_peer(peer, &mut body);
             ok(&body)
         }
         Err(e) => store_error(e),
@@ -247,7 +245,7 @@ pub async fn project_events(
     let Some(store) = state.store().cloned() else {
         return ok(&json!({ "cwd": cwd, "events": [], "next": null }));
     };
-    let remote = crate::ws::is_remote(peer);
+    let state2 = state.clone();
     // SQLite 與讀 JSONL 都會阻塞，放到 blocking 執行緒
     tokio::task::spawn_blocking(move || {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -256,10 +254,8 @@ pub async fn project_events(
                 let next = next.map(|k| json!({ "ts": k.ts, "session": k.session, "pos": k.pos }));
                 let mut body =
                     json!({ "cwd": cwd, "from": from, "to": to, "events": events, "next": next });
-                // 遠端連線剝除敏感輸出（#654，不變式 6）
-                if remote {
-                    crate::sensitive::redact_remote(&mut body);
-                }
+                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+                state2.redact_for_peer(peer, &mut body);
                 ok(&body)
             }
             Err(e) => store_error(e),
@@ -1212,4 +1208,55 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `GET /api/sessions/<id>/thinking/<seq>`（#668）：一段 thinking 的全文。本機連線永遠給；遠端依
+/// `remote_thinking`：`on_demand`／`show` 給（寫 log：哪把金鑰讀了哪一段）、`hide` 403。不是 thinking 的 seq → 404。
+pub async fn thinking(
+    State(state): State<Arc<WebState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
+    axum::extract::Path((session, seq)): axum::extract::Path<(String, u64)>,
+) -> Response {
+    let remote = state.remote_peer(peer);
+    if remote && state.remote_thinking() == crate::config::RemoteThinking::Hide {
+        return error(
+            StatusCode::FORBIDDEN,
+            "這個 collector 不對遠端提供 thinking（remote_thinking = hide）",
+        );
+    }
+    let Some(store) = state.store() else {
+        return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
+    };
+    let found = {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        store.events_by_seq(&session, seq, seq)
+    };
+    let events = match found {
+        Ok(v) => v,
+        Err(e) => return store_error(e),
+    };
+    let Some(ev) = events.into_iter().next() else {
+        return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
+    };
+    if ev.kind != "assistant.thinking" {
+        return error(StatusCode::NOT_FOUND, "這個 seq 不是 thinking");
+    }
+    let t = &ev.payload;
+    if remote {
+        let who = match identity.as_deref() {
+            Some(crate::auth::Identity::Key { id, .. }) => format!("金鑰 {id}"),
+            _ => format!("{peer}"),
+        };
+        crate::logging::log(&format!("web：{who} 讀取 thinking {session}/{seq}"));
+    }
+    let mut body = json!({
+        "session": session, "seq": seq, "agent": ev.agent, "text": t["text"], "summarized": t["summarized"],
+        "messageId": t["messageId"], "model": t["model"],
+    });
+    if remote {
+        // 全文裡的 clk_ 金鑰也要遮（#720）；這個回應不是 Event，不會被 defer_thinking 動到
+        crate::sensitive::redact_keys(&mut body);
+    }
+    ok(&body)
 }

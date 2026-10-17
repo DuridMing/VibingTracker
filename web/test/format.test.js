@@ -120,3 +120,49 @@ test("工具輸出（#654）：遠端被剝除的敏感輸出說明原因", () =
   const d = formatRow(tool({ tool: "Read", input: { file_path: ".env" }, result: { ok: true, output: "", redacted: true } })).detail;
   assert.match(d, /敏感輸出/);
 });
+
+import { formatRow as fmtRow } from "../js/format.js";
+test("串流前綴（#669）：全部專案時每行先標專案色標；沒給 projectTag 就和以前一樣", () => {
+  const row = { key: "k", session: "aaaaaaaa-1", agent: "main", type: "text", text: "hi", v: 0, expanded: false, delayed: false };
+  const plain = fmtRow(row, {});
+  assert.ok(!plain.html.includes('class="pj"'));
+  const tagged = fmtRow(row, { projectTag: () => ({ label: "alpha", color: "var(--s3)", cwd: "/home/u/alpha" }) });
+  assert.ok(tagged.html.startsWith('<span class="pj"'), tagged.html);
+  assert.ok(tagged.html.includes("alpha") && tagged.html.includes("var(--s3)"));
+  assert.ok(tagged.html.includes('title="/home/u/alpha"'));
+});
+
+test("遠端未載入的思考：佔位帶字數，展開前的 detail 是提示；載入中與失敗各自顯示（#668）", () => {
+  const f = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 1240 });
+  assert.match(f.html, /1,240 字/);
+  assert.match(f.html, /點開載入/);
+  assert.equal(f.detail, "點一下載入思考內容");
+  assert.equal(formatRow({ ...base, type: "thinking", text: "", deferred: true, loading: true }).detail, "載入中…");
+  assert.equal(formatRow({ ...base, type: "thinking", text: "", deferred: true, loadError: "不給看" }).detail, "不給看");
+  // 載入後就是一般的思考列
+  const loaded = formatRow({ ...base, type: "thinking", text: "一\n二", deferred: false });
+  assert.doesNotMatch(loaded.html, /點開載入/);
+  assert.equal(loaded.detail, "一\n二");
+});
+
+test("串流前綴（#663）：hub 時每行最前面標 [host]；沒給 hostTag 就沒有", () => {
+  const row = { key: "k", session: "aaaaaaaa-1", agent: "main", type: "text", text: "hi", v: 0, expanded: false, delayed: false };
+  assert.ok(!fmtRow(row, {}).html.includes('class="hst"'));
+  const tagged = fmtRow(row, { hostTag: () => "build-01", projectTag: () => ({ label: "p", color: "var(--s1)", cwd: "/p" }) });
+  assert.ok(tagged.html.startsWith('<span class="hst" title="build-01">[build-01]</span><span class="pj"'), tagged.html);
+  assert.equal(fmtRow(row, { hostTag: () => null }).html.includes("hst"), false);
+});
+
+test("hide 模式與 0 字的思考佔位不寫「點開載入」、不可展開（#721）", () => {
+  const hide = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 227 }, { thinkingMode: "hide" });
+  assert.match(hide.html, /227 字，這個 collector 不對遠端提供/);
+  assert.doesNotMatch(hide.html, /點開載入/);
+  assert.equal(hide.detail, null);
+  const zero = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 0 }, { thinkingMode: "on_demand" });
+  assert.match(zero.html, /（思考）/);
+  assert.doesNotMatch(zero.html, /點開載入|0 字/);
+  assert.equal(zero.detail, null);
+  const od = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 5 }, { thinkingMode: "on_demand" });
+  assert.match(od.html, /點開載入/);
+  assert.equal(od.detail, "點一下載入思考內容");
+});

@@ -3,8 +3,9 @@
 //! 每 50 ms 從 [`Live`] 取一個 frame，用 broadcast 發給各連線，各連線依自己訂的頻道與時區過濾。
 //! 連線落後超過 broadcast 容量時直接重送 snapshot（snapshot 就是最新狀態，什麼都不會漏）。
 //!
-//! 安全：P6 的金鑰驗證完成前只綁 loopback；連 localhost 也檢查 `Origin`，否則使用者瀏覽器裡任何網頁
-//! 都能連 `ws://127.0.0.1:4801` 讀走 transcript。沒帶 `Origin` 的程式（wscat、curl）放行。
+//! 安全（[`gate`]）：本機免金鑰的連線要 `Host` 是 loopback 名稱、`/api` 與 `/ws` 的 `Origin` 要等於 `Host`
+//! （否則使用者瀏覽器裡任何網頁都能連 `ws://127.0.0.1:4801` 讀走 transcript；沒帶 `Origin` 的 wscat、curl 放行）。
+//! 遠端或 `auth = "always"` 的連線每個請求都要金鑰（[`crate::auth`]）：Bearer 或登入 cookie。
 
 use std::collections::BTreeMap;
 use std::io;
@@ -14,17 +15,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use axum::Router;
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Router};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use crate::auth::{self, Auth, Denied, Identity};
+use crate::config::{AuthMode, RemoteThinking};
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
 use crate::store::{ProjectKey, SessionRow, Store};
@@ -47,17 +51,42 @@ pub struct WebState {
     resume_window_ms: AtomicU64,
     /// 這次啟動的識別（`welcome.instance`）：frame 編號每次啟動從頭算，resume 要同一個 instance 才接得上
     instance: String,
+    auth: Auth,
+    /// 遠端連線的 thinking 怎麼送（#668）；本機連線永遠完整
+    remote_thinking: Mutex<RemoteThinking>,
+    /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
+    force_remote: std::sync::atomic::AtomicBool,
 }
 
 /// 同一毫秒建立兩個 [`WebState`]（測試）也要不同
 static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
 impl WebState {
-    /// `capacity`：每個連線最多落後幾個 frame，超過就改送 snapshot。
+    /// `capacity`：每個連線最多落後幾個 frame，超過就改送 snapshot。沒有金鑰檔：只信本機，遠端一律拒絕。
     pub fn new(
         store: Option<Arc<Mutex<Store>>>,
         web_root: Option<PathBuf>,
         capacity: usize,
+    ) -> Arc<WebState> {
+        WebState::build(store, web_root, capacity, Auth::local_only())
+    }
+
+    /// 金鑰在 `<home>/keys.json`；`mode` 決定 localhost 要不要金鑰（#667）。
+    pub fn new_with_auth(
+        store: Option<Arc<Mutex<Store>>>,
+        web_root: Option<PathBuf>,
+        capacity: usize,
+        home: PathBuf,
+        mode: AuthMode,
+    ) -> Arc<WebState> {
+        WebState::build(store, web_root, capacity, Auth::new(home, mode))
+    }
+
+    fn build(
+        store: Option<Arc<Mutex<Store>>>,
+        web_root: Option<PathBuf>,
+        capacity: usize,
+        auth: Auth,
     ) -> Arc<WebState> {
         let (frames, _) = broadcast::channel(capacity.max(1));
         Arc::new(WebState {
@@ -72,7 +101,39 @@ impl WebState {
                 crate::now_ms(),
                 INSTANCES.fetch_add(1, Ordering::Relaxed)
             ),
+            auth,
+            remote_thinking: Mutex::new(RemoteThinking::OnDemand),
+            force_remote: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    pub fn auth(&self) -> &Auth {
+        &self.auth
+    }
+
+    /// `[web].remote_thinking`（#668）。
+    pub fn set_remote_thinking(&self, mode: RemoteThinking) {
+        *self
+            .remote_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+
+    pub fn remote_thinking(&self) -> RemoteThinking {
+        *self
+            .remote_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 測試用：所有連線都當成遠端（剝除敏感輸出與 thinking）。
+    pub fn set_force_remote(&self, on: bool) {
+        self.force_remote.store(on, Ordering::Relaxed);
+    }
+
+    /// 這條連線算不算遠端：來源不是 loopback（[`is_remote`]），或測試強制。
+    pub fn remote_peer(&self, peer: SocketAddr) -> bool {
+        self.force_remote.load(Ordering::Relaxed) || is_remote(peer)
     }
 
     /// hello 的 `resume` 對之後多久內的 subscribe 有效，見 [`RESUME_WINDOW`]（測試用）。
@@ -179,19 +240,11 @@ impl WebState {
     }
 }
 
-/// 開始提供 web 入口；回傳實際綁定的位址（測試用 port 0）。
+/// 開始提供 web 入口；回傳實際綁定的位址（測試用 port 0）。綁定位址能不能用由 [`crate::config`] 把關。
 pub async fn serve_web(
     addr: SocketAddr,
     state: Arc<WebState>,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    if !addr.ip().is_loopback() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "web 入口在金鑰驗證（P6）完成前只能綁 127.0.0.1，收到 {addr}；要從別台看請用 SSH 通道"
-            ),
-        ));
-    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let api = Router::new()
@@ -204,13 +257,20 @@ pub async fn serve_web(
         .route("/api/graph", get(crate::api::graph))
         .route("/api/commit", get(crate::api::commit))
         .route("/api/commit-diff", get(crate::api::commit_diff))
+        .route(
+            "/api/sessions/{id}/thinking/{seq}",
+            get(crate::api::thinking),
+        )
         .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
         .merge(api)
         .route("/ws", get(ws_handler))
         .route("/healthz", get(healthz))
+        .route("/auth/login", get(auth_login_page).post(auth_login))
+        .route("/auth/once/{code}", get(auth_once))
+        .route("/auth/logout", post(auth_logout))
         .fallback(get(static_file))
-        .layer(middleware::from_fn(loopback_host))
+        .layer(middleware::from_fn_with_state(state.clone(), gate))
         .with_state(state);
     let task = tokio::spawn(async move {
         // 連線來源位址：遠端連線送出前剝除敏感輸出（#654）
@@ -222,17 +282,201 @@ pub async fn serve_web(
     Ok((local, task))
 }
 
-/// 只接受 loopback 名稱的 `Host`。DNS rebinding 時攻擊者的網域解析到 127.0.0.1，瀏覽器送出的
-/// `Origin` 與 `Host` 都是攻擊者網域、彼此相同，[`same_origin`] 擋不住；P6 開放遠端時改由金鑰驗證把關。
-async fn loopback_host(req: Request, next: Next) -> Response {
-    if host_is_loopback(req.headers()) {
-        next.run(req).await
-    } else {
-        (StatusCode::FORBIDDEN, "Host 不是本機").into_response()
+/// 每個請求的門口：決定這條連線是「本機免金鑰」還是要驗金鑰，並把 [`Identity`] 放進 request extensions。
+///
+/// - `/healthz` 與 `/auth/*` 不驗（登入頁本身要能開）。
+/// - 本機免金鑰（loopback 來源且 `auth = "local-open"`）：`Host` 必須是 loopback 名稱——DNS rebinding 時攻擊者的
+///   網域解析到 127.0.0.1，瀏覽器送出的 `Origin` 與 `Host` 都是攻擊者網域、彼此相同，只比 Origin 擋不住。
+///   `/api` 與 `/ws` 另外要 `Origin == Host`。
+/// - 要金鑰的連線：Bearer 或 cookie（cookie 要配 `Origin`）。沒有或不對：API 與 WS 回 401／403，網頁導去登入頁。
+///   cookie 是 SameSite=Strict 且綁 Host，rebinding 的網域拿不到它，所以這裡不限制 `Host`（tailnet 的 MagicDNS 名稱要能用）。
+async fn gate(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    let open = path == "/healthz" || path.starts_with("/auth/");
+    let guarded = path.starts_with("/api/") || path == "/ws";
+    if !state.auth.needs_auth(peer) {
+        if !host_is_loopback(req.headers()) {
+            return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
+        }
+        if guarded && !same_origin(req.headers()) {
+            return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
+        }
+        req.extensions_mut().insert(Identity::Local);
+        return next.run(req).await;
+    }
+    if open {
+        return next.run(req).await;
+    }
+    match state.auth.identify(req.headers(), crate::now_ms()) {
+        Ok(id) => {
+            req.extensions_mut().insert(id);
+            next.run(req).await
+        }
+        Err(Denied::OriginMismatch) => {
+            (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
+        }
+        Err(denied) => {
+            if let Denied::BadCredentials(why) = &denied {
+                crate::logging::log(&format!("web：{peer} 的憑證被拒：{why}"));
+            }
+            if guarded {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "需要金鑰：登入或 Authorization: Bearer clk_…",
+                )
+                    .into_response()
+            } else {
+                Redirect::to("/auth/login").into_response()
+            }
+        }
     }
 }
 
-fn host_is_loopback(headers: &HeaderMap) -> bool {
+const LOGIN_PAGE: &str = r#"<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>coding-lab 登入</title>
+<style>
+body{font:15px/1.5 system-ui,sans-serif;background:#f4f4f3;color:#222;display:flex;min-height:100vh;margin:0;align-items:center;justify-content:center}
+main{background:#fff;border:1px solid #ddd;border-radius:8px;padding:24px 28px;max-width:440px;width:calc(100% - 32px)}
+h1{font-size:18px;margin:0 0 12px}input{width:100%;box-sizing:border-box;font:inherit;padding:8px 10px;border:1px solid #bbb;border-radius:6px}
+button{margin-top:12px;font:inherit;padding:8px 16px;border:0;border-radius:6px;background:#2a6;color:#fff}
+p{margin:8px 0}code{background:#eee;padding:1px 4px;border-radius:3px}.err{color:#b00}.hint{color:#555;font-size:13px}
+@media (prefers-color-scheme:dark){body{background:#1b1b1b;color:#ddd}main{background:#242424;border-color:#333}input{background:#1b1b1b;color:#ddd;border-color:#444}code{background:#333}}
+</style></head><body><main>
+<h1>coding-lab</h1>
+<p>這個 collector 需要金鑰才能看。貼上在伺服器上用 <code>coding-lab key create --name &lt;名稱&gt;</code> 建立的金鑰（<code>clk_…</code>）：</p>
+<!--ERROR-->
+<form method="post" action="/auth/login"><input name="key" type="password" autocomplete="off" placeholder="clk_xxxxxxxx_…" autofocus required><button type="submit">登入</button></form>
+<p class="hint">登入後 30 天內不必再貼；撤銷金鑰（<code>coding-lab key revoke &lt;id&gt;</code>）會立即登出。<!--NOKEYS--></p>
+</main></body></html>"#;
+
+fn login_html(state: &WebState, error: Option<&str>) -> Html<String> {
+    let mut page = LOGIN_PAGE.replace(
+        "<!--ERROR-->",
+        &error
+            .map(|e| format!("<p class=\"err\">{e}</p>"))
+            .unwrap_or_default(),
+    );
+    if !state.auth.has_keys() {
+        page = page.replace(
+            "<!--NOKEYS-->",
+            "<br>這台還沒有任何金鑰：請先在伺服器上執行 <code>coding-lab key create --name laptop</code>。",
+        );
+    }
+    Html(page)
+}
+
+async fn auth_login_page(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let error = uri
+        .query()
+        .is_some_and(|q| q.split('&').any(|kv| kv == "error=1"))
+        .then_some("金鑰不對、已撤銷或已到期");
+    login_html(&state, error).into_response()
+}
+
+fn cookie_response(location: &str, cookie: &str, headers: &HeaderMap) -> Response {
+    let set = auth::set_cookie_header(
+        cookie,
+        auth::COOKIE_TTL_MS / 1000,
+        auth::forwarded_https(headers),
+    );
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, location.to_string()),
+            (header::SET_COOKIE, set),
+        ],
+    )
+        .into_response()
+}
+
+/// `POST /auth/login`（表單 `key=clk_…`）：成功發 cookie 導回首頁；失敗 401（每個 IP 每分鐘最多 10 次）。
+async fn auth_login(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let now = crate::now_ms();
+    if !state.auth.login_allowed(peer.ip(), now) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            login_html(&state, Some("登入失敗太多次，一分鐘後再試")),
+        )
+            .into_response();
+    }
+    let key = auth::form_value(&String::from_utf8_lossy(&body), "key").unwrap_or_default();
+    match state.auth.login(key.trim(), now) {
+        Ok((cookie, id, scope)) => {
+            crate::logging::log(&format!(
+                "web：金鑰 {id}（{}）從 {peer} 登入",
+                scope.as_str()
+            ));
+            cookie_response("/", &cookie, &headers)
+        }
+        Err(why) => {
+            state.auth.login_failed(peer.ip(), now);
+            crate::logging::log(&format!("web：{peer} 登入失敗：{why}"));
+            (
+                StatusCode::UNAUTHORIZED,
+                login_html(&state, Some("金鑰不對、已撤銷或已到期")),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// `GET /auth/once/<code>`：一次性登入連結（`coding-lab key login-link`），5 分鐘內、只能用一次。
+async fn auth_once(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::extract::Path(code): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let now = crate::now_ms();
+    if !state.auth.login_allowed(peer.ip(), now) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "登入失敗太多次，一分鐘後再試",
+        )
+            .into_response();
+    }
+    match state.auth.login_once(&code, now) {
+        Ok((cookie, id)) => {
+            crate::logging::log(&format!("web：金鑰 {id} 從 {peer} 以一次性連結登入"));
+            cookie_response("/", &cookie, &headers)
+        }
+        Err(why) => {
+            state.auth.login_failed(peer.ip(), now);
+            crate::logging::log(&format!("web：{peer} 的一次性連結被拒：{why}"));
+            (
+                StatusCode::NOT_FOUND,
+                "連結已失效或用過；在伺服器上重新執行 coding-lab key login-link",
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn auth_logout(headers: HeaderMap) -> Response {
+    let set = auth::set_cookie_header("", 0, auth::forwarded_https(&headers));
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, "/auth/login".to_string()),
+            (header::SET_COOKIE, set),
+        ],
+    )
+        .into_response()
+}
+
+/// `Host` 是 loopback 名稱（hub 的 web 入口也用，#663）。
+pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -255,22 +499,18 @@ async fn require_same_origin(req: Request, next: Next) -> Response {
 
 /// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
 fn same_origin(headers: &HeaderMap) -> bool {
-    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
-        return true;
-    };
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let authority = origin
-        .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"))
-        .unwrap_or("");
-    !host.is_empty() && authority.trim_end_matches('/') == host
+    auth::same_origin(headers)
 }
 
-/// 連線是不是從別台來的。P6 之前 web 只綁 loopback，SSH 通道進來的也是本機位址，所以目前一律是本機；
-/// P6 開放非 loopback 綁定後，遠端連線送出前剝除敏感輸出（不變式 6）。
+pub fn thinking_str(mode: RemoteThinking) -> &'static str {
+    match mode {
+        RemoteThinking::OnDemand => "on_demand",
+        RemoteThinking::Hide => "hide",
+        RemoteThinking::Show => "show",
+    }
+}
+
+/// 連線是不是從別台來的。SSH 通道進來的也是本機位址，等同信任；遠端連線送出前剝除敏感輸出（不變式 6）。
 pub fn is_remote(peer: SocketAddr) -> bool {
     !peer.ip().is_loopback()
 }
@@ -278,14 +518,12 @@ pub fn is_remote(peer: SocketAddr) -> bool {
 async fn ws_handler(
     State(state): State<Arc<WebState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    Extension(identity): Extension<Identity>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if !same_origin(&headers) {
-        return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
-    }
-    let remote = is_remote(peer);
-    ws.on_upgrade(move |socket| connection(socket, state, remote))
+    // Origin 與金鑰都在 gate 驗過了
+    let remote = state.remote_peer(peer);
+    ws.on_upgrade(move |socket| connection(socket, state, remote, identity))
 }
 
 struct Conn {
@@ -296,12 +534,21 @@ struct Conn {
     resume: Option<(u64, Instant)>,
     /// 從別台連進來（[`is_remote`]）
     remote: bool,
+    /// 本機或哪一把金鑰（決定 `welcome.scope` 與能不能 ack）
+    identity: Identity,
+    /// 連線建立時的 `remote_thinking`（只對 remote 有意義）
+    thinking: RemoteThinking,
 }
 
-async fn send(socket: &mut WebSocket, remote: bool, v: &Value) -> bool {
-    let text = if remote {
+/// 送一則訊息；遠端連線先剝除敏感輸出（#654）與 thinking 全文（#668，依 `remote_thinking`）。
+async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
+    let text = if conn.remote {
         let mut v = v.clone();
         crate::sensitive::redact_remote(&mut v);
+        crate::sensitive::redact_keys(&mut v);
+        if conn.thinking != RemoteThinking::Show {
+            defer_thinking(&mut v);
+        }
         v.to_string()
     } else {
         v.to_string()
@@ -309,13 +556,60 @@ async fn send(socket: &mut WebSocket, remote: bool, v: &Value) -> bool {
     socket.send(Message::Text(text.into())).await.is_ok()
 }
 
-async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool) {
+impl WebState {
+    /// HTTP API 回應送給遠端前的剝除：敏感輸出（#654）＋依 `remote_thinking` 的 thinking（#668）。
+    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。
+    pub fn redact_for_peer(&self, peer: SocketAddr, body: &mut Value) {
+        if !self.remote_peer(peer) {
+            return;
+        }
+        crate::sensitive::redact_remote(body);
+        crate::sensitive::redact_keys(body);
+        if self.remote_thinking() != RemoteThinking::Show {
+            defer_thinking(body);
+        }
+    }
+}
+
+/// 把送出副本裡所有 `assistant.thinking` 的 `text` 換成空字串，加 `deferred: true` 與 `chars`（佔位要顯示長度）。
+/// frame、snapshot、載入更多的形狀不同，所以整個走一遍；只改送出的副本，JSONL 與 store 不變。
+pub fn defer_thinking(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("assistant.thinking")
+                && let Some(Value::Object(p)) = map.get_mut("payload")
+            {
+                let chars = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map_or(0, |t| t.chars().count());
+                p.insert("text".into(), Value::String(String::new()));
+                p.insert("deferred".into(), Value::Bool(true));
+                p.insert("chars".into(), json!(chars));
+                return;
+            }
+            for child in map.values_mut() {
+                defer_thinking(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                defer_thinking(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, identity: Identity) {
     let mut rx = state.frames.subscribe();
     let mut conn = Conn {
         subs: BTreeMap::new(),
         offset: 0,
         resume: None,
         remote,
+        identity,
+        thinking: state.remote_thinking(),
     };
     loop {
         tokio::select! {
@@ -330,13 +624,14 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool) {
             },
             frame = rx.recv() => match frame {
                 Ok(f) => {
-                    for (ch, since) in conn.subs.iter_mut() {
-                        if f.no <= *since {
+                    let channels: Vec<Channel> = conn.subs.keys().cloned().collect();
+                    for ch in channels {
+                        if conn.subs.get(&ch).is_some_and(|since| f.no <= *since) {
                             continue;
                         }
-                        *since = f.no;
-                        if let Some(j) = f.to_json(ch, conn.offset)
-                            && !send(&mut socket, conn.remote, &j).await
+                        conn.subs.insert(ch.clone(), f.no);
+                        if let Some(j) = f.to_json(&ch, conn.offset)
+                            && !send(&mut socket, &conn, &j).await
                         {
                             return;
                         }
@@ -365,7 +660,7 @@ async fn send_snapshot(
     let snap = state.live().snapshot(ch, conn.offset, crate::now_ms());
     conn.subs
         .insert(ch.clone(), snap["frame"].as_u64().unwrap_or(0));
-    send(socket, conn.remote, &snap).await
+    send(socket, conn, &snap).await
 }
 
 /// 處理一則 client 訊息；回傳 false 表示連線該結束。
@@ -373,7 +668,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
     let Ok(msg) = serde_json::from_str::<Value>(text) else {
         return send(
             socket,
-            conn.remote,
+            conn,
             &json!({ "t": "error", "message": "不是 JSON" }),
         )
         .await;
@@ -392,15 +687,17 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             state.live().register_offset(conn.offset);
             let welcome = json!({
                 "t": "welcome", "protocol": PROTOCOL, "instance": state.instance, "host": "local",
-                "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote, "thinking": "full", "scope": "local",
+                "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote,
+                "thinking": if conn.remote { thinking_str(conn.thinking) } else { "full" },
+                "scope": conn.identity.scope_str(),
             });
-            send(socket, conn.remote, &welcome).await
+            send(socket, conn, &welcome).await
         }
         "subscribe" => {
             let Some(ch) = msg["channel"].as_str().and_then(Channel::parse) else {
                 return send(
                     socket,
-                    conn.remote,
+                    conn,
                     &json!({ "t": "error", "message": "不認得的頻道" }),
                 )
                 .await;
@@ -419,7 +716,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                     conn.subs.insert(ch.clone(), now_no);
                     for f in frames {
                         if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(socket, conn.remote, &j).await
+                            && !send(socket, conn, &j).await
                         {
                             return false;
                         }
@@ -436,6 +733,14 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             true
         }
         "ack" => {
+            if !conn.identity.can_operate() {
+                return send(
+                    socket,
+                    conn,
+                    &json!({ "t": "error", "message": "這把金鑰只能看（view）；「已確認」需要 operate 金鑰" }),
+                )
+                .await;
+            }
             let (s, k, r) = (
                 msg["session"].as_str().unwrap_or_default(),
                 msg["kind"].as_str().unwrap_or_default(),
@@ -467,12 +772,12 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             };
             let reply =
                 json!({ "t": "more", "session": session, "beforePos": before, "events": events });
-            send(socket, conn.remote, &reply).await
+            send(socket, conn, &reply).await
         }
         other => {
             send(
                 socket,
-                conn.remote,
+                conn,
                 &json!({ "t": "error", "message": format!("不認得的 op：{other}") }),
             )
             .await
@@ -561,8 +866,13 @@ async fn healthz(State(state): State<Arc<WebState>>) -> Response {
 }
 
 async fn static_file(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    static_response(state.web_root.as_deref(), &uri).await
+}
+
+/// 前端靜態檔（hub 的 web 入口也用同一份 `web/`，#663）。
+pub(crate) async fn static_response(root: Option<&Path>, uri: &Uri) -> Response {
     let not_found = || (StatusCode::NOT_FOUND, "not found").into_response();
-    let Some(root) = &state.web_root else {
+    let Some(root) = root else {
         return not_found();
     };
     let rel = Path::new(uri.path().trim_start_matches('/'));

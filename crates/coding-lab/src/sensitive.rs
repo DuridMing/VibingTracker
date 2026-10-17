@@ -107,3 +107,30 @@ pub fn redact_remote(v: &mut Value) {
         _ => {}
     }
 }
+
+/// 這個系統自己發的金鑰（#666）：`clk_<8 碼 base62>_<43 碼 base62>`。
+fn key_pattern() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(r"clk_([0-9A-Za-z]{8})_[0-9A-Za-z]{20,}")
+            .unwrap_or_else(|e| panic!("金鑰正則有誤：{e}"))
+    })
+}
+
+/// 遠端連線送出前（#720）：所有字串欄位裡的 `clk_<id>_<secret>` 只留 `clk_<id>_…`。
+/// 金鑰是 collector 自己發的、形狀固定，所以精準比對不會誤殺；本機副本不剝（JSONL 本來就有）。
+pub fn redact_keys(v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if s.contains("clk_") {
+                let re = key_pattern();
+                if re.is_match(s) {
+                    *s = re.replace_all(s, "clk_${1}_…").into_owned();
+                }
+            }
+        }
+        Value::Object(map) => map.values_mut().for_each(redact_keys),
+        Value::Array(items) => items.iter_mut().for_each(redact_keys),
+        _ => {}
+    }
+}
