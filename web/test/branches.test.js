@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel } from "../js/branches.js";
+import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices } from "../js/branches.js";
 
 // contracts §7 的 /api/branches 列（#696）
 const row = (branch, o = {}) => ({ branch, worktree: `/repo/wt/${branch}`, integration: false, ahead: 0, behind: 0, dirty: 0, changed: 0, sessions: [], shared: [], last: null, ...o });
@@ -80,4 +80,11 @@ test("未 commit 列：放在那個 worktree 的 HEAD 正上方，parent 是 HEA
   assert.deepEqual(rows.map((r) => r.hash), ["wip:/r/wt/x", "x", "wip:/r", "b", "c"]);
   assert.deepEqual(rows[2].parents, ["b"]);
   assert.equal(rows[2].wip.branch, "dev");
+});
+
+// #709：commit 圖沒截斷時底下不能多一列（直接把 null 交給 replaceChildren 會顯示文字「null」）
+test("截斷提示：沒截斷回空陣列，截斷才有一列", () => {
+  const commits = [{ hash: "a" }, { hash: "b" }, { hash: "c" }];
+  assert.deepEqual(graphNotices({ commits, truncated: false }), []);
+  assert.deepEqual(graphNotices({ commits, truncated: true }), ["只列最近 3 個 commit"]);
 });

@@ -17,7 +17,7 @@ import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, create
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
 import { mergeSessions, projectRoots, pickProject, canReplay, fitTabs } from "./sessions.js";
 import { degradedNotice } from "./degraded.js";
-import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, layoutGraph, withWip } from "./branches.js";
+import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices, layoutGraph, withWip } from "./branches.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -992,7 +992,7 @@ function renderBranches() {
     h("span", { class: "ga" }, r.wip ? "" : r.author ?? ""),
     h("span", { class: "gt" }, r.wip ? "" : when(r.ts)),
     h("span", { class: "gh mono" }, r.wip ? "" : r.hash.slice(0, 7)))),
-    br.graph.truncated ? h("div", { class: "none" }, `只列最近 ${br.graph.commits.length} 個 commit`) : null);
+    ...graphNotices(br.graph).map((t) => h("div", { class: "none" }, t)));
   }
   renderDetail();
 }

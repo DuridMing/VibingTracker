@@ -16,6 +16,11 @@ export function changedBranches(body) {
   return (body?.branches ?? []).filter((r) => !r.integration && ((r.changed ?? 0) > 0 || (r.dirty ?? 0) > 0)).length;
 }
 
+// commit 圖底下的提示列（#709）：回陣列，沒截斷就是空的；呼叫端用 ... 展開，不能把 null 交給 replaceChildren（會顯示文字「null」）
+export function graphNotices(graph) {
+  return graph?.truncated ? [`只列最近 ${graph.commits.length} 個 commit`] : [];
+}
+
 // unified diff → 行：meta（檔頭）、hunk、add、del、ctx
 export function diffLines(diff) {
   if (!diff) return [];
