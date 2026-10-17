@@ -133,6 +133,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         cfg.home.clone(),
         cfg.auth,
     );
+    web.set_remote_thinking(cfg.remote_thinking);
     if !cfg.web_bind.ip().is_loopback() && !web.auth().has_keys() {
         log(
             "web 入口綁在非本機位址，但還沒有任何金鑰：遠端連線都會被拒，請先 coding-lab key create --name <名稱>",

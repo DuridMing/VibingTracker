@@ -149,7 +149,7 @@ export function createStream({ cap = CAP } = {}) {
       case "assistant.thinking":
       case "assistant.text":
         if (ev.pos != null) {
-          newRow(ev, { type: ev.type === "assistant.thinking" ? "thinking" : "text", text: p.text ?? "", summarized: !!p.summarized, delayed: p.delayed === true, deferred: p.deferred === true }, out);
+          newRow(ev, { type: ev.type === "assistant.thinking" ? "thinking" : "text", text: p.text ?? "", summarized: !!p.summarized, delayed: p.delayed === true, deferred: p.deferred === true, chars: p.chars ?? null }, out);
         }
         break;
       case "prompt.submitted":

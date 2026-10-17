@@ -661,7 +661,9 @@ const activeRoots = () => (proj.cur ? [proj.cur] : proj.rootCwds);
 const fetchedById = () => new Map(left.fetched.map((s) => [s.id, s]));
 let fetchedIndex = new Map();
 const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?? null;
-const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }));
+// 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
+const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
+const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }).then(toLogin));
 const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 function allSessions() {
@@ -1541,12 +1543,39 @@ const stream = createStream();
 // 串流前綴、改動紀錄、Agents 面板用同一套名稱（agents.js）
 const agentName = (session, agentId) => { const a = store.agents.get(`${session}/${agentId}`); return a ? agentLabel(a) : null; };
 const benchProf = new URLSearchParams(location.search).has("bench") ? [] : null;
+// 遠端未載入的思考（#668）：展開那一行時用 API 取全文；hide 模式不會給，直接提示
+async function loadThinking(row, v) {
+  if (row.type !== "thinking" || !row.deferred || row.loading) return;
+  const repaint = () => { row.h = 0; row.v++; v.update({ updated: new Set([row.key]) }); };
+  if (ui.welcome?.thinking === "hide") {
+    row.loadError = "這個 collector 不對遠端提供思考內容（remote_thinking = hide）";
+    repaint();
+    return;
+  }
+  row.loading = true;
+  repaint();
+  try {
+    const r = await apiFetch(`/api/sessions/${encodeURIComponent(row.session)}/thinking/${row.seq}`);
+    if (!r.ok) throw new Error(r.status === 403 ? "這個 collector 不對遠端提供思考內容" : `載入失敗（${r.status}）`);
+    const j = await r.json();
+    row.text = j.text ?? "";
+    row.summarized = !!j.summarized;
+    row.deferred = false;
+    row.loadError = null;
+  } catch (e) {
+    row.loadError = e?.message ?? String(e);
+  }
+  row.loading = false;
+  repaint();
+}
+
 const view = createStreamView({
   prof: benchProf,
   scroller: $("#stream"),
   model: stream,
   agentName,
   projectTag,
+  onExpand: (row) => loadThinking(row, view),
   onNeedMore: requestMore,
   onFollow: (on) => {
     // 回到底部恢復跟隨：載入更多時暫時保留的舊行修剪回上限
@@ -1558,6 +1587,7 @@ const paneView = createStreamView({
   scroller: $("#spStream"),
   model: pane.stream,
   agentName,
+  onExpand: (row) => loadThinking(row, paneView),
   onNeedMore: paneMore,
   onFollow: (on) => {
     if (on && pane.stream.holding) paneView.update({ ...pane.stream.trim(), appended: 0, updated: new Set() });
@@ -1696,7 +1726,7 @@ function benchFrame(m) {
 // ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
 const rp = createReplay();
 let rpReq = 0; // 換範圍後，舊的回應丟掉
-const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, onNeedMore: () => replayMore(), onFollow: () => {} });
+const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
 const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
 function fillReplayProjects() {
@@ -1887,7 +1917,12 @@ const client = createClient({
       render();
     },
     more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
-    onStatus: (s) => { if (ui.conn !== "incompatible") ui.conn = s; render(true); },
+    onStatus: (s) => {
+      if (ui.conn !== "incompatible") ui.conn = s;
+      // WS 握手被 401 拒絕（cookie 過期、金鑰被撤銷）在瀏覽器只看得到斷線：用一個 API 請求確認，是就導去登入
+      if (s === "closed" && !mock) fetch("/api/sessions?limit=1", { credentials: "same-origin" }).then(toLogin).catch(() => {});
+      render(true);
+    },
     onIncompatible: () => { ui.conn = "incompatible"; render(true); },
     onError: (e) => console.warn("ws message", e),
   },

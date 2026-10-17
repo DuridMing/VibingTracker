@@ -114,9 +114,16 @@ export function formatRow(row, { agentName, projectTag } = {}) {
   let detail = null;
 
   if (row.type === "thinking") {
-    body = row.deferred ? '<span class="lbl">think</span> <span class="o">（思考內容未載入）</span>' : `<span class="lbl">think</span> ${esc(firstLine(row.text))}`;
+    if (row.deferred) {
+      // 遠端連線：collector 只送佔位（#668），點開才用 API 載入；hide 模式載入會被拒，提示放在 loadError
+      const n = row.chars != null ? ` · ${Number(row.chars).toLocaleString()} 字` : "";
+      body = `<span class="lbl">think</span> <span class="o">（思考${n}，點開載入）</span>`;
+      detail = row.loadError ?? (row.loading ? "載入中…" : "點一下載入思考內容");
+    } else {
+      body = `<span class="lbl">think</span> ${esc(firstLine(row.text))}`;
+      detail = row.text || null;
+    }
     if (row.summarized) tags.push("摘要");
-    detail = row.text || null;
   } else if (row.type === "text") {
     body = `<span class="tx">${esc(firstLine(row.text))}</span>`;
     detail = row.text.includes("\n") || row.text.length > LONG ? row.text : null;

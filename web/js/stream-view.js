@@ -9,7 +9,8 @@ export const ROW_H = 20;
 const OVERSCAN = 30;
 
 // projectTag：全部專案時每行的專案色標（#669），不給就沒有
-export function createStreamView({ scroller, model, agentName, projectTag = null, onNeedMore, onFollow, prof = null }) {
+// onExpand(row)：一行被展開時呼叫（遠端未載入的思考在這時去載，#668）
+export function createStreamView({ scroller, model, agentName, projectTag = null, onNeedMore, onFollow, onExpand = null, prof = null }) {
   const T = () => (prof ? performance.now() : 0);
   const more = document.createElement("button");
   more.className = "vl-more";
@@ -81,6 +82,7 @@ export function createStreamView({ scroller, model, agentName, projectTag = null
     nd.row.v++;
     dirty = true;
     schedule();
+    if (nd.row.expanded) onExpand?.(nd.row);
   }
   space.addEventListener("click", (e) => {
     if (e.target.closest(".full")) return; // 展開內容裡可以選字，不收合

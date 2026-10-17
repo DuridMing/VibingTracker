@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::auth::{self, Auth, Denied, Identity};
-use crate::config::AuthMode;
+use crate::config::{AuthMode, RemoteThinking};
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
 use crate::store::{ProjectKey, SessionRow, Store};
@@ -52,6 +52,10 @@ pub struct WebState {
     /// 這次啟動的識別（`welcome.instance`）：frame 編號每次啟動從頭算，resume 要同一個 instance 才接得上
     instance: String,
     auth: Auth,
+    /// 遠端連線的 thinking 怎麼送（#668）；本機連線永遠完整
+    remote_thinking: Mutex<RemoteThinking>,
+    /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
+    force_remote: std::sync::atomic::AtomicBool,
 }
 
 /// 同一毫秒建立兩個 [`WebState`]（測試）也要不同
@@ -98,11 +102,38 @@ impl WebState {
                 INSTANCES.fetch_add(1, Ordering::Relaxed)
             ),
             auth,
+            remote_thinking: Mutex::new(RemoteThinking::OnDemand),
+            force_remote: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
     pub fn auth(&self) -> &Auth {
         &self.auth
+    }
+
+    /// `[web].remote_thinking`（#668）。
+    pub fn set_remote_thinking(&self, mode: RemoteThinking) {
+        *self
+            .remote_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
+    }
+
+    pub fn remote_thinking(&self) -> RemoteThinking {
+        *self
+            .remote_thinking
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 測試用：所有連線都當成遠端（剝除敏感輸出與 thinking）。
+    pub fn set_force_remote(&self, on: bool) {
+        self.force_remote.store(on, Ordering::Relaxed);
+    }
+
+    /// 這條連線算不算遠端：來源不是 loopback（[`is_remote`]），或測試強制。
+    pub fn remote_peer(&self, peer: SocketAddr) -> bool {
+        self.force_remote.load(Ordering::Relaxed) || is_remote(peer)
     }
 
     /// hello 的 `resume` 對之後多久內的 subscribe 有效，見 [`RESUME_WINDOW`]（測試用）。
@@ -226,6 +257,10 @@ pub async fn serve_web(
         .route("/api/graph", get(crate::api::graph))
         .route("/api/commit", get(crate::api::commit))
         .route("/api/commit-diff", get(crate::api::commit_diff))
+        .route(
+            "/api/sessions/{id}/thinking/{seq}",
+            get(crate::api::thinking),
+        )
         .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
         .merge(api)
@@ -466,6 +501,14 @@ fn same_origin(headers: &HeaderMap) -> bool {
     auth::same_origin(headers)
 }
 
+pub fn thinking_str(mode: RemoteThinking) -> &'static str {
+    match mode {
+        RemoteThinking::OnDemand => "on_demand",
+        RemoteThinking::Hide => "hide",
+        RemoteThinking::Show => "show",
+    }
+}
+
 /// 連線是不是從別台來的。SSH 通道進來的也是本機位址，等同信任；遠端連線送出前剝除敏感輸出（不變式 6）。
 pub fn is_remote(peer: SocketAddr) -> bool {
     !peer.ip().is_loopback()
@@ -478,7 +521,7 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
 ) -> Response {
     // Origin 與金鑰都在 gate 驗過了
-    let remote = is_remote(peer);
+    let remote = state.remote_peer(peer);
     ws.on_upgrade(move |socket| connection(socket, state, remote, identity))
 }
 
@@ -492,17 +535,53 @@ struct Conn {
     remote: bool,
     /// 本機或哪一把金鑰（決定 `welcome.scope` 與能不能 ack）
     identity: Identity,
+    /// 連線建立時的 `remote_thinking`（只對 remote 有意義）
+    thinking: RemoteThinking,
 }
 
-async fn send(socket: &mut WebSocket, remote: bool, v: &Value) -> bool {
-    let text = if remote {
+/// 送一則訊息；遠端連線先剝除敏感輸出（#654）與 thinking 全文（#668，依 `remote_thinking`）。
+async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
+    let text = if conn.remote {
         let mut v = v.clone();
         crate::sensitive::redact_remote(&mut v);
+        if conn.thinking != RemoteThinking::Show {
+            defer_thinking(&mut v);
+        }
         v.to_string()
     } else {
         v.to_string()
     };
     socket.send(Message::Text(text.into())).await.is_ok()
+}
+
+/// 把送出副本裡所有 `assistant.thinking` 的 `text` 換成空字串，加 `deferred: true` 與 `chars`（佔位要顯示長度）。
+/// frame、snapshot、載入更多的形狀不同，所以整個走一遍；只改送出的副本，JSONL 與 store 不變。
+pub fn defer_thinking(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("assistant.thinking")
+                && let Some(Value::Object(p)) = map.get_mut("payload")
+            {
+                let chars = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map_or(0, |t| t.chars().count());
+                p.insert("text".into(), Value::String(String::new()));
+                p.insert("deferred".into(), Value::Bool(true));
+                p.insert("chars".into(), json!(chars));
+                return;
+            }
+            for child in map.values_mut() {
+                defer_thinking(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                defer_thinking(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, identity: Identity) {
@@ -513,6 +592,7 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, i
         resume: None,
         remote,
         identity,
+        thinking: state.remote_thinking(),
     };
     loop {
         tokio::select! {
@@ -527,13 +607,14 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, i
             },
             frame = rx.recv() => match frame {
                 Ok(f) => {
-                    for (ch, since) in conn.subs.iter_mut() {
-                        if f.no <= *since {
+                    let channels: Vec<Channel> = conn.subs.keys().cloned().collect();
+                    for ch in channels {
+                        if conn.subs.get(&ch).is_some_and(|since| f.no <= *since) {
                             continue;
                         }
-                        *since = f.no;
-                        if let Some(j) = f.to_json(ch, conn.offset)
-                            && !send(&mut socket, conn.remote, &j).await
+                        conn.subs.insert(ch.clone(), f.no);
+                        if let Some(j) = f.to_json(&ch, conn.offset)
+                            && !send(&mut socket, &conn, &j).await
                         {
                             return;
                         }
@@ -562,7 +643,7 @@ async fn send_snapshot(
     let snap = state.live().snapshot(ch, conn.offset, crate::now_ms());
     conn.subs
         .insert(ch.clone(), snap["frame"].as_u64().unwrap_or(0));
-    send(socket, conn.remote, &snap).await
+    send(socket, conn, &snap).await
 }
 
 /// 處理一則 client 訊息；回傳 false 表示連線該結束。
@@ -570,7 +651,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
     let Ok(msg) = serde_json::from_str::<Value>(text) else {
         return send(
             socket,
-            conn.remote,
+            conn,
             &json!({ "t": "error", "message": "不是 JSON" }),
         )
         .await;
@@ -589,16 +670,17 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             state.live().register_offset(conn.offset);
             let welcome = json!({
                 "t": "welcome", "protocol": PROTOCOL, "instance": state.instance, "host": "local",
-                "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote, "thinking": "full",
+                "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote,
+                "thinking": if conn.remote { thinking_str(conn.thinking) } else { "full" },
                 "scope": conn.identity.scope_str(),
             });
-            send(socket, conn.remote, &welcome).await
+            send(socket, conn, &welcome).await
         }
         "subscribe" => {
             let Some(ch) = msg["channel"].as_str().and_then(Channel::parse) else {
                 return send(
                     socket,
-                    conn.remote,
+                    conn,
                     &json!({ "t": "error", "message": "不認得的頻道" }),
                 )
                 .await;
@@ -617,7 +699,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                     conn.subs.insert(ch.clone(), now_no);
                     for f in frames {
                         if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(socket, conn.remote, &j).await
+                            && !send(socket, conn, &j).await
                         {
                             return false;
                         }
@@ -637,7 +719,7 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             if !conn.identity.can_operate() {
                 return send(
                     socket,
-                    conn.remote,
+                    conn,
                     &json!({ "t": "error", "message": "這把金鑰只能看（view）；「已確認」需要 operate 金鑰" }),
                 )
                 .await;
@@ -673,12 +755,12 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             };
             let reply =
                 json!({ "t": "more", "session": session, "beforePos": before, "events": events });
-            send(socket, conn.remote, &reply).await
+            send(socket, conn, &reply).await
         }
         other => {
             send(
                 socket,
-                conn.remote,
+                conn,
                 &json!({ "t": "error", "message": format!("不認得的 op：{other}") }),
             )
             .await

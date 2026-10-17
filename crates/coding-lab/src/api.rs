@@ -1213,3 +1213,49 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+/// `GET /api/sessions/<id>/thinking/<seq>`（#668）：一段 thinking 的全文。本機連線永遠給；遠端依
+/// `remote_thinking`：`on_demand`／`show` 給（寫 log：哪把金鑰讀了哪一段）、`hide` 403。不是 thinking 的 seq → 404。
+pub async fn thinking(
+    State(state): State<Arc<WebState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    identity: Option<axum::Extension<crate::auth::Identity>>,
+    axum::extract::Path((session, seq)): axum::extract::Path<(String, u64)>,
+) -> Response {
+    let remote = state.remote_peer(peer);
+    if remote && state.remote_thinking() == crate::config::RemoteThinking::Hide {
+        return error(
+            StatusCode::FORBIDDEN,
+            "這個 collector 不對遠端提供 thinking（remote_thinking = hide）",
+        );
+    }
+    let Some(store) = state.store() else {
+        return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
+    };
+    let found = {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        store.events_by_seq(&session, seq, seq)
+    };
+    let events = match found {
+        Ok(v) => v,
+        Err(e) => return store_error(e),
+    };
+    let Some(ev) = events.into_iter().next() else {
+        return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
+    };
+    if ev.kind != "assistant.thinking" {
+        return error(StatusCode::NOT_FOUND, "這個 seq 不是 thinking");
+    }
+    let t = &ev.payload;
+    if remote {
+        let who = match identity.as_deref() {
+            Some(crate::auth::Identity::Key { id, .. }) => format!("金鑰 {id}"),
+            _ => format!("{peer}"),
+        };
+        crate::logging::log(&format!("web：{who} 讀取 thinking {session}/{seq}"));
+    }
+    ok(&json!({
+        "session": session, "seq": seq, "agent": ev.agent, "text": t["text"], "summarized": t["summarized"],
+        "messageId": t["messageId"], "model": t["model"],
+    }))
+}

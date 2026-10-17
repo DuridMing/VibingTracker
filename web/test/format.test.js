@@ -131,3 +131,16 @@ test("串流前綴（#669）：全部專案時每行先標專案色標；沒給 
   assert.ok(tagged.html.includes("alpha") && tagged.html.includes("var(--s3)"));
   assert.ok(tagged.html.includes('title="/home/u/alpha"'));
 });
+
+test("遠端未載入的思考：佔位帶字數，展開前的 detail 是提示；載入中與失敗各自顯示（#668）", () => {
+  const f = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 1240 });
+  assert.match(f.html, /1,240 字/);
+  assert.match(f.html, /點開載入/);
+  assert.equal(f.detail, "點一下載入思考內容");
+  assert.equal(formatRow({ ...base, type: "thinking", text: "", deferred: true, loading: true }).detail, "載入中…");
+  assert.equal(formatRow({ ...base, type: "thinking", text: "", deferred: true, loadError: "不給看" }).detail, "不給看");
+  // 載入後就是一般的思考列
+  const loaded = formatRow({ ...base, type: "thinking", text: "一\n二", deferred: false });
+  assert.doesNotMatch(loaded.html, /點開載入/);
+  assert.equal(loaded.detail, "一\n二");
+});
