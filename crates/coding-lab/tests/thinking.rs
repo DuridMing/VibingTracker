@@ -357,3 +357,68 @@ async fn rest_events_to_remote_are_deferred_like_ws() {
     let (_, body) = get(s.addr, "/api/sessions/s1/events?limit=10").await;
     assert_full(&thinking_rows(&body), "REST events 本機");
 }
+
+/// #720：遠端的 WS、REST events、thinking API 都不能露出 clk_ 金鑰的 secret；本機照常。
+#[tokio::test]
+async fn remote_copies_mask_clk_keys_but_local_keeps_them() {
+    let key = "clk_HWYrRkbl_ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
+    let secret = "ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
+    let evs = vec![
+        ev(
+            "s1",
+            1,
+            "assistant.thinking",
+            Some(1),
+            json!({"text": format!("要用 {key} 登入"), "summarized": false, "messageId": "m1", "model": "claude-opus-5-5"}),
+        ),
+        ev(
+            "s1",
+            2,
+            "assistant.text",
+            Some(2),
+            json!({"text": format!("金鑰：{key}"), "messageId": "m1", "model": "claude-opus-5-5"}),
+        ),
+        ev(
+            "s1",
+            3,
+            "tool.called",
+            Some(3),
+            json!({"toolUseId": "t1", "tool": "Bash", "input": {"command": format!("curl -H 'Authorization: Bearer {key}' x")}, "sensitive": false, "danger": null}),
+        ),
+    ];
+    for remote in [true, false] {
+        let home = tmp("keys");
+        let mut store = Store::open(&home).unwrap();
+        for e in &evs {
+            store.append(e.clone());
+        }
+        store.flush().unwrap();
+        let state = WebState::new(Some(Arc::new(Mutex::new(store))), None, 8);
+        state.set_remote_thinking(RemoteThinking::Show);
+        state.set_force_remote(remote);
+        state.apply(&evs);
+        state.flush(5_000);
+        let (addr, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+            .await
+            .unwrap();
+        let (_w, _, snap) = open(addr).await;
+        let (_, rest) = get(addr, "/api/sessions/s1/events?limit=10").await;
+        let (_, think) = get(addr, "/api/sessions/s1/thinking/1").await;
+        for (what, body) in [
+            ("snapshot", &snap),
+            ("REST events", &rest),
+            ("thinking API", &think),
+        ] {
+            let text = body.to_string();
+            if remote {
+                assert!(!text.contains(secret), "遠端 {what} 不能有 secret：{text}");
+                assert!(
+                    text.contains("clk_HWYrRkbl_…"),
+                    "遠端 {what} 要留 id：{text}"
+                );
+            } else {
+                assert!(text.contains(key), "本機 {what} 完整：{text}");
+            }
+        }
+    }
+}

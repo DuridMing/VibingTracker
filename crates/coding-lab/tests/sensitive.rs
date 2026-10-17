@@ -1,6 +1,6 @@
 //! 敏感輸出（#654）：每條規則都有命中與不命中的案例。
 
-use coding_lab::sensitive::{is_sensitive, redact_remote};
+use coding_lab::sensitive::{is_sensitive, redact_keys, redact_remote};
 use serde_json::{Value, json};
 
 fn read(path: &str) -> bool {
@@ -137,4 +137,56 @@ fn redact_remote_blanks_sensitive_results_anywhere_in_a_frame() {
     );
     assert_eq!(out(&frame["stream"][0]), (json!(""), json!(true)));
     assert_eq!(out(&frame["nested"]["events"][0]), (json!(""), json!(true)));
+}
+
+/// #720：遠端送出的副本裡，這個系統自己發的金鑰（`clk_<8 碼>_<43 碼>`）不論出現在哪個字串欄位都只留 id。
+#[test]
+fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
+    let k1 = "clk_HWYrRkbl_ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
+    let k2 = "clk_xka2cp5X_BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD";
+    let mut v = json!({
+        "events": [
+            {"type": "assistant.text", "payload": {"text": format!("金鑰是 {k1}，另一把 {k2}。")}},
+            {"type": "tool.called", "payload": {"tool": "Bash", "input": {"command": format!("curl -H 'Authorization: Bearer {k1}' http://x")}}},
+            {"type": "tool.result", "payload": {"output": format!("{{\"token\":\"{k2}\"}}"), "sensitive": false}},
+            {"type": "prompt.submitted", "payload": {"text": format!("用 {k1} 登入")}},
+        ],
+        "rows": {"sessions": [{"id": "s", "doing": format!("正在貼 {k1}")}],
+                 "agents": [{"id": "a", "current": k2}]},
+        // 形狀不對的不動：id 不是 8 碼、secret 太短、不是 clk_ 開頭
+        "keep": ["clk_abc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "clk_abcdefgh_short", "xlk_abcdefgh_ffffffffffffffffffffffffffffffffffffffffffff"]
+    });
+    redact_keys(&mut v);
+    let text = v.to_string();
+    assert!(
+        !text.contains("ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD"),
+        "{text}"
+    );
+    assert_eq!(
+        v["events"][0]["payload"]["text"],
+        "金鑰是 clk_HWYrRkbl_…，另一把 clk_xka2cp5X_…。"
+    );
+    assert_eq!(
+        v["events"][1]["payload"]["input"]["command"],
+        "curl -H 'Authorization: Bearer clk_HWYrRkbl_…' http://x"
+    );
+    assert_eq!(v["rows"]["agents"][0]["current"], "clk_xka2cp5X_…");
+    assert_eq!(v["rows"]["sessions"][0]["doing"], "正在貼 clk_HWYrRkbl_…");
+    assert_eq!(
+        v["keep"][0],
+        "clk_abc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    );
+    assert_eq!(v["keep"][1], "clk_abcdefgh_short");
+    assert_eq!(
+        v["keep"][2],
+        "xlk_abcdefgh_ffffffffffffffffffffffffffffffffffffffffffff"
+    );
+    // 已經遮過的再遮一次不變
+    let again = v.clone();
+    redact_keys(&mut v);
+    assert_eq!(v, again);
 }

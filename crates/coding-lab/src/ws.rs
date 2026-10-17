@@ -545,6 +545,7 @@ async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
     let text = if conn.remote {
         let mut v = v.clone();
         crate::sensitive::redact_remote(&mut v);
+        crate::sensitive::redact_keys(&mut v);
         if conn.thinking != RemoteThinking::Show {
             defer_thinking(&mut v);
         }
@@ -563,6 +564,7 @@ impl WebState {
             return;
         }
         crate::sensitive::redact_remote(body);
+        crate::sensitive::redact_keys(body);
         if self.remote_thinking() != RemoteThinking::Show {
             defer_thinking(body);
         }

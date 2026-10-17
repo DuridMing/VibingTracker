@@ -1250,8 +1250,13 @@ pub async fn thinking(
         };
         crate::logging::log(&format!("web：{who} 讀取 thinking {session}/{seq}"));
     }
-    ok(&json!({
+    let mut body = json!({
         "session": session, "seq": seq, "agent": ev.agent, "text": t["text"], "summarized": t["summarized"],
         "messageId": t["messageId"], "model": t["model"],
-    }))
+    });
+    if remote {
+        // 全文裡的 clk_ 金鑰也要遮（#720）；這個回應不是 Event，不會被 defer_thinking 動到
+        crate::sensitive::redact_keys(&mut body);
+    }
+    ok(&body)
 }
