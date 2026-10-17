@@ -6,6 +6,10 @@
 //!
 //! 閒置結束時（#685）先 [`HookServer::set_closing`]：`ensure` 轉送的 SessionStart 改回 503，ensure 會等埠放掉後
 //! 拉起新的 collector 再送一次；接著 [`HookServer::close`] 放掉埠，之後才停 tail、flush。
+//!
+//! `POST /stop`（#700）：`coding-lab stop` 用它請 collector 走同一條正常結束路徑。背景 collector 沒有 console
+//! （Windows 更沒人能按 Ctrl-C），這是三平台都通的停法。和 hook 一樣只綁 loopback、不驗金鑰：能連到這個埠的
+//! 程序本來就能殺掉 collector。
 
 use std::io;
 use std::net::SocketAddr;
@@ -18,13 +22,15 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::hook::HookInput;
 use crate::merge::Input;
 
 pub const HOOK_PATH: &str = "/hook";
+/// `coding-lab stop` 打的路徑（#700）
+pub const STOP_PATH: &str = "/stop";
 /// `ensure` 轉送時帶的標頭（值是 `ensure`）
 pub const VIA_HEADER: &str = "x-coding-lab-via";
 /// 放掉埠時最多等進行中的請求多久
@@ -33,6 +39,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 struct HookState {
     tx: mpsc::Sender<Input>,
     closing: Arc<AtomicBool>,
+    /// `POST /stop` 來過（permit 會留著，主迴圈晚一點等也等得到）
+    stop: Arc<Notify>,
     /// merge 的 channel 滿了而丟掉的 hook 數（之後給 /healthz）
     dropped: AtomicU64,
 }
@@ -41,6 +49,7 @@ struct HookState {
 pub struct HookServer {
     pub addr: SocketAddr,
     closing: Arc<AtomicBool>,
+    stop: Arc<Notify>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -49,6 +58,11 @@ impl HookServer {
     /// 決定要結束（或取消結束）：結束中 ensure 轉送的 hook 回 503，其他 hook 照收。
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    /// 收到 `POST /stop` 時完成（#700）；主迴圈拿它放進 select，和閒置結束、Ctrl-C 走同一條路。
+    pub fn stop_requested(&self) -> Arc<Notify> {
+        self.stop.clone()
     }
 
     /// 不再接新連線並放掉埠；進行中的請求最多等 [`CLOSE_GRACE`]。丟掉 `HookServer` 不會關閉。
@@ -77,7 +91,8 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     let closing = Arc::new(AtomicBool::new(false));
-    let app = router_with(tx, closing.clone());
+    let stop_flag = Arc::new(Notify::new());
+    let app = router_with(tx, closing.clone(), stop_flag.clone());
     let (shutdown, stop) = oneshot::channel::<()>();
     let stop = async move {
         if stop.await.is_err() {
@@ -95,24 +110,38 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     Ok(HookServer {
         addr: local,
         closing,
+        stop: stop_flag,
         shutdown: Some(shutdown),
         task,
     })
 }
 
 pub fn router(tx: mpsc::Sender<Input>) -> Router {
-    router_with(tx, Arc::new(AtomicBool::new(false)))
+    router_with(
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(Notify::new()),
+    )
 }
 
-fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>) -> Router {
+fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>, stop: Arc<Notify>) -> Router {
     let state = Arc::new(HookState {
         tx,
         closing,
+        stop,
         dropped: AtomicU64::new(0),
     });
     Router::new()
         .route(HOOK_PATH, post(handle))
+        .route(STOP_PATH, post(handle_stop))
         .with_state(state)
+}
+
+/// `POST /stop`：記下要結束，立刻回 200；實際結束由主迴圈做（它要先放埠、停 tail、flush）。
+async fn handle_stop(State(state): State<Arc<HookState>>) -> StatusCode {
+    crate::logging::log("收到 stop");
+    state.stop.notify_one();
+    StatusCode::OK
 }
 
 async fn handle(

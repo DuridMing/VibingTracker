@@ -220,6 +220,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut closing_since: Option<Instant> = None;
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let stop = hooks.stop_requested();
 
     let sink = |events: Vec<Event>| {
         if events.is_empty() {
@@ -313,6 +314,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             }
             _ = &mut shutdown => {
                 log("收到結束訊號");
+                break;
+            }
+            // `coding-lab stop`（#700）：和閒置結束、Ctrl-C 同一條路——先放埠、停 tail、flush、刪 collector.json
+            _ = stop.notified() => {
+                log("stop：結束");
                 break;
             }
         }

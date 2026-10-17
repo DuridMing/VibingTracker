@@ -1008,3 +1008,44 @@ fn broken_transcript_still_shows_tool_events() {
         types().iter().any(|v| v["type"] == "transcript.recovered")
     });
 }
+
+/// `coding-lab stop`（#700）：背景 collector 沒有 console、按不到 Ctrl-C，要有一條三平台都通的正常結束路徑——
+/// 放掉 hook 埠、flush store、刪 collector.json、程序 exit 0；不是 pkill／taskkill 那種硬殺。
+#[test]
+fn stop_subcommand_shuts_the_collector_down_cleanly() {
+    let e = env(0);
+    let mut s = start_serve(&e);
+    let start = json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t1.jsonl"), "cwd": "/p"});
+    assert!(http(e.hook, "POST", "/hook", &start.to_string()).starts_with("HTTP/1.1 200"));
+
+    let out = cmd(&e, &["stop"]).output().unwrap();
+    assert!(out.status.success(), "stop 要 exit 0");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        if let Some(st) = s.0.try_wait().unwrap() {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "stop 之後 collector 要自己結束");
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    assert!(status.success(), "正常結束，不是被殺");
+    assert!(collector(&e).is_none(), "結束時移除 collector.json");
+    assert!(
+        TcpStream::connect(("127.0.0.1", e.hook)).is_err(),
+        "stop 回來時 hook 埠已放掉"
+    );
+    // 結束前有 flush：剛送的 SessionStart 在 store 裡
+    let text = std::fs::read_to_string(e.home.join("events/s1.jsonl")).unwrap_or_default();
+    assert!(text.contains("session.started"), "{text}");
+}
+
+/// collector 沒在跑時 `stop` 也是 exit 0，只在 stderr 說明（手冊裡的更新與卸載步驟可以無條件先跑它）。
+#[test]
+fn stop_without_a_collector_exits_zero() {
+    let e = env(0);
+    let out = cmd(&e, &["stop"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("沒有在跑"));
+}

@@ -103,7 +103,7 @@ wrapper 找不到二進位時，會在背景下載對應平台的壓縮檔，sha
 
 平常不會遇到：新 session 的 `SessionStart` 會自動拉起 collector，collector 也要等**所有 session 都結束**、再閒置 10 分鐘才會自己退出。會看到提示的情況：
 
-- collector 當掉，或被手動停掉：開一個新 session 就會重新拉起（`ensure`）。也可以直接執行 `coding-lab serve`（前景執行，關掉終端機就停）。
+- collector 當掉，或被手動停掉（`coding-lab stop`）：開一個新 session 就會重新拉起（`ensure`）。也可以直接執行 `coding-lab serve`（前景執行，關掉終端機就停）。
 - session 沒有送出 `SessionEnd` 就消失（例如終端機被直接關掉），而且之後 24 小時都沒有任何 hook：collector 會當作這些 session 已經不在了而退出。
 - 找不到 collector 二進位：`SessionStart` 只會在 stderr 印出安裝方式，這個 session 就不追蹤。
 
@@ -190,9 +190,10 @@ claude plugin uninstall coding-lab@coding-lab
 claude plugin marketplace remove coding-lab
 ```
 
-collector 在所有 session 結束、閒置 10 分鐘後會自己退出；要立刻停就結束 `coding-lab serve` 這個程序。之後再刪掉二進位與資料：
+然後請 collector 結束（寫完紀錄才回來；沒在跑也不會報錯），再刪掉二進位與資料：
 
 ```bash
+coding-lab stop
 rm -rf ~/.coding-lab      # 二進位、網頁、設定、所有追蹤紀錄（JSONL 與 SQLite）
 ```
 

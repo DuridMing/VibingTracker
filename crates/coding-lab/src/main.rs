@@ -28,6 +28,8 @@ enum Command {
     Prune,
     /// 查詢執行中 collector 的健康狀態
     Healthz,
+    /// 請執行中的 collector 正常結束（放掉埠、寫完紀錄）；沒在跑也 exit 0
+    Stop,
     /// 安裝或移除常駐服務
     Service,
 }
@@ -82,6 +84,7 @@ fn main() -> ExitCode {
             }
         },
         Command::Healthz => healthz(),
+        Command::Stop => stop(),
         Command::Prune => prune(),
         Command::Service => {
             eprintln!("coding-lab：此子命令尚未實作");
@@ -298,6 +301,67 @@ fn prune() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 放掉埠、刪掉 collector.json 才回。
+/// 背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），這是三平台都通、不丟資料的停法；
+/// 沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
+fn stop() -> ExitCode {
+    const STOP_WAIT: Duration = Duration::from_secs(15);
+    let cfg = match Config::load(&Overrides::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let info = cfg.home.join("collector.json");
+    let hook = std::fs::read_to_string(&info)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            v["hook"]
+                .as_str()
+                .and_then(|w| w.parse::<SocketAddr>().ok())
+        })
+        .unwrap_or(cfg.hook_bind);
+    let Ok(mut s) = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT) else {
+        eprintln!("coding-lab：collector 沒有在跑（{hook}）");
+        return ExitCode::SUCCESS;
+    };
+    let _ = s.set_read_timeout(Some(FORWARD_TIMEOUT));
+    let _ = s.set_write_timeout(Some(FORWARD_TIMEOUT));
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {hook}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH
+    );
+    let mut resp = [0u8; 64];
+    let accepted = s.write_all(req.as_bytes()).is_ok()
+        && matches!(s.read(&mut resp), Ok(n) if resp[..n].starts_with(b"HTTP/1.1 200"));
+    drop(s);
+    if !accepted {
+        eprintln!(
+            "coding-lab：collector 沒有接受 stop（{hook}）；請直接結束 coding-lab serve 這個程序"
+        );
+        return ExitCode::FAILURE;
+    }
+    // 埠放掉之後它還在停 tail、flush：等 collector.json 被刪掉（它是最後一步）
+    let deadline = Instant::now() + STOP_WAIT;
+    while Instant::now() < deadline {
+        let port_free = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT).is_err();
+        let info_gone = !info.exists();
+        if port_free && info_gone {
+            eprintln!("coding-lab：collector 已結束");
+            return ExitCode::SUCCESS;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "coding-lab：collector 收到 stop 但 {} 秒內還沒結束；看 {}",
+        STOP_WAIT.as_secs(),
+        cfg.home.join("collector.log").display()
+    );
+    ExitCode::FAILURE
 }
 
 fn healthz() -> ExitCode {

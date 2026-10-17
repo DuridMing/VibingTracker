@@ -125,14 +125,13 @@ git pull
 cargo build --release -p coding-lab
 ```
 
-替換前要先讓 collector 停下來（Windows 不能覆蓋執行中的 .exe）。等所有 session 結束 10 分鐘它會自己退出，或直接結束它：
+替換前要先讓 collector 停下來（Windows 不能覆蓋執行中的 .exe）。請它正常結束（寫完紀錄、放掉埠才回來；沒在跑也不會報錯）：
 
 ```bash
-pkill coding-lab                               # Linux、macOS
-taskkill /IM coding-lab.exe /F                 # Windows（PowerShell 或命令提示字元）
+~/.coding-lab/bin/coding-lab stop              # Windows 在 Git Bash 用同一行
 ```
 
-直接結束不會弄壞紀錄，下一個 session 開始時會重新拉起，中間漏掉的部分會從 transcript 補回來。接著：
+它不理會時（`stop` 會印出說明）才直接結束程序：`pkill coding-lab`（Linux、macOS）或 `taskkill /IM coding-lab.exe /F`（Windows）。直接結束不會弄壞紀錄，下一個 session 開始時會重新拉起，中間漏掉的部分會從 transcript 補回來。接著：
 
 ```bash
 cp target/release/coding-lab ~/.coding-lab/bin/      # Windows：coding-lab.exe
@@ -210,9 +209,10 @@ claude plugin uninstall coding-lab@coding-lab
 claude plugin marketplace remove coding-lab
 ```
 
-collector 會在所有 session 結束、閒置 10 分鐘後自己退出（或用上面「更新」裡的指令結束它）。最後刪掉執行檔、網頁、設定與所有追蹤紀錄：
+接著結束 collector，再刪掉執行檔、網頁、設定與所有追蹤紀錄：
 
 ```bash
+~/.coding-lab/bin/coding-lab stop
 rm -rf ~/.coding-lab
 ```
 
