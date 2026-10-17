@@ -1195,3 +1195,56 @@ fn session_abandoned_before_restart_is_ended_later() {
         1
     );
 }
+
+/// 閒置 24 小時被補 abandoned 的 session，終端機其實還開著、使用者繼續打字（不會有 SessionStart）：
+/// 要重新打開、回到 run（#679 驗證缺口）。重啟後補的與記憶體內補的都一樣。
+#[test]
+fn abandoned_session_reopens_when_used_again() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.tick(1_000 + DAY);
+    assert_eq!(r.statuses(), ["ended"]);
+    r.feed(prompt("continue", 2_000 + DAY));
+    assert_eq!(r.last_status(), "run");
+
+    let mut r = Run::new();
+    r.feed(start("startup", 500)).feed(prompt("hi", 1_000));
+    r.tick(1_000 + DAY);
+    assert_eq!(r.last_status(), "ended");
+    r.feed(prompt("continue", 2_000 + DAY));
+    assert_eq!(r.last_status(), "run");
+}
+
+/// 補 abandoned 的結束時間記成最後一次活動，不是發現的那一刻（升級後第一次重啟會一次補很多舊 session）。
+#[test]
+fn abandoned_end_is_stamped_at_the_last_activity() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.tick(10 * DAY);
+    let mut r2 = Run::new();
+    r2.feed(start("startup", 500)).feed(prompt("hi", 2_000));
+    r2.tick(10 * DAY);
+    for (r, last) in [(&r, 1_000), (&r2, 2_000)] {
+        let ended: Vec<&Event> = r
+            .evs
+            .iter()
+            .filter(|e| e.type_name() == "session.ended")
+            .collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].ts_seen, last);
+    }
+}
+
+/// 只有 main 的動作才重新打開已結束的 session：SessionEnd（例如 /clear）之後才到的 subagent hook
+/// 不代表使用者繼續使用，打開了就再也不會有 SessionEnd，只能等 24 小時補 abandoned。
+#[test]
+fn subagent_hook_after_end_does_not_reopen() {
+    let mut r = Run::new();
+    r.feed(start("startup", 500))
+        .feed(prompt("hi", 1_000))
+        .feed(end(2_000))
+        .feed(pre_agent("tx", "ls", "x", 2_500));
+    assert_eq!(r.last_status(), "ended");
+}

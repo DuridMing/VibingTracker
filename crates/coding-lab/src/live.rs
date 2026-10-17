@@ -561,6 +561,10 @@ impl Live {
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default();
                 s.status_since = p.since;
+                // 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）
+                if s.status != "ended" {
+                    s.ended_at = None;
+                }
             }
             Payload::PromptSubmitted(p) => {
                 let text = clip(&p.text);
@@ -741,13 +745,24 @@ impl Live {
     /// 開始時間與累計值以 store 為準；模型與分支 live 已經有的保留（重放看得到 checkout，store 不追）。
     /// live 還沒有這個 session 時新建一列，`ts` 是狀態的起點。
     pub fn seed(&mut self, r: &SessionRow, ts: u64) {
+        // 新建的列照 store 的狀態與結束時間：merge 重啟時也種回同樣的狀態（D3，#679），
+        // 不然重建窗口外的 session 回來時 live 顯示 run、merge 與 store 是 ended
         let s = self
             .sessions
             .entry(r.id.clone())
             .or_insert_with(|| SessionLive {
                 host: r.host.clone(),
-                status: "run".into(),
-                status_since: ts,
+                status: if r.status.is_empty() {
+                    "run".into()
+                } else {
+                    r.status.clone()
+                },
+                status_since: if r.status.is_empty() {
+                    ts
+                } else {
+                    r.status_since
+                },
+                ended_at: r.ended_at,
                 ..SessionLive::default()
             });
         if !r.cwd.is_empty() {
