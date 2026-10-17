@@ -10,7 +10,8 @@ import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, ackAllTargets, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel, agentWho } from "./agents.js";
-import { createSessionPane, nowOf, switchTab, sessionTitle, snapshotLoad } from "./session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle, snapshotLoad, isSessionTab } from "./session-pane.js";
+import { REPLAY_TAB, rangeFor, replayUrl, createReplay } from "./replay.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
@@ -127,6 +128,7 @@ function renderTabs() {
         h("span", { class: "dot" }),
         sessTag(s),
         h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"))),
+    h("button", { class: `stab rp${ui.tab === REPLAY_TAB ? " on" : ""}`, title: "選專案與時間範圍，回放所有 session（含已結束）合成的串流", onclick: () => selectTab(REPLAY_TAB) }, "⟲ 專案回放"),
   );
 }
 
@@ -634,7 +636,7 @@ function scheduleFiles(ms) {
 
 function currentBase() {
   if (left.base === "session") {
-    const id = left.baseSess ?? (ui.tab !== "all" ? ui.tab : projectSessions()[0]?.id);
+    const id = left.baseSess ?? (isSessionTab(ui.tab) ? ui.tab : projectSessions()[0]?.id);
     return id ? { kind: "session", id } : null;
   }
   if (left.base === "commit") return { kind: "commit", hash: left.hash, cwd: left.hashCwd ?? undefined };
@@ -926,7 +928,7 @@ const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失
 
 // replay：session 已不在 live（#653），從最新的往前讀（beforePos 不帶）
 function paneMore(replay = false) {
-  if (paneMoreReq || ui.tab === "all") return;
+  if (paneMoreReq || !isSessionTab(ui.tab)) return;
   const beforePos = replay ? null : pane.stream.minPos().get(pane.session);
   if (!replay && !(beforePos > 1)) return;
   paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
@@ -952,9 +954,11 @@ function lane(a) {
 }
 
 function renderPane() {
-  const on = ui.tab !== "all";
-  $("#allblk").hidden = on;
+  const on = isSessionTab(ui.tab);
+  $("#allblk").hidden = ui.tab !== "all";
   $("#spane").hidden = !on;
+  $("#replayblk").hidden = ui.tab !== REPLAY_TAB;
+  if (ui.tab === REPLAY_TAB) renderReplay();
   if (!on) return;
   const id = pane.session;
   // 已從 live 移除的 session（回放）只有 /api/sessions 補進來的列
@@ -1263,6 +1267,101 @@ function benchFrame(m) {
   return ops;
 }
 
+// ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
+const rp = createReplay();
+let rpReq = 0; // 換範圍後，舊的回應丟掉
+const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, onNeedMore: () => replayMore(), onFollow: () => {} });
+const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+
+function fillReplayProjects() {
+  const roots = projectRoots(allSessions());
+  const sel = $("#rpProj");
+  if (!changed("rpProj", roots.map((r) => r.cwd).join("|"))) return;
+  const keep = sel.value || rp.cwd || left.project;
+  sel.replaceChildren(...roots.map((r) => h("option", { value: r.cwd }, r.cwd)));
+  if (roots.some((r) => r.cwd === keep)) sel.value = keep;
+}
+
+function startReplay() {
+  const cwd = $("#rpProj").value;
+  if (!cwd) return;
+  const choice = $("#rpRange").value;
+  let { from, to } = rangeFor(choice, Date.now(), -new Date().getTimezoneOffset());
+  if (choice === "custom") {
+    // datetime-local 沒有時區，Date.parse 當成本地時間
+    from = Date.parse($("#rpFrom").value);
+    to = Date.parse($("#rpTo").value);
+    if (!(from <= to)) {
+      rp.error = "自訂範圍要填開始與結束，而且開始不能晚於結束";
+      render(true);
+      return;
+    }
+  }
+  rpReq++;
+  rp.reset({ cwd, from, to });
+  rpView.reset();
+  rpView.setHasMore(false);
+  replayMore();
+}
+
+async function replayMore() {
+  if (rp.loading || rp.done || !rp.cwd) return;
+  rp.loading = true;
+  const req = rpReq;
+  render(true);
+  try {
+    const res = await apiFetch(replayUrl({ cwd: rp.cwd, from: rp.from, to: rp.to, before: rp.next }));
+    const body = await res.json();
+    if (req !== rpReq) return;
+    if (!res.ok) {
+      rp.loading = false;
+      rp.error = body?.error ?? `讀取失敗（HTTP ${res.status}）`;
+    } else {
+      rpView.prepended(rp.load(body));
+      rpView.setHasMore(!rp.done);
+    }
+  } catch {
+    if (req !== rpReq) return;
+    rp.loading = false;
+    rp.error = "讀取失敗（collector 沒有回應，或版本太舊不支援專案回放）";
+  }
+  render(true);
+}
+
+function renderReplay() {
+  fillReplayProjects();
+  $("#rpCustom").hidden = $("#rpRange").value !== "custom";
+  const ids = rp.sessions();
+  const n = rp.stream.rows.length;
+  const info = rp.error ?? (rp.cwd ? `${fmtTime(rp.from)} – ${fmtTime(rp.to)} · ${ids.length} 個 session · ${n} 行${rp.loading ? " · 載入中…" : rp.done ? (n ? " · 已到範圍開頭" : " · 這段時間沒有動作") : " · 捲到頂按「↑ 載入更多」看更早的"}` : "");
+  if (changed("rpInfo", info)) $("#rpInfo").textContent = info;
+  if (changed("rpSess", ids.map((id) => `${id}:${rp.stream.hiddenSessions.has(id)}`).join("|"))) {
+    $("#rpSess").replaceChildren(
+      ...(ids.length
+        ? ids.map((id) => {
+            const off = rp.stream.hiddenSessions.has(id);
+            return h("button", { class: `fchip${off ? " off" : ""}`, title: `${id}\n點一下${off ? "顯示" : "隱藏"}這個 session`, "aria-pressed": String(!off), onclick: () => { rp.stream.setSessionHidden(id, !off); rpView.filterChanged(); render(true); } },
+              h("i", { style: `background:${sessionColor(id)}` }), h("span", { class: "mono" }, shortId(id)));
+          })
+        : [h("span", { class: "none" }, "無")]),
+    );
+  }
+  if (changed("rpKind", [...rp.stream.hiddenKinds].sort().join("|"))) {
+    $("#rpKind").replaceChildren(
+      ...KIND_LABEL.map(([k, label]) => {
+        const off = rp.stream.hiddenKinds.has(k);
+        return h("button", { class: `fchip${off ? " off" : ""}`, "aria-pressed": String(!off), onclick: () => { rp.stream.setKindHidden(k, !off); rpView.filterChanged(); render(true); } }, label);
+      }),
+    );
+  }
+}
+$("#rpGo").addEventListener("click", startReplay);
+$("#rpRange").addEventListener("change", () => {
+  if ($("#rpRange").value !== "custom") startReplay();
+  else render(true);
+});
+$("#rpProj").addEventListener("change", startReplay);
+
 // ---------- 互動 ----------
 // ▶ 回放（#690）：已經開著就清空後從 JSONL 由最新往前讀；否則開 tab，等 session 頻道的 snapshot 進來時改走回放
 function replaySession(id) {
@@ -1284,7 +1383,12 @@ function selectTab(id) {
   if (id === ui.tab) return;
   switchTab(client, ui.tab, id);
   ui.tab = id;
-  if (id !== "all") {
+  // 第一次打開專案回放：用目前的專案、最近 3 小時直接載入
+  if (id === REPLAY_TAB && !rp.cwd) {
+    fillReplayProjects();
+    startReplay();
+  }
+  if (isSessionTab(id)) {
     // 先清空，等 session 頻道的 snapshot 進來再畫（subscribe 一定會回 snapshot，contracts §6）
     pane.open(id);
     paneMoreReq = null;
@@ -1321,7 +1425,7 @@ const client = createClient({
     snapshot: (m) => {
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
-      if (ui.tab !== "all" && m.ch === `session:${pane.session}`) {
+      if (isSessionTab(ui.tab) && m.ch === `session:${pane.session}`) {
         const r = snapshotLoad(pane.session, m, { replay: ui.replayNext === pane.session });
         ui.replayNext = null;
         pane.load(r.load);
@@ -1345,7 +1449,7 @@ const client = createClient({
       applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
       // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
-      if (ui.tab !== "all" && m.ch === `session:${pane.session}`) paneView.update(pane.apply(m.events));
+      if (isSessionTab(ui.tab) && m.ch === `session:${pane.session}`) paneView.update(pane.apply(m.events));
       // session:<id> 頻道的 Event 與 `*` 重複，只有 `*` 進合流串流
       if (m.ch === "*") {
         if (bench.on) benchFrame(m);

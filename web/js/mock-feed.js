@@ -351,11 +351,36 @@ function createWorld(n, { bigtree = false } = {}) {
     return { status: 200, body: { root: cwd === ROOT || base === "main" ? ROOT : cwd, base, baseRef: base === "main" ? "main" : base.startsWith("commit:") ? base.slice(7).padEnd(40, "0") : null, tree: [...tree].sort(), treeTruncated: false, changes, worktrees: [...new Map(sessions.map((s) => [s.cwd, { path: s.cwd, branch: s.branch }])).values()] } };
   }
 
+  // 全專案回放（#702）：cwd 底下的 session、範圍內有 pos 的 Event，依 (ts_seen, session, pos) 由新到舊一頁
+  function projectEvents(q) {
+    const cwd = (q.get("cwd") ?? "").replace(/\/$/, "");
+    if (!cwd) return err(400, "缺少 cwd（專案根目錄）");
+    const from = Number(q.get("from") ?? 0);
+    const to = Number(q.get("to") ?? Number.MAX_SAFE_INTEGER);
+    const limit = Math.min(500, Number(q.get("limit") ?? 200));
+    const [bts, bs, bpos] = (q.get("before") ?? "").split(",");
+    const under = new Set(sessions.filter((s) => s.cwd === cwd || s.cwd.startsWith(`${cwd}/`)).map((s) => s.id));
+    const key = (e) => [e.ts_seen, e.session, e.pos];
+    const older = (a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) || a[2] - b[2];
+    const win = glog
+      .filter((e) => e.pos != null && under.has(e.session) && e.ts_seen >= from && e.ts_seen <= to && (!bts || older(key(e), [Number(bts), bs, Number(bpos)]) < 0))
+      .sort((a, b) => older(key(b), key(a)))
+      .slice(0, limit);
+    const bySession = new Map();
+    for (const e of [...win].reverse()) {
+      if (!bySession.has(e.session)) bySession.set(e.session, []);
+      bySession.get(e.session).push(...expand(e));
+    }
+    const last = win.length === limit ? win[win.length - 1] : null;
+    return { status: 200, body: { cwd, from, to, events: [...bySession.values()].flat(), next: last && { ts: last.ts_seen, session: last.session, pos: last.pos } } };
+  }
+
   return {
     // GET /api/*：{ status, body }
     api(url) {
       const u = new URL(url, "http://mock");
       if (u.pathname === "/api/files") return files(u.searchParams);
+      if (u.pathname === "/api/projects/events") return projectEvents(u.searchParams);
       if (u.pathname === "/api/sessions") return { status: 200, body: { sessions: [...sessions.map((s) => ({ ...s })), ...ended.map((s) => ({ ...s, model: s.model }))] } };
       return err(404, "not found");
     },

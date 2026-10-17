@@ -77,6 +77,13 @@ test("tab 切換：全部 → A 訂 A；A → B 先退 A 再訂 B；B → 全部
   switchTab(client, "B", "all");
   assert.deepEqual(calls, ["+session:A", "-session:A", "+session:B", "-session:B"]);
   assert.ok(!calls.some((c) => c.includes("*")));
+  // 全專案回放的分頁（#702）不是 session：不訂閱任何頻道，離開時也不退訂
+  calls.length = 0;
+  switchTab(client, "A", "replay");
+  switchTab(client, "replay", "B");
+  switchTab(client, "B", "replay");
+  switchTab(client, "replay", "all");
+  assert.deepEqual(calls, ["-session:A", "+session:B", "-session:B"]);
 });
 
 test("open 換到另一個 session：清空終端機、git 列、思考條、改動，之後只收新 session 的 Event", () => {

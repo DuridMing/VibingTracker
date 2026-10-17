@@ -332,6 +332,7 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
         "/api/sessions",
         "/api/sessions/s1/events",
         "/api/files?cwd=%2Fp",
+        "/api/projects/events?cwd=%2Fp",
     ] {
         let (code, _) = get_with(addr, path, &me, Some("http://evil.example")).await;
         assert_eq!(code, 403, "{path}：別的網頁的 Origin");
@@ -342,6 +343,144 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
     assert_eq!(code, 200, "同源的前端可以");
     let (code, _) = get_with(addr, "/api/sessions", &me, None).await;
     assert_eq!(code, 200, "沒帶 Origin 的程式（curl）可以");
+}
+
+// ── /api/projects/events（全專案回放，#702）
+
+/// 專案 /p：s1 在根目錄、s2 在 worktree；s3 是別的專案。時間交錯，s1 有一張完整的工具卡片。
+fn project_events_fixture() -> Vec<Event> {
+    let mut evs = vec![
+        started("s1", 1, 1_000, "/p"),
+        started("s2", 1, 1_000, "/p/worktrees/feature/x"),
+        started("s3", 1, 1_000, "/other"),
+        ev(
+            "s1",
+            2,
+            "tool.called",
+            None,
+            1_001,
+            json!({"toolUseId": "t1", "tool": "Bash",
+            "input": {"command": "ls"}, "status": "running", "placement": "staged", "danger": null}),
+        ),
+        ev(
+            "s1",
+            3,
+            "tool.placed",
+            Some(1),
+            1_002,
+            json!({"toolUseId": "t1", "placement": "stream"}),
+        ),
+        ev(
+            "s1",
+            4,
+            "tool.result",
+            None,
+            1_003,
+            json!({"toolUseId": "t1", "ok": true,
+            "exitCode": 0, "output": "a\n", "truncated": false}),
+        ),
+    ];
+    for i in 0..6u64 {
+        evs.push(text("s1", 5 + i, 2 + i, 1_010 + 2 * i));
+        evs.push(text("s2", 2 + i, 1 + i, 1_011 + 2 * i));
+        evs.push(text("s3", 2 + i, 1 + i, 1_011 + 2 * i));
+    }
+    evs
+}
+
+fn positions(body: &Value) -> Vec<(String, u64)> {
+    body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| !e["pos"].is_null())
+        .map(|e| {
+            (
+                e["session"].as_str().unwrap().to_string(),
+                e["pos"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn project_events_merge_the_projects_sessions_with_their_cards() {
+    let home = tmp("project-events");
+    let store = store_with(&home, &project_events_fixture());
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&limit=100").await;
+    assert_eq!(code, 200, "{body}");
+    let mut got = positions(&body);
+    got.sort();
+    let mut want: Vec<_> = (1..=7).map(|p| ("s1".to_string(), p)).collect();
+    want.extend((1..=6).map(|p| ("s2".to_string(), p)));
+    want.sort();
+    assert_eq!(got, want, "worktree 的 s2 算進來，別的專案的 s3 不算");
+    let kinds: Vec<_> = body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["payload"]["toolUseId"] == "t1")
+        .map(|e| e["type"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        kinds.contains(&"tool.called".into()) && kinds.contains(&"tool.result".into()),
+        "卡片的呼叫與結果一起帶回來：{kinds:?}"
+    );
+    assert!(body["next"].is_null(), "一頁就拿完時沒有 next");
+}
+
+#[tokio::test]
+async fn project_events_page_back_to_the_start_without_gaps() {
+    let home = tmp("project-pages");
+    let store = store_with(&home, &project_events_fixture());
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    let mut seen = Vec::new();
+    let mut path = "/api/projects/events?cwd=%2Fp&limit=4".to_string();
+    for _ in 0..20 {
+        let (code, body) = get(addr, &path).await;
+        assert_eq!(code, 200, "{body}");
+        seen.extend(positions(&body));
+        let next = &body["next"];
+        if next.is_null() {
+            break;
+        }
+        path = format!(
+            "/api/projects/events?cwd=%2Fp&limit=4&before={},{},{}",
+            next["ts"],
+            enc(next["session"].as_str().unwrap()),
+            next["pos"]
+        );
+    }
+    let total = seen.len();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), total, "分頁之間不重複");
+    assert_eq!(seen.len(), 13, "s1 的 7 個與 s2 的 6 個都拿到");
+}
+
+#[tokio::test]
+async fn project_events_respect_the_time_range_and_need_a_cwd() {
+    let home = tmp("project-range");
+    let store = store_with(&home, &project_events_fixture());
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    // s1 的 text 在 1010、1012…；s2 在 1011、1013…
+    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&from=1011&to=1013").await;
+    assert_eq!(code, 200, "{body}");
+    let mut got = positions(&body);
+    got.sort();
+    assert_eq!(
+        got,
+        vec![("s1".into(), 3), ("s2".into(), 1), ("s2".into(), 2)],
+        "兩端都包含"
+    );
+    let (code, _) = get(addr, "/api/projects/events").await;
+    assert_eq!(code, 400, "沒有 cwd");
+    let (code, _) = get(addr, "/api/projects/events?cwd=%2Fp&before=x").await;
+    assert_eq!(code, 400, "游標格式錯");
 }
 
 // ── /api/files

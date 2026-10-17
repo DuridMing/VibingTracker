@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::event::Payload;
 use crate::live::{clip, short_model};
+use crate::store::ProjectKey;
 use crate::store::{SessionRow, Store};
 use crate::ws::{MORE_LIMIT, WebState, more_events};
 
@@ -204,6 +205,68 @@ pub async fn events(
         }
         Err(e) => store_error(e),
     }
+}
+
+// ── /api/projects/events（全專案回放，#702）
+
+/// `before=<ts>,<session>,<pos>`：上一頁回應的 `next`。
+fn parse_project_key(s: &str) -> Option<ProjectKey> {
+    let mut it = s.splitn(3, ',');
+    let ts = it.next()?.parse().ok()?;
+    let session = it.next()?.to_string();
+    let pos = it.next()?.parse().ok()?;
+    (!session.is_empty()).then_some(ProjectKey { ts, session, pos })
+}
+
+pub async fn project_events(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    uri: Uri,
+) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd（專案根目錄）");
+    };
+    let num = |k: &str| q.get(k).map(|v| v.parse::<u64>());
+    let (from, to) = match (num("from"), num("to")) {
+        (Some(Err(_)), _) | (_, Some(Err(_))) => {
+            return error(StatusCode::BAD_REQUEST, "from、to 要是 epoch ms");
+        }
+        (f, t) => (
+            f.and_then(Result::ok).unwrap_or(0),
+            t.and_then(Result::ok).unwrap_or(u64::MAX),
+        ),
+    };
+    let before = match q.get("before").map(|b| parse_project_key(b)) {
+        Some(None) => {
+            return error(StatusCode::BAD_REQUEST, "before 要是 <ts>,<session>,<pos>");
+        }
+        b => b.flatten(),
+    };
+    let n = limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize);
+    let Some(store) = state.store().cloned() else {
+        return ok(&json!({ "cwd": cwd, "events": [], "next": null }));
+    };
+    let remote = crate::ws::is_remote(peer);
+    // SQLite 與讀 JSONL 都會阻塞，放到 blocking 執行緒
+    tokio::task::spawn_blocking(move || {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        match crate::ws::project_events(&store, &cwd, from, to, before.as_ref(), n) {
+            Ok((events, next)) => {
+                let next = next.map(|k| json!({ "ts": k.ts, "session": k.session, "pos": k.pos }));
+                let mut body =
+                    json!({ "cwd": cwd, "from": from, "to": to, "events": events, "next": next });
+                // 遠端連線剝除敏感輸出（#654，不變式 6）
+                if remote {
+                    crate::sensitive::redact_remote(&mut body);
+                }
+                ok(&body)
+            }
+            Err(e) => store_error(e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 // ── /api/files

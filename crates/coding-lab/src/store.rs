@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::event::{Event, Payload};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 /// 資料保留多久：最後活動早於這麼多天前的 session 由 [`Store::prune`] 清掉
 pub const RETENTION_DAYS: u64 = 30;
 
@@ -81,6 +81,14 @@ pub struct TailRow {
     pub file: String,
     pub path: Option<String>,
     pub line_no: u64,
+}
+
+/// 全專案回放（#702）的一個串流位置：跨 session 的順序鍵 `(ts_seen, session, pos)`（contracts §6），也當分頁游標。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectKey {
+    pub ts: u64,
+    pub session: String,
+    pub pos: u64,
 }
 
 /// [`Store::prune`] 清掉了什麼。
@@ -226,6 +234,11 @@ CREATE TABLE IF NOT EXISTS tails (
   line_no INTEGER NOT NULL,
   PRIMARY KEY (session, file)
 ) WITHOUT ROWID;
+";
+
+/// v4：全專案回放（#702）依跨 session 順序鍵 (ts_seen, session, pos) 分頁，只索引進串流的 Event。
+const EVENTS_BY_TS_V4: &str = "
+CREATE INDEX IF NOT EXISTS events_by_ts ON events (ts_seen, session, pos) WHERE pos IS NOT NULL;
 ";
 
 /// Event 帶 `line` 時更新那個檔的行號（同一個檔的行依序進來，直接覆寫；檔案被替換後行號變小也跟著變小）。
@@ -523,6 +536,51 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// 全專案回放（#702）：專案根 `root` 底下（含 worktree、子目錄）所有 session、ts_seen 在 [from, to] 的串流位置，
+    /// 比 `before` 舊的 `limit` 個，由新到舊。
+    pub fn project_window(
+        &self,
+        root: &str,
+        from: u64,
+        to: u64,
+        before: Option<&ProjectKey>,
+        limit: usize,
+    ) -> Result<Vec<ProjectKey>, StoreError> {
+        let root = root.trim_end_matches('/');
+        // cwd 等於 root，或以 root + '/' 開頭（用 substr 比，不用 LIKE，路徑裡的 % _ 不會被當萬用字元）
+        let (b_ts, b_session, b_pos) = match before {
+            Some(k) => (k.ts as i64, k.session.as_str(), k.pos as i64),
+            None => (i64::MAX, "", 0),
+        };
+        let mut stmt = self.db.prepare(
+            "SELECT e.ts_seen, e.session, e.pos FROM events e JOIN sessions s ON s.id = e.session
+             WHERE e.pos IS NOT NULL AND e.ts_seen BETWEEN ?2 AND ?3
+               AND (s.cwd = ?1 OR substr(s.cwd, 1, length(?1) + 1) = ?1 || '/')
+               AND (?4 = 1 OR (e.ts_seen, e.session, e.pos) < (?5, ?6, ?7))
+             ORDER BY e.ts_seen DESC, e.session DESC, e.pos DESC LIMIT ?8",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                root,
+                from.min(i64::MAX as u64) as i64,
+                to.min(i64::MAX as u64) as i64,
+                before.is_none(),
+                b_ts,
+                b_session,
+                b_pos,
+                limit as i64
+            ],
+            |r| {
+                Ok(ProjectKey {
+                    ts: r.get::<_, i64>(0)? as u64,
+                    session: r.get(1)?,
+                    pos: r.get::<_, i64>(2)? as u64,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// 某 session 在 seq 範圍（含兩端）內的所有 Event，依 seq 排序。
@@ -982,6 +1040,9 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         }
         if v == 2 {
             tx.execute_batch(TAILS_V3)?;
+        }
+        if v == 3 {
+            tx.execute_batch(EVENTS_BY_TS_V4)?;
         }
         v += 1;
         tx.execute(
