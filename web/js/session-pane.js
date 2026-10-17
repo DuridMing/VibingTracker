@@ -6,6 +6,16 @@ import { createStream } from "./stream.js";
 import { createChanges, countHunk } from "./changes.js";
 import { REPLAY_TAB } from "./replay.js";
 
+// 遠端連線只拿到佔位（#668）：思考條顯示字數，不假裝有內容；hide 模式與 0 字沒東西可載，文案和串流列一致（#724）
+export function thinkingText(payload, mode = null) {
+  if (!payload?.deferred) return payload?.text ?? "";
+  const n = payload.chars ?? null;
+  if (n === 0) return "（思考）";
+  if (mode === "hide") return `（思考 ${n ?? "?"} 字，這個 collector 不對遠端提供）`;
+  return `（思考 ${n ?? "?"} 字，遠端未載入；在串流裡點開那一行可載入）`;
+}
+
+// p.thinkingMode(session)：這個 session 那台 collector 對遠端的 thinking 模式，由 main.js 掛上（hub 時每台不同）
 export function createSessionPane(session = null) {
   const p = {
     session,
@@ -74,9 +84,7 @@ export function createSessionPane(session = null) {
         const id = e.payload?.toolUseId;
         if (id && e.payload?.status) status.set(id, e.payload.status);
       } else if (e.type === "assistant.thinking") {
-        // 遠端連線只拿到佔位（#668）：思考條顯示字數，不假裝有內容
-        const text = e.payload?.deferred ? `（思考 ${e.payload?.chars ?? "?"} 字，遠端未載入；在串流裡點開那一行可載入）` : e.payload?.text ?? "";
-        thinking = { text, agent: e.agent, summarized: !!e.payload?.summarized };
+        thinking = { text: thinkingText(e.payload, p.thinkingMode?.(p.session)), agent: e.agent, summarized: !!e.payload?.summarized };
       }
     }
     for (const [id, st] of status) if (!older || !toolStatus.has(id)) toolStatus.set(id, st);

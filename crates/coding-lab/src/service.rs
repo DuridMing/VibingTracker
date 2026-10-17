@@ -419,15 +419,72 @@ pub fn install(
     }
 }
 
-/// 子程序輸出轉成文字：合法 UTF-8 照用；不是（Windows 的 schtasks 用 OEM code page，例如 cp950）就 lossy，並回報 `true`
-pub fn decode_output(bytes: &[u8]) -> (String, bool) {
-    match std::str::from_utf8(bytes) {
-        Ok(t) => (t.trim().to_string(), false),
-        Err(_) => (String::from_utf8_lossy(bytes).trim().to_string(), true),
-    }
+/// Windows 的 OEM code page 編號 → WHATWG 編碼標籤（`encoding_rs` 認得的）；不認得回 None。
+pub fn code_page_label(cp: u32) -> Option<&'static str> {
+    Some(match cp {
+        65001 => "utf-8",
+        950 => "big5",
+        936 => "gbk",
+        932 => "shift_jis",
+        949 => "euc-kr",
+        874 => "windows-874",
+        1250 => "windows-1250",
+        1251 => "windows-1251",
+        1252 => "windows-1252",
+        1253 => "windows-1253",
+        1254 => "windows-1254",
+        1255 => "windows-1255",
+        1256 => "windows-1256",
+        1257 => "windows-1257",
+        1258 => "windows-1258",
+        _ => return None,
+    })
 }
 
-fn output_error(prog: &str, out: &std::process::Output) -> String {
+/// 用指定的 code page 解碼（Windows 子程序的 stderr／stdout，#724）；不認得的 code page 回 None。
+pub fn decode_with_code_page(bytes: &[u8], cp: u32) -> Option<String> {
+    let enc = encoding_rs::Encoding::for_label(code_page_label(cp)?.as_bytes())?;
+    let (text, _, had_errors) = enc.decode(bytes);
+    (!had_errors).then(|| text.trim().to_string())
+}
+
+/// 這台 Windows 主控台的 OEM code page：`reg query` 的 `OEMCP` 值（不用 unsafe 的 Win32 呼叫）。非 Windows 回 None。
+fn oem_code_page() -> Option<u32> {
+    if !cfg!(windows) {
+        return None;
+    }
+    static CP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CP.get_or_init(|| {
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage",
+                "/v",
+                "OEMCP",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.split_whitespace()
+            .last()
+            .and_then(|v| v.parse::<u32>().ok())
+    })
+}
+
+/// 子程序輸出轉成文字：合法 UTF-8 照用；不是（Windows 的 schtasks 用 OEM code page，例如 cp950）就依這台的
+/// code page 解碼，解不了才 lossy。回報 `true` 表示最後是 lossy 的。
+pub fn decode_output(bytes: &[u8]) -> (String, bool) {
+    if let Ok(t) = std::str::from_utf8(bytes) {
+        return (t.trim().to_string(), false);
+    }
+    if let Some(t) = oem_code_page().and_then(|cp| decode_with_code_page(bytes, cp)) {
+        return (t, false);
+    }
+    (String::from_utf8_lossy(bytes).trim().to_string(), true)
+}
+
+/// 失敗的子程序輸出變成錯誤訊息。`quiet`：預期中的失敗（查詢「沒裝」）不寫 log。
+fn output_error(prog: &str, out: &std::process::Output, quiet: bool) -> String {
     let raw = if out.stderr.is_empty() {
         &out.stdout
     } else {
@@ -437,24 +494,33 @@ fn output_error(prog: &str, out: &std::process::Output) -> String {
     if text.is_empty() {
         return format!("exit {}", out.status.code().unwrap_or(-1));
     }
-    if lossy {
-        // 不是 UTF-8（Windows 主控台的 OEM code page）：畫面給 lossy 版，原始位元組寫進 log 讓人用對的編碼看
+    if lossy && !quiet {
+        // 連這台的 code page 都解不了：原始位元組寫進 log（CLI 子命令要先 logging::to_file 才會進檔案）
         let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         crate::logging::log(&format!(
-            "service：{prog} 的輸出不是 UTF-8（原始十六進位）：{hex}"
+            "service：{prog} 的輸出解不了（原始十六進位）：{hex}"
         ));
-        return format!("{text}（原始訊息不是 UTF-8，原文已寫進 collector.log）");
+        return format!("{text}（原始訊息解不了，位元組已寫進 collector.log）");
     }
     text
 }
 
-/// 真的執行一條指令：成功要 exit 0，否則把 stderr 帶回來
+/// 真的執行一條指令：成功要 exit 0，否則把 stderr 帶回來（並寫 log）
 pub fn run_command(cmd: &[String]) -> Result<(), String> {
     run_command_capture(cmd).map(|_| ())
 }
 
-/// 同 [`run_command`]，成功時回 stdout（status 查詢用）
+/// 同 [`run_command`]，成功時回 stdout
 pub fn run_command_capture(cmd: &[String]) -> Result<String, String> {
+    capture(cmd, false)
+}
+
+/// 同 [`run_command_capture`]，但失敗是預期中的（status 查詢、uninstall 時工作早就不在）：不寫 log、不印十六進位（#724）
+pub fn run_command_capture_quiet(cmd: &[String]) -> Result<String, String> {
+    capture(cmd, true)
+}
+
+fn capture(cmd: &[String], quiet: bool) -> Result<String, String> {
     let (prog, args) = cmd.split_first().ok_or("空的指令")?;
     let out = std::process::Command::new(prog)
         .args(args)
@@ -463,5 +529,5 @@ pub fn run_command_capture(cmd: &[String]) -> Result<String, String> {
     if out.status.success() {
         return Ok(decode_output(&out.stdout).0);
     }
-    Err(output_error(prog, &out))
+    Err(output_error(prog, &out, quiet))
 }
