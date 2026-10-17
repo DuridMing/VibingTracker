@@ -367,6 +367,177 @@ fn subagent_stop_does_not_count_as_done() {
     assert!(r.attention().is_empty());
 }
 
+// ── 「等你」保底判斷（#706）：最後一行是 main 的 assistant 文字，N 秒（預設 30）沒有任何事件
+
+fn said(no: u64, msg: &str, file: &str, ts: u64) -> Input {
+    Input::Line {
+        session: S.into(),
+        file: file.into(),
+        no,
+        value: json!({ "type": "assistant", "uuid": format!("a{no}"),
+                       "message": { "id": msg, "model": "claude-test",
+                                    "content": [{ "type": "text", "text": "要用 A 還是 B？" }] } }),
+        ts_seen: ts,
+    }
+}
+
+fn tool_use_line(no: u64, msg: &str, id: &str, ts: u64) -> Input {
+    line(
+        no,
+        json!({ "type": "assistant", "uuid": format!("u{no}"),
+                "message": { "id": msg, "model": "claude-test",
+                             "content": [{ "type": "tool_use", "id": id, "name": "Bash",
+                                           "input": bash("ls") }] } }),
+        ts,
+    )
+}
+
+fn guesses(r: &Run) -> Vec<(String, String, String)> {
+    r.attention()
+        .into_iter()
+        .filter(|(_, _, re)| re.starts_with("guess-"))
+        .collect()
+}
+
+#[test]
+fn guess_wait_after_silence_following_assistant_text() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .tick(31_999);
+    assert!(r.attention().is_empty(), "30 秒內不發");
+    r.tick(32_000);
+    assert_eq!(r.attention(), [a("raised", "wait", "guess-m1")]);
+    assert_eq!(r.last_status(), "wait");
+    let raised = r
+        .evs
+        .iter()
+        .find(|e| e.type_name() == "attention.raised")
+        .unwrap();
+    assert_eq!(raised.payload["reason"], "等你回答（推測）");
+    r.tick(90_000);
+    assert_eq!(guesses(&r).len(), 1, "同一段沉默只發一次");
+}
+
+#[test]
+fn guess_wait_is_not_raised_when_something_follows_the_text() {
+    // transcript 新行（同一則訊息接著 tool_use）、hook（PreToolUse）都算有事件
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .feed(tool_use_line(3, "m1", "t1", 2100))
+        .tick(60_000);
+    assert!(
+        guesses(&r).is_empty(),
+        "最後一行是 tool_use：{:?}",
+        r.attention()
+    );
+
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .feed(pre("t1", "ls", 20_000))
+        .tick(45_000);
+    assert!(
+        guesses(&r).is_empty(),
+        "N 秒內來了 hook：{:?}",
+        r.attention()
+    );
+}
+
+#[test]
+fn guess_wait_is_cleared_by_new_events() {
+    for next in [
+        prompt("A", 40_000),
+        pre("t1", "ls", 40_000),
+        tool_use_line(3, "m2", "t1", 40_000),
+    ] {
+        let mut r = Run::new();
+        r.feed(prompt("做事", 0))
+            .feed(said(2, "m1", "main", 2000))
+            .tick(32_000)
+            .feed(next);
+        assert_eq!(
+            guesses(&r),
+            [
+                a("raised", "wait", "guess-m1"),
+                a("cleared", "wait", "guess-m1")
+            ]
+        );
+        assert_eq!(r.last_status(), "run");
+    }
+}
+
+#[test]
+fn guess_wait_is_not_raised_after_stop_done_or_session_end() {
+    // Stop 先到、文字行晚到（hook 永遠先到）：走「完成待確認」，使用者確認之後也不再推測
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(2000))
+        .feed(said(2, "m1", "main", 2500))
+        .tick(10_000)
+        .tick(60_000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
+
+    // -p：SessionEnd 已到
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .feed(hook("SessionEnd", json!({}), 2500))
+        .tick(60_000);
+    assert!(r.attention().is_empty());
+
+    // 已經在等權限：不重複進佇列
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(pre("t1", "ls", 1000))
+        .feed(ask("ls", 1050))
+        .feed(said(2, "m1", "main", 1100))
+        .tick(2100)
+        .tick(60_000);
+    assert_eq!(r.attention(), [a("raised", "wait", "t1")]);
+}
+
+#[test]
+fn guess_wait_ignores_subagent_text_and_notifications() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "agent-x1", 2000))
+        .tick(60_000);
+    assert!(r.attention().is_empty(), "subagent 的文字不是在問使用者");
+
+    // idle_prompt 正是「在等使用者」的補強，不能把推測撤掉
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .feed(hook(
+            "Notification",
+            json!({ "notification_type": "idle_prompt", "message": "Claude is waiting for your input" }),
+            20_000,
+        ))
+        .tick(32_000);
+    assert_eq!(guesses(&r), [a("raised", "wait", "guess-m1")]);
+}
+
+#[test]
+fn guess_wait_threshold_is_configurable() {
+    let mut r = Run::new();
+    r.m.set_wait_guess_ms(10_000);
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .tick(11_999);
+    assert!(r.attention().is_empty());
+    r.tick(12_000);
+    assert_eq!(guesses(&r), [a("raised", "wait", "guess-m1")]);
+
+    let mut r = Run::new();
+    r.m.set_wait_guess_ms(0);
+    r.feed(prompt("做事", 0))
+        .feed(said(2, "m1", "main", 2000))
+        .tick(600_000);
+    assert!(r.attention().is_empty(), "0 表示關閉");
+}
+
 // ── fail
 
 #[test]
@@ -693,6 +864,35 @@ fn samples_background_task_is_marked_and_withdraws_done() {
         raised >= 1 && cleared >= 1,
         "done 有發也有被撤回：{raised}／{cleared}"
     );
+}
+
+/// #706：真實 session（互動的、`-p` 的、Esc、背景 agent）回放時，「等你」的推測一次都不會發。
+#[test]
+fn samples_never_raise_a_guessed_wait() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        eprintln!("略過：沒有 samples/sessions");
+        return;
+    };
+    let mut n = 0;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(evs) = replay_sample(&name) else {
+            continue;
+        };
+        n += 1;
+        let guessed: Vec<_> = evs
+            .iter()
+            .filter(|e| {
+                e.type_name() == "attention.raised"
+                    && e.payload["ref"]
+                        .as_str()
+                        .is_some_and(|r| r.starts_with("guess-"))
+            })
+            .collect();
+        assert!(guessed.is_empty(), "{name}：{guessed:?}");
+    }
+    eprintln!("回放 {n} 個 session");
 }
 
 // ── sessions 列的分數（契約 §6：整數、每 10 秒重算）

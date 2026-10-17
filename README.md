@@ -129,12 +129,13 @@ remote_thinking = "on_demand"   # 遠端連線的 thinking：on_demand 點開才
 
 [collector]
 idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出；0＝不退出
+wait_guess_seconds = 30   # Claude 最後寫了一段話、之後這麼久沒有任何動作時，注意佇列推測「等你回答」；0＝關閉
 ```
 
 | 環境變數 | 對應 |
 | --- | --- |
 | `CODING_LAB_HOME` | 資料目錄（預設 `~/.coding-lab`） |
-| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS`、`CODING_LAB_WEB_AUTH`、`CODING_LAB_REMOTE_THINKING`、`CODING_LAB_ALLOW_INSECURE` | 同上表的設定 |
+| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS`、`CODING_LAB_WAIT_GUESS_SECONDS`、`CODING_LAB_WEB_AUTH`、`CODING_LAB_REMOTE_THINKING`、`CODING_LAB_ALLOW_INSECURE` | 同上表的設定 |
 | `CODING_LAB_BIN` | wrapper 要用的二進位（優先於 `~/.coding-lab/bin`） |
 | `CODING_LAB_RELEASE_URL` | wrapper 自動下載的來源（見「從 Release 自動下載」） |
 

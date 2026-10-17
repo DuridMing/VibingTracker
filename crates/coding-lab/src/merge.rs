@@ -242,6 +242,8 @@ pub struct Merger {
     resumed: HashMap<String, Resumed>,
     /// 費用暴增的基準（#675）；有花費的日子不到 3 天時是 None
     cost_baseline: Option<f64>,
+    /// 「等你」保底判斷的門檻（#706）；新建的 session 套用它
+    wait_guess_ms: u64,
 }
 
 #[derive(Default)]
@@ -266,6 +268,7 @@ impl Merger {
             sessions: BTreeMap::new(),
             resumed: HashMap::new(),
             cost_baseline: None,
+            wait_guess_ms: status::WAIT_GUESS_AFTER_MS,
         }
     }
 
@@ -321,8 +324,10 @@ impl Merger {
     /// 之後 Tracker 一被用到就已經是接續的狀態。
     fn session(&mut self, sid: &str) -> &mut Session {
         let resumed = &mut self.resumed;
+        let guess = self.wait_guess_ms;
         self.sessions.entry(sid.to_string()).or_insert_with(|| {
             let mut s = Session::default();
+            s.status.set_wait_guess_after(guess);
             if let Some(r) = resumed.remove(sid) {
                 (s.seq, s.pos, s.cwd) = (r.seq, r.pos, r.cwd);
                 s.ended_at = r.ended_at;
@@ -371,7 +376,17 @@ impl Merger {
             s.last_seen = s.last_seen.max(ts);
         }
         match input {
-            Input::Hook { hook, ts_seen } => self.on_hook(&hook, ts_seen),
+            Input::Hook { hook, ts_seen } => {
+                // Notification（idle_prompt 等）本身就是「在等使用者」的補強，不算 session 有動作（#706）
+                let mut out = Vec::new();
+                if hook.event_name() != "Notification" {
+                    let sid = hook.session_id().to_string();
+                    let changes = self.tracker(&sid).activity(ts_seen);
+                    out = self.apply(&sid, changes, "main", ts_seen);
+                }
+                out.extend(self.on_hook(&hook, ts_seen));
+                out
+            }
             Input::Line {
                 session,
                 file,
@@ -571,6 +586,14 @@ impl Merger {
     /// 費用暴增的基準（#675）：serve 啟動時與每小時由 store 算好交進來。
     pub fn set_cost_baseline(&mut self, baseline: Option<f64>) {
         self.cost_baseline = baseline;
+    }
+
+    /// 「等你」保底判斷的門檻（#706，`[collector].wait_guess_seconds`）；0 表示關閉。
+    pub fn set_wait_guess_ms(&mut self, ms: u64) {
+        self.wait_guess_ms = ms;
+        for s in self.sessions.values_mut() {
+            s.status.set_wait_guess_after(ms);
+        }
     }
 
     /// 重啟時補回 session 最近 24 小時的花費（只進滾動區間，不觸發）。
@@ -1565,6 +1588,17 @@ impl Merger {
             self.tracker(sid).cost(ts_seen, usd, base);
             out.push(self.emit(sid, Payload::Usage(p), meta(false)));
         }
+        // 「等你」保底判斷（#706）：main 的 assistant 文字開始計時，其他訊息行都算有動作
+        let changes = if agent == "main" && v["type"] == "assistant" && block["type"] == "text" {
+            let r = Some(message_id.as_str())
+                .filter(|m| !m.is_empty())
+                .or(v["uuid"].as_str())
+                .map_or_else(|| format!("line-{no}"), str::to_string);
+            self.tracker(sid).assistant_text(&r, ts_seen)
+        } else {
+            self.tracker(sid).activity(ts_seen)
+        };
+        out.extend(self.apply(sid, changes, "main", ts_seen));
         let s = self.session(sid);
 
         let main = match (v["type"].as_str(), block["type"].as_str()) {

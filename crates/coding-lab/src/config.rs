@@ -13,6 +13,8 @@ pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:4801";
 pub const DEFAULT_IDLE_EXIT_SECONDS: u64 = 600;
 /// store 批次 flush 的間隔（transcript 行的 Event；hook 事件不等批次，#713）
 pub const DEFAULT_STORE_FLUSH_MS: u64 = 100;
+/// 「等你」保底判斷的預設門檻（#706）
+pub const DEFAULT_WAIT_GUESS_SECONDS: u64 = crate::status::WAIT_GUESS_AFTER_MS / 1000;
 
 /// web 入口什麼時候要金鑰：`local-open`（預設）localhost 免金鑰；`always` 連 localhost 也要（多人共用的伺服器）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +95,8 @@ pub struct Config {
     pub idle_exit_seconds: u64,
     /// store 的批次 flush 間隔（毫秒，≥ 1）；只影響 transcript 行的 Event，hook 事件處理完就寫（#713）
     pub store_flush_ms: u64,
+    /// main 最後一行是 assistant 文字、這麼久沒有任何事件就推測「等你回答」（#706）；0 表示關閉
+    pub wait_guess_seconds: u64,
     pub auth: AuthMode,
     pub remote_thinking: RemoteThinking,
     /// 公開 IP 又沒有 TLS 時也照綁（使用者自己承擔明文風險）
@@ -157,6 +161,7 @@ struct WebSection {
 struct CollectorSection {
     idle_exit_seconds: Option<u64>,
     store_flush_ms: Option<u64>,
+    wait_guess_seconds: Option<u64>,
 }
 
 impl Config {
@@ -266,6 +271,15 @@ impl Config {
         if store_flush_ms == 0 {
             return Err("[collector].store_flush_ms 要大於 0".into());
         }
+        let wait_guess_seconds = match env("CODING_LAB_WAIT_GUESS_SECONDS") {
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("CODING_LAB_WAIT_GUESS_SECONDS 不是非負整數：{v}"))?,
+            None => f
+                .collector
+                .wait_guess_seconds
+                .unwrap_or(DEFAULT_WAIT_GUESS_SECONDS),
+        };
         let auth: AuthMode =
             pick(&None, "CODING_LAB_WEB_AUTH", &f.web.auth, "local-open").parse()?;
         let remote_thinking: RemoteThinking = pick(
@@ -333,6 +347,7 @@ impl Config {
             web_root,
             idle_exit_seconds,
             store_flush_ms,
+            wait_guess_seconds,
             auth,
             remote_thinking,
             allow_insecure,

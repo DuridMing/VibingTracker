@@ -197,6 +197,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         log(&w);
     }
     merger.set_prices(prices);
+    merger.set_wait_guess_ms(cfg.wait_guess_seconds.saturating_mul(1000));
     {
         let counters = store
             .lock()

@@ -13,6 +13,10 @@ use crate::event::{Attention, AttentionKind, SessionState, SessionStatus};
 pub const WAIT_AFTER_MS: u64 = 1_000;
 /// main agent 的 Stop 後要靜默這麼久才標「完成待確認」。
 pub const DONE_AFTER_MS: u64 = 5_000;
+/// 「等你」保底判斷的預設門檻（#706）：main 的最後一行是 assistant 文字，這麼久沒有任何事件就推測在等使用者。
+pub const WAIT_GUESS_AFTER_MS: u64 = 30_000;
+/// 推測出來的 wait 的 ref 前綴（真的 PermissionRequest 的 ref 是 toolUseId）。
+pub const GUESS_REF_PREFIX: &str = "guess-";
 /// 同一個 agent 連續幾次 Bash 失敗才進佇列。
 pub const FAIL_STREAK: u32 = 2;
 
@@ -121,6 +125,12 @@ pub struct Tracker {
     /// 已收到 PermissionRequest、還沒滿 1 秒的 (tool_use_id, 到達時間)
     pending_wait: Vec<(String, u64)>,
     stop_at: Option<u64>,
+    /// 這一輪 prompt 已經收到 Stop：交給「完成待確認」，不再推測「等你」
+    stopped: bool,
+    /// main 最後一行是 assistant 文字時的 (推測 wait 的 ref, 時間)；之後有任何事件就取消（#706）
+    guess_from: Option<(String, u64)>,
+    /// 推測門檻，0 表示關閉
+    guess_after: u64,
     prompt_ref: Option<String>,
     fail_streak: HashMap<String, u32>,
     /// agent → 它目前未解除的 fail 的 ref（ref 照契約是 toolUseId）
@@ -142,6 +152,9 @@ impl Default for Tracker {
             running: Vec::new(),
             pending_wait: Vec::new(),
             stop_at: None,
+            stopped: false,
+            guess_from: None,
+            guess_after: WAIT_GUESS_AFTER_MS,
             prompt_ref: None,
             fail_streak: HashMap::new(),
             fail_open: HashMap::new(),
@@ -224,6 +237,38 @@ impl Tracker {
         out
     }
 
+    /// 「等你」保底判斷的門檻（毫秒，0 表示關閉）。
+    pub fn set_wait_guess_after(&mut self, ms: u64) {
+        self.guess_after = ms;
+    }
+
+    /// main 的 transcript 出現 assistant 文字（#706）：之後 N 秒沒有任何事件就推測在等使用者。
+    /// `message_id` 當推測項目的 ref。
+    pub fn assistant_text(&mut self, message_id: &str, now: u64) -> Vec<Change> {
+        let out = self.activity(now);
+        self.guess_from = Some((format!("{GUESS_REF_PREFIX}{message_id}"), now));
+        out
+    }
+
+    /// session 有任何事件（hook 或 transcript 的訊息行；Notification 除外）：取消推測、撤回已發的推測。
+    pub fn activity(&mut self, now: u64) -> Vec<Change> {
+        self.guess_from = None;
+        let refs: Vec<String> = self
+            .open
+            .iter()
+            .filter(|o| o.kind == AttentionKind::Wait && o.reference.starts_with(GUESS_REF_PREFIX))
+            .map(|o| o.reference.clone())
+            .collect();
+        let mut out: Vec<Change> = refs
+            .iter()
+            .filter_map(|r| self.clear(AttentionKind::Wait, r))
+            .collect();
+        if !out.is_empty() {
+            out.extend(self.recompute(now));
+        }
+        out
+    }
+
     pub fn prompt(&mut self, prompt_id: Option<String>, now: u64) -> Vec<Change> {
         let mut out = self.clear_waits();
         let done: Vec<String> = self
@@ -236,6 +281,7 @@ impl Tracker {
             out.extend(self.clear(AttentionKind::Done, &r));
         }
         self.stop_at = None;
+        self.stopped = false;
         self.idle = false;
         self.prompt_ref = prompt_id.or_else(|| Some(format!("prompt-{now}")));
         out.extend(self.recompute(now));
@@ -246,6 +292,7 @@ impl Tracker {
     pub fn stop(&mut self, now: u64) -> Vec<Change> {
         let mut out = self.clear_waits();
         self.stop_at = Some(now);
+        self.stopped = true;
         out.extend(self.recompute(now));
         out
     }
@@ -264,6 +311,7 @@ impl Tracker {
         self.ended = false;
         self.idle = false;
         self.stop_at = None;
+        self.stopped = false;
         self.recompute(now).into_iter().collect()
     }
 
@@ -377,10 +425,41 @@ impl Tracker {
                 out.push(self.raise(AttentionKind::Done, &r, Some("完成待確認".into()), now));
             }
         }
+        if let Some(c) = self.guess_due(now) {
+            out.push(c);
+        }
         if !out.is_empty() {
             out.extend(self.recompute(now));
         }
         out
+    }
+
+    /// 推測的「等你」到期（#706）。已經結束、中斷、這輪收過 Stop（交給 done）、已有 wait、
+    /// 或還有工具在跑時不推測：保底判斷寧可漏報，也不要在正常的 session 上誤報。
+    fn guess_due(&mut self, now: u64) -> Option<Change> {
+        let (r, at) = self.guess_from.as_ref()?;
+        if self.guess_after == 0 || at + self.guess_after > now {
+            return None;
+        }
+        let r = r.clone();
+        self.guess_from = None;
+        let busy = self.ended
+            || self.idle
+            || self.stopped
+            || !self.running.is_empty()
+            || !self.pending_wait.is_empty()
+            || self
+                .open
+                .iter()
+                .any(|o| matches!(o.kind, AttentionKind::Wait | AttentionKind::Done));
+        (!busy).then(|| {
+            self.raise(
+                AttentionKind::Wait,
+                &r,
+                Some("等你回答（推測）".into()),
+                now,
+            )
+        })
     }
 
     /// 目前分數（彙總列定期重算用）。

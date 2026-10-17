@@ -254,6 +254,27 @@ fn store_flush_interval_is_configurable() {
     );
 }
 
+/// #706：「等你」保底判斷的門檻；0 表示關閉。
+#[test]
+fn wait_guess_threshold_is_configurable() {
+    let c = resolve(Overrides::default(), &[], None).unwrap();
+    assert_eq!(c.wait_guess_seconds, 30);
+    let file = "[collector]\nwait_guess_seconds = 0\n";
+    let c = resolve(Overrides::default(), &[], Some(file)).unwrap();
+    assert_eq!(c.wait_guess_seconds, 0);
+    let env = [("CODING_LAB_WAIT_GUESS_SECONDS", "45")];
+    let c = resolve(Overrides::default(), &env, Some(file)).unwrap();
+    assert_eq!(c.wait_guess_seconds, 45, "環境變數蓋過檔案");
+    assert!(
+        resolve(
+            Overrides::default(),
+            &[("CODING_LAB_WAIT_GUESS_SECONDS", "半分鐘")],
+            None
+        )
+        .is_err()
+    );
+}
+
 /// #722：`[web].bind` 可以是一個字串或陣列（區網直連與 SSH 通道的 127.0.0.1 並存）；環境變數用逗號分隔。
 #[test]
 fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
