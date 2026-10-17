@@ -362,6 +362,8 @@ pub struct Live {
     /// 卡片的伴隨 Event（同卡只留最新的 tool.updated）與每個 session 的狀態行
     card_events: HashMap<(String, String), Vec<Event>>,
     status_lines: HashMap<String, VecDeque<Event>>,
+    /// KPI 已扣回的卡片（被拒或失敗的改動只扣一次，#682）
+    reverted: HashSet<(String, String)>,
     /// 執行中的背景 subagent（每個 session 只顯示一列「背景」）
     bg_running: HashMap<String, HashSet<String>>,
     pending: Vec<Event>,
@@ -493,7 +495,9 @@ impl Live {
             Payload::ToolUpdated(u) => {
                 if u.status == crate::event::ToolStatus::Failed {
                     counts.failures += 1;
+                    self.revert_kpi(&sid, &u.tool_use_id);
                 }
+                let counts = self.slots.entry(ts / SLOT_MS).or_default();
                 if u.danger
                     .as_ref()
                     .is_some_and(|d| d.level == DangerLevel::Danger)
@@ -1042,6 +1046,35 @@ impl Live {
         let mut e = e.clone();
         e.payload["danger"] = danger;
         Some(e)
+    }
+
+    /// 被拒或失敗的 Edit／Write 視為沒有發生（contracts §4，#682）：從它當初計入的時段扣回 KPI 的
+    /// 改動與新檔案。同一張卡片只扣一次。
+    fn revert_kpi(&mut self, sid: &str, tool_use_id: &str) {
+        let key = (sid.to_string(), tool_use_id.to_string());
+        let Some(list) = self.card_events.get(&key) else {
+            return;
+        };
+        let mut minus: Vec<(u64, bool)> = Vec::new();
+        for e in list {
+            match e.payload_typed().ok().flatten() {
+                Some(Payload::FileEdit(_)) => minus.push((e.ts_seen / SLOT_MS, true)),
+                Some(Payload::FileWrite(w)) if w.is_new => minus.push((e.ts_seen / SLOT_MS, false)),
+                _ => {}
+            }
+        }
+        if minus.is_empty() || !self.reverted.insert(key) {
+            return;
+        }
+        for (slot, is_edit) in minus {
+            if let Some(c) = self.slots.get_mut(&slot) {
+                if is_edit {
+                    c.edits = c.edits.saturating_sub(1);
+                } else {
+                    c.writes = c.writes.saturating_sub(1);
+                }
+            }
+        }
     }
 
     fn stage_update(&mut self, sid: &str, tool_use_id: &str, e: &Event) {

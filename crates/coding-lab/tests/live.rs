@@ -1428,3 +1428,43 @@ fn worktree_add_does_not_change_the_session_branch() {
     l.apply(&e);
     assert_eq!(l.session_row("s1").unwrap()["branch"], "feature/y");
 }
+
+/// 被拒或失敗的 Edit／Write 視為沒有發生（contracts §4、#682）：頂部 KPI 的改動與新檔案也要扣回，
+/// 而且只扣一次；成功的照算。
+#[test]
+fn kpi_does_not_count_denied_or_failed_changes() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let failed = |b: &mut B, id: &str, ts| {
+        b.ev("s1", "tool.updated", "main", ts, false,
+             json!({"toolUseId": id, "status": "failed", "durationMs": null, "error": "denied", "interrupted": null}))
+    };
+    apply_all(&mut l, &[
+        b.ev("s1", "file.edit", "main", DAY + 1, false,
+             json!({"toolUseId": "e1", "path": "a.rs", "hunk": null, "hunkSource": "none"})),
+        b.ev("s1", "file.edit", "main", DAY + 2, false,
+             json!({"toolUseId": "e2", "path": "a.rs", "hunk": null, "hunkSource": "none"})),
+        b.ev("s1", "file.write", "main", DAY + 3, false,
+             json!({"toolUseId": "w1", "path": "n.rs", "content": "x", "isNew": true, "truncated": false, "lines": 1})),
+    ]);
+    let before = l.snapshot(&Channel::All, 0, DAY + 3)["kpi"].clone();
+    assert_eq!(
+        (before["edits"].as_u64(), before["writes"].as_u64()),
+        (Some(2), Some(1)),
+        "前提"
+    );
+    // e2 被拒、w1 失敗；e2 再收到一次 failed 也不能扣兩次
+    apply_all(
+        &mut l,
+        &[
+            failed(&mut b, "e2", DAY + 4),
+            failed(&mut b, "w1", DAY + 5),
+            failed(&mut b, "e2", DAY + 6),
+        ],
+    );
+    let k = l.snapshot(&Channel::All, 0, DAY + 10)["kpi"].clone();
+    assert_eq!(
+        (k["edits"].as_u64(), k["writes"].as_u64()),
+        (Some(1), Some(0))
+    );
+}
