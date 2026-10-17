@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use coding_lab::event::Event;
-use coding_lab::store::{SCHEMA_VERSION, Store};
+use coding_lab::store::{ProjectKey, SCHEMA_VERSION, Store};
 use serde_json::{Value, json};
 
 static N: AtomicU32 = AtomicU32::new(0);
@@ -970,7 +970,7 @@ fn tails_record_the_last_line_of_each_transcript_file() {
         s.flush().unwrap();
     }
     let s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
     let mut rows: Vec<_> = s
         .tail_lines()
         .unwrap()
@@ -1005,7 +1005,7 @@ fn v2_database_is_backfilled_with_tails_and_prune_clears_them() {
     drop(db);
 
     let mut s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 3);
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
     let rows: Vec<_> = s
         .tail_lines()
         .unwrap()
@@ -1070,4 +1070,139 @@ fn tool_paths_are_forgotten_when_the_session_ends() {
     ));
     s.flush().unwrap();
     assert_eq!(s.cached_tool_paths(), 0);
+}
+
+fn key(ts: u64, session: &str, pos: u64) -> ProjectKey {
+    ProjectKey {
+        ts,
+        session: session.into(),
+        pos,
+    }
+}
+
+/// 專案 /p 的兩個 session（一個在 worktree 裡）、別的專案 /other，以及名字只是前綴相同的 /p2。
+fn project_fixture() -> Store {
+    let mut s = Store::open(&home()).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(started("s2", 1, "/p/worktrees/feature/x"));
+    s.append(started("s3", 1, "/other"));
+    s.append(started("s4", 1, "/p2"));
+    let at = |session: &str, seq: u64, pos: u64, ts: u64| {
+        ev(
+            session,
+            seq,
+            "assistant.text",
+            Some(pos),
+            ts,
+            json!({ "text": "x", "messageId": "m" }),
+        )
+    };
+    s.append(at("s1", 2, 1, 100));
+    s.append(at("s2", 2, 1, 200));
+    s.append(at("s1", 3, 2, 300));
+    s.append(at("s1", 4, 3, 300));
+    s.append(at("s2", 3, 2, 300));
+    s.append(at("s3", 2, 1, 250));
+    s.append(at("s4", 2, 1, 300));
+    // 沒有 pos 的（staged 卡片、usage）不是串流位置
+    s.append(ev("s1", 5, "usage", None, 300, json!({})));
+    s.flush().unwrap();
+    s
+}
+
+/// 全專案回放（#702）：依 (ts_seen, session, pos) 由新到舊；同一毫秒依 session、pos 決定；只含專案根底下的 session。
+#[test]
+fn project_window_orders_across_sessions_newest_first() {
+    let s = project_fixture();
+    let all = s.project_window("/p", 0, u64::MAX, None, 100).unwrap();
+    assert_eq!(
+        all,
+        vec![
+            key(300, "s2", 2),
+            key(300, "s1", 3),
+            key(300, "s1", 2),
+            key(200, "s2", 1),
+            key(100, "s1", 1),
+        ],
+        "worktree 裡的 s2 算同一個專案，/other 與 /p2 不算"
+    );
+    // 專案根帶結尾的 / 也一樣
+    assert_eq!(
+        s.project_window("/p/", 0, u64::MAX, None, 100).unwrap(),
+        all
+    );
+}
+
+#[test]
+fn project_window_pages_with_the_last_key_as_cursor() {
+    let s = project_fixture();
+    let mut got = Vec::new();
+    let mut before = None;
+    loop {
+        let page = s
+            .project_window("/p", 0, u64::MAX, before.as_ref(), 2)
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        before = page.last().cloned();
+        got.extend(page);
+    }
+    assert_eq!(got.len(), 5, "三頁：2＋2＋1");
+    assert_eq!(
+        got,
+        s.project_window("/p", 0, u64::MAX, None, 100).unwrap(),
+        "分頁接起來不重複不漏"
+    );
+}
+
+#[test]
+fn project_window_respects_the_time_range() {
+    let s = project_fixture();
+    assert_eq!(
+        s.project_window("/p", 150, 250, None, 100).unwrap(),
+        vec![key(200, "s2", 1)]
+    );
+    assert_eq!(
+        s.project_window("/p", 100, 200, None, 100).unwrap(),
+        vec![key(200, "s2", 1), key(100, "s1", 1)],
+        "兩端都包含"
+    );
+}
+
+/// v3 升 v4：加上 events 依 ts_seen 的索引，全專案回放不用掃全表（不變式 9）。
+#[test]
+fn v3_database_gets_the_ts_index() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.append(text("s1", 2, 1));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX IF EXISTS events_by_ts;
+         UPDATE meta SET value = '3' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(
+        s.project_window("/p", 0, u64::MAX, None, 10).unwrap(),
+        vec![key(1002, "s1", 1)],
+        "升級前的資料查得到"
+    );
+    drop(s);
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    let n: i64 = db
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_by_ts'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "v4 有 events_by_ts 索引");
 }

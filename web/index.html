@@ -57,6 +57,24 @@
 
   <section class="col col-work">
     <nav class="stabs" id="stabs"></nav>
+    <div class="blk" id="replayblk" hidden>
+      <div class="ovh"><h2>專案回放<small>選專案與時間範圍，所有 session（含已結束）合成一條串流</small></h2><span class="rptag">回放</span></div>
+      <div class="filters rpform">
+        <select id="rpProj" title="專案（session 的 cwd；worktree 與子目錄歸到上層）"></select>
+        <select id="rpRange" title="時間範圍">
+          <option value="3h">最近 3 小時</option>
+          <option value="today">今天</option>
+          <option value="yesterday">昨天</option>
+          <option value="custom">自訂</option>
+        </select>
+        <span id="rpCustom" hidden><input type="datetime-local" id="rpFrom" aria-label="開始"> – <input type="datetime-local" id="rpTo" aria-label="結束"></span>
+        <button class="btn sm" id="rpGo">載入</button>
+        <small class="tinfo" id="rpInfo"></small>
+      </div>
+      <div class="filters"><span class="lab">session：</span><span id="rpSess"><span class="none">無</span></span></div>
+      <div class="filters"><span class="lab">類型：</span><span id="rpKind"></span></div>
+      <div class="streamwrap rpwrap"><div class="stream" id="rpStream"></div></div>
+    </div>
     <div class="blk" id="allblk">
       <div class="ovh"><h2>專案即時串流<small>所有 session 合在一起，每行標示 [session id] [agent]</small></h2><span class="hint">點 session 標籤只看它；⧉ 開成監視器視窗</span></div>
       <div class="degraded-note" id="degradedNote" role="status" hidden></div>

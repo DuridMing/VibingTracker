@@ -353,6 +353,11 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 
 /* 監視器視窗（#650）：只留連線狀態與單 session 畫面 */
 .spane .ph .right{display:inline-flex;gap:8px;align-items:center}
+#replayblk .rpwrap{flex:1}
+#replayblk .rptag,.stab.rp{color:var(--accent)}
+.rpform{gap:6px;align-items:center}
+.rpform select,.rpform input{font:inherit;font-size:12px}
+#replayblk .rptag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft)}
 .spane .ph .rptag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 body.monitor .kpis,body.monitor .col-tree,body.monitor .stabs,body.monitor #allblk,body.monitor #spPop{display:none!important}
 body.monitor .main{grid-template-columns:1fr}

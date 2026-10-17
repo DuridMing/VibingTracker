@@ -4,6 +4,7 @@
 
 import { createStream } from "./stream.js";
 import { createChanges, countHunk } from "./changes.js";
+import { REPLAY_TAB } from "./replay.js";
 
 export function createSessionPane(session = null) {
   const p = {
@@ -162,10 +163,13 @@ export function nowOf(view, row) {
 }
 
 // `*` 一直訂著（全部串流、彙總列都靠它），所以切回「全部」不必補任何事件；session 頻道只在看那個 tab 時訂
+// 「全部串流」與「專案回放」（#702）不是 session 分頁：不訂閱 session 頻道
+export const isSessionTab = (t) => t !== "all" && t !== REPLAY_TAB;
+
 export function switchTab(client, from, to) {
   if (from === to) return;
-  if (from !== "all") client.unsubscribe(`session:${from}`);
-  if (to !== "all") client.subscribe(`session:${to}`);
+  if (isSessionTab(from)) client.unsubscribe(`session:${from}`);
+  if (isSessionTab(to)) client.subscribe(`session:${to}`);
 }
 
 // session 的滑過提示（tab、Sessions 列）：完整 id、現在在做什麼（§6 doing，#648）、最近的 prompt

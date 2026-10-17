@@ -27,7 +27,7 @@ use tokio::task::JoinHandle;
 
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
-use crate::store::{SessionRow, Store};
+use crate::store::{ProjectKey, SessionRow, Store};
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
@@ -198,6 +198,7 @@ pub async fn serve_web(
         .route("/api/sessions", get(crate::api::sessions))
         .route("/api/sessions/{id}/events", get(crate::api::events))
         .route("/api/files", get(crate::api::files))
+        .route("/api/projects/events", get(crate::api::project_events))
         .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
         .merge(api)
@@ -496,6 +497,39 @@ pub(crate) fn more_events(
         pool,
         next.map(|(_, ts)| ts),
     ))
+}
+
+/// 全專案回放（#702）的一頁：先依跨 session 順序鍵挑出 `limit` 個串流位置，再把每個 session 的那一段
+/// 照「載入更多」組回來（卡片的呼叫、狀態、結果一起帶）。回傳 (Event, 下一頁的游標)；沒有更舊的時游標是 None。
+pub(crate) fn project_events(
+    store: &Store,
+    root: &str,
+    from: u64,
+    to: u64,
+    before: Option<&ProjectKey>,
+    limit: usize,
+) -> Result<(Vec<Event>, Option<ProjectKey>), crate::store::StoreError> {
+    let window = store.project_window(root, from, to, before, limit)?;
+    // 同一個 session 在這一頁的 pos 範圍；pos 在 session 內連續，用範圍取不受 ts_seen 偶爾倒退影響
+    let mut spans: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for k in &window {
+        let e = spans.entry(&k.session).or_insert((k.pos, k.pos));
+        e.0 = e.0.min(k.pos);
+        e.1 = e.1.max(k.pos);
+    }
+    let mut out = Vec::new();
+    for (session, (lo, hi)) in spans {
+        out.extend(more_events(
+            store,
+            session,
+            Some(hi + 1),
+            (hi - lo + 1) as usize,
+        )?);
+    }
+    let next = (window.len() == limit)
+        .then(|| window.last().cloned())
+        .flatten();
+    Ok((out, next))
 }
 
 async fn healthz(State(state): State<Arc<WebState>>) -> Response {
