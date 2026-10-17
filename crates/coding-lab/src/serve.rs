@@ -376,6 +376,13 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         let _ = task.await;
     }
     remove_info_if_mine(&info, me);
+    // 先關 SQLite（最後一條連線關閉時做 checkpoint，I/O 忙時要好幾秒）才放 store 鎖：
+    // 鎖一放掉 ensure 拉起的新 collector 就會開 store，不能撞上還在 checkpoint 的資料庫（#727）
+    drop(web);
+    match Arc::try_unwrap(store) {
+        Ok(store) => drop(store.into_inner().unwrap_or_else(|e| e.into_inner())),
+        Err(_) => log("結束時 store 還有別的持有者，放鎖前沒能先關閉 SQLite"),
+    }
     drop(store_lock);
     Ok(Outcome::Stopped)
 }

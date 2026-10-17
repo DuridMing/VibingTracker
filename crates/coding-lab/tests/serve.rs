@@ -1062,6 +1062,50 @@ fn stop_subcommand_shuts_the_collector_down_cleanly() {
     assert!(text.contains("session.started"), "{text}");
 }
 
+/// #727：結束時先關 SQLite、才放 `collector.lock`。WAL 模式下連線開著時 `index.sqlite-wal` 一直在，
+/// 最後一條連線關閉（checkpoint 完）才刪：一拿到鎖時 -wal 必須已經不在。順序反了的話，ensure 拉起的
+/// 新 collector 會在舊的還在 checkpoint 時開 store，I/O 慢時超過 busy timeout 就以 database is locked 起不來。
+#[test]
+fn store_is_closed_before_the_store_lock_is_released() {
+    let e = env(0);
+    let _serve = start_serve(&e);
+    // WAL 裡有一些內容，關閉時的 checkpoint 才要花點時間、順序錯時看得到
+    let input = "x".repeat(4000);
+    for i in 0..300 {
+        let pre = json!({"session_id": "s727", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                         "tool_input": {"command": input}, "tool_use_id": format!("t{i}"),
+                         "transcript_path": e.home.join("t727.jsonl"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &pre.to_string());
+    }
+    let wal = e.home.join("index.sqlite-wal");
+    assert!(wal.exists(), "前提：WAL 模式、連線開著時有 -wal");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.home.join("collector.lock"))
+        .unwrap();
+    let home = e.home.clone();
+    let stopper = std::thread::spawn(move || {
+        Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+            .arg("stop")
+            .env("CODING_LAB_HOME", home)
+            .output()
+            .unwrap()
+    });
+    let deadline = Instant::now() + DEADLINE;
+    while lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "stop 後 collector.lock 要放掉");
+        std::hint::spin_loop();
+    }
+    let wal_left = wal.exists();
+    assert!(stopper.join().unwrap().status.success());
+    assert!(
+        !wal_left,
+        "拿到 collector.lock 時 SQLite 還沒關（index.sqlite-wal 還在）"
+    );
+}
+
 /// collector 沒在跑時 `stop` 也是 exit 0，只在 stderr 說明（手冊裡的更新與卸載步驟可以無條件先跑它）。
 #[test]
 fn stop_without_a_collector_exits_zero() {
