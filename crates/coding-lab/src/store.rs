@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::event::{Event, Payload};
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 /// 資料保留多久：最後活動早於這麼多天前的 session 由 [`Store::prune`] 清掉
 pub const RETENTION_DAYS: u64 = 30;
 
@@ -75,6 +75,7 @@ pub struct SessionRow {
 }
 
 /// `tails` 表的一列（schema v3，#684）：某個 transcript 檔已產生 Event 的最大行號。
+/// 0 表示這個檔從頭讀、還沒有行產生 Event（重啟從第 1 行讀，#713）；表裡 `line_no` 是 NULL（不知道，從檔尾）的列不回傳。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TailRow {
     pub session: String,
@@ -241,13 +242,37 @@ const EVENTS_BY_TS_V4: &str = "
 CREATE INDEX IF NOT EXISTS events_by_ts ON events (ts_seen, session, pos) WHERE pos IS NOT NULL;
 ";
 
+/// v5（#713）：`tails.line_no` 可為 NULL，把「不知道（從檔尾）」和「從頭讀、還沒有行產生 Event」（0）分開。
+/// 既有的 0 全改成 NULL：舊資料維持從檔尾，不把 #684 之前從檔尾 tail 的 session 整份重讀。
+const TAILS_V5: &str = "
+CREATE TABLE tails_v5 (
+  session TEXT NOT NULL,
+  file TEXT NOT NULL,
+  path TEXT,
+  line_no INTEGER,
+  PRIMARY KEY (session, file)
+) WITHOUT ROWID;
+INSERT INTO tails_v5 (session, file, path, line_no)
+  SELECT session, file, path, NULLIF(line_no, 0) FROM tails;
+DROP TABLE tails;
+ALTER TABLE tails_v5 RENAME TO tails;
+";
+
 /// Event 帶 `line` 時更新那個檔的行號（同一個檔的行依序進來，直接覆寫；檔案被替換後行號變小也跟著變小）。
 const UPSERT_TAIL_LINE: &str = "INSERT INTO tails (session, file, line_no) VALUES (?1, ?2, ?3)
   ON CONFLICT (session, file) DO UPDATE SET line_no = excluded.line_no";
-/// session.started 記主檔路徑；換了檔就把行號歸零（舊檔的行號對新檔沒有意義）。
-const UPSERT_TAIL_PATH: &str = "INSERT INTO tails (session, file, path, line_no) VALUES (?1, 'main', ?2, 0)
+/// session.started 記主檔路徑與起始行號（?3：從頭讀的檔是 0，從檔尾接的是 NULL，見 [`initial_tail_line`]）；
+/// 換了檔就用新的起始行號（舊檔的行號對新檔沒有意義），同一個檔則保留已讀到的行號。
+const UPSERT_TAIL_PATH: &str = "INSERT INTO tails (session, file, path, line_no) VALUES (?1, 'main', ?2, ?3)
   ON CONFLICT (session, file) DO UPDATE SET
-    line_no = CASE WHEN tails.path IS excluded.path THEN tails.line_no ELSE 0 END, path = excluded.path";
+    line_no = CASE WHEN tails.path IS excluded.path THEN tails.line_no ELSE excluded.line_no END, path = excluded.path";
+
+/// session.started 時 `tails.line_no` 的起始值（#713）：startup／clear／late 的檔從頭 tail，記 0，
+/// collector 重啟時從第 1 行讀，當掉前還沒 flush 的行補得回來；resume／compact 接的是從檔尾 tail 的檔，
+/// 記 NULL（不知道讀到哪），重啟照舊從檔尾。
+fn initial_tail_line(source: &str) -> Option<i64> {
+    matches!(source, "startup" | "clear" | "late").then_some(0)
+}
 
 /// 一次 flush 裡同一個 session 檔要追加的內容。
 struct Batch {
@@ -267,6 +292,8 @@ pub struct Store {
     path_of_tool: HashMap<(String, String), String>,
     /// 已寫進 JSONL、還沒進索引的 (Event, offset)：索引寫入失敗時留到下次 flush
     unindexed: Vec<(Event, u64)>,
+    /// tail 讀到的行（(session, file) → 行號），下次 flush 和 Event 同一個交易寫進 `tails`（#713）
+    read_lines: BTreeMap<(String, String), u64>,
     /// 開啟時 recover 讀了多少 bytes
     recover_bytes: u64,
 }
@@ -289,6 +316,7 @@ impl Store {
             cwd_of: HashMap::new(),
             path_of_tool: HashMap::new(),
             unindexed: Vec::new(),
+            read_lines: BTreeMap::new(),
             recover_bytes: 0,
         };
         {
@@ -310,7 +338,7 @@ impl Store {
     /// v2 → v3 升級時掃一次全部 JSONL，回填每個 transcript 檔讀到的行號（只在升級那次做）。
     fn backfill_tails(&mut self) -> Result<(), StoreError> {
         let mut last: BTreeMap<(String, String), u64> = BTreeMap::new();
-        let mut paths: BTreeMap<String, String> = BTreeMap::new();
+        let mut paths: BTreeMap<String, (String, Option<i64>)> = BTreeMap::new();
         for entry in fs::read_dir(&self.events_dir)?.flatten() {
             let path = entry.path();
             if path.extension().is_none_or(|x| x != "jsonl") {
@@ -326,13 +354,17 @@ impl Store {
                 if e.kind == "session.started"
                     && let Some(p) = e.payload["transcriptPath"].as_str()
                 {
-                    paths.insert(e.session.clone(), p.to_string());
+                    let source = e.payload["source"].as_str().unwrap_or_default();
+                    paths.insert(
+                        e.session.clone(),
+                        (p.to_string(), initial_tail_line(source)),
+                    );
                 }
             }
         }
         let tx = self.db.transaction()?;
-        for (sid, p) in &paths {
-            tx.execute(UPSERT_TAIL_PATH, params![sid, p])?;
+        for (sid, (p, start)) in &paths {
+            tx.execute(UPSERT_TAIL_PATH, params![sid, p, start])?;
         }
         for ((sid, file), no) in &last {
             tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
@@ -346,10 +378,17 @@ impl Store {
         self.pending.push(e);
     }
 
+    /// tail 讀到第 `no` 行（不論這行有沒有產生 Event）：下次 flush 寫進 `tails`，重啟從它之後接著讀（#713）。
+    /// 和同一批 Event 同一個交易寫入，當掉時位置不會跑在 Event 前面。
+    pub fn saw_line(&mut self, session: &str, file: &str, no: u64) {
+        self.read_lines
+            .insert((session.to_string(), file.to_string()), no);
+    }
+
     /// 寫入失敗時不丟資料（#683）：JSONL 寫不進去的 Event 放回緩衝、寫到一半的檔截回原長度；
     /// 已寫進 JSONL 但索引交易失敗的留在 `unindexed`，下次 flush 再索引。
     pub fn flush(&mut self) -> Result<(), StoreError> {
-        if self.pending.is_empty() && self.unindexed.is_empty() {
+        if self.pending.is_empty() && self.unindexed.is_empty() && self.read_lines.is_empty() {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending);
@@ -413,8 +452,12 @@ impl Store {
         for (e, off) in &self.unindexed {
             index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
         }
+        for ((sid, file), no) in &self.read_lines {
+            tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+        }
         tx.commit()?;
         self.unindexed.clear();
+        self.read_lines.clear();
         match failure {
             Some(e) => Err(e.into()),
             None => Ok(()),
@@ -937,12 +980,11 @@ impl Store {
         Ok(report)
     }
 
-    /// collector 重啟時交給 TailPlanner：每個 transcript 檔讀到第幾行。
-    /// 行號 0 的列（只記了路徑、還沒有任何行產生 Event）不回傳：那種 session 照舊從檔尾讀，
-    /// 不把 #684 之前從檔尾開始 tail 的舊 session 整份重讀。
+    /// collector 重啟時交給 TailPlanner：每個 transcript 檔讀到第幾行（0＝從頭讀、還沒讀到行，重啟從第 1 行）。
+    /// `line_no` 是 NULL 的列（resume／compact 從檔尾接的檔、或 v5 之前的舊列）不回傳：照舊從檔尾讀（#713）。
     pub fn tail_lines(&self) -> Result<Vec<TailRow>, StoreError> {
         let mut stmt = self.db.prepare(
-            "SELECT session, file, path, line_no FROM tails WHERE line_no > 0 ORDER BY session, file",
+            "SELECT session, file, path, line_no FROM tails WHERE line_no IS NOT NULL ORDER BY session, file",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(TailRow {
@@ -1043,6 +1085,9 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         }
         if v == 3 {
             tx.execute_batch(EVENTS_BY_TS_V4)?;
+        }
+        if v == 4 {
+            tx.execute_batch(TAILS_V5)?;
         }
         v += 1;
         tx.execute(
@@ -1165,7 +1210,11 @@ fn index_event(
                 params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],
             )?;
             if let Some(path) = &p.transcript_path {
-                exec(tx, UPSERT_TAIL_PATH, params![sid, path])?;
+                exec(
+                    tx,
+                    UPSERT_TAIL_PATH,
+                    params![sid, path, initial_tail_line(&p.source)],
+                )?;
             }
         }
         Payload::SessionEnded(p) => {

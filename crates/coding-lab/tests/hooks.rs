@@ -588,3 +588,24 @@ fn stopped_subagent_is_not_reopened() {
     ));
     assert!(late.is_empty(), "已結束的 agent 不重開：{late:?}");
 }
+
+/// #713：store 記的是 0（這個檔從頭讀、還沒有行產生 Event）：重啟從第 1 行讀（`After(0)`），不是從檔尾。
+#[test]
+fn restart_reads_a_fresh_file_with_no_recorded_line_from_the_start() {
+    let mut p = TailPlanner::default();
+    p.seed("s1", "main", Some(T), 0);
+    let a = p.on_hook(&h(
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "transcript_path": T,
+                                "tool_name": "Bash", "tool_use_id": "t"}),
+    ));
+    assert!(
+        matches!(
+            a[0],
+            TailAction::Start {
+                start: Start::After(0),
+                ..
+            }
+        ),
+        "{a:?}"
+    );
+}

@@ -170,3 +170,33 @@ fn bundled_web_is_next_to_the_binary() {
         Some(dir.join("bin/web"))
     );
 }
+
+/// #713：store 的批次 flush 間隔可調（測試把它調大讓時序可控）；預設 100 ms。
+#[test]
+fn store_flush_interval_is_configurable() {
+    let c = resolve(Overrides::default(), &[], None).unwrap();
+    assert_eq!(c.store_flush_ms, 100);
+    let file = "[collector]\nstore_flush_ms = 250\n";
+    let c = resolve(Overrides::default(), &[], Some(file)).unwrap();
+    assert_eq!(c.store_flush_ms, 250);
+    let env = [("CODING_LAB_STORE_FLUSH_MS", "60000")];
+    let c = resolve(Overrides::default(), &env, Some(file)).unwrap();
+    assert_eq!(c.store_flush_ms, 60_000, "環境變數蓋過檔案");
+    assert!(
+        resolve(
+            Overrides::default(),
+            &[("CODING_LAB_STORE_FLUSH_MS", "x")],
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        resolve(
+            Overrides::default(),
+            &[("CODING_LAB_STORE_FLUSH_MS", "0")],
+            None
+        )
+        .is_err(),
+        "0 會讓 flush 迴圈空轉"
+    );
+}

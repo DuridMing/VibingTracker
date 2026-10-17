@@ -1166,3 +1166,170 @@ fn wrapper_ensure_releases_the_callers_std_pipes_too() {
     let (status, out, err) = run_piped(c, &start);
     assert_pipes_released(&e, status, out, err);
 }
+
+// ── #713：collector 當掉不能掉 hook 事件；還沒 flush 的 transcript 行重啟後要補回來
+
+/// 像 `start_serve`，但 store 的批次 flush 調成 60 秒：測試裡「還沒 flush 就當掉」的時序由此控制，不靠 sleep。
+fn start_serve_slow_flush(e: &Env) -> Kill {
+    let child = cmd(e, &["serve"])
+        .env("CODING_LAB_STORE_FLUSH_MS", "60000")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    wait_for("collector.json", || {
+        collector(e).is_some_and(|c| c["pid"] == pid)
+    });
+    Kill(child)
+}
+
+/// live 裡的 session 列（WS `hello` 後 `subscribe *` 的 snapshot）：`/api/sessions` 讀的是 store，
+/// 看不到還沒 flush 的部分，這裡要的是「merge 已經處理」的訊號。
+fn live_session(e: &Env, id: &str) -> Value {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let Ok(Ok((mut ws, _))) = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", e.web)),
+        )
+        .await
+        else {
+            return Value::Null;
+        };
+        for v in [
+            json!({"op": "hello", "protocol": 1}),
+            json!({"op": "subscribe", "channel": "*"}),
+        ] {
+            let _ = ws.send(Message::Text(v.to_string().into())).await;
+        }
+        for _ in 0..8 {
+            let Ok(Some(Ok(Message::Text(t)))) =
+                tokio::time::timeout(Duration::from_secs(2), ws.next()).await
+            else {
+                return Value::Null;
+            };
+            let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+            if v["t"] == "snapshot"
+                && let Some(rows) = v["sessions"].as_array()
+            {
+                return rows
+                    .iter()
+                    .find(|r| r["id"] == id)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+            }
+        }
+        Value::Null
+    })
+}
+
+fn session_row(e: &Env, id: &str) -> Value {
+    json_body(&http(e.web, "GET", "/api/sessions", ""))["sessions"]
+        .as_array()
+        .and_then(|a| a.iter().find(|r| r["id"] == id).cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// hook 事件沒有別的來源可以補：merge 處理完就要寫進 store，不等 100 ms 的批次。
+/// 這裡 flush 間隔是 60 秒，prompt 進了 live（merge 已處理）就 kill：JSONL 裡要已經有它。
+#[test]
+fn hook_events_are_stored_before_the_periodic_flush() {
+    let e = env(30);
+    let transcript = e.home.join("t713a.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    {
+        let _c = start_serve_slow_flush(&e);
+        http(
+            e.hook,
+            "POST",
+            "/hook",
+            &json!({"session_id": "sh", "hook_event_name": "SessionStart",
+            "source": "startup", "transcript_path": transcript, "cwd": "/p"})
+            .to_string(),
+        );
+        http(
+            e.hook,
+            "POST",
+            "/hook",
+            &json!({"session_id": "sh", "hook_event_name": "UserPromptSubmit",
+            "transcript_path": transcript, "cwd": "/p", "prompt": "一"})
+            .to_string(),
+        );
+        wait_for("prompt 進 live", || {
+            live_session(&e, "sh")["lastPrompt"] == "一"
+        });
+    } // kill：模擬當掉
+    let jsonl = std::fs::read_to_string(e.home.join("events/sh.jsonl")).unwrap_or_default();
+    assert!(
+        jsonl.contains("session.started"),
+        "SessionStart 要在 store 裡：{jsonl}"
+    );
+    assert!(
+        jsonl.contains("\"一\""),
+        "當掉前 merge 已處理的 prompt 要在 store 裡：{jsonl}"
+    );
+}
+
+/// transcript 的行可以補：session.started 已寫進 store（tails 記 0＝從頭讀、還沒讀到行），之後讀到的行還沒
+/// flush 就當掉，重啟後 tail 要從第 1 行再讀，usage 與 assistant 內容補回來，而不是從檔尾開始、永遠漏掉。
+#[test]
+fn transcript_lines_lost_in_a_crash_are_reread_after_a_restart() {
+    let e = env(30);
+    let transcript = e.home.join("t713b.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    let line = json!({"type": "assistant", "uuid": "u1", "timestamp": "2026-10-16T00:00:00Z",
+                      "message": {"id": "m713", "model": "claude-opus-5-5",
+                                  "content": [{"type": "text", "text": "好。"}],
+                                  "usage": {"input_tokens": 1_000_000, "output_tokens": 0}}});
+    let before = {
+        let _c = start_serve_slow_flush(&e);
+        http(e.hook, "POST", "/hook", &json!({"session_id": "st", "hook_event_name": "SessionStart",
+            "source": "startup", "transcript_path": transcript, "cwd": "/p", "model": "claude-opus-5-5"}).to_string());
+        wait_for("session 進 live", || live_session(&e, "st")["id"] == "st");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap()
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        wait_for("usage 進 live", || {
+            live_session(&e, "st")["costUsd"]
+                .as_f64()
+                .is_some_and(|c| c > 0.0)
+        });
+        live_session(&e, "st")
+    }; // kill：usage 那行的 Event 還在緩衝裡
+    let jsonl = std::fs::read_to_string(e.home.join("events/st.jsonl")).unwrap_or_default();
+    assert!(jsonl.contains("session.started"), "{jsonl}");
+    assert!(
+        !jsonl.contains("m713"),
+        "前提：當掉時那行還沒 flush：{jsonl}"
+    );
+
+    let _second = start_serve(&e);
+    // session 還在跑：下一個 hook 讓 collector 重開 tail（從 tails 記的 0 之後，也就是第 1 行）
+    http(
+        e.hook,
+        "POST",
+        "/hook",
+        &json!({"session_id": "st", "hook_event_name": "UserPromptSubmit",
+        "transcript_path": transcript, "cwd": "/p", "prompt": "二"})
+        .to_string(),
+    );
+    wait_for("重啟後從第 1 行補回 usage", || {
+        session_row(&e, "st")["costUsd"]
+            .as_f64()
+            .is_some_and(|c| c > 0.0)
+    });
+    wait_for("補回的行寫進 store", || {
+        std::fs::read_to_string(e.home.join("events/st.jsonl")).is_ok_and(|t| t.contains("m713"))
+    });
+    let after = session_row(&e, "st");
+    for k in ["costUsd", "model", "cwd"] {
+        assert_eq!(after[k], before[k], "{k}：重啟前 {before}\n重啟後 {after}");
+    }
+}

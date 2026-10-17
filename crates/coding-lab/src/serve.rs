@@ -27,7 +27,6 @@ use crate::ws::{WebState, serve_web};
 /// 重啟時從 store 重建多久以內的 live 狀態（涵蓋任何時區的「今天」）。
 const REBUILD_WINDOW_MS: u64 = 36 * 60 * 60 * 1000;
 const TICK: Duration = Duration::from_millis(500);
-const STORE_FLUSH: Duration = Duration::from_millis(100);
 /// sessions 列的分數多久重算一次（契約 §6）
 const SCORE_EVERY: Duration = Duration::from_secs(10);
 /// 費用暴增的基準多久重算一次（#675）
@@ -208,7 +207,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     // 每個 tail 一個編號：TailReset 帶新的編號，merge 不理會被取代的舊 tail 送來的降級（#684 R20）
     let mut next_tail: u64 = 1;
     let mut tick = tokio::time::interval(TICK);
-    let mut flush = tokio::time::interval(STORE_FLUSH);
+    // transcript 行的 Event 批次寫（可從 transcript 補回來）；hook 事件處理完立刻寫，見下面（#713）
+    let mut flush = tokio::time::interval(Duration::from_millis(cfg.store_flush_ms));
     let mut rescore = tokio::time::interval(SCORE_EVERY);
     let mut prune = tokio::time::interval(PRUNE_EVERY);
     prune.tick().await; // 第一次立即觸發，啟動時已經清過
@@ -240,6 +240,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             Some(input) = rx.recv() => {
                 if let Input::Line { session, file, no, .. } = &input {
                     planner.saw_line(session, file, *no);
+                    // 讀到的位置跟著這批 Event 一起寫進 store：沒產生 Event 的行重啟也不重讀（#713）
+                    store.lock().unwrap_or_else(|e| e.into_inner()).saw_line(session, file, *no);
                 }
                 if let Input::Hook { hook, .. } = &input {
                     last_hook = Instant::now();
@@ -262,7 +264,15 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                         web.set_health(json!({ "tails": tails.len(), "schedLagMs": 0 }));
                     }
                 }
+                let from_hook = matches!(input, Input::Hook { .. });
                 sink(merger.handle(input));
+                // hook 事件沒有別的來源可以補（transcript 的行有）：處理完立刻寫進 store，不等批次（#713）。
+                // hook 的 200 早在 try_send 時就回了，這裡的寫入不在 Claude Code 的等待路徑上
+                if from_hook
+                    && let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush()
+                {
+                    log(&format!("寫入 store 失敗：{e}"));
+                }
             }
             scheduled = tick.tick() => {
                 let lag = Instant::now().saturating_duration_since(scheduled.into_std());

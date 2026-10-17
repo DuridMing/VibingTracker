@@ -1206,3 +1206,121 @@ fn v3_database_gets_the_ts_index() {
         .unwrap();
     assert_eq!(n, 1, "v4 有 events_by_ts 索引");
 }
+
+// ── #713：tails 的「不知道」（NULL，從檔尾）和「從頭、還沒讀」（0，重啟從第 1 行）分開
+
+fn started_from(session: &str, path: &str, source: &str) -> Event {
+    ev(
+        session,
+        1,
+        "session.started",
+        None,
+        1000,
+        json!({"cwd": "/p", "source": source, "transcriptPath": path}),
+    )
+}
+
+fn raw_tail_line_no(h: &std::path::Path, session: &str) -> Option<Option<i64>> {
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.query_row(
+        "SELECT line_no FROM tails WHERE session = ?1 AND file = 'main'",
+        [session],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .ok()
+}
+
+/// startup／clear／late 的 session.started 是從檔頭讀的檔：還沒有行產生 Event 時記 0，重啟從第 1 行讀；
+/// resume／compact 接的是從檔尾 tail 的檔：記 NULL，重啟照舊從檔尾，不整份重讀。
+#[test]
+fn tails_of_a_fresh_file_start_at_zero_and_of_a_resumed_file_are_unknown() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started_from("fresh", "/t/fresh.jsonl", "startup"));
+    s.append(started_from("cleared", "/t/cleared.jsonl", "clear"));
+    s.append(started_from("late", "/t/late.jsonl", "late"));
+    s.append(started_from("resumed", "/t/resumed.jsonl", "resume"));
+    s.append(started_from("compacted", "/t/compacted.jsonl", "compact"));
+    s.flush().unwrap();
+    let mut rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.session, t.line_no))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            ("cleared".to_string(), 0),
+            ("fresh".to_string(), 0),
+            ("late".to_string(), 0)
+        ],
+        "從頭讀的檔記 0 並交給 TailPlanner；resume／compact 的不交（NULL）"
+    );
+    assert_eq!(raw_tail_line_no(&h, "resumed"), Some(None), "NULL＝不知道");
+    assert_eq!(raw_tail_line_no(&h, "compacted"), Some(None));
+
+    // 之後讀到的行照常更新；resume 的檔讀到行之後也會接著讀
+    s.append(at_line("resumed", 2, "main", 7));
+    s.flush().unwrap();
+    assert_eq!(raw_tail_line_no(&h, "resumed"), Some(Some(7)));
+}
+
+/// v4 → v5：既有的 0 全改成 NULL（舊資料維持「從檔尾」，不把 #684 之前從檔尾 tail 的 session 整份重讀）；
+/// 升級後新的 startup 列才記 0。
+#[test]
+fn v4_database_turns_zero_tails_into_unknown() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(started_at("s2", "/t/s2.jsonl"));
+        s.append(at_line("s2", 2, "main", 4));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "UPDATE tails SET line_no = 0 WHERE session = 's1';
+         UPDATE meta SET value = '4' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(raw_tail_line_no(&h, "s1"), Some(None), "升級把 0 改成 NULL");
+    assert_eq!(raw_tail_line_no(&h, "s2"), Some(Some(4)), "有行號的不動");
+    s.append(started_at("s3", "/t/s3.jsonl"));
+    s.flush().unwrap();
+    assert_eq!(
+        raw_tail_line_no(&h, "s3"),
+        Some(Some(0)),
+        "升級後新的 startup 列記 0"
+    );
+}
+
+/// tails 記的是「tail 讀到哪一行」，不只是「哪一行產生了 Event」：沒產生 Event（或 Event 不帶 line）的行
+/// 也算讀過，重啟不重讀（例如 Esc 的 `[Request interrupted by user]` 行只改狀態，重讀會讓 session 又變 idle）。
+/// 位置和 Event 在同一次 flush 寫入：當掉時兩者一起留下或一起沒有。
+#[test]
+fn tails_advance_to_the_last_line_read_even_without_events() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started_at("s1", "/t/s1.jsonl"));
+    s.flush().unwrap();
+    s.saw_line("s1", "main", 3);
+    assert_eq!(raw_tail_line_no(&h, "s1"), Some(Some(0)), "flush 前還沒寫");
+    s.flush().unwrap();
+    assert_eq!(raw_tail_line_no(&h, "s1"), Some(Some(3)));
+    s.saw_line("s1", "agent-a1", 2);
+    s.flush().unwrap();
+    let mut rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.line_no))
+        .collect();
+    rows.sort();
+    assert_eq!(rows, [("agent-a1".to_string(), 2), ("main".to_string(), 3)]);
+}

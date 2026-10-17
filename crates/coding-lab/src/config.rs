@@ -11,6 +11,8 @@ use serde::Deserialize;
 pub const DEFAULT_HOOK_BIND: &str = "127.0.0.1:4800";
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:4801";
 pub const DEFAULT_IDLE_EXIT_SECONDS: u64 = 600;
+/// store 批次 flush 的間隔（transcript 行的 Event；hook 事件不等批次，#713）
+pub const DEFAULT_STORE_FLUSH_MS: u64 = 100;
 
 /// 命令列給的值（沒給就是 None）。
 #[derive(Clone, Debug, Default)]
@@ -31,6 +33,8 @@ pub struct Config {
     pub web_root: Option<PathBuf>,
     /// 沒有任何 hook 進來多久就自動結束；0 表示不結束（形態 B 常駐）
     pub idle_exit_seconds: u64,
+    /// store 的批次 flush 間隔（毫秒，≥ 1）；只影響 transcript 行的 Event，hook 事件處理完就寫（#713）
+    pub store_flush_ms: u64,
 }
 
 #[derive(Default, Deserialize)]
@@ -57,6 +61,7 @@ struct WebSection {
 #[derive(Default, Deserialize)]
 struct CollectorSection {
     idle_exit_seconds: Option<u64>,
+    store_flush_ms: Option<u64>,
 }
 
 impl Config {
@@ -148,6 +153,16 @@ impl Config {
                 .unwrap_or(DEFAULT_IDLE_EXIT_SECONDS),
         };
 
+        let store_flush_ms = match env("CODING_LAB_STORE_FLUSH_MS") {
+            Some(v) => v
+                .parse()
+                .map_err(|_| format!("CODING_LAB_STORE_FLUSH_MS 不是正整數：{v}"))?,
+            None => f.collector.store_flush_ms.unwrap_or(DEFAULT_STORE_FLUSH_MS),
+        };
+        if store_flush_ms == 0 {
+            return Err("[collector].store_flush_ms 要大於 0".into());
+        }
+
         if !hook_bind.ip().is_loopback() {
             return Err(format!(
                 "[hook].bind 只能是 127.0.0.1（只給同機的 Claude Code），收到 {hook_bind}"
@@ -164,6 +179,7 @@ impl Config {
             web_bind,
             web_root,
             idle_exit_seconds,
+            store_flush_ms,
         })
     }
 }

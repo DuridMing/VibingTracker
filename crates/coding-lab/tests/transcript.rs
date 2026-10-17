@@ -484,3 +484,13 @@ async fn degraded_carries_the_tail_number() {
     assert!(matches!(got, Input::Degraded { tail: 5, .. }));
     h.stop().await;
 }
+
+/// #713：`After(0)`（store 記 0：從頭讀、還沒有行產生 Event）等於從檔頭讀。
+#[test]
+fn after_zero_reads_from_the_beginning() {
+    let content: String = ["a", "b", "c"].iter().map(|u| line(u)).collect();
+    let p = tmpfile(&content);
+    let mut r = TailReader::open(&p, Start::After(0)).unwrap();
+    let got: Vec<u64> = r.poll().unwrap().lines.iter().map(|l| l.no).collect();
+    assert_eq!(got, [1, 2, 3]);
+}

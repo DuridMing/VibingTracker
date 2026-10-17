@@ -138,7 +138,7 @@ cargo build --release -p coding-lab
 ~/.coding-lab/bin/coding-lab stop              # Windows 在 Git Bash 用同一行
 ```
 
-它不理會時（`stop` 會印出說明）才直接結束程序：`pkill coding-lab`（Linux、macOS）或 `taskkill /IM coding-lab.exe /F`（Windows）。直接結束不會弄壞紀錄，下一個 session 開始時會重新拉起，中間漏掉的部分會從 transcript 補回來。接著：
+它不理會時（`stop` 會印出說明）才直接結束程序：`pkill coding-lab`（Linux、macOS）或 `taskkill /IM coding-lab.exe /F`（Windows）。直接結束不會弄壞紀錄：hook 事件一收到就寫進磁碟，transcript 的內容最多掉結束前 0.1 秒內還沒寫的那一批，下一個 session 開始時會重新拉起、從上次讀到的行接著把它們補回來。接著：
 
 ```bash
 cp target/release/coding-lab ~/.coding-lab/bin/      # Windows：coding-lab.exe
