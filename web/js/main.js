@@ -10,11 +10,11 @@ import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel, agentWho } from "./agents.js";
-import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay } from "./session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle, snapshotLoad } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
-import { mergeSessions, projectRoots, pickProject } from "./sessions.js";
+import { mergeSessions, projectRoots, pickProject, canReplay } from "./sessions.js";
 import { degradedNotice } from "./degraded.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -37,7 +37,7 @@ const CONN_TEXT = { connecting: "連線中…", open: "已連線", closed: "已�
 const store = createStore();
 // #monitor=<id>：監視器視窗（#650），整頁只看一個 session、自己連 collector
 const monitorId = parseMonitor(location.hash);
-const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null };
+const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null, replayNext: null }; // replayNext：按了 ▶ 回放、等 snapshot 的 session
 
 // ---------- render ----------
 // 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
@@ -189,12 +189,14 @@ function renderSessions() {
   $("#sess").replaceChildren(
     ...(all.length
       ? all.slice(0, SESS_SHOWN).map((s) =>
-          h("button", { class: `${ui.tab === s.id ? "sel" : ""}${s.status === "ended" ? " ended" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
-            sessTag(s),
-            h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
-              s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
-              h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
-            h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")))
+          h("div", { class: "srow" },
+            h("button", { class: `${ui.tab === s.id ? "sel" : ""}${s.status === "ended" ? " ended" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
+              sessTag(s),
+              h("span", {}, h("span", { class: "pr" }, s.firstPrompt ?? "—"),
+                s.doing && s.status !== "ended" ? h("small", { class: "doing" }, `▸ ${s.doing}`) : null,
+                h("small", {}, `⎇ ${s.branch ?? "—"} · commits ${s.commits ?? 0}${s.dangers ? ` · ⚠ ${s.dangers}` : ""}`, s.model ? h("span", { class: "mdl", title: s.modelId ?? s.model }, s.model) : null)),
+              h("span", { class: `r ${s.status}` }, STATUS_TEXT[s.status] ?? s.status ?? "")),
+            canReplay(s) ? h("button", { class: "btn sm rp", title: "從存下來的紀錄重新讀回這個 session", onclick: () => replaySession(s.id) }, "▶ 回放") : null))
       : [h("div", { class: "none" }, "尚無 session")]),
     ...(all.length > SESS_SHOWN ? [h("div", { class: "more" }, `只列最近 ${SESS_SHOWN} 個（共 ${all.length}）`)] : []),
   );
@@ -513,6 +515,7 @@ $("#nBrowser").addEventListener("change", async (e) => {
 });
 $("#nHint").addEventListener("click", unlockAudio);
 $("#spPop").addEventListener("click", () => openMonitor(pane.session));
+$("#spReplay").addEventListener("click", () => replaySession(pane.session));
 setInterval(() => render(), 30_000); // 佇列的「幾分前」
 
 // ---------- 左欄：專案檔案（#642）與改動基準（#644） ----------
@@ -950,6 +953,8 @@ function renderPane() {
   const modelId = s?.model ? s.modelId : main?.modelId; // 完整 id 放滑過提示（#643）
   const g = pane.git;
   const now = nowOf(v, s);
+  $("#spReplay").hidden = !canReplay(s);
+  $("#spReplayTag").hidden = !pane.replaying;
 
   if (changed("spHead", JSON.stringify([id, s?.lastPrompt, s?.firstPrompt, s?.doing, model, modelId, s?.branch, s?.cwd, s?.commits, s?.dangers, s?.costUsd, g.last, g.commits.length]))) {
     $("#spDoing").hidden = !s?.doing;
@@ -1247,6 +1252,22 @@ function benchFrame(m) {
 }
 
 // ---------- 互動 ----------
+// ▶ 回放（#690）：已經開著就清空後從 JSONL 由最新往前讀；否則開 tab，等 session 頻道的 snapshot 進來時改走回放
+function replaySession(id) {
+  if (ui.tab !== id) {
+    ui.replayNext = id;
+    selectTab(id);
+    return;
+  }
+  pane.open(id);
+  pane.replaying = true;
+  paneMoreReq = null;
+  paneView.reset();
+  paneView.setHasMore(false);
+  paneMore(true);
+  render(true);
+}
+
 function selectTab(id) {
   if (id === ui.tab) return;
   switchTab(client, ui.tab, id);
@@ -1289,11 +1310,14 @@ const client = createClient({
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
       if (ui.tab !== "all" && m.ch === `session:${pane.session}`) {
-        pane.load({ staged: m.staged, stream: m.stream });
+        const r = snapshotLoad(pane.session, m, { replay: ui.replayNext === pane.session });
+        ui.replayNext = null;
+        pane.load(r.load);
+        pane.replaying = r.replay;
         paneMoreReq = null;
         paneView.reset();
         paneHasMore();
-        if (needsReplay(pane.session, m)) paneMore(true);
+        if (r.replay) paneMore(true);
       }
       if (m.ch === "*") {
         applySnapshot(store, m);

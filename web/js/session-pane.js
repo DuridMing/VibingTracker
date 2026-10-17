@@ -140,6 +140,13 @@ export function needsReplay(session, { stream = [] } = {}) {
   return !stream.some((e) => e.session === session && e.pos != null);
 }
 
+// session 頻道的 snapshot 怎麼填進 pane：按了「▶ 回放」（#690）就不用 snapshot 的串流（結束不到 2 小時的還在 live），
+// 一律清空後從 JSONL 由最新往前讀；沒按時照舊，snapshot 沒有它的串流才自動回放
+export function snapshotLoad(session, m, { replay = false } = {}) {
+  if (replay) return { load: { staged: [], stream: [] }, replay: true };
+  return { load: { staged: m.staged, stream: m.stream }, replay: needsReplay(session, m) };
+}
+
 const STATE_TEXT = { wait: "等你回應", done: "回合結束，等你確認", fail: "連續失敗，等你處理", danger: "危險指令", idle: "已中斷", ended: "已結束" };
 
 // view：agentView() 的結果；row：sessions 列

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay } from "../js/session-pane.js";
+import { createSessionPane, nowOf, switchTab, sessionTitle, needsReplay, snapshotLoad } from "../js/session-pane.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 let seq = 0;
@@ -213,4 +213,12 @@ test("回放：舊的一頁裡工具還在 running，不能蓋掉之後已知的
   p.prepend(list.slice(4)); // 有 e1 的 done
   p.prepend(list.slice(0, 4)); // 只有 e1 的 running
   assert.equal(p.files().find((f) => f.path === "src/a.ts").running, false);
+});
+
+test("按 ▶ 回放（#690）：snapshot 已有串流也不用它，清空後從 JSONL 由最新往前讀；沒按時照舊（有串流就用，沒有才自動回放）", () => {
+  const m = { staged: [ev("tool.called", { toolUseId: "t1" })], stream: [ev("assistant.text", { text: "a" }, { pos: 1 })] };
+  assert.deepEqual(snapshotLoad(S, m, { replay: true }), { load: { staged: [], stream: [] }, replay: true });
+  assert.deepEqual(snapshotLoad(S, m), { load: { staged: m.staged, stream: m.stream }, replay: false });
+  const gone = { staged: [], stream: [] };
+  assert.deepEqual(snapshotLoad(S, gone), { load: { staged: [], stream: [] }, replay: true });
 });

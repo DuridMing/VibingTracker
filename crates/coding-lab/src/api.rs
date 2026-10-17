@@ -350,23 +350,39 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
             None => ("main".into(), Value::Null, Vec::new()),
             Some(r) => {
                 let rp = Path::new(r);
-                let Some(main) = ["main", "master"].into_iter().find(|b| {
+                let main = ["main", "master"].into_iter().find(|b| {
                     git(
                         rp,
                         &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
                     )
                     .is_some()
-                }) else {
-                    return error(StatusCode::CONFLICT, "repo 沒有 main 也沒有 master 分支");
+                });
+                // 還沒有任何 commit（git init 之後）：以空樹為基準，檔案都算新增（#691）
+                let empty = match main {
+                    Some(_) => None,
+                    None if git(rp, &["rev-parse", "--verify", "-q", "HEAD"]).is_none() => {
+                        git(rp, &["hash-object", "-t", "tree", "--stdin"])
+                            .map(|h| h.trim().to_string())
+                    }
+                    None => {
+                        return error(
+                            StatusCode::CONFLICT,
+                            "repo 沒有 main 也沒有 master 分支，無法比「相對 main」",
+                        );
+                    }
                 };
                 // 比到工作目錄（PLAN「改動基準」，#682）：還沒 commit 的改動也算
                 let sources = wts
                     .iter()
                     .cloned()
                     .map(|(wt, branch)| Source {
-                        entries: git(Path::new(&wt), &["merge-base", main, "HEAD"])
-                            .map(|base| git_changes(Path::new(&wt), &[base.trim()]))
-                            .unwrap_or_default(),
+                        entries: match (main, &empty) {
+                            (Some(main), _) => git(Path::new(&wt), &["merge-base", main, "HEAD"])
+                                .map(|base| git_changes(Path::new(&wt), &[base.trim()]))
+                                .unwrap_or_default(),
+                            (None, Some(tree)) => git_changes(Path::new(&wt), &[tree]),
+                            (None, None) => Changes::new(),
+                        },
                         by: json!({ "worktree": wt, "branch": branch }),
                         head: git(Path::new(&wt), &["rev-parse", "HEAD"])
                             .map(|h| h.trim().to_string()),

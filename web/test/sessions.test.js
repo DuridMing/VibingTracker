@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeSessions, projectRoots, pickProject } from "../js/sessions.js";
+import { mergeSessions, projectRoots, pickProject, canReplay } from "../js/sessions.js";
 
 const row = (id, extra = {}) => ({ id, cwd: "/repo", status: "run", startedAt: 1000, model: null, ...extra });
 
@@ -39,4 +39,10 @@ test("預設專案：使用者選過且還在就用它，否則選 live 最多�
   assert.equal(pickProject(roots, "/a"), "/a");
   assert.equal(pickProject(roots, "/gone"), "/b");
   assert.equal(pickProject([], "/a"), null);
+});
+
+test("▶ 回放按鍵只給已結束的 session（#690）", () => {
+  assert.equal(canReplay(row("a", { status: "ended" })), true);
+  for (const status of ["run", "wait", "done", "fail", "danger", "idle"]) assert.equal(canReplay(row("a", { status })), false, status);
+  assert.equal(canReplay(null), false);
 });

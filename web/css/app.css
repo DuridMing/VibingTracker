@@ -134,6 +134,9 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .sess button .r{text-align:right;color:var(--muted);font-weight:500;font-size:11px}
 .sess button .mdl{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-left:4px}
 .sess button.ended{opacity:.75}
+.sess .srow{display:flex;gap:4px;align-items:center}
+.sess .srow>button:first-child{flex:1;min-width:0}
+.sess button.rp{display:inline-block;flex:none;padding:2px 8px;font-size:11px;white-space:nowrap;color:var(--accent)}
 .sess .more{font-size:11px;color:var(--dim);text-align:center;padding:4px}
 .sess button .r.run{color:var(--teal)}.sess button .r.danger,.sess button .r.fail{color:var(--rose)}.sess button .r.wait{color:var(--amber)}.sess button .r.done{color:var(--accent)}
 
@@ -350,6 +353,7 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 
 /* 監視器視窗（#650）：只留連線狀態與單 session 畫面 */
 .spane .ph .right{display:inline-flex;gap:8px;align-items:center}
+.spane .ph .rptag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 body.monitor .kpis,body.monitor .col-tree,body.monitor .stabs,body.monitor #allblk,body.monitor #spPop{display:none!important}
 body.monitor .main{grid-template-columns:1fr}
 body.monitor .top{grid-template-columns:auto 1fr}

@@ -838,3 +838,64 @@ async fn files_never_run_clean_filters() {
     assert_eq!(code, 200, "{body}");
     assert!(!marker.exists(), "clean filter 被執行了");
 }
+
+/// 還沒有任何 commit 的 repo（HEAD 指向還不存在的 main，e2e 腳本 git init 後就是這樣）：
+/// 相對 main 以空樹為基準，tree 照常、檔案都算新增；不能整棵樹載入失敗（#691）。
+#[tokio::test]
+async fn files_relative_to_main_on_a_repo_without_commits() {
+    let root = tmp("unborn").canonicalize().unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, "staged.txt", "s\n");
+    write(&root, "loose.txt", "l\n");
+    git(&root, &["add", "staged.txt"]);
+    let home = tmp("unborn-home");
+    let store = store_with(&home, &[started("su", 1, 1_000, &s(&root))]);
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    let (code, body) = get(
+        addr,
+        &format!("/api/files?cwd={}&base=main", enc(&s(&root))),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["baseRef"], Value::Null, "沒有 commit 可指：{body}");
+    assert_eq!(
+        by_source(&body, "worktree", &s(&root)),
+        BTreeSet::from([
+            ("?".to_string(), "loose.txt".to_string()),
+            ("A".to_string(), "staged.txt".to_string()),
+        ]),
+        "{body}"
+    );
+    let tree: BTreeSet<&str> = body["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(
+        tree.contains("staged.txt") && tree.contains("loose.txt"),
+        "{body}"
+    );
+}
+
+/// 有 commit、但分支既不是 main 也不是 master：仍是錯誤，不能拿空樹當基準（#691）。
+#[tokio::test]
+async fn files_relative_to_main_without_main_branch_is_an_error() {
+    let root = tmp("trunk").canonicalize().unwrap();
+    git(&root, &["init", "-q", "-b", "trunk"]);
+    write(&root, "a.txt", "a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "init"]);
+    let home = tmp("trunk-home");
+    let store = store_with(&home, &[started("st", 1, 1_000, &s(&root))]);
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    let (code, body) = get(
+        addr,
+        &format!("/api/files?cwd={}&base=main", enc(&s(&root))),
+    )
+    .await;
+    assert_eq!(code, 409, "{body}");
+    assert!(body["error"].is_string(), "{body}");
+}

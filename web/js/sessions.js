@@ -2,6 +2,9 @@
 // - WS 的 sessions 列是即時的；GET /api/sessions 補上已結束、不在 live 狀態裡的（contracts §7）。
 // - 專案：session 的 cwd 在另一個 session 的 cwd 底下（worktree、子目錄）就歸到那個上層；檔案樹一次看一個專案。
 
+// ▶ 回放按鍵（#690）：只給已結束的 session；進行中的直接看即時串流
+export const canReplay = (s) => s?.status === "ended";
+
 const under = (p, base) => p === base || p.startsWith(base.endsWith("/") ? base : `${base}/`);
 
 // 同一個 id：WS 的列為準；WS 還沒有模型時用 API 查到的（SQLite 從 usage 補的，#673）。依 startedAt 新到舊
