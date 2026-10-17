@@ -316,7 +316,8 @@ fn every_tail_action_resets_degraded_in_merge() {
     assert_eq!(reset(all), ("s".into(), None, 7));
 }
 
-/// 同步送一個 hook，回傳是否在 `wait` 內收到回應。
+/// 同步送一個 hook，回傳是否在 `wait` 內收到回應。只有 unix 的測試用到。
+#[cfg(unix)]
 fn post_blocking(addr: SocketAddr, body: &str, wait: Duration) -> bool {
     use std::io::{Read, Write};
     let Ok(mut s) = std::net::TcpStream::connect(addr) else {

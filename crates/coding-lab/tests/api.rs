@@ -19,6 +19,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 static N: AtomicU32 = AtomicU32::new(0);
 
+/// 真實路徑，和正式碼從 `git rev-parse`／`git worktree list` 拿到的一樣：
+/// Windows 的 `canonicalize()` 會帶 `\\?\` 前綴，git 印的路徑沒有，直接比會不相等。
+fn canon(p: &Path) -> PathBuf {
+    let c = p.canonicalize().unwrap();
+    match c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(plain) => PathBuf::from(plain),
+        None => c,
+    }
+}
+
 fn tmp(name: &str) -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "api-{name}-{}-{}",
@@ -379,7 +389,7 @@ struct Repo {
 /// main ← develop（改 shared.txt）；主工作樹在 develop；worktree x、y 從 develop 開：
 /// 兩邊都改 a.txt（內容不同＝衝突候選），y 另改 b.txt，x 有未追蹤的 new.txt；之後 develop 再改 shared.txt。
 fn repo() -> Repo {
-    let root = tmp("repo").canonicalize().unwrap();
+    let root = canon(&tmp("repo"));
     git(&root, &["init", "-q", "-b", "main"]);
     write(&root, ".gitignore", "wt/\n*.log\n");
     for f in ["a.txt", "b.txt", "shared.txt"] {
@@ -843,7 +853,7 @@ async fn files_never_run_clean_filters() {
 /// 相對 main 以空樹為基準，tree 照常、檔案都算新增；不能整棵樹載入失敗（#691）。
 #[tokio::test]
 async fn files_relative_to_main_on_a_repo_without_commits() {
-    let root = tmp("unborn").canonicalize().unwrap();
+    let root = canon(&tmp("unborn"));
     git(&root, &["init", "-q", "-b", "main"]);
     write(&root, "staged.txt", "s\n");
     write(&root, "loose.txt", "l\n");
@@ -882,7 +892,7 @@ async fn files_relative_to_main_on_a_repo_without_commits() {
 /// 有 commit、但分支既不是 main 也不是 master：仍是錯誤，不能拿空樹當基準（#691）。
 #[tokio::test]
 async fn files_relative_to_main_without_main_branch_is_an_error() {
-    let root = tmp("trunk").canonicalize().unwrap();
+    let root = canon(&tmp("trunk"));
     git(&root, &["init", "-q", "-b", "trunk"]);
     write(&root, "a.txt", "a\n");
     git(&root, &["add", "."]);

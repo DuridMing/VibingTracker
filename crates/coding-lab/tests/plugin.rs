@@ -1,6 +1,7 @@
 //! plugin 的結構驗證與 wrapper 行為（#628）。hooks.json 必須和契約 §2 訂閱的事件一致。
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use coding_lab::config::DEFAULT_HOOK_BIND;
