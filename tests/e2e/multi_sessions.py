@@ -87,7 +87,7 @@ def workdir(i):
     cwd = L.WORK / f"s{i:02d}"
     shutil.rmtree(cwd, ignore_errors=True)
     cwd.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(cwd)], check=True)
+    L.git_init(cwd)
     (cwd / "notes.txt").write_text("".join(f"line {n}\n" for n in range(1, NOTES_LINES + 1)))
     return cwd
 

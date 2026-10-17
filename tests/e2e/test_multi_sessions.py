@@ -1,7 +1,10 @@
 """tests/e2e/multi_sessions.py 的準備邏輯（#658）：不呼叫模型。"""
 
+import os
 import shutil
+import subprocess
 import unittest
+from unittest import mock
 
 import multi_sessions as M
 
@@ -18,6 +21,13 @@ class Workdir(unittest.TestCase):
         self.assertFalse((cwd / "out-2.txt").exists())
         self.assertTrue((cwd / ".git").exists())
         self.assertEqual(len((cwd / "notes.txt").read_text().splitlines()), M.NOTES_LINES)
+
+    def test_git_init_ignores_the_callers_git_dir(self):
+        # 從 worktree commit 時 pre-commit hook 帶著 GIT_DIR：git init 不能跑去重新初始化外面那個 repo（#703）
+        outer = subprocess.run(["git", "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, check=True).stdout.strip()
+        with mock.patch.dict(os.environ, {"GIT_DIR": outer}):
+            cwd = M.workdir(99)
+        self.assertTrue((cwd / ".git").exists())
 
 
 class HunkChangedLine(unittest.TestCase):

@@ -39,6 +39,12 @@ MORE_LIMIT = 500
 IDLE_EXIT_SECONDS = 120
 
 
+def git_init(path):
+    """git init 一個獨立的 repo。清掉 GIT_*：pre-commit hook 裡跑時繼承的 GIT_DIR 會讓它去重新初始化外面那個 repo（#703）。"""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    subprocess.run(["git", "init", "-q", str(path)], check=True, env=env)
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -64,7 +70,7 @@ def setup():
     hooks = PLUGIN / "hooks" / "hooks.json"
     hooks.write_text(hooks.read_text().replace("127.0.0.1:4800", f"127.0.0.1:{hook}"))
     if not (WORK / ".git").exists():  # 自己的 git root，避免讀到上層的 .claude/settings.local.json
-        subprocess.run(["git", "init", "-q", str(WORK)], check=True)
+        git_init(WORK)
     return hook, web
 
 
