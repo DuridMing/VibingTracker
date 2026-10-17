@@ -964,7 +964,10 @@ fn index_event(
                 .and_then(|v| v.as_str().map(str::to_string));
             exec(
                 tx,
-                "UPDATE sessions SET status = ?2, status_since = ?3 WHERE id = ?1",
+                // 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）：結束不再成立
+                "UPDATE sessions SET status = ?2, status_since = ?3,
+                   ended_at = CASE WHEN ?2 = 'ended' THEN ended_at END,
+                   end_reason = CASE WHEN ?2 = 'ended' THEN end_reason END WHERE id = ?1",
                 params![sid, status, p.since as i64],
             )?;
         }

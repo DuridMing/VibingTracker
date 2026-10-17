@@ -355,18 +355,17 @@ impl Merger {
     fn evict(&mut self, now: u64) -> Vec<Event> {
         let mut out = Vec::new();
         // 重啟前就沒有 SessionEnd、之後也沒再回到記憶體的 session（只在 resumed 裡）
-        let stale: Vec<String> = self
+        // 結束時間記成最後一次活動，不是發現它的這一刻（升級後第一次重啟會一次補很多舊 session）
+        let stale: Vec<(String, u64)> = self
             .resumed
             .iter()
-            .filter(|(_, r)| {
-                r.ended_at.is_none()
-                    && r.last_seen
-                        .is_some_and(|t| t + SESSION_IDLE_EVICT_MS <= now)
+            .filter_map(|(id, r)| {
+                let t = r.last_seen.filter(|_| r.ended_at.is_none())?;
+                (t + SESSION_IDLE_EVICT_MS <= now).then(|| (id.clone(), t))
             })
-            .map(|(id, _)| id.clone())
             .collect();
-        for id in stale {
-            out.extend(self.end_session(&id, Some("abandoned".into()), now, None));
+        for (id, last) in stale {
+            out.extend(self.end_session(&id, Some("abandoned".into()), last, None));
         }
         let gone: Vec<String> = self
             .sessions
@@ -382,9 +381,10 @@ impl Merger {
             let abandoned = self
                 .sessions
                 .get(&id)
-                .is_some_and(|s| s.ended_at.is_none() && s.seq > 0);
-            if abandoned {
-                out.extend(self.end_session(&id, Some("abandoned".into()), now, None));
+                .filter(|s| s.ended_at.is_none() && s.seq > 0)
+                .map(|s| s.last_seen);
+            if let Some(last) = abandoned {
+                out.extend(self.end_session(&id, Some("abandoned".into()), last, None));
             }
             if let Some(s) = self.sessions.remove(&id)
                 && (s.seq > 0 || !s.status.open_items().is_empty())
@@ -617,6 +617,17 @@ impl Merger {
             ..Meta::default()
         };
         let s = |k: &str| h.str_field(k).map(str::to_string);
+        // 已結束（多半是閒置 24 小時被補 abandoned）的 session 又有新的動作，而且不會有 SessionStart
+        // （終端機一直開著）：重新打開，status 回到依注意項目決定（#679）
+        // 只認 main：SessionEnd（例如 /clear）之後才到的 subagent hook 不代表使用者繼續使用
+        if matches!(h.event_name(), "UserPromptSubmit" | "PreToolUse")
+            && agent == "main"
+            && self.session(&sid).ended_at.is_some()
+        {
+            self.session(&sid).ended_at = None;
+            let changes = self.tracker(&sid).started(ts_seen);
+            out.extend(self.apply(&sid, changes, &agent, ts_seen));
+        }
         match h.event_name() {
             "SessionStart" => {
                 let cwd = s("cwd").unwrap_or_default().replace('\\', "/");

@@ -771,3 +771,32 @@ fn write_line_count_uses_full_length() {
     s.flush().unwrap();
     assert_eq!(s.recent_changes("/p", 10).unwrap()[0].added, Some(5000));
 }
+
+/// 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）：sessions 列的結束時間與原因清掉，
+/// 否則下次重啟又被種回 ended。
+#[test]
+fn status_after_end_clears_the_end() {
+    let mut s = Store::open(&home()).unwrap();
+    s.append(ev(
+        "s1",
+        1,
+        "session.ended",
+        None,
+        100,
+        json!({"reason": "abandoned"}),
+    ));
+    s.append(ev(
+        "s1",
+        2,
+        "session.status",
+        None,
+        200,
+        json!({"status": "run", "since": 200, "score": 0.0}),
+    ));
+    s.flush().unwrap();
+    let row = s.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (row.ended_at, row.end_reason, row.status.as_str()),
+        (None, None, "run")
+    );
+}

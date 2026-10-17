@@ -1520,3 +1520,52 @@ fn status_line_tie_follows_seq_like_live_append() {
     let seqs: Vec<u64> = out.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, [1, 2], "即時 append 是 prompt（seq 1）在前");
 }
+
+/// 重啟後 live 第一次看到的 session 用 store 的列種（#676）：狀態與結束時間也要照 store，
+/// 和 merge 種回的一致（D3，#679）。
+#[test]
+fn seeded_row_keeps_the_stored_status_and_end() {
+    use coding_lab::store::SessionRow;
+    let row = SessionRow {
+        id: "s1".into(),
+        host: "local".into(),
+        cwd: "/p".into(),
+        transcript_path: None,
+        model: None,
+        branch: None,
+        first_prompt: None,
+        started_at: DAY - 3 * H,
+        ended_at: Some(DAY - 2 * H),
+        end_reason: Some("abandoned".into()),
+        status: "ended".into(),
+        status_since: DAY - 2 * H,
+        commits: 0,
+        dangers: 0,
+        failures: 0,
+        cost_usd: 0.0,
+        thinking_tokens: 0,
+        last_seq: 40,
+    };
+    let mut l = Live::new();
+    l.seed(&row, DAY);
+    let r = l.session_row("s1").unwrap();
+    assert_eq!(
+        (r["status"].clone(), r["endedAt"].clone()),
+        (json!("ended"), json!(DAY - 2 * H))
+    );
+    // 之後又回到 run：結束不再成立
+    let mut b = B::new();
+    l.apply(&b.ev(
+        "s1",
+        "session.status",
+        "main",
+        DAY + 1,
+        false,
+        json!({"status": "run", "since": DAY + 1, "score": 0.0}),
+    ));
+    let r = l.session_row("s1").unwrap();
+    assert_eq!(
+        (r["status"].clone(), r["endedAt"].clone()),
+        (json!("run"), Value::Null)
+    );
+}
