@@ -277,6 +277,76 @@ mod download {
         .unwrap();
     }
 
+    /// Windows 的假 Release：`coding-lab-<target>.zip`，內容同 tar.gz 版（二進位叫 coding-lab.exe）。
+    fn fake_zip_release(dir: &Path, target: &str) {
+        let name = format!("coding-lab-{target}");
+        let stage = dir.join("stage").join(&name);
+        std::fs::create_dir_all(stage.join("web")).unwrap();
+        exec(
+            &stage.join("coding-lab.exe"),
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/ran\"\n",
+        );
+        std::fs::write(stage.join("web/index.html"), "<!doctype html>").unwrap();
+        let archive = dir.join(format!("{name}.zip"));
+        let ok = Command::new("zip")
+            .arg("-qr")
+            .arg(&archive)
+            .arg(&name)
+            .current_dir(dir.join("stage"))
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let sum = Command::new("sha256sum").arg(&archive).output().unwrap();
+        let hex = String::from_utf8_lossy(&sum.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            dir.join(format!("{name}.zip.sha256")),
+            format!("{hex} *{name}.zip\n"),
+        )
+        .unwrap();
+    }
+
+    /// 只有 wrapper 安裝時用得到的工具、**沒有 unzip** 的 PATH 目錄（模擬標準的 Git for Windows）。
+    fn tools_without_unzip(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for t in [
+            "mkdir",
+            "find",
+            "rmdir",
+            "rm",
+            "curl",
+            "cut",
+            "tr",
+            "sha256sum",
+            "chmod",
+            "mv",
+            "dirname",
+            "sed",
+        ] {
+            let from = Path::new("/usr/bin").join(t);
+            assert!(from.exists(), "測試機要有 {t}");
+            std::os::unix::fs::symlink(&from, dir.join(t)).unwrap();
+        }
+    }
+
+    /// PATH 上的假 powershell：把整串參數記到 $FAKE_PS_LOG，再用真的 unzip 做 Expand-Archive 的事。
+    fn stub_powershell(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        exec(
+            &dir.join("powershell"),
+            concat!(
+                "#!/bin/sh\n",
+                "echo \"$*\" > \"$FAKE_PS_LOG\"\n",
+                "zip=$(printf '%s' \"$*\" | sed \"s/.*-LiteralPath '\\([^']*\\)'.*/\\1/\")\n",
+                "dest=$(printf '%s' \"$*\" | sed \"s/.*-DestinationPath '\\([^']*\\)'.*/\\1/\")\n",
+                "exec /usr/bin/unzip -q \"$zip\" -d \"$dest\"\n",
+            ),
+        );
+    }
+
     struct Env {
         home: PathBuf,
         stubs: PathBuf,
@@ -297,12 +367,28 @@ mod download {
     }
 
     fn run(e: &Env, args: &[&str], uname: (&str, &str), url: Option<&str>) -> Output {
+        run_with_path(
+            e,
+            args,
+            uname,
+            url,
+            &format!("{}:/usr/bin:/bin", e.stubs.display()),
+        )
+    }
+
+    fn run_with_path(
+        e: &Env,
+        args: &[&str],
+        uname: (&str, &str),
+        url: Option<&str>,
+        path: &str,
+    ) -> Output {
         let mut c = Command::new(plugin_dir().join("bin/coding-lab"));
         c.args(args)
             .env_remove("CODING_LAB_BIN")
             .env_remove("CODING_LAB_RELEASE_URL")
             .env("CODING_LAB_HOME", &e.home)
-            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("PATH", path)
             .env("FAKE_UNAME_S", uname.0)
             .env("FAKE_UNAME_M", uname.1)
             .stdin(Stdio::null());
@@ -404,6 +490,81 @@ mod download {
                 .trim(),
             "ensure"
         );
+    }
+
+    /// Windows 的 Release 是 .zip：有 unzip 時照常解開（二進位叫 coding-lab.exe）。
+    #[test]
+    fn install_unpacks_a_zip_release_with_unzip() {
+        let e = env("zip");
+        fake_zip_release(&e.release, "x86_64-pc-windows-msvc");
+        let out = run(
+            &e,
+            &["install"],
+            ("MINGW64_NT-10.0", "x86_64"),
+            Some(&url(&e)),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(e.home.join("bin/coding-lab.exe").exists(), "{err}");
+        assert!(e.home.join("bin/web/index.html").exists(), "{err}");
+    }
+
+    /// 標準的 Git for Windows 沒有 unzip（#699）：要退到 PowerShell 的 Expand-Archive，不能直接報解壓失敗。
+    #[test]
+    fn install_without_unzip_falls_back_to_powershell_expand_archive() {
+        let e = env("zip-ps");
+        fake_zip_release(&e.release, "x86_64-pc-windows-msvc");
+        let tools = e.home.join("../tools");
+        tools_without_unzip(&tools);
+        let ps = e.home.join("../ps");
+        stub_powershell(&ps);
+        let log = e.home.join("../ps.log");
+        let path = format!("{}:{}:{}", e.stubs.display(), ps.display(), tools.display());
+        let out = {
+            let mut c = Command::new(plugin_dir().join("bin/coding-lab"));
+            c.arg("install")
+                .env_remove("CODING_LAB_BIN")
+                .env("CODING_LAB_HOME", &e.home)
+                .env("CODING_LAB_RELEASE_URL", url(&e))
+                .env("PATH", &path)
+                .env("FAKE_UNAME_S", "MINGW64_NT-10.0")
+                .env("FAKE_UNAME_M", "x86_64")
+                .env("FAKE_PS_LOG", &log)
+                .stdin(Stdio::null());
+            c.output().unwrap()
+        };
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(out.stdout.is_empty());
+        let called = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            called.contains("Expand-Archive"),
+            "要用 powershell 解壓：{called}\n{err}"
+        );
+        assert!(e.home.join("bin/coding-lab.exe").exists(), "{err}");
+        assert!(e.home.join("bin/web/index.html").exists(), "{err}");
+    }
+
+    /// 連 PowerShell 都沒有：報解壓失敗、不裝、exit 0。
+    #[test]
+    fn install_without_any_unzipper_reports_and_installs_nothing() {
+        let e = env("zip-none");
+        fake_zip_release(&e.release, "x86_64-pc-windows-msvc");
+        let tools = e.home.join("../tools");
+        tools_without_unzip(&tools);
+        let path = format!("{}:{}", e.stubs.display(), tools.display());
+        let out = run_with_path(
+            &e,
+            &["install"],
+            ("MINGW64_NT-10.0", "x86_64"),
+            Some(&url(&e)),
+            &path,
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "失敗也 exit 0：{err}");
+        assert!(out.stdout.is_empty());
+        assert!(!e.home.join("bin/coding-lab.exe").exists());
+        assert!(err.contains("解壓"), "{err}");
     }
 
     #[test]

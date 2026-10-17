@@ -181,6 +181,24 @@ plugin 找不到執行檔。它依序找：環境變數 `CODING_LAB_BIN`、`~/.c
 xattr -d com.apple.quarantine ~/.coding-lab/bin/coding-lab
 ```
 
+**`SessionStart` 自動下載後印出「解壓 … 失敗」（Windows）**
+
+標準的 Git for Windows 沒有 `unzip`。plugin 會退到 Windows 10 以後內建的 `C:\Windows\System32\tar.exe`，再退到 PowerShell 的 `Expand-Archive`；三個都沒有才會失敗。沒有自動下載也可以照「編譯並放好 collector」手動放好執行檔。
+
+**Claude Code 顯示 `SessionStart hook timed out`（Windows）**
+
+`SessionStart` 的啟動腳本要先開 Git Bash、再拉起 collector，上限 5 秒。Git Bash 冷啟動和 Windows Defender 第一次掃描新編好的執行檔可能超過。偶爾一次不用理；每次都超時的話，把 `plugin/hooks/hooks.json` 裡 `SessionStart` 的 `timeout` 從 5 改成 10，重開 session。
+
+**collector 綁不到埠，每個 session 都顯示 `ECONNREFUSED`（Windows）**
+
+Hyper-V 或 WSL 可能把 4800／4801 劃進保留範圍，collector 啟動就失敗（`collector.log` 會寫綁埠錯誤）。用這個指令查：
+
+```powershell
+netsh int ipv4 show excludedportrange protocol=tcp
+```
+
+4800 或 4801 落在列出的範圍裡時，改用別的埠：在 `~/.coding-lab/config.toml` 把 `[web].bind` 改成例如 `127.0.0.1:4811`；`[hook].bind` 目前不能改（plugin 固定送到 4800），只能重新整理保留範圍（`netsh int ipv4 set dynamicport tcp start=49152 num=16384`，要系統管理員權限，之後重開機）。
+
 **看日誌**
 
 collector 的日誌在 `~/.coding-lab/collector.log`（10 MB 輪替五份）。回報問題時附上最後幾十行與 `coding-lab healthz` 的輸出。

@@ -96,6 +96,24 @@ sha256_of() {
     fi
 }
 
+# 解 zip 到目錄。標準的 Git for Windows 不附 unzip：退到 Windows 10+ 內建的 bsdtar（PATH 上的 tar 是
+# Git 自帶的 GNU tar，解不了 zip，所以用絕對路徑），再退到 PowerShell 的 Expand-Archive（要 Windows 路徑）。
+unzip_to() { # zip 目錄
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$1" -d "$2"
+    elif [ -x /c/Windows/System32/tar.exe ]; then
+        mkdir -p "$2" && /c/Windows/System32/tar.exe -xf "$1" -C "$2"
+    elif command -v powershell >/dev/null 2>&1; then
+        zip=$(cygpath -w "$1" 2>/dev/null || echo "$1")
+        dest=$(cygpath -w "$2" 2>/dev/null || echo "$2")
+        powershell -NoProfile -NonInteractive -Command \
+            "Expand-Archive -LiteralPath '$zip' -DestinationPath '$dest' -Force"
+    else
+        say "沒有 unzip、tar.exe 或 powershell，無法解壓。"
+        return 1
+    fi
+}
+
 # 下載、校驗、解壓到 <home>/bin；成功回 0。暫存檔與鎖一律清掉。
 install() {
     if [ -z "$CODING_LAB_RELEASE_URL" ]; then
@@ -144,7 +162,7 @@ install() {
         return 1
     fi
     case "$archive" in
-        *.zip) unzip -q "$work/$archive" -d "$work/x" ;;
+        *.zip) unzip_to "$work/$archive" "$work/x" ;;
         *) mkdir -p "$work/x" && tar -xzf "$work/$archive" -C "$work/x" ;;
     esac || {
         say "解壓 $archive 失敗。"

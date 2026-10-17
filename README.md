@@ -109,6 +109,8 @@ wrapper 找不到二進位時，會在背景下載對應平台的壓縮檔，sha
 
 不想看到提示時，可以停用 plugin：`claude plugin disable coding-lab`。
 
+Windows 上另外兩種情況也會看到這些提示：`SessionStart` 超過 5 秒（Git Bash 冷啟動、Defender 掃描新執行檔），以及 4800／4801 被 Hyper-V／WSL 劃進保留埠範圍。處理方式見[安裝手冊的疑難排解](docs/install.md#疑難排解)。
+
 ## 設定
 
 `~/.coding-lab/config.toml`（優先序：命令列 > `CODING_LAB_*` 環境變數 > 設定檔 > 預設）。`coding-lab config` 印出合併後實際生效的設定。
@@ -207,6 +209,8 @@ python3 -m http.server 4802 -d web   # 只看前端：開 127.0.0.1:4802/?mock=1
 ```
 
 開發時設 `CODING_LAB_HOME` 指到暫存目錄，避免動到正在用的 `~/.coding-lab/`。
+
+Windows 開發機：指令都在 **Git Bash** 跑（`scripts/`、`tests/scripts/` 的腳本是 bash，PowerShell 不行）；前端測試要有 podman（或在 WSL 裡跑），沒有的話至少跑 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。
 
 ### 分支（git-flow）
 
