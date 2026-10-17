@@ -272,6 +272,12 @@ impl Merger {
     /// collector 重啟時，把 store 裡各 session 已用到的 seq／pos 交給 merge，續跑的 session 接著編號
     /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
     /// `cwd` 是 file.* 的路徑基準（store 的 sessions.cwd），空字串表示不知道。
+    /// 忘掉一個 session（store 已經把它清掉，#655）：之後不會再替它補發任何事件。
+    pub fn forget(&mut self, sid: &str) {
+        self.sessions.remove(sid);
+        self.resumed.remove(sid);
+    }
+
     pub fn resume(&mut self, sid: &str, seq: u64, pos: u64, cwd: &str) {
         let r = self.resumed.entry(sid.to_string()).or_default();
         (r.seq, r.pos) = (seq, pos);

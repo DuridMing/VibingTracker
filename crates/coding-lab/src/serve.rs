@@ -107,7 +107,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         }
     };
 
-    let store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
+    // 啟動時先清超過保留期限的 session，再把計數交給 merge：反過來的話 merge 會把清掉的 session
+    // 當成「被丟下」補發 session.ended，又把它寫回 store
+    prune_store(&mut store);
     let recent = store
         .recent_events(crate::now_ms().saturating_sub(REBUILD_WINDOW_MS))
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -208,6 +211,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut flush = tokio::time::interval(STORE_FLUSH);
     let mut rescore = tokio::time::interval(SCORE_EVERY);
     let mut prune = tokio::time::interval(PRUNE_EVERY);
+    prune.tick().await; // 第一次立即觸發，啟動時已經清過
     let mut rebase = tokio::time::interval(COST_BASELINE_EVERY);
     rebase.tick().await; // 第一次立即觸發，啟動時已經算過
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
@@ -293,16 +297,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 merger.set_cost_baseline(crate::status::cost_baseline(&cost_usage(&store, now), now));
             }
             _ = prune.tick() => {
-                let before = crate::now_ms().saturating_sub(crate::store::RETENTION_DAYS * DAY_MS);
-                match store.lock().unwrap_or_else(|e| e.into_inner()).prune(before) {
-                    Ok(r) if !r.sessions.is_empty() => log(&format!(
-                        "清掉 {} 個超過 {} 天的 session（{} KB）",
-                        r.sessions.len(),
-                        crate::store::RETENTION_DAYS,
-                        r.bytes / 1024
-                    )),
-                    Ok(_) => {}
-                    Err(e) => log(&format!("清理舊資料失敗：{e}")),
+                let gone = prune_store(&mut store.lock().unwrap_or_else(|e| e.into_inner()));
+                for sid in gone {
+                    merger.forget(&sid);
                 }
             }
             _ = rescore.tick() => {
@@ -351,6 +348,28 @@ pub fn try_lock_store(home: &Path) -> io::Result<Option<std::fs::File>> {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
+/// 清掉最後活動超過保留期限的 session，回傳清掉的 id（#655）。
+fn prune_store(store: &mut Store) -> Vec<String> {
+    let before = crate::now_ms().saturating_sub(crate::store::RETENTION_DAYS * DAY_MS);
+    match store.prune(before) {
+        Ok(r) => {
+            if !r.sessions.is_empty() {
+                log(&format!(
+                    "清掉 {} 個超過 {} 天的 session（{} KB）",
+                    r.sessions.len(),
+                    crate::store::RETENTION_DAYS,
+                    r.bytes / 1024
+                ));
+            }
+            r.sessions
+        }
+        Err(e) => {
+            log(&format!("清理舊資料失敗：{e}"));
+            Vec::new()
+        }
     }
 }
 
