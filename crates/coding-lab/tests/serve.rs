@@ -529,23 +529,12 @@ fn prices_json_overrides_the_builtin_price() {
 fn broken_prices_json_warns_and_keeps_the_builtin_price() {
     let e = env(0);
     std::fs::write(e.home.join("prices.json"), "{ 壞掉").unwrap();
-    let mut child = cmd(&e, &["serve"]).stderr(Stdio::piped()).spawn().unwrap();
-    let pid = child.id();
-    wait_for("collector.json", || {
-        collector(&e).is_some_and(|c| c["pid"] == pid)
-    });
+    let _serve = start_serve(&e);
     let cost = cost_of_one_million_input(&e);
-    let _ = child.kill();
-    let mut err = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut err)
-        .unwrap();
-    let _ = child.wait();
     assert_eq!(cost, 4.0, "照內建表");
-    assert!(err.contains("prices.json"), "log 要有警告：{err}");
+    // 背景執行時警告寫進 collector.log（#655）
+    let log = std::fs::read_to_string(e.home.join("collector.log")).unwrap_or_default();
+    assert!(log.contains("prices.json"), "log 要有警告：{log}");
 }
 
 // ── 重啟後的 sessions 列（#676）
@@ -733,4 +722,289 @@ fn idle_from_before_a_restart_returns_to_run_on_the_next_prompt() {
     );
     wait_for("新的 prompt 讓 live 回到 run", || status() == "run");
     wait_for("store 也回到 run", || stored_status() == "run");
+}
+
+/// #685：hook 埠放掉之後，新的 collector 要等舊的寫完 store 才開（store 鎖），不能兩個同時寫。
+#[test]
+fn serve_waits_for_the_store_lock_before_opening_the_store() {
+    let e = env(0);
+    let lock = std::fs::File::create(e.home.join("collector.lock")).unwrap();
+    lock.lock().unwrap();
+    let child = Kill(cmd(&e, &["serve"]).spawn().unwrap());
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        collector(&e).is_none(),
+        "還拿不到 store 鎖時不能開始服務（collector.json 不能出現）"
+    );
+    lock.unlock().unwrap();
+    let pid = child.0.id();
+    wait_for("拿到鎖後開始服務", || {
+        collector(&e).is_some_and(|c| c["pid"] == pid)
+    });
+}
+
+/// #685：ensure 轉送時拿到 503（舊的 collector 正在閒置結束），要等埠放掉後拉起新的再轉送一次。
+#[test]
+fn ensure_retries_on_a_new_collector_when_the_old_one_is_exiting() {
+    let e = env(5);
+    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let exiting = std::thread::spawn(move || {
+        // probe 只連線不送資料；轉送的那一條回 503，然後放掉埠（模擬舊 collector 結束）
+        for conn in old.incoming() {
+            let Ok(mut c) = conn else { continue };
+            c.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+            let mut buf = [0u8; 4096];
+            if matches!(c.read(&mut buf), Ok(n) if n > 0) {
+                let _ =
+                    c.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n");
+                return;
+            }
+        }
+    });
+    let start = json!({"session_id": "s7", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t7.jsonl"), "cwd": "/p"})
+    .to_string();
+    let t = Instant::now();
+    let out = ensure(&e, &start);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
+    exiting.join().unwrap();
+    let jsonl = e.home.join("events/s7.jsonl");
+    wait_for("SessionStart 轉送到新的 collector", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    if let Some(c) = collector(&e) {
+        kill_pid(c["pid"].as_u64().unwrap());
+    }
+}
+
+fn old_event(session: &str, seq: u64, kind: &str, ts: u64) -> coding_lab::event::Event {
+    ev_with(
+        session,
+        seq,
+        kind,
+        None,
+        ts,
+        json!({"cwd": "/p", "source": "startup"}),
+    )
+}
+
+fn seed_old_and_recent(e: &Env) -> u64 {
+    let day = 24 * 60 * 60 * 1000;
+    let now = coding_lab::now_ms();
+    let mut s = coding_lab::store::Store::open(&e.home).unwrap();
+    s.append(old_event("old", 1, "session.started", now - 31 * day));
+    s.append(old_event("recent", 1, "session.started", now - day));
+    s.flush().unwrap();
+    now
+}
+
+/// #655：`coding-lab prune` 清掉 30 天前的 session，近期的留著。
+#[test]
+fn prune_command_removes_sessions_older_than_30_days() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let out = cmd(&e, &["prune"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!e.home.join("events/old.jsonl").exists());
+    assert!(e.home.join("events/recent.jsonl").exists());
+}
+
+/// #655：collector 在跑時 prune 不碰 store（兩個程序同時寫），說明 collector 自己會清。
+#[test]
+fn prune_command_refuses_while_the_collector_runs() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let _serve = start_serve(&e);
+    let out = cmd(&e, &["prune"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("collector"));
+}
+
+/// #655：collector 啟動時自己清一次 30 天前的資料。
+#[test]
+fn serve_prunes_old_sessions_on_start() {
+    let e = env(0);
+    seed_old_and_recent(&e);
+    let _serve = start_serve(&e);
+    wait_for("啟動時清掉 old", || {
+        !e.home.join("events/old.jsonl").exists()
+    });
+    assert!(e.home.join("events/recent.jsonl").exists());
+}
+
+/// #655：背景執行（stderr 不是終端機）時 collector 自己寫 collector.log。
+#[test]
+fn detached_serve_writes_its_own_log() {
+    let e = env(0);
+    let _serve = start_serve(&e);
+    wait_for("collector.log 有啟動訊息", || {
+        std::fs::read_to_string(e.home.join("collector.log"))
+            .is_ok_and(|t| t.contains("hook 127.0.0.1"))
+    });
+}
+
+/// #685（驗證找到的缺口）：probe 連上之後、轉送之前舊的 collector 就放掉了埠——轉送被拒或被 RST，
+/// ensure 要在預算內改拉新的 collector，不能直接放棄（SessionStart 會掉）。
+#[test]
+fn ensure_retries_when_the_port_closes_between_probe_and_forward() {
+    let e = env(5);
+    let old = TcpListener::bind(("127.0.0.1", e.hook)).unwrap();
+    let exiting = std::thread::spawn(move || {
+        // 只接 probe 那一條，接著放掉埠（還在 backlog 的轉送連線會被 RST）
+        let probe = old.accept();
+        drop(old);
+        drop(probe);
+    });
+    let start = json!({"session_id": "s8", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t8.jsonl"), "cwd": "/p"})
+    .to_string();
+    let t = Instant::now();
+    let out = ensure(&e, &start);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
+    exiting.join().unwrap();
+    let jsonl = e.home.join("events/s8.jsonl");
+    wait_for("SessionStart 轉送到新的 collector", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    if let Some(c) = collector(&e) {
+        kill_pid(c["pid"].as_u64().unwrap());
+    }
+}
+
+/// #685：進入「結束中」（ensure 轉送回 503）之後有一般 hook 進來，取消結束、繼續服務。
+#[test]
+fn a_hook_during_closing_cancels_the_idle_exit() {
+    let e = env(1);
+    let mut s = start_serve(&e);
+    let via_ensure = |body: &str| {
+        let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        let mut out = String::new();
+        let _ = c.read_to_string(&mut out);
+        out
+    };
+    // 壞掉的 body 不會變成 hook（不重設閒置計時），只用來看 collector 進入結束中了沒
+    wait_for("進入結束中", || {
+        via_ensure("x").starts_with("HTTP/1.1 503")
+    });
+    let stop = json!({"session_id": "s1", "hook_event_name": "Stop"});
+    assert!(http(e.hook, "POST", "/hook", &stop.to_string()).starts_with("HTTP/1.1 200"));
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "結束中收到 hook 要取消結束"
+    );
+    assert!(
+        via_ensure("x").starts_with("HTTP/1.1 200"),
+        "取消後 ensure 轉送照常收"
+    );
+}
+
+fn text_line(uuid: &str, msg: &str, text: &str) -> String {
+    format!(
+        "{}\n",
+        json!({"type": "assistant", "uuid": uuid, "timestamp": "2026-10-17T00:00:00Z",
+               "message": {"id": msg, "model": "claude-opus-5-5",
+                           "content": [{"type": "text", "text": text}]}})
+    )
+}
+
+/// #684 驗收：collector 停掉期間 transcript 寫進的行，重啟後從 store 記的行號接著讀，進串流且不重複。
+#[test]
+fn lines_written_while_the_collector_was_down_are_read_after_restart() {
+    let e = env(0);
+    let transcript = e.home.join("t5.jsonl");
+    std::fs::write(
+        &transcript,
+        text_line("u1", "m1", "一") + &text_line("u2", "m2", "二"),
+    )
+    .unwrap();
+    let jsonl = e.home.join("events/s5.jsonl");
+    let texts = || -> Vec<String> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["type"] == "assistant.text")
+            .map(|v| {
+                v["payload"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    };
+    {
+        let _first = start_serve(&e);
+        let start = json!({"session_id": "s5", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": transcript, "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &start.to_string());
+        wait_for("前兩行進 store", || texts().len() == 2);
+    } // Kill：collector 停掉
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    f.write_all((text_line("u3", "m3", "三") + &text_line("u4", "m4", "四")).as_bytes())
+        .unwrap();
+    drop(f);
+
+    let _second = start_serve(&e);
+    let prompt = json!({"session_id": "s5", "hook_event_name": "UserPromptSubmit", "prompt": "繼續",
+                        "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &prompt.to_string());
+    wait_for("停機期間的兩行補進來", || texts().len() >= 4);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(texts(), ["一", "二", "三", "四"], "不漏、不重複");
+}
+
+/// #652 驗收：transcript 被弄壞後，hook 的工具事件照樣進串流（降級放置），恢復後回到正常。
+#[test]
+fn broken_transcript_still_shows_tool_events() {
+    let e = env(0);
+    let _serve = start_serve(&e);
+    let transcript = e.home.join("t6.jsonl");
+    std::fs::write(&transcript, "{壞掉的一行\n").unwrap();
+    let start = json!({"session_id": "s6", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    let jsonl = e.home.join("events/s6.jsonl");
+    let types = || -> Vec<Value> {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    };
+    wait_for("transcript.degraded", || {
+        types().iter().any(|v| v["type"] == "transcript.degraded")
+    });
+    let pre = json!({"session_id": "s6", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                     "tool_input": {"command": "ls"}, "tool_use_id": "t1", "transcript_path": transcript});
+    http(e.hook, "POST", "/hook", &pre.to_string());
+    wait_for("工具卡片直接進串流", || {
+        types()
+            .iter()
+            .any(|v| v["type"] == "tool.placed" && v["payload"]["placement"] == "fallback")
+    });
+    // 之後寫進好的行：恢復
+    let good = json!({"type": "assistant", "uuid": "u1", "timestamp": "2026-10-17T00:00:00Z",
+                      "message": {"id": "m1", "model": "claude-opus-5-5",
+                                  "content": [{"type": "text", "text": "好了"}]}});
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap();
+    writeln!(f, "{good}").unwrap();
+    wait_for("transcript.recovered", || {
+        types().iter().any(|v| v["type"] == "transcript.recovered")
+    });
 }

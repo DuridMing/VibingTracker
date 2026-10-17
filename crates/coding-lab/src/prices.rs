@@ -83,23 +83,21 @@ impl Prices {
         }
     }
 
+    /// 找不到時再去掉 `-YYYYMMDD` 日期後綴查一次（`claude-haiku-4-5-20251001` 用 `claude-haiku-4-5`，#687 R3）。
     pub fn get(&self, model: &str) -> Option<Price> {
-        self.table.get(base_model(model)).copied()
+        let base = base_model(model);
+        self.table
+            .get(base)
+            .or_else(|| self.table.get(undated(base)?))
+            .copied()
     }
 
     /// transcript `message.usage` 的費用（USD）。
     pub fn cost(&self, model: &str, usage: &Value) -> f64 {
         let Some(p) = self.get(model) else { return 0.0 };
         let n = |v: &Value| v.as_u64().unwrap_or(0) as f64;
-        let cc = &usage["cache_creation"];
-        let (w5, w1) = if cc.is_object() {
-            (
-                n(&cc["ephemeral_5m_input_tokens"]),
-                n(&cc["ephemeral_1h_input_tokens"]),
-            )
-        } else {
-            (n(&usage["cache_creation_input_tokens"]), 0.0)
-        };
+        let (w5, w1) = cache_writes(usage);
+        let (w5, w1) = (w5 as f64, w1 as f64);
         (n(&usage["input_tokens"]) * p.input
             + n(&usage["output_tokens"]) * p.output
             + n(&usage["cache_read_input_tokens"]) * p.cache_read
@@ -107,6 +105,26 @@ impl Prices {
             + w1 * p.input * 2.0)
             / 1_000_000.0
     }
+}
+
+/// `message.usage` 的 cache 寫入（5 分鐘、1 小時）：有 `cache_creation` 細分就用它，否則全部算 5 分鐘。
+pub fn cache_writes(usage: &Value) -> (u64, u64) {
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    let cc = &usage["cache_creation"];
+    if cc.is_object() {
+        (
+            n(&cc["ephemeral_5m_input_tokens"]),
+            n(&cc["ephemeral_1h_input_tokens"]),
+        )
+    } else {
+        (n(&usage["cache_creation_input_tokens"]), 0)
+    }
+}
+
+/// `…-YYYYMMDD` 去掉日期；不是 8 碼數字就不算日期。
+fn undated(model: &str) -> Option<&str> {
+    let (head, tail) = model.rsplit_once('-')?;
+    (tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit())).then_some(head)
 }
 
 /// transcript 的模型名稱可能帶 `[1m]` 之類的後綴；比對時去掉（prices.json 的鍵也一樣）。

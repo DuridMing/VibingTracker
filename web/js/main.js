@@ -15,6 +15,7 @@ import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
 import { mergeSessions, projectRoots, pickProject } from "./sessions.js";
+import { degradedNotice } from "./degraded.js";
 
 const $ = (sel) => document.querySelector(sel);
 
@@ -277,6 +278,19 @@ function renderAgents() {
 }
 
 // 串流以外的面板（KPI、tab、篩選、Sessions、Agents、即時計數）不需要每幀更新：
+// transcript 降級（#652）：collector 的 sessions 列說哪些 session 讀不到 transcript，串流上方標出來
+let lastDegraded = "";
+function renderDegraded() {
+  const el = document.getElementById("degradedNote");
+  if (!el) return;
+  const n = degradedNotice(store.sessions.values());
+  const text = n ? n.text : "";
+  if (text === lastDegraded) return;
+  lastDegraded = text;
+  el.textContent = text;
+  el.hidden = !n;
+}
+
 // 資料進來時最多每 PANEL_MS 畫一次；使用者操作與連線狀態改變（urgent）下一幀就畫。
 // （試過把面板分到連續三幀畫，排版的固定成本變成付三次，p50／p95 反而變差，所以一次畫完。）
 const PANEL_MS = 250;
@@ -300,6 +314,7 @@ function render(urgent = false) {
     lastPanelRender = performance.now();
     renderOnce = stream.rows.length >= 3000;
     renderConn();
+    renderDegraded();
     renderKpis();
     renderTabs();
     renderSessFilters();

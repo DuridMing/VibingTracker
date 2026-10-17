@@ -83,7 +83,7 @@ remote_thinking = "on_demand"   # 遠端看 thinking：on_demand（點開才載�
 | --- | --- |
 | `~/.coding-lab/rules.json` | 覆寫危險指令規則（正則、原因、等級 `warn`／`danger`） |
 | `~/.coding-lab/prices.json` | 覆寫模型單價表 |
-| `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替 |
+| `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替（`collector.log.1`…`.5`）；前景執行 `coding-lab serve` 時改印在終端機 |
 
 `prices.json` 只要列出想改的模型，單位是 USD／每百萬 tokens，改完重啟 collector 才生效；格式有錯時整個改用內建單價，並在日誌寫一行警告：
 
@@ -91,7 +91,7 @@ remote_thinking = "on_demand"   # 遠端看 thinking：on_demand（點開才載�
 { "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cacheRead": 0.2 } }
 ```
 
-資料保留 30 天（`coding-lab prune`）。
+資料保留 30 天：最後活動超過 30 天的 session 會連同事件檔一起刪掉。collector 啟動時和之後每天會自動清理；collector 沒在跑時可以用 `coding-lab prune` 手動清（collector 在跑時這個指令不會動資料）。
 
 ### 從本機看伺服器上的 session
 

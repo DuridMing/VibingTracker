@@ -235,6 +235,7 @@ fn degraded_transcript_falls_back_immediately() {
     let mut m = merger();
     m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
     let a = m.handle(Input::Degraded {
+        tail: 0,
         session: S.into(),
         file: "main".into(),
         error: "invalid JSON".into(),
@@ -251,6 +252,7 @@ fn degraded_transcript_falls_back_immediately() {
     );
 
     let c = m.handle(Input::Recovered {
+        tail: 0,
         session: S.into(),
         file: "main".into(),
         ts_seen: 1300,
@@ -761,6 +763,7 @@ fn resumed_session_continues_seq_and_pos() {
 
 fn degraded(file: &str, ts: u64) -> Input {
     Input::Degraded {
+        tail: 0,
         session: S.into(),
         file: file.into(),
         error: "invalid JSON".into(),
@@ -815,6 +818,7 @@ fn degraded_is_cleared_when_the_tail_is_stopped_or_restarted() {
     m.handle(degraded("agent-a1", 1000));
     m.handle(degraded("main", 1000));
     let a = m.handle(Input::TailReset {
+        tail: 0,
         session: S.into(),
         file: Some("agent-a1".into()),
         ts_seen: 1100,
@@ -825,6 +829,7 @@ fn degraded_is_cleared_when_the_tail_is_stopped_or_restarted() {
     assert_eq!(types(&b), ["tool.called", "tool.placed"], "main 還在降級");
 
     let c = m.handle(Input::TailReset {
+        tail: 0,
         session: S.into(),
         file: None,
         ts_seen: 1300,
@@ -835,6 +840,7 @@ fn degraded_is_cleared_when_the_tail_is_stopped_or_restarted() {
     assert_eq!(types(&d), ["tool.called"], "重開 tail 後回到暫存");
 
     let e = m.handle(Input::TailReset {
+        tail: 0,
         session: S.into(),
         file: Some("main".into()),
         ts_seen: 1500,
@@ -888,6 +894,7 @@ fn fallback_wait_expires_or_is_reset_with_the_tail() {
     m.handle(pre("t2", "Bash", json!({"command": "pwd"}), 90_000));
     m.tick(90_000 + FALLBACK_AFTER_MS);
     m.handle(Input::TailReset {
+        tail: 0,
         session: S.into(),
         file: Some("main".into()),
         ts_seen: 100_001,
@@ -1372,4 +1379,163 @@ fn known_parent_survives_a_call_taken_by_order() {
     let got = spawned(&evs);
     assert_eq!(got[1].0, "y");
     assert_eq!(got[1].2, json!("ta"), "{got:?}");
+}
+
+/// #684 R20：TailReset 早於舊 tail 停下；舊 tail 最後一次讀到壞行送來的 Degraded（編號較舊）不能讓降級留著。
+#[test]
+fn degraded_from_a_replaced_tail_is_ignored() {
+    let mut m = merger();
+    m.handle(Input::TailReset {
+        tail: 2,
+        session: S.into(),
+        file: Some("main".into()),
+        ts_seen: 1000,
+    });
+    let stale = m.handle(Input::Degraded {
+        tail: 1,
+        session: S.into(),
+        file: "main".into(),
+        error: "invalid JSON".into(),
+        ts_seen: 1100,
+    });
+    assert!(stale.is_empty(), "舊 tail 的降級不算：{stale:?}");
+    let a = m.handle(pre("t1", "Bash", json!({"command": "ls"}), 1200));
+    assert_eq!(types(&a), ["tool.called"], "沒有降級，照常暫存");
+
+    let live = m.handle(Input::Degraded {
+        tail: 2,
+        session: S.into(),
+        file: "main".into(),
+        error: "invalid JSON".into(),
+        ts_seen: 1300,
+    });
+    assert_eq!(
+        types(&live)[0],
+        "transcript.degraded",
+        "目前的 tail 照常降級"
+    );
+
+    // 整個 session 的 tail 停掉之後，比停掉時的編號舊的都不算
+    m.handle(Input::TailReset {
+        tail: 9,
+        session: S.into(),
+        file: None,
+        ts_seen: 1400,
+    });
+    let stale = m.handle(Input::Degraded {
+        tail: 2,
+        session: S.into(),
+        file: "agent-a1".into(),
+        error: "invalid JSON".into(),
+        ts_seen: 1500,
+    });
+    assert!(stale.is_empty(), "{stale:?}");
+}
+
+/// #684 R33：Windows 的 transcript 路徑存進 Event 時一律是 `/`（不變式 11）。
+#[test]
+fn transcript_paths_are_stored_with_forward_slashes() {
+    let mut m = merger();
+    let a = m.handle(Input::Hook {
+        hook: hook(json!({"session_id": S, "hook_event_name": "SessionStart", "source": "startup",
+                          "cwd": "C:\\p", "transcript_path": "C:\\Users\\u\\.claude\\projects\\p\\s1.jsonl"})),
+        ts_seen: 1000,
+    });
+    assert_eq!(
+        a[0].payload["transcriptPath"],
+        "C:/Users/u/.claude/projects/p/s1.jsonl"
+    );
+    m.handle(Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": "SubagentStart", "agent_id": "a1",
+                          "agent_type": "Explore"}),
+        ),
+        ts_seen: 1100,
+    });
+    let b = m.handle(Input::Hook {
+        hook: hook(
+            json!({"session_id": S, "hook_event_name": "SubagentStop", "agent_id": "a1",
+                          "agent_type": "Explore",
+                          "agent_transcript_path": "C:\\Users\\u\\s1\\subagents\\agent-a1.jsonl"}),
+        ),
+        ts_seen: 1200,
+    });
+    let finished = b
+        .iter()
+        .find(|e| e.type_name() == "agent.finished")
+        .unwrap();
+    assert_eq!(
+        finished.payload["transcriptPath"],
+        "C:/Users/u/s1/subagents/agent-a1.jsonl"
+    );
+}
+
+fn post_read(id: &str, output: &str, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "PostToolUse", "tool_name": "Read",
+            "tool_use_id": id, "tool_response": output,
+        })),
+        ts_seen: ts,
+    }
+}
+
+/// #654：讀 `.env` 的 tool.result 標 sensitive（本機照存，遠端送出時剝除）；一般檔案不標。
+#[test]
+fn reading_secrets_marks_the_result_sensitive() {
+    let mut m = merger();
+    m.handle(pre("t1", "Read", json!({"file_path": "/p/.env"}), 1000));
+    let a = m.handle(post_read("t1", "TOKEN=abc", 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["sensitive"], true);
+    assert_eq!(r.payload["output"], "TOKEN=abc", "本機照存");
+
+    m.handle(pre(
+        "t2",
+        "Read",
+        json!({"file_path": "/p/src/main.rs"}),
+        1200,
+    ));
+    let b = m.handle(post_read("t2", "fn main() {}", 1300));
+    let r = b.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert!(
+        r.payload.get("sensitive").is_none(),
+        "沒命中時不輸出這個欄位"
+    );
+}
+
+/// #654（R22）：tool.called 的 input 裡過長的字串截到 8 KB，標 inputTruncated；短的不動。
+#[test]
+fn long_tool_input_strings_are_truncated() {
+    let mut m = merger();
+    let big = "a".repeat(20 * 1024);
+    let a = m.handle(pre(
+        "t1",
+        "Write",
+        json!({"file_path": "/p/a.txt", "content": big}),
+        1000,
+    ));
+    let c = a.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert!(c.payload["input"]["content"].as_str().unwrap().len() <= 8 * 1024);
+    assert_eq!(c.payload["input"]["file_path"], "/p/a.txt");
+    assert_eq!(c.payload["inputTruncated"], true);
+
+    let b = m.handle(pre("t2", "Bash", json!({"command": "ls"}), 1100));
+    let c = b.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert!(c.payload.get("inputTruncated").is_none());
+}
+
+/// #654：output 截在 8 KB 時不把多位元組字切壞。
+#[test]
+fn output_truncation_keeps_utf8_intact() {
+    let mut m = merger();
+    m.handle(pre("t1", "Read", json!({"file_path": "/p/a.md"}), 1000));
+    // 8 KB 的位置落在三位元組字的中間
+    let text = format!("{}{}", "a".repeat(8 * 1024 - 1), "中".repeat(10));
+    let a = m.handle(post_read("t1", &text, 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    let out = r.payload["output"].as_str().unwrap();
+    assert!(out.len() <= 8 * 1024);
+    assert!(out.ends_with('a'), "不留下半個字");
+    assert_eq!(r.payload["truncated"], true);
 }

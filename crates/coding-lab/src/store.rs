@@ -14,7 +14,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::event::{Event, Payload};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
+/// 資料保留多久：最後活動早於這麼多天前的 session 由 [`Store::prune`] 清掉
+pub const RETENTION_DAYS: u64 = 30;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -70,6 +72,23 @@ pub struct SessionRow {
     pub cost_usd: f64,
     pub thinking_tokens: u64,
     pub last_seq: u64,
+}
+
+/// `tails` 表的一列（schema v3，#684）：某個 transcript 檔已產生 Event 的最大行號。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TailRow {
+    pub session: String,
+    pub file: String,
+    pub path: Option<String>,
+    pub line_no: u64,
+}
+
+/// [`Store::prune`] 清掉了什麼。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    pub sessions: Vec<String>,
+    /// 刪掉的 JSONL 大小
+    pub bytes: u64,
 }
 
 /// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
@@ -198,6 +217,25 @@ CREATE INDEX attention_open ON attention (raised_at)
   WHERE acked_at IS NULL AND (cleared_at IS NULL OR kind = 'danger');
 ";
 
+/// v3：每個 transcript 檔已產生 Event 的最大行號，collector 重啟後接著讀（#684）。
+const TAILS_V3: &str = "
+CREATE TABLE IF NOT EXISTS tails (
+  session TEXT NOT NULL,
+  file TEXT NOT NULL,
+  path TEXT,
+  line_no INTEGER NOT NULL,
+  PRIMARY KEY (session, file)
+) WITHOUT ROWID;
+";
+
+/// Event 帶 `line` 時更新那個檔的行號（同一個檔的行依序進來，直接覆寫；檔案被替換後行號變小也跟著變小）。
+const UPSERT_TAIL_LINE: &str = "INSERT INTO tails (session, file, line_no) VALUES (?1, ?2, ?3)
+  ON CONFLICT (session, file) DO UPDATE SET line_no = excluded.line_no";
+/// session.started 記主檔路徑；換了檔就把行號歸零（舊檔的行號對新檔沒有意義）。
+const UPSERT_TAIL_PATH: &str = "INSERT INTO tails (session, file, path, line_no) VALUES (?1, 'main', ?2, 0)
+  ON CONFLICT (session, file) DO UPDATE SET
+    line_no = CASE WHEN tails.path IS excluded.path THEN tails.line_no ELSE 0 END, path = excluded.path";
+
 /// 一次 flush 裡同一個 session 檔要追加的內容。
 struct Batch {
     name: String,
@@ -228,7 +266,7 @@ impl Store {
         let db = Connection::open(home.join("index.sqlite"))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
-        migrate(&db)?;
+        let backfill_tails = migrate(&db)?;
 
         let mut store = Store {
             events_dir,
@@ -249,8 +287,45 @@ impl Store {
                 store.cwd_of.insert(id, cwd);
             }
         }
+        if backfill_tails {
+            store.backfill_tails()?;
+        }
         store.recover()?;
         Ok(store)
+    }
+
+    /// v2 → v3 升級時掃一次全部 JSONL，回填每個 transcript 檔讀到的行號（只在升級那次做）。
+    fn backfill_tails(&mut self) -> Result<(), StoreError> {
+        let mut last: BTreeMap<(String, String), u64> = BTreeMap::new();
+        let mut paths: BTreeMap<String, String> = BTreeMap::new();
+        for entry in fs::read_dir(&self.events_dir)?.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "jsonl") {
+                continue;
+            }
+            for line in BufReader::new(File::open(&path)?).lines() {
+                let Ok(e) = Event::from_json_line(&line?) else {
+                    continue;
+                };
+                if let Some(l) = &e.line {
+                    last.insert((e.session.clone(), l.file.clone()), l.no);
+                }
+                if e.kind == "session.started"
+                    && let Some(p) = e.payload["transcriptPath"].as_str()
+                {
+                    paths.insert(e.session.clone(), p.to_string());
+                }
+            }
+        }
+        let tx = self.db.transaction()?;
+        for (sid, p) in &paths {
+            tx.execute(UPSERT_TAIL_PATH, params![sid, p])?;
+        }
+        for ((sid, file), no) in &last {
+            tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 先放進緩衝；呼叫端定期 [`Store::flush`]（store task 每 100 ms 一次）。
@@ -344,7 +419,7 @@ impl Store {
                 .open(&path)
                 .and_then(|f| f.set_len(b.base))
             {
-                eprintln!("coding-lab store：截回 {} 失敗：{t}", b.name);
+                crate::logging::log(&format!("store：截回 {} 失敗：{t}", b.name));
             }
             return Err(e);
         }
@@ -757,6 +832,76 @@ impl Store {
     }
 
     /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
+    /// 清掉最後活動早於 `before`（epoch ms）的 session：先刪索引列，再刪 JSONL（#655）。
+    /// 中途當掉時 JSONL 還在、索引沒了，下次開啟會被 recover 補回，再清一次即可。
+    pub fn prune(&mut self, before: u64) -> Result<PruneReport, StoreError> {
+        let old: Vec<String> = {
+            let mut stmt = self.db.prepare(
+                "SELECT s.id FROM sessions s
+                 LEFT JOIN (SELECT session, MAX(ts_seen) AS t FROM events GROUP BY session) e
+                   ON e.session = s.id
+                 WHERE MAX(COALESCE(e.t, 0), s.started_at, COALESCE(s.ended_at, 0), s.status_since) < ?1
+                 ORDER BY s.id",
+            )?;
+            stmt.query_map(params![before.min(i64::MAX as u64) as i64], |r| r.get(0))?
+                .collect::<Result<_, _>>()?
+        };
+        let mut report = PruneReport::default();
+        if old.is_empty() {
+            return Ok(report);
+        }
+        let tx = self.db.transaction()?;
+        for sid in &old {
+            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
+            for table in ["events", "file_touch", "changes", "attention", "tails"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session = ?1"),
+                    params![sid],
+                )?;
+            }
+        }
+        tx.commit()?;
+        for sid in old {
+            let name = file_name(&sid);
+            let path = self.events_dir.join(&name);
+            if let Ok(meta) = fs::metadata(&path) {
+                report.bytes += meta.len();
+            }
+            match fs::remove_file(&path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+            self.file_len.remove(&name);
+            self.cwd_of.remove(&sid);
+            self.path_of_tool.retain(|(s, _), _| *s != sid);
+            report.sessions.push(sid);
+        }
+        Ok(report)
+    }
+
+    /// collector 重啟時交給 TailPlanner：每個 transcript 檔讀到第幾行。
+    /// 行號 0 的列（只記了路徑、還沒有任何行產生 Event）不回傳：那種 session 照舊從檔尾讀，
+    /// 不把 #684 之前從檔尾開始 tail 的舊 session 整份重讀。
+    pub fn tail_lines(&self) -> Result<Vec<TailRow>, StoreError> {
+        let mut stmt = self.db.prepare(
+            "SELECT session, file, path, line_no FROM tails WHERE line_no > 0 ORDER BY session, file",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(TailRow {
+                session: r.get(0)?,
+                file: r.get(1)?,
+                path: r.get(2)?,
+                line_no: r.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// 記著的「工具卡片碰的檔」數（測試確認 session 結束後清掉）
+    pub fn cached_tool_paths(&self) -> usize {
+        self.path_of_tool.len()
+    }
+
     pub fn recover_bytes(&self) -> u64 {
         self.recover_bytes
     }
@@ -813,8 +958,10 @@ fn read_version(db: &Connection) -> rusqlite::Result<Option<u32>> {
 }
 
 /// 依版本逐步升級；v0（空資料庫）先建 v1 的表，再一路升上來。
-fn migrate(db: &Connection) -> Result<(), StoreError> {
-    let mut v = match read_version(db)? {
+/// 回傳要不要回填 tails：舊版資料庫升到 v3 時要；新建的不用（JSONL 由 recover 從頭索引，順便填好）。
+fn migrate(db: &Connection) -> Result<bool, StoreError> {
+    let from = read_version(db)?;
+    let mut v = match from {
         Some(v) if v > SCHEMA_VERSION => return Err(StoreError::FutureSchema(v)),
         Some(v) => v,
         None => {
@@ -833,6 +980,9 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
                 "DROP INDEX IF EXISTS attention_open;{ATTENTION_OPEN_V2}"
             ))?;
         }
+        if v == 2 {
+            tx.execute_batch(TAILS_V3)?;
+        }
         v += 1;
         tx.execute(
             "UPDATE meta SET value = ?1 WHERE key = 'schema_version'",
@@ -840,7 +990,7 @@ fn migrate(db: &Connection) -> Result<(), StoreError> {
         )?;
         tx.commit()?;
     }
-    Ok(())
+    Ok(from.is_some_and(|v| v < 3))
 }
 
 const SESSION_COLUMNS: &str = "id, host, cwd, transcript_path, model, branch, first_prompt, started_at, ended_at,
@@ -894,6 +1044,9 @@ fn index_event(
     // 同一個 (session, seq) 已經索引過：彙總也已經算過，不再累加（#683）
     if inserted == 0 {
         return Ok(());
+    }
+    if let Some(l) = &e.line {
+        exec(tx, UPSERT_TAIL_LINE, params![sid, l.file, l.no as i64])?;
     }
     exec(
         tx,
@@ -950,8 +1103,13 @@ fn index_event(
                    ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
                 params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],
             )?;
+            if let Some(path) = &p.transcript_path {
+                exec(tx, UPSERT_TAIL_PATH, params![sid, path])?;
+            }
         }
         Payload::SessionEnded(p) => {
+            // 結束的 session 不會再有工具結束的 Event（#686）
+            path_of_tool.retain(|(s, _), _| s != sid);
             exec(
                 tx,
                 "UPDATE sessions SET ended_at = ?2, end_reason = ?3, status = 'ended', status_since = ?2 WHERE id = ?1",

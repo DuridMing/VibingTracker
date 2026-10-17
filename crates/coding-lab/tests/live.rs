@@ -1569,3 +1569,140 @@ fn seeded_row_keeps_the_stored_status_and_end() {
         (json!("run"), Value::Null)
     );
 }
+
+/// #652：transcript 解析失敗時 sessions 列帶 `degraded`（哪些檔降級），恢復後清掉；前端依它顯示標語。
+#[test]
+fn session_row_lists_degraded_transcript_files_until_recovered() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY + H),
+            b.ev(
+                "s1",
+                "transcript.degraded",
+                "main",
+                DAY + H,
+                false,
+                json!({"file": "main", "error": "第 3 行：invalid JSON"}),
+            ),
+            b.ev(
+                "s1",
+                "transcript.degraded",
+                "main",
+                DAY + H,
+                false,
+                json!({"file": "agent-a1", "error": "第 1 行：invalid JSON"}),
+            ),
+        ],
+    );
+    let degraded = |l: &Live| l.session_row("s1").unwrap()["degraded"].clone();
+    assert_eq!(degraded(&l), json!(["agent-a1", "main"]));
+    l.apply(&b.ev(
+        "s1",
+        "transcript.recovered",
+        "main",
+        DAY + H,
+        false,
+        json!({"file": "main"}),
+    ));
+    assert_eq!(degraded(&l), json!(["agent-a1"]));
+    l.apply(&b.ev(
+        "s1",
+        "transcript.recovered",
+        "main",
+        DAY + H,
+        false,
+        json!({"file": "agent-a1"}),
+    ));
+    assert_eq!(degraded(&l), json!([]));
+}
+
+/// #686（R24）：結束超過 2 小時的 session 從 live 移除（列、串流、狀態行），snapshot 不再含它；
+/// 之後看它改由 /api/sessions 與回放。
+#[test]
+fn ended_sessions_leave_live_after_two_hours() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.text("s1", DAY + 1),
+            b.ev(
+                "s1",
+                "session.ended",
+                "main",
+                DAY + H,
+                false,
+                json!({"reason": "exit"}),
+            ),
+            b.started("s2", DAY),
+        ],
+    );
+    l.flush(DAY + 3 * H - 1);
+    assert_eq!(l.session_count(), 2, "結束 2 小時內還在");
+    l.flush(DAY + 3 * H + 1);
+    assert_eq!(l.session_count(), 1);
+    let snap = l.snapshot(&Channel::All, 0, DAY + 3 * H + 2);
+    let text = snap.to_string();
+    assert!(!text.contains("\"s1\""), "snapshot 不含 s1：{text}");
+    assert!(text.contains("\"s2\""));
+}
+
+/// #686（R23）：沒有新 Event 時 flush 不重算 KPI（只在有新 Event、跨時間格或跨午夜時算）。
+#[test]
+fn flush_without_new_events_does_not_recompute_kpi() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.register_offset(0);
+    l.apply(&b.started("s1", DAY + H));
+    l.flush(DAY + H + 10);
+    let n = l.kpi_computations();
+    assert!(n >= 1);
+    l.flush(DAY + H + 60);
+    l.flush(DAY + H + 110);
+    assert_eq!(l.kpi_computations(), n, "沒有新 Event、同一格：不重算");
+    l.apply(&b.text("s1", DAY + H + 120));
+    l.flush(DAY + H + 160);
+    assert_eq!(l.kpi_computations(), n + 1, "有新 Event 才重算");
+}
+
+/// #687（R32）：重啟後用 store 補 live 時，live 從串流看到的模型保留（照 seed 的說明），沒有才用 store 的。
+#[test]
+fn seed_keeps_the_model_live_already_knows() {
+    use coding_lab::store::SessionRow;
+    let row = |id: &str| SessionRow {
+        id: id.into(),
+        host: "local".into(),
+        cwd: "/p".into(),
+        transcript_path: None,
+        model: Some("claude-sonnet-5-5".into()),
+        branch: None,
+        first_prompt: None,
+        started_at: DAY,
+        ended_at: None,
+        end_reason: None,
+        status: "run".into(),
+        status_since: DAY,
+        commits: 0,
+        dangers: 0,
+        failures: 0,
+        cost_usd: 0.0,
+        thinking_tokens: 0,
+        last_seq: 0,
+    };
+    let mut b = B::new();
+    let mut l = Live::new();
+    l.apply(&b.started("s1", DAY));
+    l.apply(&b.text("s1", DAY + 1)); // main 第一行 assistant：opus
+    l.seed(&row("s1"), DAY);
+    assert_eq!(l.session_row("s1").unwrap()["modelId"], "claude-opus-5-5");
+    l.seed(&row("s2"), DAY);
+    assert_eq!(
+        l.session_row("s2").unwrap()["modelId"],
+        "claude-sonnet-5-5",
+        "live 沒有就用 store 的"
+    );
+}

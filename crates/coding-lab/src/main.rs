@@ -82,7 +82,8 @@ fn main() -> ExitCode {
             }
         },
         Command::Healthz => healthz(),
-        Command::Prune | Command::Service => {
+        Command::Prune => prune(),
+        Command::Service => {
             eprintln!("coding-lab：此子命令尚未實作");
             ExitCode::FAILURE
         }
@@ -121,7 +122,8 @@ fn run_serve(overrides: &Overrides) -> ExitCode {
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
-const START_WAIT: Duration = Duration::from_secs(3);
+/// ensure 整體最多花多久（plugin 的 SessionStart hook timeout 是 5 秒）
+const ENSURE_BUDGET: Duration = Duration::from_secs(4);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SessionStart command hook：確保 collector 在跑，再把 stdin 的 payload 轉送給它。
@@ -135,24 +137,44 @@ fn ensure() -> Result<(), String> {
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    if !probe(cfg.hook_bind) {
-        spawn_collector(&cfg)?;
-        let deadline = Instant::now() + START_WAIT;
-        while !probe(cfg.hook_bind) {
-            if Instant::now() > deadline {
-                return Err("collector 3 秒內沒有起來".into());
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    // 轉送拿到 503，或 probe 之後埠就被放掉（連線被拒、還沒回應就被 RST），表示舊的 collector 正在閒置結束
+    // （#685）：等它放掉埠，拉起新的再送一次。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout
+    let deadline = Instant::now() + ENSURE_BUDGET;
+    let mut spawned = false;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "collector {} 秒內沒有起來",
+                ENSURE_BUDGET.as_secs()
+            ));
         }
+        if probe(cfg.hook_bind, left) {
+            if body.is_empty() {
+                return Ok(());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match forward(cfg.hook_bind, &body, left)? {
+                Forwarded::Accepted => return Ok(()),
+                Forwarded::Exiting => {}
+            }
+        } else if !spawned {
+            spawn_collector(&cfg)?;
+            spawned = true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    if !body.is_empty() {
-        forward(cfg.hook_bind, &body)?;
-    }
-    Ok(())
 }
 
-fn probe(addr: SocketAddr) -> bool {
-    TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).is_ok()
+#[derive(PartialEq)]
+enum Forwarded {
+    Accepted,
+    /// collector 正在結束、或連線在送達前就斷了：確定沒有收下，可以再送
+    Exiting,
+}
+
+fn probe(addr: SocketAddr, left: Duration) -> bool {
+    !left.is_zero() && TcpStream::connect_timeout(&addr, PROBE_TIMEOUT.min(left)).is_ok()
 }
 
 fn spawn_collector(cfg: &Config) -> Result<(), String> {
@@ -188,25 +210,40 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
 }
 
 /// 把 SessionStart 轉送到 `/hook`（實測 SessionStart 不送 http hook）。
-fn forward(addr: SocketAddr, body: &[u8]) -> Result<(), String> {
-    let mut s = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).map_err(|e| e.to_string())?;
-    s.set_write_timeout(Some(FORWARD_TIMEOUT))
+///
+/// 連線被拒、寫入失敗、還沒回應就斷線（EOF、RST）都表示 collector 沒收下，回 [`Forwarded::Exiting`] 讓呼叫端再送；
+/// 讀取逾時不重送：對方可能已經收下，重送會多一個 SessionStart。
+fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, String> {
+    use std::io::ErrorKind;
+    let step = |d: Duration| d.min(left).max(Duration::from_millis(1));
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(PROBE_TIMEOUT)) else {
+        return Ok(Forwarded::Exiting);
+    };
+    s.set_write_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
-    s.set_read_timeout(Some(FORWARD_TIMEOUT))
+    s.set_read_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
     let head = format!(
         "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::HOOK_PATH,
         body.len()
     );
-    s.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
-    s.write_all(body).map_err(|e| e.to_string())?;
+    if s.write_all(head.as_bytes()).is_err() || s.write_all(body).is_err() {
+        return Ok(Forwarded::Exiting);
+    }
     let mut resp = [0u8; 64];
-    let n = s
-        .read(&mut resp)
-        .map_err(|e| format!("collector 沒有回應：{e}"))?;
+    let n = match s.read(&mut resp) {
+        Ok(0) => return Ok(Forwarded::Exiting),
+        Ok(n) => n,
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+            return Err(format!("collector 沒有回應：{e}"));
+        }
+        Err(_) => return Ok(Forwarded::Exiting),
+    };
     if resp[..n].starts_with(b"HTTP/1.1 200") {
-        Ok(())
+        Ok(Forwarded::Accepted)
+    } else if resp[..n].starts_with(b"HTTP/1.1 503") {
+        Ok(Forwarded::Exiting)
     } else {
         Err("collector 回應不是 200".into())
     }
@@ -217,12 +254,47 @@ fn append_log(msg: &str) {
         .map(|c| c.home)
         .unwrap_or_else(|_| coding_lab::config::default_home());
     let _ = std::fs::create_dir_all(&home);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home.join("collector.log"))
-    {
-        let _ = writeln!(f, "[{}] coding-lab：{msg}", coding_lab::now_ms());
+    coding_lab::logging::append(&home.join("collector.log"), msg);
+}
+
+/// 清掉超過保留期限的 session。collector 在跑時不動（它啟動時與每天會自己清），避免兩個程序同時寫 store。
+fn prune() -> ExitCode {
+    let cfg = match Config::load(&Overrides::default()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            return ExitCode::from(2);
+        }
+    };
+    let days = coding_lab::store::RETENTION_DAYS;
+    let _lock = match serve::try_lock_store(&cfg.home) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!(
+                "coding-lab：collector 正在執行，它啟動時與每天會自動清掉 {days} 天前的資料；要立刻清請先結束 collector"
+            );
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let before = coding_lab::now_ms().saturating_sub(days * 24 * 60 * 60 * 1000);
+    let result = coding_lab::store::Store::open(&cfg.home).and_then(|mut s| s.prune(before));
+    match result {
+        Ok(r) => {
+            println!(
+                "清掉 {} 個超過 {days} 天的 session（{} KB）",
+                r.sessions.len(),
+                r.bytes / 1024
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

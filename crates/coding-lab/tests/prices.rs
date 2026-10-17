@@ -94,3 +94,16 @@ fn broken_or_unreasonable_files_fall_back_to_builtin_with_a_warning() {
         );
     }
 }
+
+/// #687（R3）：帶日期後綴的模型 id 用去掉日期的單價。
+#[test]
+fn dated_model_id_uses_the_undated_price() {
+    let p = Prices::builtin();
+    let undated = p.get("claude-haiku-4-5").expect("內建有 claude-haiku-4-5");
+    assert_eq!(p.get("claude-haiku-4-5-20251001"), Some(undated));
+    assert_eq!(
+        p.get("claude-haiku-4-5-2025"),
+        None,
+        "不是 8 碼日期就不去掉"
+    );
+}

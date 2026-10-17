@@ -126,7 +126,7 @@ export function createStream({ cap = CAP } = {}) {
         break;
       }
       case "tool.result":
-        card(id, ev).result = { ok: p.ok, exitCode: p.exitCode, output: p.output ?? "", truncated: !!p.truncated };
+        card(id, ev).result = { ok: p.ok, exitCode: p.exitCode, output: p.output ?? "", truncated: !!p.truncated, redacted: !!p.redacted };
         touch(id, ops);
         break;
       case "file.edit":

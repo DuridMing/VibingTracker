@@ -659,3 +659,45 @@ async fn resume_only_covers_the_resubscribe_burst() {
     send(&mut ws, json!({"op": "subscribe", "channel": "session:s1"})).await;
     assert_eq!(recv(&mut ws).await["t"], "snapshot");
 }
+
+/// #654 驗收（本機那一半）：本機連線收到的敏感輸出是全文；welcome 說明這是本機連線。
+/// 遠端那一半（剝除）由 tests/sensitive.rs 的 redact_remote 與下面的 is_remote 涵蓋：P6 之前 web 只綁 loopback。
+#[tokio::test]
+async fn local_connection_sees_sensitive_output_in_full() {
+    let state = WebState::new(None, None, 64);
+    state.apply(&[ev(
+        "s1",
+        1,
+        "tool.called",
+        Some(1),
+        json!({"toolUseId": "t1", "tool": "Read", "input": {"file_path": "/p/.env"},
+               "status": "done", "placement": "stream", "danger": null}),
+    )]);
+    state.apply(&[ev(
+        "s1",
+        2,
+        "tool.result",
+        None,
+        json!({"toolUseId": "t1", "ok": true, "exitCode": null, "output": "TOKEN=abc",
+               "truncated": false, "sensitive": true}),
+    )]);
+    state.flush(2_000);
+    let addr = start(state.clone()).await;
+    let mut ws = connect(addr, None).await.unwrap();
+    let w = hello(&mut ws, json!({})).await;
+    assert_eq!(w["remote"], false);
+    send(&mut ws, json!({"op": "subscribe", "channel": "session:s1"})).await;
+    let snap = recv(&mut ws).await;
+    let text = snap.to_string();
+    assert!(text.contains("TOKEN=abc"), "本機看得到全文：{text}");
+    assert!(!text.contains("\"redacted\""));
+}
+
+#[test]
+fn only_non_loopback_peers_are_remote() {
+    use coding_lab::ws::is_remote;
+    assert!(!is_remote("127.0.0.1:5000".parse().unwrap()));
+    assert!(!is_remote("[::1]:5000".parse().unwrap()));
+    assert!(is_remote("100.64.0.7:5000".parse().unwrap()));
+    assert!(is_remote("192.168.1.20:5000".parse().unwrap()));
+}

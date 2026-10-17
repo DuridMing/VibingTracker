@@ -105,3 +105,18 @@ test("session 狀態行：resume、compact 各有自己的文字（#651；clear 
   assert.match(formatRow({ ...base, source: "resume" }).html, /resume/);
   assert.match(formatRow({ ...base, source: "compact" }).html, /compact/);
 });
+
+test("工具輸出（#654）：超過 20 行只顯示前 20 行並註明總行數", () => {
+  const out = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
+  const d = formatRow(tool({ tool: "Read", input: { file_path: "a.md" }, result: { ok: true, output: out } })).detail;
+  assert.match(d, /line 20/);
+  assert.doesNotMatch(d, /line 21/);
+  assert.match(d, /共 30 行，只顯示前 20 行/);
+  const short = formatRow(tool({ tool: "Read", input: { file_path: "a.md" }, result: { ok: true, output: "a\nb" } })).detail;
+  assert.equal(short, "a\nb");
+});
+
+test("工具輸出（#654）：遠端被剝除的敏感輸出說明原因", () => {
+  const d = formatRow(tool({ tool: "Read", input: { file_path: ".env" }, result: { ok: true, output: "", redacted: true } })).detail;
+  assert.match(d, /敏感輸出/);
+});

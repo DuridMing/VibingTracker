@@ -174,6 +174,8 @@ fn simulate(s: &Sample) -> (Vec<(u64, Input)>, Vec<u64>) {
                     next = Some(match start {
                         Start::Beginning => 1,
                         Start::End => written + 1,
+                        Start::After(n) if n <= written => n + 1,
+                        Start::After(_) => 1,
                     });
                     drain(&mut next, written, ts, &mut read, &mut inputs);
                 }

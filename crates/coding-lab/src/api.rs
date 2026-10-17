@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use axum::extract::{Path as UrlPath, State};
+use axum::extract::{ConnectInfo, Path as UrlPath, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -41,7 +41,7 @@ fn error(code: StatusCode, msg: impl Into<String>) -> Response {
 }
 
 fn store_error(e: impl std::fmt::Display) -> Response {
-    eprintln!("coding-lab web：API 讀取 store 失敗：{e}");
+    crate::logging::log(&format!("web：API 讀取 store 失敗：{e}"));
     error(StatusCode::INTERNAL_SERVER_ERROR, "讀取資料失敗")
 }
 
@@ -164,6 +164,8 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
         "commits": r.commits, "dangers": r.dangers, "failures": r.failures,
         "agentsLive": 0, "costUsd": r.cost_usd, "thinkingTokens": r.thinking_tokens,
         "lastPos": last_pos,
+        // 降級只在 live 裡追蹤（#652）；store 的列（多半是已結束的）沒有進行中的降級
+        "degraded": [],
     })
 }
 
@@ -171,6 +173,7 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
 
 pub async fn events(
     State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     UrlPath(id): UrlPath<String>,
     uri: Uri,
 ) -> Response {
@@ -191,7 +194,14 @@ pub async fn events(
         before,
         limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize),
     ) {
-        Ok(events) => ok(&json!({ "session": id, "beforePos": before, "events": events })),
+        Ok(events) => {
+            let mut body = json!({ "session": id, "beforePos": before, "events": events });
+            // 遠端連線剝除敏感輸出（#654，不變式 6）
+            if crate::ws::is_remote(peer) {
+                crate::sensitive::redact_remote(&mut body);
+            }
+            ok(&body)
+        }
         Err(e) => store_error(e),
     }
 }

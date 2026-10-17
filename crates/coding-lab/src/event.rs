@@ -304,6 +304,9 @@ pub struct ToolCalled {
     pub tool_use_id: String,
     pub tool: String,
     pub input: Value,
+    /// input 裡有字串被截到 8 KB（#654）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub input_truncated: bool,
     pub status: ToolStatus,
     pub placement: Placement,
     pub danger: Option<Danger>,
@@ -337,6 +340,9 @@ pub struct ToolResult {
     pub exit_code: Option<i32>,
     pub output: String,
     pub truncated: bool,
+    /// 命中敏感規則（讀 `.env` 等）：對遠端連線剝除（#654）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

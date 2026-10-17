@@ -371,7 +371,7 @@ fn cleared_danger_stays_open_until_ack() {
     assert!(s.open_attention().unwrap().is_empty());
 }
 
-/// v1 的資料庫開啟時升到 v2：換掉 attention_open 索引，資料不動（不變式 9）。
+/// v1 的資料庫開啟時升級：v2 換掉 attention_open 索引，資料不動（不變式 9）。
 #[test]
 fn v1_database_is_migrated_to_v2() {
     let h = home();
@@ -391,8 +391,11 @@ fn v1_database_is_migrated_to_v2() {
     drop(db);
 
     let s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), 2);
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(
+        s.schema_version().unwrap(),
+        SCHEMA_VERSION,
+        "v1 一路升到最新"
+    );
     assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p", "資料不動");
     drop(s);
     let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
@@ -799,4 +802,272 @@ fn status_after_end_clears_the_end() {
         (row.ended_at, row.end_reason, row.status.as_str()),
         (None, None, "run")
     );
+}
+
+fn rows_of(h: &std::path::Path, session: &str) -> Vec<(String, i64)> {
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    ["sessions", "events", "file_touch", "changes", "attention"]
+        .iter()
+        .map(|t| {
+            let col = if *t == "sessions" { "id" } else { "session" };
+            let n: i64 = db
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {t} WHERE {col} = ?1"),
+                    [session],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (t.to_string(), n)
+        })
+        .collect()
+}
+
+/// #655：最後活動早於界線的 session 整個清掉（JSONL 與所有索引列），剛好在界線上的留著；重開不會被 recover 補回來。
+#[test]
+fn prune_removes_sessions_whose_last_activity_is_before_the_cutoff() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("old", 1, "/p"));
+        s.append(ev(
+            "old",
+            2,
+            "assistant.text",
+            Some(1),
+            5000,
+            json!({"text": "a", "messageId": "m"}),
+        ));
+        s.append(started("edge", 1, "/p"));
+        s.append(ev(
+            "edge",
+            2,
+            "assistant.text",
+            Some(1),
+            5001,
+            json!({"text": "b", "messageId": "m"}),
+        ));
+        s.flush().unwrap();
+    }
+    {
+        // 其他表也放一列，確認一起清掉
+        let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+        for sid in ["old", "edge"] {
+            db.execute(
+                "INSERT INTO file_touch VALUES ('/p', 'a.rs', ?1, 'edit', 1, 5000)",
+                [sid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO changes VALUES (?1, 99, 't', '/p', 'a.rs', 'edit', 'main', 5000, 1, 0)",
+                [sid],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO attention VALUES (?1, 'danger', 't', NULL, 5000, NULL, NULL)",
+                [sid],
+            )
+            .unwrap();
+        }
+    }
+    let mut s = Store::open(&h).unwrap();
+    let report = s.prune(5001).unwrap();
+    assert_eq!(
+        report.sessions,
+        ["old"],
+        "5000 早於 5001，5001 剛好在界線上不清"
+    );
+    assert!(report.bytes > 0);
+    assert!(!h.join("events/old.jsonl").exists());
+    assert!(h.join("events/edge.jsonl").exists());
+    assert!(
+        rows_of(&h, "old").iter().all(|(_, n)| *n == 0),
+        "{:?}",
+        rows_of(&h, "old")
+    );
+    assert!(
+        rows_of(&h, "edge").iter().all(|(_, n)| *n == 1 || *n == 2),
+        "{:?}",
+        rows_of(&h, "edge")
+    );
+    // 留下來的 session 照常寫入
+    s.append(text("edge", 3, 2));
+    s.flush().unwrap();
+    drop(s);
+
+    let s = Store::open(&h).unwrap();
+    assert!(s.session("old").unwrap().is_none(), "重開不會被補回來");
+    assert_eq!(s.session("edge").unwrap().unwrap().last_seq, 3);
+}
+
+/// 驗收：舊版（v1）資料目錄升級後照常查詢：session 列、事件、注意佇列都在。
+#[test]
+fn old_data_directory_is_queryable_after_upgrade() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.append(text("s1", 2, 1));
+        s.append(ev(
+            "s1",
+            3,
+            "attention.raised",
+            None,
+            1003,
+            json!({"kind": "danger", "ref": "t1", "reason": "rm -rf"}),
+        ));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP INDEX attention_open;
+         CREATE INDEX attention_open ON attention (raised_at) WHERE cleared_at IS NULL AND acked_at IS NULL;
+         UPDATE meta SET value = '1' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(s.sessions(Some("/p"), 10).unwrap().len(), 1);
+    assert_eq!(s.events_by_seq("s1", 1, 3).unwrap().len(), 3);
+    assert_eq!(s.open_attention().unwrap().len(), 1);
+}
+
+fn at_line(session: &str, seq: u64, file: &str, no: u64) -> Event {
+    Event::from_json_line(
+        &json!({
+            "v": 1, "session": session, "seq": seq, "type": "assistant.text", "agent": "main",
+            "line": {"file": file, "no": no}, "pos": seq, "ts_model": null, "ts_exec": null,
+            "ts_seen": 1000 + seq, "host": "local",
+            "payload": {"text": "t", "messageId": "m", "model": "claude-opus-5-5"},
+        })
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn started_at(session: &str, path: &str) -> Event {
+    ev(
+        session,
+        1,
+        "session.started",
+        None,
+        1000,
+        json!({"cwd": "/p", "source": "startup", "transcriptPath": path}),
+    )
+}
+
+/// #684 D4：tails 記每個 transcript 檔已產生 Event 的最大行號，重開後還在。
+#[test]
+fn tails_record_the_last_line_of_each_transcript_file() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 3));
+        s.append(at_line("s1", 3, "agent-a1", 2));
+        s.append(at_line("s1", 4, "main", 5));
+        s.flush().unwrap();
+    }
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    let mut rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.session, t.file, t.path, t.line_no))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [
+            ("s1".into(), "agent-a1".into(), None, 2),
+            ("s1".into(), "main".into(), Some("/t/s1.jsonl".into()), 5),
+        ]
+    );
+}
+
+/// #684 D4：v2 的資料庫升到 v3 時掃一次 JSONL 回填 tails；prune 一起清掉。
+#[test]
+fn v2_database_is_backfilled_with_tails_and_prune_clears_them() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 4));
+        s.flush().unwrap();
+    }
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE IF EXISTS tails; UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+
+    let mut s = Store::open(&h).unwrap();
+    assert_eq!(s.schema_version().unwrap(), 3);
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.line_no))
+        .collect();
+    assert_eq!(rows, [("main".to_string(), 4)], "升級時從 JSONL 回填");
+
+    s.prune(u64::MAX).unwrap();
+    assert!(s.tail_lines().unwrap().is_empty(), "prune 一起清掉 tails");
+}
+
+/// #684：index.sqlite 整個刪掉重建時，tails 也從 JSONL 重建。
+#[test]
+fn tails_are_rebuilt_with_the_index() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 6));
+        s.flush().unwrap();
+    }
+    for f in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        let _ = std::fs::remove_file(h.join(f));
+    }
+    let s = Store::open(&h).unwrap();
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.path, t.line_no))
+        .collect();
+    assert_eq!(
+        rows,
+        [("main".to_string(), Some("/t/s1.jsonl".to_string()), 6)]
+    );
+}
+
+/// #686：工具卡片碰的檔（索引改動用）在 session 結束時清掉，不隨時間一直長大。
+#[test]
+fn tool_paths_are_forgotten_when_the_session_ends() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(ev(
+        "s1",
+        2,
+        "file.read",
+        None,
+        1002,
+        json!({"toolUseId": "t1", "path": "a.rs"}),
+    ));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 1);
+    s.append(ev(
+        "s1",
+        3,
+        "session.ended",
+        None,
+        1003,
+        json!({"reason": "exit"}),
+    ));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 0);
 }

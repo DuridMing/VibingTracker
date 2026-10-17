@@ -63,11 +63,14 @@ pub enum Input {
         session: String,
         file: String,
         error: String,
+        /// 送出的 tail 的編號（[`crate::transcript::TailOptions::tail`]）
+        tail: u64,
         ts_seen: u64,
     },
     Recovered {
         session: String,
         file: String,
+        tail: u64,
         ts_seen: u64,
     },
     /// serve 在 SubagentStart 後讀 subagent 目錄的 `agent-<id>.meta.json` 的結果（#680）。
@@ -82,6 +85,8 @@ pub enum Input {
     TailReset {
         session: String,
         file: Option<String>,
+        /// 之後有效的 tail 編號下限
+        tail: u64,
         ts_seen: u64,
     },
 }
@@ -106,6 +111,22 @@ struct Card {
     finished: bool,
     /// 已送出 tool.called。PreToolUse 遺失時 PostToolUse／tool_result 會先建出沒有 tool.called 的卡片
     called: bool,
+    /// 命中敏感規則（#654）：tool.result 帶 sensitive，遠端送出時剝除
+    sensitive: bool,
+}
+
+impl Card {
+    /// 還沒進暫存區、什麼都還沒送的卡片（PreToolUse 遺失時由 PostToolUse／tool_result 先建出來）
+    fn new(agent: &str) -> Card {
+        Card {
+            agent: agent.to_string(),
+            staged_at: None,
+            result_sent: false,
+            finished: false,
+            called: false,
+            sensitive: false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -115,6 +136,9 @@ struct Session {
     cards: HashMap<String, Card>,
     seen_uuids: HashSet<String>,
     degraded: HashSet<String>,
+    /// TailReset 之後有效的 tail 編號下限（每個檔、整個 session）：比它舊的 tail 送來的降級訊號不理（#684 R20）
+    tail_floor: HashMap<String, u64>,
+    tail_floor_all: u64,
     /// 已降級進串流、但 transcript 的 tool_use 行還沒到的卡片：id → (transcript 檔, 開始等的時間)。
     /// 背景 agent 的卡片沒有 transcript 行，不記。
     fallback_waiting: HashMap<String, (String, u64)>,
@@ -142,6 +166,19 @@ struct Session {
     ended_at: Option<u64>,
     /// session.status 與注意佇列（#645）
     status: Tracker,
+}
+
+impl Session {
+    /// 這個 tail 已經被 TailReset 取代（編號比下限舊）
+    fn replaced(&self, file: &str, tail: u64) -> bool {
+        let floor = self
+            .tail_floor
+            .get(file)
+            .copied()
+            .unwrap_or(0)
+            .max(self.tail_floor_all);
+        tail < floor
+    }
 }
 
 struct HeldTool {
@@ -235,6 +272,12 @@ impl Merger {
     /// collector 重啟時，把 store 裡各 session 已用到的 seq／pos 交給 merge，續跑的 session 接著編號
     /// （seq 重複會被索引忽略、pos 倒退會破壞只 append 的串流）。到 session 第一次產生事件時才套用。
     /// `cwd` 是 file.* 的路徑基準（store 的 sessions.cwd），空字串表示不知道。
+    /// 忘掉一個 session（store 已經把它清掉，#655）：之後不會再替它補發任何事件。
+    pub fn forget(&mut self, sid: &str) {
+        self.sessions.remove(sid);
+        self.resumed.remove(sid);
+    }
+
     pub fn resume(&mut self, sid: &str, seq: u64, pos: u64, cwd: &str) {
         let r = self.resumed.entry(sid.to_string()).or_default();
         (r.seq, r.pos) = (seq, pos);
@@ -341,9 +384,13 @@ impl Merger {
                 file,
                 error,
                 ts_seen,
+                tail,
             } => {
                 let mut out = Vec::new();
                 let s = self.session(&session);
+                if s.replaced(&file, tail) {
+                    return out;
+                }
                 s.degraded.insert(file.clone());
                 let file_name = file.clone();
                 let payload = Payload::TranscriptDegraded(TranscriptHealth {
@@ -366,8 +413,13 @@ impl Merger {
                 session,
                 file,
                 ts_seen,
+                tail,
             } => {
-                self.session(&session).degraded.remove(&file);
+                let s = self.session(&session);
+                if s.replaced(&file, tail) {
+                    return Vec::new();
+                }
+                s.degraded.remove(&file);
                 vec![self.recovered(&session, file, ts_seen)]
             }
             Input::AgentMeta {
@@ -384,10 +436,17 @@ impl Merger {
                 session,
                 file,
                 ts_seen,
+                tail,
             } => {
-                let Some(s) = self.sessions.get_mut(&session) else {
-                    return Vec::new();
-                };
+                // 第一個 hook 的 TailReset 排在 hook 本身之前：session 還沒建立也要記下限
+                let s = self.session(&session);
+                match &file {
+                    Some(f) => {
+                        let floor = s.tail_floor.entry(f.clone()).or_default();
+                        *floor = (*floor).max(tail);
+                    }
+                    None => s.tail_floor_all = s.tail_floor_all.max(tail),
+                }
                 // 重開的 tail 從檔尾讀，降級卡片的 tool_use 行不會再來
                 s.fallback_waiting
                     .retain(|_, (f, _)| file.as_ref().is_some_and(|reset| reset != f));
@@ -708,7 +767,7 @@ impl Merger {
                     cwd,
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
-                    transcript_path: s("transcript_path"),
+                    transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),
                     branch: None,
                 };
                 out.push(self.emit(&sid, Payload::SessionStarted(p), meta()));
@@ -884,7 +943,7 @@ impl Merger {
                     agent_id,
                     last_message: s("last_assistant_message")
                         .map(|m| truncate(&m, MESSAGE_LIMIT).0),
-                    transcript_path: s("agent_transcript_path"),
+                    transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
                 out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
@@ -1169,6 +1228,7 @@ impl Merger {
         let tool = h.str_field("tool_name").unwrap_or_default().to_string();
         let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
         let danger = self.danger.check(&tool, &input);
+        let sensitive = crate::sensitive::is_sensitive(&tool, &input);
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
@@ -1197,13 +1257,13 @@ impl Merger {
             session.cards.insert(
                 id.clone(),
                 Card {
-                    agent: agent.clone(),
                     staged_at: Some(ts_seen),
-                    result_sent: false,
-                    finished: false,
                     called: true,
+                    sensitive,
+                    ..Card::new(&agent)
                 },
             );
+            let (input, input_truncated) = truncate_input(input);
             let p = ToolCalled {
                 tool_use_id: id.clone(),
                 tool,
@@ -1211,6 +1271,7 @@ impl Merger {
                 status: ToolStatus::Running,
                 placement: Placement::Staged,
                 danger: danger.clone(),
+                input_truncated,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1356,13 +1417,7 @@ impl Merger {
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card {
-            agent: agent.to_string(),
-            staged_at: None,
-            result_sent: false,
-            finished: false,
-            called: false,
-        });
+        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1378,18 +1433,13 @@ impl Merger {
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card {
-            agent: agent.to_string(),
-            staged_at: None,
-            result_sent: false,
-            finished: false,
-            called: false,
-        });
+        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
         if card.result_sent {
             return None;
         }
         card.result_sent = true;
         let agent = card.agent.clone();
+        let sensitive = card.sensitive;
         let (output, truncated) = truncate(output, OUTPUT_LIMIT);
         let p = ToolResult {
             tool_use_id: id.to_string(),
@@ -1397,6 +1447,7 @@ impl Merger {
             exit_code,
             output,
             truncated,
+            sensitive,
         };
         Some(self.emit(
             sid,
@@ -1467,15 +1518,7 @@ impl Merger {
         {
             let u = Value::Object(u.clone());
             let n = |v: &Value| v.as_u64().unwrap_or(0);
-            let cc = &u["cache_creation"];
-            let (w5, w1) = if cc.is_object() {
-                (
-                    n(&cc["ephemeral_5m_input_tokens"]),
-                    n(&cc["ephemeral_1h_input_tokens"]),
-                )
-            } else {
-                (n(&u["cache_creation_input_tokens"]), 0)
-            };
+            let (w5, w1) = crate::prices::cache_writes(&u);
             let p = Usage {
                 message_id: message_id.clone(),
                 model: m.clone(),
@@ -1527,21 +1570,19 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card {
-                            agent: agent.clone(),
-                            staged_at: None,
-                            result_sent: false,
-                            finished: false,
-                            called: false,
-                        });
+                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
                         card.called = true;
+                        let tool = block["name"].as_str().unwrap_or_default().to_string();
+                        card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
+                        let (input, input_truncated) = truncate_input(block["input"].clone());
                         let p = ToolCalled {
                             tool_use_id: id,
-                            tool: block["name"].as_str().unwrap_or_default().to_string(),
-                            input: block["input"].clone(),
+                            tool,
+                            input,
                             status: ToolStatus::Pending,
                             placement: Placement::Stream,
                             danger: None,
+                            input_truncated,
                         };
                         vec![self.emit(sid, Payload::ToolCalled(p), meta(true))]
                     }
@@ -1624,6 +1665,41 @@ fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
 }
 
 /// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。
+/// tool.called 的 input：每個超過 [`OUTPUT_LIMIT`] 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）；
+/// 回傳有沒有截到。Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
+fn truncate_input(v: Value) -> (Value, bool) {
+    match v {
+        Value::String(s) if s.len() > OUTPUT_LIMIT => {
+            (Value::String(truncate(&s, OUTPUT_LIMIT).0), true)
+        }
+        Value::Array(items) => {
+            let mut cut = false;
+            let items = items
+                .into_iter()
+                .map(|x| {
+                    let (x, c) = truncate_input(x);
+                    cut |= c;
+                    x
+                })
+                .collect();
+            (Value::Array(items), cut)
+        }
+        Value::Object(map) => {
+            let mut cut = false;
+            let map = map
+                .into_iter()
+                .map(|(k, x)| {
+                    let (x, c) = truncate_input(x);
+                    cut |= c;
+                    (k, x)
+                })
+                .collect();
+            (Value::Object(map), cut)
+        }
+        other => (other, false),
+    }
+}
+
 fn truncate(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
