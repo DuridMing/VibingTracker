@@ -15,7 +15,7 @@ import { REPLAY_TAB, rangeFor, replayUrl, createReplay } from "./replay.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
-import { mergeSessions, projectRoots, pickProject, canReplay } from "./sessions.js";
+import { mergeSessions, projectRoots, pickProject, canReplay, fitTabs } from "./sessions.js";
 import { degradedNotice } from "./degraded.js";
 import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, layoutGraph, withWip } from "./branches.js";
 
@@ -117,21 +117,76 @@ function sessTag(s, cls = "id") {
   return h("span", { class: cls, style: `color:${sessionColor(s.id)}`, title: s.id }, shortId(s.id));
 }
 
+function sessionTab(s, extra = {}) {
+  return h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id), ...extra },
+    h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
+    h("span", { class: "dot" }),
+    sessTag(s),
+    h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
+}
+
+// 放不下的 session tab 收進「+N」（#704）：先全部畫出來量寬，再依 fitTabs 收起來；寬度變了重算
+let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions();
   if (!changed("tabs", ui.tab + "|" + live.map((s) => `${s.id}:${s.status}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
-    ...live.map((s) =>
-      h("button", { class: `stab ${s.status}${ui.tab === s.id ? " on" : ""}`, title: sessionTitle(s), onclick: () => selectTab(s.id) },
-        h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
-        h("span", { class: "dot" }),
-        sessTag(s),
-        h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"))),
+    ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
+    h("button", { class: "stab more", id: "stMore", "aria-haspopup": "true", "aria-expanded": "false", onclick: (e) => { e.stopPropagation(); toggleTabMenu(); } }, "+99"),
     h("button", { class: `stab rp${ui.tab === REPLAY_TAB ? " on" : ""}`, title: "選專案與時間範圍，回放所有 session（含已結束）合成的串流", onclick: () => selectTab(REPLAY_TAB) }, "⟲ 專案回放"),
   );
+  fitTabRow();
 }
+
+function fitTabRow() {
+  const box = $("#stabs");
+  const tabs = [...box.querySelectorAll(".stab[data-sid]")];
+  const more = $("#stMore");
+  if (!more) return;
+  for (const t of tabs) t.hidden = false;
+  more.hidden = false;
+  more.textContent = "+99";
+  const gap = 4;
+  const first = box.firstElementChild;
+  const replay = box.querySelector(".stab.rp"); // 「⟲ 專案回放」（#702）永遠留在最後
+  const avail = box.clientWidth - first.offsetWidth - gap - (replay ? replay.offsetWidth + gap : 0);
+  const sel = tabs.findIndex((t) => t.dataset.sid === ui.tab);
+  const { hidden } = fitTabs(tabs.map((t) => t.offsetWidth + gap), avail, more.offsetWidth + gap, sel);
+  for (const i of hidden) tabs[i].hidden = true;
+  tabsHidden = hidden.map((i) => tabs[i].dataset.sid);
+  more.hidden = !hidden.length;
+  more.textContent = `+${hidden.length}`;
+  more.title = `還有 ${hidden.length} 個 session，點一下列出來`;
+  if (!hidden.length) closeTabMenu();
+  else if (!$("#tabMenu").hidden) renderTabMenu();
+}
+if (typeof ResizeObserver === "function") new ResizeObserver(() => fitTabRow()).observe($("#stabs"));
+
+function renderTabMenu() {
+  const byId = new Map(liveSessions().map((s) => [s.id, s]));
+  const menu = $("#tabMenu");
+  menu.replaceChildren(
+    h("div", { class: "tmh" }, `收起來的 session（${tabsHidden.length}）`),
+    ...tabsHidden.map((id) => byId.get(id)).filter(Boolean).map((s) => sessionTab(s, { onclick: () => { closeTabMenu(); selectTab(s.id); } })),
+  );
+  const b = $("#stMore").getBoundingClientRect();
+  menu.style.top = `${b.bottom + 4}px`;
+  menu.style.left = `${Math.max(8, Math.min(b.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8))}px`;
+}
+function toggleTabMenu() {
+  if (!$("#tabMenu").hidden) return closeTabMenu();
+  $("#tabMenu").hidden = false;
+  $("#stMore")?.setAttribute("aria-expanded", "true");
+  renderTabMenu();
+}
+function closeTabMenu() {
+  $("#tabMenu").hidden = true;
+  $("#stMore")?.setAttribute("aria-expanded", "false");
+}
+document.addEventListener("click", (e) => { if (!$("#tabMenu").hidden && !$("#tabMenu").contains(e.target)) closeTabMenu(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeTabMenu(); });
 
 function openMonitor(id) {
   window.open(monitorUrl(location, id), `coding-lab-monitor-${id}`, "popup,width=980,height=760");

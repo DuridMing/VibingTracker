@@ -40,3 +40,23 @@ export function pickProject(roots, prev) {
   if (prev && roots.some((r) => r.cwd === prev)) return prev;
   return roots.reduce((a, b) => (b.live > a.live ? b : a)).cwd;
 }
+
+// session tab 列放不下時（#704）：widths 是每個 tab 的寬（含間距），avail 是可用寬，moreW 是「+N」按鈕的寬。
+// 從前面放到放不下為止；選中的（selected）被收起來時換上來，從最後一個看得到的開始擠掉。回 { shown, hidden }（索引，遞增）
+export function fitTabs(widths, avail, moreW, selected) {
+  const all = widths.map((_, i) => i);
+  const sum = (ix) => ix.reduce((t, i) => t + widths[i], 0);
+  if (sum(all) <= avail) return { shown: all, hidden: [] };
+  const room = avail - moreW;
+  const shown = [];
+  for (const i of all) {
+    if (sum(shown) + widths[i] > room) break;
+    shown.push(i);
+  }
+  if (selected >= 0 && selected < widths.length && !shown.includes(selected)) {
+    while (shown.length && sum(shown) + widths[selected] > room) shown.pop();
+    shown.push(selected);
+    shown.sort((a, b) => a - b);
+  }
+  return { shown, hidden: all.filter((i) => !shown.includes(i)) };
+}
