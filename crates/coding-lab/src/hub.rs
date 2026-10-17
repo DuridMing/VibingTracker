@@ -41,6 +41,48 @@ const SINCE_MAX: usize = 5000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// 心跳（#718）：每 10 秒 Ping、15 秒沒有任何訊息就當斷線（Wi-Fi 斷掉時 TCP 不會自己 FIN）
+pub const PING_EVERY_MS: u64 = 10_000;
+pub const DEAD_AFTER_MS: u64 = 15_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Beat {
+    Nothing,
+    Ping,
+    Dead,
+}
+
+/// 一條上游連線的心跳狀態（純邏輯，時間由外面給）
+pub struct Heartbeat {
+    last_activity: u64,
+    last_ping: u64,
+}
+
+impl Heartbeat {
+    pub fn new(now: u64) -> Heartbeat {
+        Heartbeat {
+            last_activity: now,
+            last_ping: now,
+        }
+    }
+
+    /// 收到任何訊息（frame、snapshot、Pong、Ping）
+    pub fn on_activity(&mut self, now: u64) {
+        self.last_activity = now;
+        self.last_ping = now; // 對方有在說話就不必急著 Ping
+    }
+
+    pub fn tick(&mut self, now: u64) -> Beat {
+        if now.saturating_sub(self.last_activity) >= DEAD_AFTER_MS {
+            return Beat::Dead;
+        }
+        if now.saturating_sub(self.last_ping) >= PING_EVERY_MS {
+            self.last_ping = now;
+            return Beat::Ping;
+        }
+        Beat::Nothing
+    }
+}
 
 /// `[[hub.upstream]]`：一台 collector。`key` 省略時只適合本機或 SSH 通道（那台 `auth = "local-open"`）。
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -645,6 +687,8 @@ struct UpHandle {
     up: Upstream,
     /// 要送給這台上游的 client → server 訊息（subscribe／unsubscribe／more／ack）
     tx: mpsc::UnboundedSender<Value>,
+    /// 連上幾次（healthz 的 `connects`；#718 驗證時區變了不會重連）
+    connects: AtomicU64,
 }
 
 struct HubState {
@@ -653,8 +697,10 @@ struct HubState {
     out: broadcast::Sender<Arc<Out>>,
     web_root: Option<PathBuf>,
     instance: String,
-    /// 客戶端的時區（上游的 KPI「今天」照它算；變了就重連上游）
+    /// 上游 KPI「今天」用的時區：第一個明確帶 `utcOffsetMin` 的客戶端決定，之後不再變（#718：不然瀏覽器與
+    /// 不帶時區的腳本輪流連就一直讓所有上游斷線重連）
     offset: AtomicI32,
+    offset_fixed: std::sync::atomic::AtomicBool,
     /// 每個 session 頻道有幾條客戶端連線在訂（最後一條退訂才對上游退訂）
     subs: Mutex<HashMap<String, usize>>,
 }
@@ -699,7 +745,11 @@ pub async fn serve_with_backoff(
     let mut rxs = Vec::new();
     for up in upstreams {
         let (tx, rx) = mpsc::unbounded_channel();
-        ups.push(UpHandle { up: up.clone(), tx });
+        ups.push(UpHandle {
+            up: up.clone(),
+            tx,
+            connects: AtomicU64::new(0),
+        });
         rxs.push((up, rx));
     }
     let state = Arc::new(HubState {
@@ -713,6 +763,7 @@ pub async fn serve_with_backoff(
             INSTANCES.fetch_add(1, Ordering::Relaxed)
         ),
         offset: AtomicI32::new(0),
+        offset_fixed: std::sync::atomic::AtomicBool::new(false),
         subs: Mutex::new(HashMap::new()),
     });
     let mut tasks = Vec::new();
@@ -761,6 +812,9 @@ async fn upstream_loop(
         let offset = state.offset.load(Ordering::Relaxed);
         match connect_upstream(&up).await {
             Ok(mut ws) => {
+                if let Some(h) = state.handle(&up.name) {
+                    h.connects.fetch_add(1, Ordering::Relaxed);
+                }
                 crate::logging::log(&format!("hub：已連上 {}（{}）", up.name, up.url));
                 logged_down = false;
                 backoff = base_backoff;
@@ -846,23 +900,37 @@ async fn run_upstream(
 ) {
     use tokio_tungstenite::tungstenite::Message as M;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut hb = Heartbeat::new(crate::now_ms());
     loop {
         tokio::select! {
             msg = ws.next() => match msg {
                 Some(Ok(M::Text(t))) => {
+                    hb.on_activity(crate::now_ms());
                     let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
                     let outs = state.hub().on_message(&up.name, &v);
                     state.emit(outs);
                 }
-                Some(Ok(M::Ping(p))) => { let _ = ws.send(M::Pong(p)).await; }
+                Some(Ok(M::Ping(p))) => { hb.on_activity(crate::now_ms()); let _ = ws.send(M::Pong(p)).await; }
+                Some(Ok(M::Pong(_))) => hb.on_activity(crate::now_ms()),
                 Some(Ok(M::Close(_))) | None | Some(Err(_)) => return,
-                _ => {}
+                _ => hb.on_activity(crate::now_ms()),
             },
             cmd = rx.recv() => match cmd {
                 Some(v) => { if ws.send(M::Text(v.to_string().into())).await.is_err() { return; } }
                 None => return,
             },
             _ = tick.tick() => {
+                match hb.tick(crate::now_ms()) {
+                    Beat::Dead => {
+                        crate::logging::log(&format!("hub：{} {} 秒沒有任何訊息，當作斷線", up.name, DEAD_AFTER_MS / 1000));
+                        let _ = ws.close(None).await;
+                        return;
+                    }
+                    Beat::Ping => { if ws.send(M::Ping(Vec::new().into())).await.is_err() { return; } }
+                    Beat::Nothing => {}
+                }
+                // 時區只會定一次（第一個明確帶時區的客戶端）：這裡最多重連一次
                 if state.offset.load(Ordering::Relaxed) != offset {
                     let _ = ws.close(None).await;
                     return;
@@ -968,11 +1036,18 @@ async fn on_client_message(
     let err = |m: &str| json!({ "t": "error", "message": m });
     match msg["op"].as_str().unwrap_or_default() {
         "hello" => {
-            let offset = msg["utcOffsetMin"]
-                .as_i64()
-                .unwrap_or(0)
-                .clamp(-14 * 60, 14 * 60) as i32;
-            state.offset.store(offset, Ordering::Relaxed); // 上游連線的時區跟著最近 hello 的客戶端
+            // 上游 KPI 的時區由第一個明確帶 utcOffsetMin 的客戶端決定；之後不同的時區不再換（#718）
+            if let Some(o) = msg["utcOffsetMin"].as_i64() {
+                let o = o.clamp(-14 * 60, 14 * 60) as i32;
+                if !state.offset_fixed.swap(true, Ordering::Relaxed) {
+                    state.offset.store(o, Ordering::Relaxed);
+                } else if state.offset.load(Ordering::Relaxed) != o {
+                    crate::logging::log(&format!(
+                        "hub：客戶端時區 {o} 和上游連線用的 {} 不同，KPI 的「今天」照後者",
+                        state.offset.load(Ordering::Relaxed)
+                    ));
+                }
+            }
             let welcome = json!({
                 "t": "welcome", "protocol": crate::ws::PROTOCOL, "instance": state.instance, "host": "hub",
                 "version": env!("CARGO_PKG_VERSION"), "remote": false,
@@ -1070,7 +1145,8 @@ async fn healthz(State(state): State<Arc<HubState>>) -> Response {
         .iter()
         .map(|u| {
             json!({ "name": u.up.name, "url": u.up.url,
-                    "online": online.iter().any(|(n, on)| *n == u.up.name && *on) })
+                    "online": online.iter().any(|(n, on)| *n == u.up.name && *on),
+                    "connects": u.connects.load(Ordering::Relaxed) })
         })
         .collect();
     json_response(

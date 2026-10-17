@@ -93,6 +93,13 @@ class Collector:
                 raise SystemExit(f"{self.name} 10 秒內沒有起來，見 {self.home / 'collector.log'}")
             time.sleep(0.05)
 
+    def pause(self):
+        """SIGSTOP：程序還在、TCP 不會 FIN，模擬 Wi-Fi 斷掉的半開連線（#718）"""
+        self.proc.send_signal(signal.SIGSTOP)
+
+    def resume(self):
+        self.proc.send_signal(signal.SIGCONT)
+
     def kill(self):
         self.proc.send_signal(signal.SIGKILL)
         self.proc.wait(timeout=10)
@@ -132,13 +139,16 @@ def wait_until(pred, timeout, what):
 class HubListener:
     """訂 hub 的 `*`，把 welcome／snapshot／frame／error 收進清單。"""
 
-    def __init__(self, port):
+    def __init__(self, port, utc_offset_min=None):
         self.ws = WS(port)
         self.msgs = []
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.ws.s.settimeout(1)
-        self.ws.send({"op": "hello", "protocol": 1})
+        hello = {"op": "hello", "protocol": 1}
+        if utc_offset_min is not None:
+            hello["utcOffsetMin"] = utc_offset_min
+        self.ws.send(hello)
         self.ws.send({"op": "subscribe", "channel": "*"})
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -215,8 +225,9 @@ def main():
         both = wait_until(lambda: all(u["online"] for u in http_get(hub_port, "/healthz")[1]["upstreams"]), 15, "兩台 online")
         check(True, f"兩台上游 online（{both:.2f} 秒）：{[u['name'] for u in h['upstreams']]}")
 
-        listener = HubListener(hub_port)
-        time.sleep(0.5)
+        # 像瀏覽器一樣帶時區：hub 用第一個明確的時區連上游（#718），之後的客戶端不再讓上游重連
+        listener = HubListener(hub_port, utc_offset_min=480)
+        time.sleep(2.5)
         welcome = [m for m in listener.take() if m.get("t") == "welcome"]
         check(welcome and welcome[0].get("host") == "hub", f"welcome.host 是 hub：{welcome[0] if welcome else None}")
         check(welcome and welcome[0].get("scope") == "operate", "welcome.scope 是 operate")
@@ -293,6 +304,33 @@ def main():
         time.sleep(1.0)
         evs = listener.events(listener.take())
         check(any(e.get("session") == sid_a and e.get("host") == "alpha" and e.get("type") == "tool.called" for e in evs), "重連後 alpha 的新事件出現在 hub")
+
+        # 半開連線（#718）：SIGSTOP beta，TCP 不會 FIN；hub 靠心跳（10 秒 Ping、15 秒沒訊息）才會標離線
+        listener.take()
+        beta.pause()
+        t_half = wait_until(lambda: not [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 40, "SIGSTOP 的 beta 標 offline")
+        # 離線判定是「最後一次訊息後 15 秒」，beta 在 SIGSTOP 前可能已經安靜了幾秒，所以是 5～25 秒
+        check(5 <= t_half <= 25, f"SIGSTOP（不 FIN）後 hub 在 {t_half:.1f} 秒標 online=false（最後一次訊息後 15 秒；沒有心跳前 54 秒都不會標）")
+        time.sleep(0.5)
+        off_rows = listener.session_rows(listener.take())
+        check(off_rows.get(sid_b, {}).get("offline") is True, f"beta 的 sessions 列送 offline: true：{off_rows.get(sid_b, {}).get('offline')}")
+        alpha_up = [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"]
+        check(alpha_up, "beta 半開期間 alpha 仍 online")
+        beta.resume()
+        t_back = wait_until(lambda: [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "SIGCONT 後 beta 回到 online")
+        check(True, f"SIGCONT 後 hub 在 {t_back:.1f} 秒重連 beta")
+        time.sleep(0.5)
+        rows = listener.session_rows(listener.take())
+        check(sid_b in rows and not rows[sid_b].get("offline"), "重連後 beta 的列不再 offline")
+
+        # 時區（#718）：帶 +480 與不帶 offset 的客戶端輪流連，上游不該重連
+        before = {u["name"]: u.get("connects") for u in http_get(hub_port, "/healthz")[1]["upstreams"]}
+        for off in (480, None, 0, 480):
+            extra = HubListener(hub_port, utc_offset_min=off)
+            time.sleep(1.2)
+            extra.stop.set()
+        after = {u["name"]: u.get("connects") for u in http_get(hub_port, "/healthz")[1]["upstreams"]}
+        check(after == before, f"不同時區的客戶端輪流連，上游連線數不變：{before} → {after}")
         listener.stop.set()
     finally:
         hub_proc.terminate()

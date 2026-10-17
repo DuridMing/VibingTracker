@@ -724,3 +724,85 @@ async fn upstream_going_away_marks_its_sessions_offline_and_reconnect_restores_t
         "重連後補齊"
     );
 }
+
+// ---------- #718：心跳與讀取逾時、時區變了不重連 ----------
+
+#[test]
+fn heartbeat_pings_every_10s_and_declares_dead_after_15s_without_any_message() {
+    use coding_lab::hub::{Beat, Heartbeat};
+    let mut hb = Heartbeat::new(0);
+    assert_eq!(hb.tick(5_000), Beat::Nothing);
+    assert_eq!(hb.tick(10_000), Beat::Ping, "10 秒沒送過 Ping 就送");
+    assert_eq!(hb.tick(12_000), Beat::Nothing, "剛送過不重送");
+    assert_eq!(
+        hb.tick(15_000),
+        Beat::Dead,
+        "15 秒沒有任何訊息（Pong、frame）就當斷線"
+    );
+    // 任何訊息都重置：14 秒時收到 Pong，16 秒還活著、20 秒才送下一個 Ping、29 秒才死
+    let mut hb = Heartbeat::new(0);
+    assert_eq!(hb.tick(10_000), Beat::Ping);
+    hb.on_activity(14_000);
+    assert_eq!(hb.tick(16_000), Beat::Nothing);
+    assert_eq!(hb.tick(19_000), Beat::Nothing);
+    assert_eq!(hb.tick(24_000), Beat::Ping, "Ping 的間隔從最後一次活動算");
+    assert_eq!(hb.tick(28_900), Beat::Nothing);
+    assert_eq!(hb.tick(29_000), Beat::Dead);
+}
+
+#[tokio::test]
+async fn clients_with_different_offsets_do_not_make_the_hub_reconnect_its_upstreams() {
+    let a = collector(
+        "a-offset",
+        &[started("s1", 1, 1000, "/a"), text("s1", 2, 1, 1001)],
+    );
+    let addr_a = upstream(&a).await;
+    let ups = vec![Upstream {
+        name: "alpha".into(),
+        url: format!("http://{addr_a}"),
+        key: None,
+    }];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+        .await
+        .unwrap();
+    let connects = |h: &Value| h["upstreams"][0]["connects"].as_u64().unwrap_or(0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, h) = http_get(hub_addr, "/healthz").await;
+        if h["upstreams"][0]["online"] == true {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{h}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 瀏覽器（+480）與測試腳本（不帶 offset）輪流連：上游最多重連一次（第一個明確的時區），之後不再變
+    let mut browser = connect(hub_addr).await;
+    send(
+        &mut browser,
+        json!({"op": "hello", "protocol": 1, "utcOffsetMin": 480}),
+    )
+    .await;
+    recv(&mut browser).await;
+    // 那一次重連要等退避（1 秒）＋重新連上，給它 3 秒安定
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    let (_, h) = http_get(hub_addr, "/healthz").await;
+    let after_first = connects(&h);
+    assert!(after_first <= 2, "第一個明確時區最多重連一次：{h}");
+    for offset in [None, Some(0), Some(480), Some(-300), None] {
+        let mut c = connect(hub_addr).await;
+        let mut hello = json!({"op": "hello", "protocol": 1});
+        if let Some(o) = offset {
+            hello["utcOffsetMin"] = json!(o);
+        }
+        send(&mut c, hello).await;
+        recv(&mut c).await;
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let (_, h) = http_get(hub_addr, "/healthz").await;
+        assert_eq!(
+            connects(&h),
+            after_first,
+            "之後的客戶端不管帶什麼時區都不重連：{h}"
+        );
+        assert_eq!(h["upstreams"][0]["online"], true);
+    }
+}
