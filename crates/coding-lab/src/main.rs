@@ -197,12 +197,14 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    // Windows 用 CREATE_NO_WINDOW 而不是 DETACHED_PROCESS：沒有 console 的 collector 再叫 git 等 console 程式時，
+    // 系統會替每個子程序開新的 CMD 視窗；給它一個隱藏的 console，子程序就沿用它、不會彈窗
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     cmd.spawn()
         .map(|_| ())

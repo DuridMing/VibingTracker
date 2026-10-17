@@ -617,6 +617,13 @@ fn base_git(dir: &Path) -> Command {
             c.env_remove(k);
         }
     }
+    // collector 在背景跑時，Windows 不加這個旗標會替每次 git 開一個 CMD 視窗
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
     c.arg("-C")
         .arg(dir)
         .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]);
