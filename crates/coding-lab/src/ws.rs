@@ -199,6 +199,11 @@ pub async fn serve_web(
         .route("/api/sessions/{id}/events", get(crate::api::events))
         .route("/api/files", get(crate::api::files))
         .route("/api/projects/events", get(crate::api::project_events))
+        .route("/api/branches", get(crate::api::branches))
+        .route("/api/branch-diff", get(crate::api::branch_diff))
+        .route("/api/graph", get(crate::api::graph))
+        .route("/api/commit", get(crate::api::commit))
+        .route("/api/commit-diff", get(crate::api::commit_diff))
         .route_layer(middleware::from_fn(require_same_origin));
     let app = Router::new()
         .merge(api)

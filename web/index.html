@@ -48,6 +48,7 @@
       </select>
       <select id="tBaseSess" title="只看這個 session 的改動" hidden></select>
       <input id="tBaseHash" class="hash" placeholder="commit hash" spellcheck="false" autocomplete="off" maxlength="64" hidden>
+      <button class="btn sm brbtn" id="brToggle" aria-expanded="false" aria-controls="brWin" title="各分支的 session、領先落後、未 commit 的檔、和其他分支同時改到的檔" hidden>⎇ 分支</button>
       <small class="tinfo" id="tInfo"></small>
     </div>
     <div class="tree pane" id="tree"><div class="none">尚無 session</div></div>
@@ -148,6 +149,15 @@
     <button class="fw-x" id="liveWinClose" aria-label="關閉">×</button>
   </div>
   <div class="fw-b livelist" id="liveList"></div>
+</dialog>
+<dialog class="floatwin" id="brWin" aria-labelledby="brWinTitle">
+  <div class="fw-h" id="brWinHandle">
+    <b id="brWinTitle">分支</b>
+    <small id="brWinSub">相對整合分支・拖標題列移動、右下角縮放</small>
+    <button class="fw-x" id="brWinClose" aria-label="關閉">×</button>
+  </div>
+  <div class="fw-b brlist" id="brList"></div>
+  <div class="brdiff" id="brDiff" hidden></div>
 </dialog>
 <pre id="benchOut" hidden></pre>
 </body>

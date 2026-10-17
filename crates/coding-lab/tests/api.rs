@@ -1089,3 +1089,292 @@ async fn files_relative_to_main_falls_back_to_master() {
         "{body}"
     );
 }
+
+// ── /api/branches（#696）
+
+/// sx 在 x、sr 在主工作樹、sy 在 y 但已結束（不列）。
+async fn branches_server(r: &Repo) -> SocketAddr {
+    let home = tmp("branches-home");
+    let store = store_with(
+        &home,
+        &[
+            started("sx", 1, 1_000, &s(&r.x)),
+            started("sr", 1, 1_000, &s(&r.root)),
+            started("sy", 1, 1_000, &s(&r.y)),
+            ev(
+                "sy",
+                2,
+                "session.ended",
+                None,
+                2_000,
+                json!({"reason": "other"}),
+            ),
+        ],
+    );
+    start(WebState::new(Some(store), None, 8)).await
+}
+
+fn branch_row<'a>(body: &'a Value, branch: &str) -> &'a Value {
+    body["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["branch"] == branch)
+        .unwrap_or_else(|| panic!("branches 裡沒有 {branch}：{body}"))
+}
+
+#[tokio::test]
+async fn branches_lists_every_worktree_with_sessions_and_counts() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let (code, body) = get(addr, &format!("/api/branches?cwd={}", enc(&s(&r.x)))).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["integration"], "main", "{body}");
+    assert_eq!(body["branches"].as_array().unwrap().len(), 3, "{body}");
+
+    for (wt, name) in [(&r.root, "dev"), (&r.x, "feature/x"), (&r.y, "feature/y")] {
+        let row = branch_row(&body, name);
+        assert_eq!(row["worktree"], s(wt));
+        let lr = git(wt, &["rev-list", "--left-right", "--count", "main...HEAD"]);
+        let mut n = lr.split_whitespace().map(|v| v.parse::<u64>().unwrap());
+        let (behind, ahead) = (n.next().unwrap(), n.next().unwrap());
+        assert_eq!(
+            (row["ahead"].as_u64(), row["behind"].as_u64()),
+            (Some(ahead), Some(behind)),
+            "{name} 與手動 git rev-list --left-right --count 一致：{row}"
+        );
+        let head = git(wt, &["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(row["last"]["hash"], head.as_str(), "{row}");
+        assert!(row["last"]["message"].is_string(), "{row}");
+        let base = git(wt, &["merge-base", "main", "HEAD"]).trim().to_string();
+        assert_eq!(
+            row["changed"].as_u64(),
+            Some(manual(wt, &base).len() as u64),
+            "{name} 相對整合分支改了幾個檔：{row}"
+        );
+    }
+
+    let ids = |name: &str| -> Vec<String> {
+        branch_row(&body, name)["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect()
+    };
+    // x 在主工作樹底下（wt/x），依最長的 worktree 前綴歸屬，不能算到主工作樹
+    assert_eq!(ids("feature/x"), ["sx"]);
+    assert_eq!(ids("dev"), ["sr"]);
+    assert!(ids("feature/y").is_empty(), "已結束的 session 不列");
+
+    let x = branch_row(&body, "feature/x");
+    assert_eq!(
+        x["dirty"].as_u64(),
+        Some(1),
+        "x 只有未追蹤的 new.txt（debug.log 被 ignore）：{x}"
+    );
+    let a = x["shared"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "a.txt")
+        .unwrap_or_else(|| panic!("x 的 shared 沒有 a.txt：{x}"));
+    assert_eq!(a["conflict"], true, "{a}");
+    assert!(
+        a["with"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == "feature/y"),
+        "{a}"
+    );
+}
+
+#[tokio::test]
+async fn branches_rejects_unknown_dirs() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let (code, _) = get(addr, &format!("/api/branches?cwd={}", enc("/etc"))).await;
+    assert_eq!(code, 404);
+    let (code, _) = get(addr, "/api/branches").await;
+    assert_eq!(code, 400);
+}
+
+/// 衝突候選的檔：某個 worktree 對整合分支的 merge-base 的 diff（比到工作目錄）。
+#[tokio::test]
+async fn branch_diff_is_against_the_merge_base() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let q = |wt: &Path, path: &str| {
+        format!(
+            "/api/branch-diff?cwd={}&worktree={}&path={}",
+            enc(&s(&r.x)),
+            enc(&s(wt)),
+            enc(path)
+        )
+    };
+    let (code, body) = get(addr, &q(&r.y, "a.txt")).await;
+    assert_eq!(code, 200, "{body}");
+    let diff = body["diff"].as_str().unwrap();
+    assert!(diff.contains("-base") && diff.contains("+y"), "{diff}");
+    assert_eq!(body["branch"], "feature/y");
+
+    let (code, _) = get(addr, &q(Path::new("/etc"), "a.txt")).await;
+    assert_eq!(code, 404, "不在 worktree 清單裡的目錄");
+    for bad in ["../a.txt", "/etc/passwd", ":(glob)*"] {
+        let (code, body) = get(addr, &q(&r.y, bad)).await;
+        assert_eq!(code, 400, "{bad}：{body}");
+    }
+}
+
+// ── /api/graph、/api/commit、/api/commit-diff（#696 改成 git graph）
+
+#[tokio::test]
+async fn graph_matches_git_log_of_every_local_branch() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let (code, body) = get(addr, &format!("/api/graph?cwd={}", enc(&s(&r.x)))).await;
+    assert_eq!(code, 200, "{body}");
+    let want: Vec<(String, String)> = git(
+        &r.root,
+        &["log", "--branches", "--topo-order", "--format=%H %P"],
+    )
+    .lines()
+    .map(|l| {
+        let (h, p) = l.split_once(' ').unwrap_or((l, ""));
+        (h.to_string(), p.to_string())
+    })
+    .collect();
+    let got: Vec<(String, String)> = body["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            let parents: Vec<&str> = c["parents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            (c["hash"].as_str().unwrap().to_string(), parents.join(" "))
+        })
+        .collect();
+    assert_eq!(got, want, "和 git log --branches --topo-order 一致");
+    assert_eq!(body["truncated"], false);
+
+    let x_head = git(&r.x, &["rev-parse", "HEAD"]).trim().to_string();
+    let c = body["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["hash"] == x_head.as_str())
+        .unwrap();
+    assert_eq!(c["refs"], json!(["feature/x"]), "{c}");
+    assert_eq!(c["subject"], "x");
+    assert!(
+        c["ts"].as_u64().unwrap() > 1_000_000_000_000,
+        "epoch ms：{c}"
+    );
+
+    let (_, body) = get(addr, &format!("/api/graph?cwd={}&limit=2", enc(&s(&r.x)))).await;
+    assert_eq!(body["commits"].as_array().unwrap().len(), 2, "{body}");
+    assert_eq!(body["truncated"], true);
+}
+
+#[tokio::test]
+async fn commit_lists_files_against_its_first_parent() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let cwd = enc(&s(&r.x));
+    let y_head = git(&r.y, &["rev-parse", "HEAD"]).trim().to_string();
+    let (code, body) = get(addr, &format!("/api/commit?cwd={cwd}&hash={y_head}")).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["subject"], "y");
+    let files: BTreeSet<(String, String)> = body["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["status"].as_str().unwrap().to_string(),
+                f["path"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let want: BTreeSet<(String, String)> = git(
+        &r.y,
+        &["diff-tree", "--no-commit-id", "-r", "--name-status", "HEAD"],
+    )
+    .lines()
+    .map(|l| {
+        let (st, p) = l.split_once('\t').unwrap();
+        (st.to_string(), p.to_string())
+    })
+    .collect();
+    assert_eq!(files, want, "和 git diff-tree --name-status 一致");
+
+    // 未 commit 的改動：worktree 對 HEAD，含未追蹤檔
+    let (code, body) = get(
+        addr,
+        &format!("/api/commit?cwd={cwd}&worktree={}", enc(&s(&r.x))),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "new.txt" && f["status"] == "?"),
+        "{body}"
+    );
+
+    for (q, want) in [
+        (format!("/api/commit?cwd={cwd}&hash=zz"), 400),
+        (
+            format!("/api/commit?cwd={cwd}&hash={}", "0".repeat(40)),
+            404,
+        ),
+        (format!("/api/commit?cwd={cwd}"), 400),
+        (format!("/api/commit?cwd={cwd}&worktree=%2Fetc"), 404),
+    ] {
+        let (code, body) = get(addr, &q).await;
+        assert_eq!(code, want, "{q}：{body}");
+    }
+}
+
+#[tokio::test]
+async fn commit_diff_of_a_commit_and_of_the_worktree() {
+    let r = repo();
+    let addr = branches_server(&r).await;
+    let cwd = enc(&s(&r.x));
+    let y_head = git(&r.y, &["rev-parse", "HEAD"]).trim().to_string();
+    let (code, body) = get(
+        addr,
+        &format!("/api/commit-diff?cwd={cwd}&hash={y_head}&path=a.txt"),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    let d = body["diff"].as_str().unwrap();
+    assert!(d.contains("-base") && d.contains("+y"), "{d}");
+
+    let (code, body) = get(
+        addr,
+        &format!(
+            "/api/commit-diff?cwd={cwd}&worktree={}&path=new.txt",
+            enc(&s(&r.x))
+        ),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(body["diff"].as_str().unwrap().contains("+new"), "{body}");
+
+    for bad in ["../a.txt", "/etc/passwd", ":(glob)*"] {
+        let (code, body) = get(
+            addr,
+            &format!("/api/commit-diff?cwd={cwd}&hash={y_head}&path={}", enc(bad)),
+        )
+        .await;
+        assert_eq!(code, 400, "{bad}：{body}");
+    }
+}

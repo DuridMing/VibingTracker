@@ -313,16 +313,22 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+/// 只對 store 裡有 session 的目錄（或它的上層）跑 git：不是的話回拒絕的回應。
+fn reject_unknown(store: &Store, cwd: &str) -> Option<Response> {
+    let known = match store.cwds() {
+        Ok(k) => k,
+        Err(e) => return Some(store_error(e)),
+    };
+    let prefix = format!("{cwd}/");
+    (!known.iter().any(|k| k == cwd || k.starts_with(&prefix)))
+        .then(|| error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄"))
+}
+
 fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Response {
     let session_paths = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        let known = match store.cwds() {
-            Ok(c) => c,
-            Err(e) => return store_error(e),
-        };
-        let prefix = format!("{cwd}/");
-        if !known.iter().any(|k| k == cwd || k.starts_with(&prefix)) {
-            return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+        if let Some(resp) = reject_unknown(&store, cwd) {
+            return resp;
         }
         match &base {
             Base::Session(id) => match session_changes(&store, id) {
@@ -411,50 +417,10 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
         }
         Base::Main => match &root {
             None => ("main".into(), Value::Null, Vec::new()),
-            Some(r) => {
-                let rp = Path::new(r);
-                // 整合分支自動偵測（#693，PLAN「改動基準」）：git-flow 的 main 只收 release，有 develop 就比 develop
-                let main = INTEGRATION.into_iter().find(|b| {
-                    git(
-                        rp,
-                        &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
-                    )
-                    .is_some()
-                });
-                // 還沒有任何 commit（git init 之後）：以空樹為基準，檔案都算新增（#691）
-                let empty = match main {
-                    Some(_) => None,
-                    None if git(rp, &["rev-parse", "--verify", "-q", "HEAD"]).is_none() => {
-                        git(rp, &["hash-object", "-t", "tree", "--stdin"])
-                            .map(|h| h.trim().to_string())
-                    }
-                    None => {
-                        return error(
-                            StatusCode::CONFLICT,
-                            "repo 沒有 develop、main 或 master 分支，無法比「相對 main」",
-                        );
-                    }
-                };
-                // 比到工作目錄（PLAN「改動基準」，#682）：還沒 commit 的改動也算
-                let sources = wts
-                    .iter()
-                    .cloned()
-                    .map(|(wt, branch)| Source {
-                        entries: match (main, &empty) {
-                            (Some(main), _) => git(Path::new(&wt), &["merge-base", main, "HEAD"])
-                                .map(|base| git_changes(Path::new(&wt), &[base.trim()]))
-                                .unwrap_or_default(),
-                            (None, Some(tree)) => git_changes(Path::new(&wt), &[tree]),
-                            (None, None) => Changes::new(),
-                        },
-                        by: json!({ "worktree": wt, "branch": branch }),
-                        head: git(Path::new(&wt), &["rev-parse", "HEAD"])
-                            .map(|h| h.trim().to_string()),
-                        dir: Some(wt),
-                    })
-                    .collect();
-                ("main".into(), json!(main), sources)
-            }
+            Some(r) => match integration_sources(Path::new(r), &wts) {
+                Ok((main, sources)) => ("main".into(), json!(main), sources),
+                Err(msg) => return error(StatusCode::CONFLICT, msg),
+            },
         },
     };
 
@@ -465,8 +431,509 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
     }))
 }
 
+// ── /api/branches、/api/branch-diff（#696）
+
+/// 分支視窗的 diff 上限，超過就截斷。
+const DIFF_MAX: usize = 64 * 1024;
+
+pub async fn branches(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd");
+    };
+    let Some(store) = state.store().cloned() else {
+        return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+    };
+    tokio::task::spawn_blocking(move || branches_blocking(&store, &cwd))
+        .await
+        .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
+    // 還沒結束的 session：(id, cwd)
+    let live: Vec<(String, String)> = {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resp) = reject_unknown(&store, cwd) {
+            return resp;
+        }
+        match store.sessions(None, SESSIONS_MAX) {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.ended_at.is_none())
+                .map(|r| (r.id, norm(&r.cwd)))
+                .collect(),
+            Err(e) => return store_error(e),
+        }
+    };
+    let Some(root) = git(Path::new(cwd), &["rev-parse", "--show-toplevel"]).map(|s| norm(s.trim()))
+    else {
+        return ok(&json!({ "root": cwd, "integration": null, "branches": [] }));
+    };
+    let wts = worktrees(Path::new(&root));
+    let (main, sources) = match integration_sources(Path::new(&root), &wts) {
+        Ok(v) => v,
+        Err(msg) => return error(StatusCode::CONFLICT, msg),
+    };
+
+    // 和其他分支同時改到的檔：merge_sources 的 by 有兩個以上來源的
+    let mut shared: HashMap<String, Vec<Value>> = HashMap::new();
+    for c in merge_sources(&sources) {
+        let by = c["by"].as_array().cloned().unwrap_or_default();
+        if by.len() < 2 {
+            continue;
+        }
+        let name = |b: &Value| {
+            b["branch"]
+                .as_str()
+                .or(b["worktree"].as_str())
+                .map(str::to_string)
+        };
+        for (i, b) in by.iter().enumerate() {
+            let with: Vec<String> = by
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .filter_map(|(_, o)| name(o))
+                .collect();
+            if let Some(wt) = b["worktree"].as_str() {
+                shared
+                    .entry(wt.to_string())
+                    .or_default()
+                    .push(json!({ "path": c["path"], "conflict": c["conflict"], "with": with }));
+            }
+        }
+    }
+
+    // session 依 cwd 歸到最長前綴的 worktree（主工作樹底下的 worktrees/… 不能算主工作樹）
+    let owner = |sc: &str| {
+        wts.iter()
+            .map(|(p, _)| p)
+            .filter(|p| sc == p.as_str() || sc.starts_with(&format!("{p}/")))
+            .max_by_key(|p| p.len())
+            .cloned()
+    };
+    let mut by_wt: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, sc) in &live {
+        if let Some(wt) = owner(sc) {
+            by_wt.entry(wt).or_default().push(id.clone());
+        }
+    }
+
+    let rows: Vec<Value> = wts
+        .iter()
+        .zip(&sources)
+        .map(|((wt, branch), src)| {
+            let dir = Path::new(wt);
+            let counts = main
+                .and_then(|m| git(dir, &["rev-list", "--left-right", "--count", &format!("{m}...HEAD")]))
+                .and_then(|s| {
+                    let mut n = s.split_whitespace().map(|v| v.parse::<u64>().ok());
+                    Some((n.next()??, n.next()??))
+                });
+            let dirty = git(dir, &["status", "--porcelain"]).map(|s| s.lines().count());
+            let last = git(dir, &["log", "-1", "--format=%H%x00%s%x00%ct"]).and_then(|s| {
+                let mut f = s.trim_end().splitn(3, '\0');
+                let (hash, msg, ct) = (f.next()?, f.next()?, f.next()?);
+                Some(json!({ "hash": hash, "message": msg, "ts": ct.parse::<u64>().ok().map(|t| t * 1000) }))
+            });
+            json!({
+                "branch": branch, "worktree": wt, "head": src.head,
+                "integration": main.is_some() && branch.as_deref() == main,
+                "ahead": counts.map(|c| c.1), "behind": counts.map(|c| c.0),
+                "dirty": dirty, "changed": src.entries.len(), "last": last,
+                "sessions": by_wt.remove(wt).unwrap_or_default(),
+                "shared": shared.remove(wt).unwrap_or_default(),
+            })
+        })
+        .collect();
+    ok(&json!({ "root": root, "integration": main, "branches": rows }))
+}
+
+/// 相對 repo 根目錄的一般路徑：不能是絕對路徑、不能有 `..`、不能用 pathspec magic（`:` 開頭）。
+fn plain_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.starts_with(':')
+        && !p.contains('\0')
+        && p.split('/').all(|c| !c.is_empty() && c != "..")
+}
+
+pub async fn branch_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let q = query(&uri);
+    let field = |k: &str| q.get(k).map(|c| norm(c)).filter(|c| !c.is_empty());
+    let (Some(cwd), Some(worktree), Some(path)) = (field("cwd"), field("worktree"), field("path"))
+    else {
+        return error(StatusCode::BAD_REQUEST, "cwd、worktree、path 都要有");
+    };
+    if !plain_rel_path(&path) {
+        return error(StatusCode::BAD_REQUEST, "path 要是 repo 裡的相對路徑");
+    }
+    let Some(store) = state.store().cloned() else {
+        return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+    };
+    tokio::task::spawn_blocking(move || branch_diff_blocking(&store, &cwd, &worktree, &path))
+        .await
+        .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+fn branch_diff_blocking(
+    store: &std::sync::Mutex<Store>,
+    cwd: &str,
+    worktree: &str,
+    path: &str,
+) -> Response {
+    {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(resp) = reject_unknown(&store, cwd) {
+            return resp;
+        }
+    }
+    let root = git(Path::new(cwd), &["rev-parse", "--show-toplevel"]).map(|s| norm(s.trim()));
+    let wts = root
+        .as_ref()
+        .map(|r| worktrees(Path::new(r)))
+        .unwrap_or_default();
+    let Some((wt, branch)) = wts.into_iter().find(|(p, _)| p == worktree) else {
+        return error(StatusCode::NOT_FOUND, "不是這個 repo 的 worktree");
+    };
+    let dir = Path::new(&wt);
+    let main = integration(dir);
+    let empty = main.is_none().then(|| empty_tree_if_unborn(dir)).flatten();
+    let Some(base) = fork_point(dir, main, empty.as_deref()) else {
+        return error(StatusCode::CONFLICT, NO_INTEGRATION);
+    };
+    let (diff, truncated) = file_diff(dir, &[&base], path, true);
+    ok(&json!({
+        "worktree": wt, "branch": branch, "base": base, "integration": main,
+        "path": path, "diff": diff, "truncated": truncated,
+    }))
+}
+
+/// 一個檔的 diff（比較 `range`，只有一個時比到工作目錄）。`untracked`：未追蹤的新檔整檔當新增。
+/// 超過 DIFF_MAX 截斷。`--no-ext-diff`、`--no-textconv`：不叫起 repo 設定裡的外部程式（#682）。
+fn file_diff(dir: &Path, range: &[&str], path: &str, untracked: bool) -> (String, bool) {
+    let literal = format!(":(literal){path}");
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv"];
+    args.extend(range);
+    args.extend(["--", &literal]);
+    let mut diff = git(dir, &args).unwrap_or_default();
+    if untracked
+        && diff.is_empty()
+        && git(dir, &["ls-files", "--error-unmatch", "--", &literal]).is_none()
+        && let Ok(text) = std::fs::read_to_string(dir.join(path))
+    {
+        diff = format!("--- /dev/null\n+++ b/{path}\n")
+            + &text.lines().map(|l| format!("+{l}\n")).collect::<String>();
+    }
+    let truncated = diff.len() > DIFF_MAX;
+    if truncated {
+        let mut cut = DIFF_MAX;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        diff.truncate(cut);
+    }
+    (diff, truncated)
+}
+
+/// store 裡有 session 的 cwd 才放行（拿鎖、查完就放）。
+fn guard(store: &std::sync::Mutex<Store>, cwd: &str) -> Option<Response> {
+    reject_unknown(&store.lock().unwrap_or_else(|e| e.into_inner()), cwd)
+}
+
+fn toplevel(cwd: &str) -> Option<String> {
+    git(Path::new(cwd), &["rev-parse", "--show-toplevel"]).map(|s| norm(s.trim()))
+}
+
+/// `Changes` → `[{status, path, from?}]`
+fn files_json(c: &Changes) -> Vec<Value> {
+    c.iter()
+        .map(|(path, (status, from))| {
+            let mut f = json!({ "status": status, "path": path });
+            if let Some(from) = from {
+                f["from"] = json!(from);
+            }
+            f
+        })
+        .collect()
+}
+
+const GRAPH_DEFAULT: usize = 300;
+const GRAPH_MAX: usize = 2000;
+
+pub async fn graph(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd");
+    };
+    let n = limit(&q, GRAPH_DEFAULT, GRAPH_MAX);
+    let Some(store) = state.store().cloned() else {
+        return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+    };
+    tokio::task::spawn_blocking(move || {
+        if let Some(resp) = guard(&store, &cwd) {
+            return resp;
+        }
+        let Some(root) = toplevel(&cwd) else {
+            return ok(&json!({ "root": cwd, "integration": null, "commits": [], "truncated": false }));
+        };
+        let rp = Path::new(&root);
+        // 本機分支的 commit，拓撲順序；decoration 只留本機分支
+        let out = git(
+            rp,
+            &[
+                "log",
+                "--branches",
+                "--topo-order",
+                "--decorate-refs=refs/heads/",
+                &format!("-n{}", n + 1),
+                "--format=%H%x1f%P%x1f%s%x1f%an%x1f%ct%x1f%D%x1e",
+            ],
+        )
+        .unwrap_or_default();
+        let mut commits: Vec<Value> = out
+            .split('\x1e')
+            .map(|r| r.trim_start_matches('\n'))
+            .filter(|r| !r.is_empty())
+            .filter_map(|r| {
+                let f: Vec<&str> = r.split('\x1f').collect();
+                let [hash, parents, subject, author, ct, deco] = f[..] else {
+                    return None;
+                };
+                let refs: Vec<&str> = deco
+                    .split(", ")
+                    .map(|d| d.trim_start_matches("HEAD -> "))
+                    .filter(|d| !d.is_empty() && *d != "HEAD")
+                    .collect();
+                Some(json!({
+                    "hash": hash, "parents": parents.split_whitespace().collect::<Vec<_>>(),
+                    "subject": subject, "author": author,
+                    "ts": ct.parse::<u64>().ok().map(|t| t * 1000), "refs": refs,
+                }))
+            })
+            .collect();
+        let truncated = commits.len() > n;
+        commits.truncate(n);
+        ok(&json!({ "root": root, "integration": integration(rp), "commits": commits, "truncated": truncated }))
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+/// commit 或 worktree（未 commit 的改動）：/api/commit 與 /api/commit-diff 共用的目標。
+enum Target {
+    Commit(String),
+    Worktree(String),
+}
+
+fn parse_target(q: &HashMap<String, String>) -> Result<Target, &'static str> {
+    if let Some(h) = q.get("hash") {
+        let hex = (4..=64).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_hexdigit());
+        return hex
+            .then(|| Target::Commit(h.to_ascii_lowercase()))
+            .ok_or("hash 只收 4–64 位十六進位");
+    }
+    q.get("worktree")
+        .map(|w| norm(w))
+        .filter(|w| !w.is_empty())
+        .map(Target::Worktree)
+        .ok_or("要有 hash 或 worktree")
+}
+
+/// 目標解析成 (目錄, 比較的範圍, 這個目標的說明)：commit 對第一個 parent（root commit 對空樹），worktree 對 HEAD（還沒 commit 的 repo 對空樹）。
+fn resolve(
+    cwd: &str,
+    t: &Target,
+) -> Result<(String, Vec<String>, Value), (StatusCode, &'static str)> {
+    let root = toplevel(cwd).ok_or((StatusCode::NOT_FOUND, "不是 git repo"))?;
+    let rp = Path::new(&root);
+    let empty = || git(rp, &["hash-object", "-t", "tree", "--stdin"]).map(|h| h.trim().to_string());
+    match t {
+        Target::Commit(h) => {
+            let full = git(
+                rp,
+                &["rev-parse", "--verify", "-q", &format!("{h}^{{commit}}")],
+            )
+            .map(|s| s.trim().to_string())
+            .ok_or((StatusCode::NOT_FOUND, "找不到這個 commit"))?;
+            let parent = git(rp, &["rev-parse", "--verify", "-q", &format!("{full}^1")])
+                .map(|s| s.trim().to_string())
+                .or_else(empty)
+                .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "git 失敗"))?;
+            let info = git(
+                rp,
+                &["show", "-s", "--format=%P%x1f%an%x1f%ct%x1f%B", &full],
+            )
+            .unwrap_or_default();
+            let mut f = info.splitn(4, '\x1f');
+            let (parents, author, ct, msg) = (
+                f.next().unwrap_or(""),
+                f.next().unwrap_or(""),
+                f.next().unwrap_or(""),
+                f.next().unwrap_or(""),
+            );
+            let msg = msg.trim_end();
+            let (subject, body) = msg.split_once('\n').unwrap_or((msg, ""));
+            let v = json!({
+                "hash": full, "parents": parents.split_whitespace().collect::<Vec<_>>(),
+                "author": author, "ts": ct.trim().parse::<u64>().ok().map(|t| t * 1000),
+                "subject": subject, "body": body.trim(),
+            });
+            Ok((root.clone(), vec![parent, full], v))
+        }
+        Target::Worktree(w) => {
+            let (wt, branch) = worktrees(rp)
+                .into_iter()
+                .find(|(p, _)| p == w)
+                .ok_or((StatusCode::NOT_FOUND, "不是這個 repo 的 worktree"))?;
+            let base = if git(Path::new(&wt), &["rev-parse", "--verify", "-q", "HEAD"]).is_some() {
+                "HEAD".to_string()
+            } else {
+                empty().ok_or((StatusCode::INTERNAL_SERVER_ERROR, "git 失敗"))?
+            };
+            let v = json!({ "worktree": wt, "branch": branch });
+            Ok((wt, vec![base], v))
+        }
+    }
+}
+
+pub async fn commit(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd");
+    };
+    let target = match parse_target(&q) {
+        Ok(t) => t,
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let Some(store) = state.store().cloned() else {
+        return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+    };
+    tokio::task::spawn_blocking(move || {
+        if let Some(resp) = guard(&store, &cwd) {
+            return resp;
+        }
+        let (dir, range, mut v) = match resolve(&cwd, &target) {
+            Ok(x) => x,
+            Err((code, msg)) => return error(code, msg),
+        };
+        let dir = Path::new(&dir);
+        let files = match target {
+            Target::Commit(_) => {
+                let mut args = vec![
+                    "diff-tree",
+                    "--no-commit-id",
+                    "-r",
+                    "-M",
+                    "--name-status",
+                    "-z",
+                ];
+                args.extend(range.iter().map(String::as_str));
+                parse_name_status(&git(dir, &args).unwrap_or_default())
+            }
+            Target::Worktree(_) => git_changes(dir, &[&range[0]]),
+        };
+        v["files"] = json!(files_json(&files));
+        ok(&v)
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+pub async fn commit_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd");
+    };
+    let Some(path) = q.get("path").map(|p| norm(p)).filter(|p| plain_rel_path(p)) else {
+        return error(StatusCode::BAD_REQUEST, "path 要是 repo 裡的相對路徑");
+    };
+    let target = match parse_target(&q) {
+        Ok(t) => t,
+        Err(msg) => return error(StatusCode::BAD_REQUEST, msg),
+    };
+    let Some(store) = state.store().cloned() else {
+        return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
+    };
+    tokio::task::spawn_blocking(move || {
+        if let Some(resp) = guard(&store, &cwd) {
+            return resp;
+        }
+        let (dir, range, _) = match resolve(&cwd, &target) {
+            Ok(x) => x,
+            Err((code, msg)) => return error(code, msg),
+        };
+        let range: Vec<&str> = range.iter().map(String::as_str).collect();
+        let untracked = matches!(target, Target::Worktree(_));
+        let (diff, truncated) = file_diff(Path::new(&dir), &range, &path, untracked);
+        ok(&json!({ "path": path, "diff": diff, "truncated": truncated }))
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 /// 「相對 main」的整合分支候選，依序找第一個存在的。
 const INTEGRATION: [&str; 3] = ["develop", "main", "master"];
+
+/// 整合分支自動偵測（#693，PLAN「改動基準」）：git-flow 的 main 只收 release，有 develop 就比 develop。
+fn integration(root: &Path) -> Option<&'static str> {
+    INTEGRATION.into_iter().find(|b| {
+        git(
+            root,
+            &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+        )
+        .is_some()
+    })
+}
+
+/// 還沒有任何 commit 的 repo（git init 之後）用的空樹 hash（#691）；有 commit 時 None。
+fn empty_tree_if_unborn(root: &Path) -> Option<String> {
+    git(root, &["rev-parse", "--verify", "-q", "HEAD"])
+        .is_none()
+        .then(|| git(root, &["hash-object", "-t", "tree", "--stdin"]))
+        .flatten()
+        .map(|h| h.trim().to_string())
+}
+
+/// 某個 worktree 比較的起點：和整合分支的 merge-base；沒有 commit 的 repo 用空樹。
+fn fork_point(wt: &Path, main: Option<&str>, empty: Option<&str>) -> Option<String> {
+    match (main, empty) {
+        (Some(main), _) => git(wt, &["merge-base", main, "HEAD"]).map(|b| b.trim().to_string()),
+        (None, Some(tree)) => Some(tree.to_string()),
+        (None, None) => None,
+    }
+}
+
+const NO_INTEGRATION: &str = "repo 沒有 develop、main 或 master 分支，無法比「相對 main」";
+
+/// 「相對 main」：找整合分支，逐 worktree 對它的 merge-base 算改動（比到工作目錄，PLAN「改動基準」，#682）。
+/// 有 commit 卻找不到整合分支時回錯誤訊息。
+fn integration_sources(
+    root: &Path,
+    wts: &[(String, Option<String>)],
+) -> Result<(Option<&'static str>, Vec<Source>), &'static str> {
+    let main = integration(root);
+    let empty = match main {
+        Some(_) => None,
+        None => Some(empty_tree_if_unborn(root).ok_or(NO_INTEGRATION)?),
+    };
+    let sources = wts
+        .iter()
+        .cloned()
+        .map(|(wt, branch)| {
+            let dir = Path::new(&wt);
+            Source {
+                entries: fork_point(dir, main, empty.as_deref())
+                    .map(|base| git_changes(dir, &[&base]))
+                    .unwrap_or_default(),
+                by: json!({ "worktree": wt, "branch": branch }),
+                head: git(dir, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()),
+                dir: Some(wt),
+            }
+        })
+        .collect();
+    Ok((main, sources))
+}
 
 /// path → (status, 原路徑)；原路徑只有 R／C 有。
 type Changes = BTreeMap<String, (String, Option<String>)>;
@@ -597,10 +1064,20 @@ fn content_ids<'a>(dir: &Path, entries: &Changes, paths: &[&'a str]) -> Vec<(&'a
 
 /// `git diff --name-status <range>` 加上未追蹤檔。`range` 只有一個 commit 時比到工作目錄。
 fn git_changes(dir: &Path, range: &[&str]) -> Changes {
-    let mut out = BTreeMap::new();
     let mut args = vec!["diff", "--name-status", "-z"];
     args.extend(range);
-    let diff = git(dir, &args).unwrap_or_default();
+    let mut out = parse_name_status(&git(dir, &args).unwrap_or_default());
+    let others =
+        git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default();
+    for p in nul_split(&others) {
+        out.entry(p).or_insert_with(|| ("?".to_string(), None));
+    }
+    out
+}
+
+/// `--name-status -z` 的輸出 → path → (status, 原路徑)。
+fn parse_name_status(diff: &str) -> Changes {
+    let mut out = BTreeMap::new();
     let mut f = diff.split('\0').filter(|s| !s.is_empty());
     while let Some(st) = f.next() {
         let letter = st.chars().next().unwrap_or('M').to_string();
@@ -612,11 +1089,6 @@ fn git_changes(dir: &Path, range: &[&str]) -> Changes {
         } else if let Some(p) = f.next() {
             out.insert(norm(p), (letter, None));
         }
-    }
-    let others =
-        git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default();
-    for p in nul_split(&others) {
-        out.entry(p).or_insert_with(|| ("?".to_string(), None));
     }
     out
 }
