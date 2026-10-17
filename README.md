@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、多機總覽（hub）與常駐服務還在規劃中（P6）。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
+> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務已完成（P6），等實機驗收。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
 
 ## 它做什麼
 
