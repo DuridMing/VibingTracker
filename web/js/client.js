@@ -72,6 +72,8 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
         return;
       }
       backoff = BACKOFF_START_MS;
+      // collector 換了（重啟）：舊的 frame 編號對新的 instance 沒有意義，等新的 snapshot 給編號
+      if ((msg.instance ?? null) !== instance) lastFrame = null;
       instance = msg.instance ?? null;
       status("open");
     }

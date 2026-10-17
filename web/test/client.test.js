@@ -215,3 +215,20 @@ test("連線失敗只有 error、沒有 close（Node 的 WebSocket）也會排�
   at(1).recv(welcome);
   assert.deepEqual(got.status, ["connecting", "closed", "connecting", "open"]);
 });
+
+test("新 instance 的 welcome 後、snapshot 前斷線：resume 不能把舊 instance 的 frame 編號配上新 instance（#681）", () => {
+  const { at, clock, client } = harness();
+  client.subscribe("*");
+  client.connect();
+  at(0).open();
+  at(0).recv(welcome);
+  at(0).recv({ t: "frame", frame: 500, ch: "*", events: [], rows: {} });
+  at(0).drop();
+  clock.fire();
+  at(1).open();
+  at(1).recv({ ...welcome, instance: "i2" });
+  at(1).drop(); // snapshot 還沒到
+  clock.fire();
+  at(2).open();
+  assert.equal(at(2).sent[0].resume, undefined);
+});

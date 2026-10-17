@@ -70,7 +70,8 @@ fn card_key(e: &Event) -> Option<String> {
 /// - 帶 pos 的 Event 依 pos 排；窗口內卡片的伴隨 Event 跟在卡片旁（卡片與伴隨合起來依 seq），
 ///   同卡只留最新的 tool.updated，較早一筆帶的 danger 併進它。
 /// - 狀態行只取窗口範圍內的（窗口從 pos 1 開始時沒有下限，否則從窗口第一個 Event 的時間起，
-///   `until`（不含）為上限），插在 ts_seen 不晚於它的最後一個帶 pos Event 之後，同位置依 seq。
+///   `until`（不含）為上限），插在 seq 比它小的最後一個帶 pos Event 之後，同位置依 seq——
+///   和即時 append（依 merge 發出的順序）完全一樣，不受 ts_seen 同毫秒或倒退影響。
 pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u64>) -> Vec<Event> {
     window.sort_by_key(|e| (e.pos, e.seq));
     let lower = match window.first() {
@@ -110,7 +111,7 @@ pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u
     for l in lines {
         let at = window
             .iter()
-            .rposition(|e| e.ts_seen <= l.ts_seen)
+            .rposition(|e| e.seq < l.seq)
             .map_or(0, |i| i + 1);
         after[at].push(l);
     }
@@ -394,6 +395,8 @@ impl Live {
 
     pub fn apply(&mut self, e: &Event) {
         let carried = self.carry_danger(e);
+        // 接手來的 danger 只為了顯示，KPI 的 dangers 不再計一次
+        let danger_carried = carried.is_some();
         let e = carried.as_ref().unwrap_or(e);
         self.pending.push(e.clone());
         let sid = e.session.clone();
@@ -498,9 +501,10 @@ impl Live {
                     self.revert_kpi(&sid, &u.tool_use_id);
                 }
                 let counts = self.slots.entry(ts / SLOT_MS).or_default();
-                if u.danger
-                    .as_ref()
-                    .is_some_and(|d| d.level == DangerLevel::Danger)
+                if !danger_carried
+                    && u.danger
+                        .as_ref()
+                        .is_some_and(|d| d.level == DangerLevel::Danger)
                 {
                     counts.dangers += 1;
                 }
