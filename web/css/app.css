@@ -455,3 +455,10 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .brdiff .l.del{background:var(--rose-soft);color:var(--rose)}
 .brdiff .l.hunk{color:var(--accent);background:var(--accent-soft)}
 .brdiff .l.meta{color:var(--dim)}
+
+/* 捲軸（#705）：細、圓角、顏色跟色票（深色模式跟著換）。新版 Chrome 設了 scrollbar-color 會忽略 webkit 樣式，所以標準屬性只給 Firefox */
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track,::-webkit-scrollbar-corner{background:transparent}
+::-webkit-scrollbar-thumb{background-color:var(--line);border-radius:8px;border:2px solid transparent;background-clip:padding-box}
+::-webkit-scrollbar-thumb:hover{background-color:var(--dim)}
+@supports not selector(::-webkit-scrollbar){*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}}
