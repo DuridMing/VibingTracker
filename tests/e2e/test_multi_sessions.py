@@ -43,3 +43,26 @@ class HunkChangedLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsPortability(unittest.TestCase):
+    """#717：中途砍 collector 與 CPU 取樣在 Windows 也要能跑（沒有 SIGKILL、沒有 /proc）。"""
+
+    def test_hard_kill_ends_a_live_process_and_tolerates_a_dead_one(self):
+        import sys
+        import time
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        M.hard_kill(p.pid)
+        p.wait(timeout=10)
+        self.assertFalse(M.L.alive(p.pid))
+        M.hard_kill(p.pid)  # 已結束的 pid：不丟例外
+
+    def test_cpu_seconds_of_this_process_is_a_number(self):
+        c = M.cpu_seconds(os.getpid())
+        self.assertIsInstance(c, float)
+        self.assertGreaterEqual(c, 0.0)
+
+    @unittest.skipIf(os.name == "nt", "Windows 不走 /proc")
+    def test_cpu_seconds_is_none_without_proc(self):
+        with mock.patch.object(M, "PROC", M.Path("/nonexistent-proc")):
+            self.assertIsNone(M.cpu_seconds(os.getpid()))

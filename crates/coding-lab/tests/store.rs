@@ -1291,6 +1291,14 @@ fn v4_database_turns_zero_tails_into_unknown() {
     assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
     assert_eq!(raw_tail_line_no(&h, "s1"), Some(None), "升級把 0 改成 NULL");
     assert_eq!(raw_tail_line_no(&h, "s2"), Some(Some(4)), "有行號的不動");
+    // 重啟交給 TailPlanner 的只有 s2：s1 照舊從檔尾讀，不會整份重讀、不會重複產生 Event
+    let resumed: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.session, t.line_no))
+        .collect();
+    assert_eq!(resumed, [("s2".to_string(), 4)], "NULL 的列不拿來接續");
     s.append(started_at("s3", "/t/s3.jsonl"));
     s.flush().unwrap();
     assert_eq!(

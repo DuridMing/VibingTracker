@@ -5,4 +5,9 @@
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cargo build --release -p coding-lab --manifest-path "$root/Cargo.toml"
-exec python3 "$root/tests/e2e/multi_sessions.py" "$@"
+# Windows 的 python3 可能是 Microsoft Store 的佔位程式，要真的跑得動才算（同 scripts/check.sh，#717）
+for py in python3 python "py -3"; do
+    if $py -c pass >/dev/null 2>&1; then exec $py "$root/tests/e2e/multi_sessions.py" "$@"; fi
+done
+echo "找不到能跑的 Python（試過 python3、python、py -3）" >&2
+exit 1
