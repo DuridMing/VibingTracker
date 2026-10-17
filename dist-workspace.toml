@@ -1,0 +1,20 @@
+# cargo-dist 的發佈設定（#656）：出五個平台的壓縮檔＋sha256，plugin 的 wrapper 依同樣的檔名下載。
+# 還沒有 GitHub repo，所以沒有設 `ci`；要發佈時執行 `dist init` 產生 CI workflow，再用 `dist plan` 檢查。
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.28.0"
+# 不用 dist 的 shell／powershell installer：plugin 的 wrapper（plugin/bin/coding-lab）自己下載與校驗
+installers = []
+# 改這裡要一起改 wrapper 的 platform()（tests/plugin.rs 會比對）
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+checksum = "sha256"
