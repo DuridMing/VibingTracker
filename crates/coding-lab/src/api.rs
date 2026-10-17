@@ -413,7 +413,8 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
             None => ("main".into(), Value::Null, Vec::new()),
             Some(r) => {
                 let rp = Path::new(r);
-                let main = ["main", "master"].into_iter().find(|b| {
+                // 整合分支自動偵測（#693，PLAN「改動基準」）：git-flow 的 main 只收 release，有 develop 就比 develop
+                let main = INTEGRATION.into_iter().find(|b| {
                     git(
                         rp,
                         &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
@@ -430,7 +431,7 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
                     None => {
                         return error(
                             StatusCode::CONFLICT,
-                            "repo 沒有 main 也沒有 master 分支，無法比「相對 main」",
+                            "repo 沒有 develop、main 或 master 分支，無法比「相對 main」",
                         );
                     }
                 };
@@ -463,6 +464,9 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
         "worktrees": wts.iter().map(|(path, branch)| json!({ "path": path, "branch": branch })).collect::<Vec<_>>(),
     }))
 }
+
+/// 「相對 main」的整合分支候選，依序找第一個存在的。
+const INTEGRATION: [&str; 3] = ["develop", "main", "master"];
 
 /// path → (status, 原路徑)；原路徑只有 R／C 有。
 type Changes = BTreeMap<String, (String, Option<String>)>;

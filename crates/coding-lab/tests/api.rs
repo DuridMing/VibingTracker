@@ -525,8 +525,8 @@ struct Repo {
     develop_tip: String,
 }
 
-/// main ← develop（改 shared.txt）；主工作樹在 develop；worktree x、y 從 develop 開：
-/// 兩邊都改 a.txt（內容不同＝衝突候選），y 另改 b.txt，x 有未追蹤的 new.txt；之後 develop 再改 shared.txt。
+/// main ← dev（改 shared.txt）；主工作樹在 dev；worktree x、y 從 dev 開（dev 不是整合分支的候選，「相對 main」才比 main）：
+/// 兩邊都改 a.txt（內容不同＝衝突候選），y 另改 b.txt，x 有未追蹤的 new.txt；之後 dev 再改 shared.txt。
 fn repo() -> Repo {
     let root = canon(&tmp("repo"));
     git(&root, &["init", "-q", "-b", "main"]);
@@ -536,34 +536,18 @@ fn repo() -> Repo {
     }
     git(&root, &["add", "."]);
     git(&root, &["commit", "-qm", "init"]);
-    git(&root, &["switch", "-qc", "develop"]);
+    git(&root, &["switch", "-qc", "dev"]);
     write(&root, "shared.txt", "develop\n");
     git(&root, &["commit", "-qam", "develop"]);
     let develop_tip = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
     let (x, y) = (root.join("wt/x"), root.join("wt/y"));
     git(
         &root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feature/x",
-            "wt/x",
-            "develop",
-        ],
+        &["worktree", "add", "-q", "-b", "feature/x", "wt/x", "dev"],
     );
     git(
         &root,
-        &[
-            "worktree",
-            "add",
-            "-q",
-            "-b",
-            "feature/y",
-            "wt/y",
-            "develop",
-        ],
+        &["worktree", "add", "-q", "-b", "feature/y", "wt/y", "dev"],
     );
     write(&x, "a.txt", "x\n");
     git(&x, &["commit", "-qam", "x"]);
@@ -764,7 +748,7 @@ async fn files_lists_every_worktree_for_any_base() {
     let r = repo();
     let addr = files_server(&r).await;
     let want = BTreeSet::from([
-        (s(&r.root), "develop".to_string()),
+        (s(&r.root), "dev".to_string()),
         (s(&r.x), "feature/x".to_string()),
         (s(&r.y), "feature/y".to_string()),
     ]);
@@ -1047,4 +1031,61 @@ async fn files_relative_to_main_without_main_branch_is_an_error() {
     .await;
     assert_eq!(code, 409, "{body}");
     assert!(body["error"].is_string(), "{body}");
+}
+
+/// 只有一個 session 在 root 的 /api/files?base=main。
+async fn files_main(root: &Path) -> (u16, Value) {
+    let home = tmp("integ-home");
+    let store = store_with(&home, &[started("si", 1, 1_000, &s(root))]);
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    get(addr, &format!("/api/files?cwd={}&base=main", enc(&s(root)))).await
+}
+
+/// 整合分支自動偵測（#693）：git-flow 的 repo 有 develop 就比 develop，
+/// develop 上已 commit 的改動不算；baseRef 回實際用的分支。
+#[tokio::test]
+async fn files_relative_to_main_prefers_develop() {
+    let root = tmp("integ-develop").canonicalize().unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, "a.txt", "a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "init"]);
+    git(&root, &["switch", "-qc", "develop"]);
+    write(&root, "merged.txt", "已在 develop\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "develop"]);
+    git(&root, &["switch", "-qc", "feature/z"]);
+    write(&root, "feat.txt", "z\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "z"]);
+
+    let (code, body) = files_main(&root).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["baseRef"], "develop", "{body}");
+    assert_eq!(
+        by_source(&body, "worktree", &s(&root)),
+        BTreeSet::from([("A".to_string(), "feat.txt".to_string())]),
+        "merged.txt 已在 develop，不算：{body}"
+    );
+}
+
+/// 沒有 develop、也沒有 main，只有 master：用 master（#693）。
+#[tokio::test]
+async fn files_relative_to_main_falls_back_to_master() {
+    let root = tmp("integ-master").canonicalize().unwrap();
+    git(&root, &["init", "-q", "-b", "master"]);
+    write(&root, "a.txt", "a\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "init"]);
+    git(&root, &["switch", "-qc", "topic"]);
+    write(&root, "a.txt", "b\n");
+
+    let (code, body) = files_main(&root).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["baseRef"], "master", "{body}");
+    assert_eq!(
+        by_source(&body, "worktree", &s(&root)),
+        BTreeSet::from([("M".to_string(), "a.txt".to_string())]),
+        "{body}"
+    );
 }

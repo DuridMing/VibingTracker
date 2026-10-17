@@ -538,7 +538,7 @@ setInterval(() => render(), 30_000); // 佇列的「幾分前」
 // 專案：session 的 cwd 歸組（sessions.js），一次看一個；每個專案一棵樹，Event 先收在 fileEvents，開新樹時重放。
 const ROW_H = 22;
 const FILE_EVENTS_MAX = 50_000;
-const BASE_TEXT = { main: "相對 main", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
+const BASE_TEXT = { main: "相對整合分支", since: "本次開啟以來", session: "單一 session", commit: "相對 commit" };
 const pref = {
   get: (k) => { try { return storage?.getItem(`coding-lab.tree.${k}`) ?? null; } catch { return null; } },
   set: (k, v) => { try { storage?.setItem(`coding-lab.tree.${k}`, v); } catch { /* 無痕模式等 */ } },
