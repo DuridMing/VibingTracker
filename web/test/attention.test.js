@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sortAttention, sessionDangers } from "../js/attention.js";
+import { sortAttention, sessionDangers, ackAllTargets } from "../js/attention.js";
 import { createStore, applySnapshot, applyFrame } from "../js/store.js";
 
 const row = (id, session, kind, raisedAt) => ({ id, session, kind, ref: id, reason: "r", raisedAt });
@@ -55,4 +55,11 @@ test("單一 session 的危險提示：只取這個 session 的 danger 列，未
   ];
   assert.deepEqual(sessionDangers(rows, "s1").map((r) => r.id), ["s1/danger/d", "s1/danger/a"]);
   assert.deepEqual(sessionDangers(rows, "s3"), []);
+});
+
+test("全部確認（#697）：照佇列順序回傳每一列，確認中的不重送；空佇列回空陣列", () => {
+  const rows = [row("d", "s1", "done", 1), row("z", "s2", "danger", 1), row("w", "s1", "wait", 1)];
+  assert.deepEqual(ackAllTargets(rows, new Set(), () => 0).map((r) => r.id), ["z", "w", "d"]);
+  assert.deepEqual(ackAllTargets(rows, new Set(["w"]), () => 0).map((r) => r.id), ["z", "d"]);
+  assert.deepEqual(ackAllTargets([], new Set(), () => 0), []);
 });

@@ -8,7 +8,7 @@ import { formatRow, esc } from "./format.js";
 import { createChanges, diffRows, writeRows } from "./changes.js";
 import { makeFloating } from "./floatwin.js";
 import { fmtKpi, modelBreakdown } from "./kpi.js";
-import { sortAttention, sessionDangers, KIND_TEXT } from "./attention.js";
+import { sortAttention, sessionDangers, ackAllTargets, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel, agentWho } from "./agents.js";
 import { createSessionPane, nowOf, switchTab, sessionTitle, snapshotLoad } from "./session-pane.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
@@ -351,6 +351,9 @@ function renderAttention() {
   const canAck = ui.welcome?.scope !== "view";
   const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
+  const todo = canAck ? ackAllTargets(rows, ackPending, scoreOf) : [];
+  $("#ackAll").hidden = !todo.length;
+  $("#ackAll").textContent = `全部確認（${todo.length}）`;
   const box = $("#att");
   if (!rows.length) {
     box.replaceChildren(h("div", { class: "none" }, "目前沒有需要處理的 session"));
@@ -382,6 +385,15 @@ function ackRow(r) {
   client.ack({ session: r.session, kind: r.kind, ref: r.ref });
   render(true);
 }
+
+// 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
+$("#ackAll").addEventListener("click", () => {
+  for (const r of ackAllTargets([...store.attention.values()], ackPending, scoreOf)) {
+    ackPending.add(r.id);
+    client.ack({ session: r.session, kind: r.kind, ref: r.ref });
+  }
+  render(true);
+});
 
 // ---------- 通知（#647） ----------
 // toast 每個主視窗各自顯示；聲音與瀏覽器通知只由 leader 發；#monitor 視窗都不發。不補響、1 秒合併在 notify.js。

@@ -19,3 +19,8 @@ export function sortAttention(rows, scoreOf) {
 export function sessionDangers(rows, session) {
   return sortAttention(rows.filter((r) => r.session === session && r.kind === "danger"), () => 0);
 }
+
+// 「全部確認」（#697）：要送 ack 的列，照佇列順序；已在確認中（pending 有它的 id）的不重送
+export function ackAllTargets(rows, pending, scoreOf) {
+  return sortAttention(rows, scoreOf).filter((r) => !pending.has(r.id));
+}
