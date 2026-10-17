@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：規劃定稿，尚未開始實作（階段 0）。下面的安裝與使用是目標行為，做完前不保證可用。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
+> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、多機總覽（hub）與常駐服務還在規劃中（P6）。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
 
 ## 它做什麼
 
@@ -29,29 +29,60 @@ Claude Code ── http hook（127.0.0.1:4800）──┐
 
 順序以 transcript 為準（它本來就是 Claude Code 寫的有序日誌），hook 只負責更新「執行中／完成／失敗」與危險判斷，所以思考永遠排在它導致的動作前面。transcript 讀不懂時自動降級成只顯示工具事件。
 
-## 安裝（目標行為）
+## 安裝
+
+需要 Rust stable（`cargo`）與 Claude Code。支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行。
+
+### 1. 編譯並放好二進位與網頁
+
+二進位和 `web/` 要放在同一個資料夾：collector 沒有另外設定網頁位置時，會用二進位旁邊的 `web/`。
 
 ```bash
-claude plugin install coding-lab
+git clone <repo> VibingTracker && cd VibingTracker
+cargo build --release -p coding-lab
+mkdir -p ~/.coding-lab/bin
+cp target/release/coding-lab ~/.coding-lab/bin/     # Windows：target/release/coding-lab.exe
+cp -r web ~/.coding-lab/bin/
 ```
 
-第一次開 Claude Code session 時，`SessionStart` hook 會執行 `coding-lab ensure`：沒有二進位就從 GitHub Release 下載對應平台的版本（校驗 sha256，放在 `~/.coding-lab/bin/`），沒在跑就拉起 collector。下載失敗只印出手動安裝方式，不會擋住 Claude Code。
+也可以用 `cargo install --path crates/coding-lab` 裝到 `~/.cargo/bin`，但那裡沒有 `web/`，要在設定檔另外指定網頁位置（見「設定」的 `[web].root`），否則網頁打不開。
 
-打開 <http://127.0.0.1:4801> 即可。10 分鐘沒有 session 時 collector 自動退出。
-
-支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行。
-
-### 從原始碼安裝（目前的方式）
-
-還沒有發佈二進位，所以先自己編譯，再從這個 repo 安裝 plugin：
+### 2. 安裝 plugin
 
 ```bash
-cargo install --path crates/coding-lab          # 裝到 ~/.cargo/bin（wrapper 會在 PATH 上找到它）
 claude plugin marketplace add /path/to/VibingTracker
 claude plugin install coding-lab@coding-lab
 ```
 
-wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上的 `coding-lab`。都找不到時只在 stderr 印出安裝方式，這個 session 就不追蹤，Claude Code 照常運作。只想試一次、不安裝的話，可以用 `claude --plugin-dir plugin`。
+只想試一次、不安裝的話，可以用 `claude --plugin-dir /path/to/VibingTracker/plugin`。
+
+### 3. 開一個 Claude Code session
+
+`SessionStart` hook 會執行 `coding-lab ensure`：collector 沒在跑就拉起它，並把這個 session 交給它追蹤。打開 <http://127.0.0.1:4801> 即可。所有 session 都結束、再閒置 10 分鐘後，collector 會自己退出，下一個 session 開始時再拉起。
+
+確認 collector 在跑：
+
+```bash
+~/.coding-lab/bin/coding-lab healthz
+```
+
+wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上的 `coding-lab`。都找不到時只在 stderr 印出安裝方式，這個 session 就不追蹤，Claude Code 照常運作。
+
+### 從 Release 自動下載
+
+有發佈好的二進位時（cargo-dist 產生的 `coding-lab-<平台>.tar.gz`／`.zip` 與 `.sha256`），可以讓 wrapper 自己下載，不必編譯。把 Release 的網址設在 Claude Code 讀得到的環境變數：
+
+```bash
+export CODING_LAB_RELEASE_URL=https://example.com/coding-lab/releases/v0.1.0   # 放下載檔的目錄網址
+```
+
+wrapper 找不到二進位時，會在背景下載對應平台的壓縮檔，sha256 相符才連同 `web/` 解到 `~/.coding-lab/bin/`。這個 session 不追蹤，下一個 session 開始；過程記在 `~/.coding-lab/install.log`。下載或校驗失敗時只印出手動安裝方式，不會擋住 Claude Code。要在前景下載、直接看到結果：
+
+```bash
+/path/to/VibingTracker/plugin/bin/coding-lab install    # 印出 platform 可看這台機器對應哪個檔
+```
+
+支援的平台：Linux x86_64／aarch64、macOS x86_64／Apple Silicon、Windows x86_64。目前還沒有正式發佈的 Release，也沒有預設網址。
 
 ### 已知限制：collector 沒在跑時的 hook 錯誤提示
 
@@ -59,7 +90,7 @@ wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上�
 
 平常不會遇到：新 session 的 `SessionStart` 會自動拉起 collector，collector 也要等**所有 session 都結束**、再閒置 10 分鐘才會自己退出。會看到提示的情況：
 
-- collector 當掉，或被手動停掉：開一個新 session 就會重新拉起（`ensure`）。也可以直接執行 `coding-lab serve`。
+- collector 當掉，或被手動停掉：開一個新 session 就會重新拉起（`ensure`）。也可以直接執行 `coding-lab serve`（前景執行，關掉終端機就停）。
 - session 沒有送出 `SessionEnd` 就消失（例如終端機被直接關掉），而且之後 24 小時都沒有任何 hook：collector 會當作這些 session 已經不在了而退出。
 - 找不到 collector 二進位：`SessionStart` 只會在 stderr 印出安裝方式，這個 session 就不追蹤。
 
@@ -67,21 +98,30 @@ wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上�
 
 ## 設定
 
-`~/.coding-lab/config.toml`（優先序：命令列 > `CODING_LAB_*` 環境變數 > 設定檔 > 預設）：
+`~/.coding-lab/config.toml`（優先序：命令列 > `CODING_LAB_*` 環境變數 > 設定檔 > 預設）。`coding-lab config` 印出合併後實際生效的設定。
 
 ```toml
 [hook]
-bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，永遠不開外；plugin 的 hook 固定送到 4800，改埠只適合測試
+bind = "127.0.0.1:4800"   # 只給同機的 Claude Code，只能是 127.0.0.1；plugin 的 hook 固定送到 4800，改埠只適合測試
 
 [web]
-bind = "127.0.0.1:4801"   # 要從別台看就改 tailnet IP，例如 "100.x.x.x:4801"
-auth = "local-open"       # 多人共用的機器改成 "always"，連 localhost 也要金鑰
-remote_thinking = "on_demand"   # 遠端看 thinking：on_demand（點開才載入）| hide | show
+bind = "127.0.0.1:4801"   # 金鑰驗證做好之前只能綁 127.0.0.1；從別台看請用 SSH 通道（見下方）
+root = "/path/to/VibingTracker/web"   # 網頁位置；不設時用二進位旁邊的 web/
+
+[collector]
+idle_exit_seconds = 600   # 所有 session 都結束後閒置多久自動退出；0＝不退出
 ```
+
+| 環境變數 | 對應 |
+| --- | --- |
+| `CODING_LAB_HOME` | 資料目錄（預設 `~/.coding-lab`） |
+| `CODING_LAB_HOOK_BIND`、`CODING_LAB_WEB_BIND`、`CODING_LAB_WEB_ROOT`、`CODING_LAB_IDLE_EXIT_SECONDS` | 同上表的設定 |
+| `CODING_LAB_BIN` | wrapper 要用的二進位（優先於 `~/.coding-lab/bin`） |
+| `CODING_LAB_RELEASE_URL` | wrapper 自動下載的來源（見「從 Release 自動下載」） |
 
 | 檔案 | 用途 |
 | --- | --- |
-| `~/.coding-lab/rules.json` | 覆寫危險指令規則（正則、原因、等級 `warn`／`danger`） |
+| `~/.coding-lab/rules.json` | 覆寫危險指令規則（格式見下方） |
 | `~/.coding-lab/prices.json` | 覆寫模型單價表 |
 | `~/.coding-lab/collector.log` | 日誌，10 MB × 5 輪替（`collector.log.1`…`.5`）；前景執行 `coding-lab serve` 時改印在終端機 |
 
@@ -91,26 +131,66 @@ remote_thinking = "on_demand"   # 遠端看 thinking：on_demand（點開才載�
 { "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cacheRead": 0.2 } }
 ```
 
+`rules.json` 和內建規則同格式：同 `id` 的取代內建、新的 `id` 優先比對、`disable` 列出要停用的內建規則。`pattern` 是正則，Bash 預設比對依 `&&`、`;`、`|`、換行切開後的每一段（`"scope": "command"` 改成比對整條指令），其他工具預設比對 `file_path`（可用 `field` 指定）。改完重啟 collector 才生效；格式或正則有錯時整份不用、退回內建規則，並在日誌寫一行警告。危險只標示，不會攔截。
+
+```json
+{
+  "rules": [
+    { "id": "kubectl-delete", "tools": ["Bash"], "pattern": "^kubectl\\s+delete\\b", "level": "danger", "why": "刪除叢集資源" }
+  ],
+  "disable": ["rm-rf-build"]
+}
+```
+
 資料保留 30 天：最後活動超過 30 天的 session 會連同事件檔一起刪掉。collector 啟動時和之後每天會自動清理；collector 沒在跑時可以用 `coding-lab prune` 手動清（collector 在跑時這個指令不會動資料）。
 
 ### 從本機看伺服器上的 session
 
-在伺服器上開發、從自己的電腦看是主要用法，有兩種連法：
+在伺服器上開發、從自己的電腦看，目前用 SSH 通道：
 
-- **SSH 通道**（最簡單）：`ssh -N -L 4801:127.0.0.1:4801 <server>`，然後在本機開 <http://127.0.0.1:4801>。
-- **tailnet**：伺服器的 `[web].bind` 改成 tailnet IP，用金鑰登入。在伺服器上執行 `coding-lab key create --name laptop` 產生金鑰（只會顯示一次），或用 `coding-lab key login-link` 印出 5 分鐘有效的一次性登入連結。
+```bash
+ssh -N -L 4801:127.0.0.1:4801 <server>
+```
 
-要一次看多台伺服器，在本機跑 `coding-lab hub`，用 `coding-lab hub add <名稱> <網址>` 加入各台。
+然後在本機開 <http://127.0.0.1:4801>。網頁只綁在伺服器的 127.0.0.1，不需要另外開防火牆。
 
-遠端的 thinking 預設收合、點開才載入；讀 `.env` 這類敏感輸出在遠端一律不顯示。金鑰驗證與 hub 仍在規劃中。
+規劃中（P6）：用金鑰登入的 tailnet 直連、遠端的 thinking 點開才載入、一次看多台伺服器的 `coding-lab hub`。
+
+## 子命令
+
+| 指令 | 用途 |
+| --- | --- |
+| `coding-lab serve` | 前景執行 collector（hook 入口 4800、網頁 4801）；平常由 `ensure` 在背景拉起，不必手動執行 |
+| `coding-lab ensure` | 沒在跑就拉起 collector，並轉送 stdin 的 SessionStart；由 plugin 的 `SessionStart` hook 呼叫，失敗也 exit 0 |
+| `coding-lab healthz` | 查詢執行中 collector 的版本、session 數與事件迴圈延遲 |
+| `coding-lab config` | 印出合併後的設定 |
+| `coding-lab prune` | 立刻清掉 30 天前的資料（collector 在跑時不動資料，它自己每天會清） |
+
+`coding-lab service`（安裝成常駐服務）還沒有實作。
+
+## 卸載
+
+```bash
+claude plugin uninstall coding-lab@coding-lab
+claude plugin marketplace remove coding-lab
+```
+
+collector 在所有 session 結束、閒置 10 分鐘後會自己退出；要立刻停就結束 `coding-lab serve` 這個程序。之後再刪掉二進位與資料：
+
+```bash
+rm -rf ~/.coding-lab      # 二進位、網頁、設定、所有追蹤紀錄（JSONL 與 SQLite）
+```
+
+用 `cargo install` 裝的話，另外執行 `cargo uninstall coding-lab`。
 
 ## 開發
 
-需要 Rust stable（`cargo`）。
+需要 Rust stable（`cargo`）；前端測試用 podman 跑 `node:22-alpine`，主機不需要 Node。
 
 ```bash
-scripts/check.sh                     # fmt、clippy、test；commit 前必跑
-cargo run -p coding-lab -- serve     # 前景跑 collector
+scripts/check.sh                     # fmt、clippy、test、前端測試；commit 前必跑
+cargo run -p coding-lab -- serve --web-root web   # 前景跑 collector
+python3 -m http.server 4802 -d web   # 只看前端：開 127.0.0.1:4802/?mock=12（假資料，不需要 collector）
 ```
 
 開發時設 `CODING_LAB_HOME` 指到暫存目錄，避免動到正在用的 `~/.coding-lab/`。
@@ -129,7 +209,7 @@ Commit message 用繁體中文並加 `refs #<OpenProject 工作項目 id>`。
 
 ### 進度
 
-工作項目在 OpenProject 專案 `vibingtracker`：每個階段一個 Version（P0–P5）。
+工作項目在 OpenProject 專案 `vibingtracker`：每個階段一個 Version（P0–P6）。
 
 | 階段 | 內容 |
 | --- | --- |
@@ -139,6 +219,7 @@ Commit message 用繁體中文並加 `refs #<OpenProject 工作項目 id>`。
 | P3 狀態與注意佇列 | `session.status`、佇列、通知開關 |
 | P4 單 session 與監視器 | session tab、監視器視窗、git 列、resume／compact |
 | P5 韌性與體驗 | 降級、回放、隱私、清理、三平台發佈、乾淨機器驗收 |
+| P6 遠端與全域 | 金鑰驗證、遠端 thinking、常駐服務、全部專案切換、多機總覽（hub） |
 
 ## 文件
 
