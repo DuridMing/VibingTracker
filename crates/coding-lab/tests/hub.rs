@@ -842,3 +842,111 @@ async fn clients_with_different_offsets_do_not_make_the_hub_reconnect_its_upstre
         assert_eq!(h["upstreams"][0]["online"], true);
     }
 }
+
+/// 上游 store 裡有、live 裡沒有的 session（已結束、被移出記憶體）：hub 的 snapshot 快取不認得它，
+/// 但 Sessions 分頁列得出來，點進去要能回放與載入更多（#726，#715 第三輪實機找到）
+fn store_only_collector(name: &str, live: &[Event], stored_only: &[Event]) -> Arc<WebState> {
+    let mut s = Store::open(&tmp(name)).unwrap();
+    for e in live.iter().chain(stored_only) {
+        s.append(e.clone());
+    }
+    s.flush().unwrap();
+    let web = WebState::new(Some(Arc::new(Mutex::new(s))), None, 64);
+    web.apply(live);
+    web.flush(2000);
+    web
+}
+
+#[tokio::test]
+async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
+    let a = store_only_collector(
+        "a-old",
+        &[started("live1", 1, 1000, "/a"), text("live1", 2, 1, 1001)],
+        &[
+            started("old1", 1, 500, "/a"),
+            text("old1", 2, 1, 501),
+            text("old1", 3, 2, 502),
+        ],
+    );
+    let b = collector(
+        "b-old",
+        &[started("s2", 1, 1000, "/b"), text("s2", 2, 1, 1001)],
+    );
+    let (addr_a, addr_b) = (upstream(&a).await, upstream(&b).await);
+    let ups = vec![
+        Upstream {
+            name: "alpha".into(),
+            url: format!("http://{addr_a}"),
+            key: None,
+        },
+        Upstream {
+            name: "beta".into(),
+            url: format!("http://{addr_b}"),
+            key: None,
+        },
+    ];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+        .await
+        .unwrap();
+    let mut ws = connect(hub_addr).await;
+    send(&mut ws, json!({"op": "hello", "protocol": 1})).await;
+    send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
+    let snap = recv_until(&mut ws, |v| {
+        v["t"] == "snapshot"
+            && v["ch"] == "*"
+            && v["sessions"].as_array().is_some_and(|a| a.len() >= 2)
+    })
+    .await;
+    assert!(
+        !snap["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["id"] == "old1"),
+        "前提：old1 不在 live，hub 的快取沒有它"
+    );
+
+    // 沒先打 /api/sessions：hub 逐台試，第一個回 200 的就是擁有者
+    let (st, body) = http_get(hub_addr, "/api/sessions/old1/events?limit=10").await;
+    assert_eq!(st, 200, "快取以外的 session 也要轉發得到：{body}");
+    let evs = body["events"].as_array().unwrap();
+    assert!(!evs.is_empty(), "{body}");
+    assert!(
+        evs.iter().all(|e| e["host"] == "alpha"),
+        "回應的 Event 帶 host：{body}"
+    );
+
+    // WS 的 more 也轉給擁有者（回放與載入更多走這條）
+    send(
+        &mut ws,
+        json!({"op": "more", "session": "old1", "beforePos": 99, "limit": 50}),
+    )
+    .await;
+    let more = recv_until(&mut ws, |v| v["t"] == "more" && v["session"] == "old1").await;
+    assert!(
+        !more["events"].as_array().unwrap().is_empty(),
+        "more 要拿到 old1 的事件，不是空的：{more}"
+    );
+
+    // 訂 session 頻道也不再回「不認得」
+    send(
+        &mut ws,
+        json!({"op": "subscribe", "channel": "session:old1"}),
+    )
+    .await;
+    let s = recv_until(&mut ws, |v| {
+        (v["t"] == "snapshot" && v["ch"] == "session:old1") || v["t"] == "error"
+    })
+    .await;
+    assert_eq!(s["t"], "snapshot", "{s}");
+
+    // 先打過 /api/sessions 的也記得（另一個 id 走對照表，不必再試）
+    let (st, _) = http_get(hub_addr, "/api/sessions?limit=50").await;
+    assert_eq!(st, 200);
+    let (st, body) = http_get(hub_addr, "/api/sessions/s2/events?limit=10").await;
+    assert_eq!(st, 200, "{body}");
+
+    // 哪台都沒有的 id 仍 404
+    let (st, _) = http_get(hub_addr, "/api/sessions/nope/events").await;
+    assert_eq!(st, 404);
+}

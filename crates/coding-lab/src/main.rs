@@ -373,7 +373,9 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                     }
                 );
             };
-            service::install(&plan, &mut service::run_command, &mut restore)?;
+            service::install(&plan, &mut service::run_command, &mut restore, &mut |m| {
+                coding_lab::logging::log(m)
+            })?;
             println!(
                 "已安裝常駐服務；web 入口 {}，hook 入口 {}",
                 cfg.web_bind, cfg.hook_bind
@@ -409,6 +411,7 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 Ok(())
             })?;
             for w in warn {
+                coding_lab::logging::log(&format!("service：uninstall {w}"));
                 eprintln!("coding-lab：{w}（略過）");
             }
             for n in &plan.notes {

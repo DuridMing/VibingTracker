@@ -401,15 +401,18 @@ pub fn query_installed(
     }
 }
 
-/// install：寫檔、登記；登記失敗就把剛寫的檔收回，並呼叫 `restore`（把先前為了讓出埠而停掉的 collector 拉回來，#719）
+/// install：寫檔、登記；登記失敗就把剛寫的檔收回，並呼叫 `restore`（把先前為了讓出埠而停掉的 collector 拉回來，#719），
+/// 失敗原因交給 `log` 寫進 collector.log（#726：只印 stderr 的話事後查不到）
 pub fn install(
     plan: &Plan,
     run: &mut dyn FnMut(&[String]) -> Result<(), String>,
     restore: &mut dyn FnMut(),
+    log: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     match apply(plan, run) {
         Ok(()) => Ok(()),
         Err(e) => {
+            log(&format!("service：install 沒有裝成：{e}"));
             for (p, _) in &plan.files {
                 let _ = std::fs::remove_file(p);
             }

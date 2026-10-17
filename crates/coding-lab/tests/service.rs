@@ -290,21 +290,36 @@ fn install_restores_the_collector_when_registration_fails() {
     };
     let plan = service::plan_install(Platform::Linux, &c);
     let mut restored = 0;
+    let mut logged: Vec<String> = Vec::new();
     let err = service::install(
         &plan,
         &mut |cmd| Err(format!("{} 被拒", cmd[0])),
         &mut || restored += 1,
+        &mut |m| logged.push(m.to_string()),
     )
     .unwrap_err();
     assert!(err.contains("systemctl") && err.contains("被拒"), "{err}");
     assert_eq!(restored, 1, "註冊失敗要把先前停掉的 collector 拉回來");
+    // #726：失敗要寫進 collector.log（指令與可讀錯誤），不只印在 stderr
+    assert_eq!(logged.len(), 1, "{logged:?}");
+    assert!(
+        logged[0].contains("service")
+            && logged[0].contains("systemctl")
+            && logged[0].contains("被拒"),
+        "{logged:?}"
+    );
     assert!(
         !dir.join("config/systemd/user/coding-lab.service").exists(),
         "失敗時不留下半套：unit 檔要收回"
     );
     let mut restored = 0;
-    service::install(&plan, &mut |_| Ok(()), &mut || restored += 1).unwrap();
+    let mut logged: Vec<String> = Vec::new();
+    service::install(&plan, &mut |_| Ok(()), &mut || restored += 1, &mut |m| {
+        logged.push(m.to_string())
+    })
+    .unwrap();
     assert_eq!(restored, 0, "成功就不用拉回");
+    assert!(logged.is_empty(), "成功不寫失敗紀錄：{logged:?}");
 }
 
 #[test]
