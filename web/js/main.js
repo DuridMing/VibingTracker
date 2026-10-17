@@ -40,7 +40,7 @@ const CONN_TEXT = { connecting: "連線中…", open: "已連線", closed: "已�
 const store = createStore();
 // #monitor=<id>：監視器視窗（#650），整頁只看一個 session、自己連 collector
 const monitorId = parseMonitor(location.hash);
-const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null, replayNext: null }; // replayNext：按了 ▶ 回放、等 snapshot 的 session
+const ui = { tab: monitorId ?? "all", conn: "connecting", welcome: null, replayNext: null, ackError: null }; // replayNext：按了 ▶ 回放、等 snapshot 的 session；ackError：上一次 ack 被 server 拒絕的原因（#721）
 
 // ---------- render ----------
 // 每幀都會被叫到；內容沒變的面板不重建 DOM（避免整頁重新排版拖慢串流）
@@ -458,18 +458,20 @@ function renderAttention() {
   const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
   const now = Date.now();
   const canAck = ui.welcome?.scope !== "view";
-  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
   const todo = canAck ? ackAllTargets(rows, ackPending, scoreOf) : [];
   $("#ackAll").hidden = !todo.length;
   $("#ackAll").textContent = `全部確認（${todo.length}）`;
   const box = $("#att");
   const other = elsewhere ? h("div", { class: "none" }, `其他專案還有 ${elsewhere} 件（切回「全部專案」看）`) : null;
+  // server 拒絕上一次「已確認」（hub 上那台是 view 金鑰）：顯示原因，下一次按就清掉（#721）
+  const err = ui.ackError ? h("div", { class: "none err", role: "alert" }, `⚠ ${ui.ackError}`) : null;
   if (!rows.length) {
-    box.replaceChildren(h("div", { class: "none" }, elsewhere ? "這個專案沒有需要處理的 session" : "目前沒有需要處理的 session"), other ?? "");
+    box.replaceChildren(err ?? "", h("div", { class: "none" }, elsewhere ? "這個專案沒有需要處理的 session" : "目前沒有需要處理的 session"), other ?? "");
     return;
   }
-  box.replaceChildren(...rows.map((r) => {
+  box.replaceChildren(err ?? "", ...rows.map((r) => {
     const s = store.sessions.get(r.session);
     const pend = ackPending.has(r.id);
     const score = scoreOf(r.session);
@@ -491,13 +493,22 @@ function renderAttention() {
 }
 
 function ackRow(r) {
+  ui.ackError = null;
   ackPending.add(r.id);
   client.ack({ session: r.session, kind: r.kind, ref: r.ref });
   render(true);
 }
 
+// server 回 error（目前只有 ack 會被拒：那台上游是 view 金鑰）：解除「確認中…」、把原因放在佇列上方（#721）
+function onServerError(m) {
+  ui.ackError = m?.message || "操作被拒";
+  ackPending.clear();
+  render(true);
+}
+
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
+  ui.ackError = null;
   for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending, scoreOf)) {
     ackPending.add(r.id);
     client.ack({ session: r.session, kind: r.kind, ref: r.ref });
@@ -1589,6 +1600,7 @@ const view = createStreamView({
   agentName,
   projectTag,
   hostTag,
+  thinkingMode: () => ui.welcome?.thinking ?? null,
   onExpand: (row) => loadThinking(row, view),
   onNeedMore: requestMore,
   onFollow: (on) => {
@@ -1601,6 +1613,7 @@ const paneView = createStreamView({
   scroller: $("#spStream"),
   model: pane.stream,
   agentName,
+  thinkingMode: () => ui.welcome?.thinking ?? null,
   onExpand: (row) => loadThinking(row, paneView),
   onNeedMore: paneMore,
   onFollow: (on) => {
@@ -1740,7 +1753,7 @@ function benchFrame(m) {
 // ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
 const rp = createReplay();
 let rpReq = 0; // 換範圍後，舊的回應丟掉
-const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
+const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, thinkingMode: () => ui.welcome?.thinking ?? null, onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
 const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
 function fillReplayProjects() {
@@ -1938,6 +1951,7 @@ const client = createClient({
       render(true);
     },
     onIncompatible: () => { ui.conn = "incompatible"; render(true); },
+    error: onServerError,
     onError: (e) => console.warn("ws message", e),
   },
 });

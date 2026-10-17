@@ -107,7 +107,8 @@ const SESSION_TEXT = {
 
 // projectTag(session) → { label, color, cwd } | null：全部專案時每行先標專案（#669）
 // hostTag(session) → string | null：hub（多機總覽，#663）時每行先標 [host]
-export function formatRow(row, { agentName, projectTag, hostTag } = {}) {
+// thinkingMode：這條連線的 welcome.thinking（"hide" 時遠端拿不到全文，佔位不寫「點開載入」，#721）
+export function formatRow(row, { agentName, projectTag, hostTag, thinkingMode = null } = {}) {
   const kind = kindOf(row);
   const cls = ["ln", kind];
   const tags = [];
@@ -116,10 +117,17 @@ export function formatRow(row, { agentName, projectTag, hostTag } = {}) {
 
   if (row.type === "thinking") {
     if (row.deferred) {
-      // 遠端連線：collector 只送佔位（#668），點開才用 API 載入；hide 模式載入會被拒，提示放在 loadError
+      // 遠端連線：collector 只送佔位（#668），點開才用 API 載入。
+      // 0 字（claude -p 的 transcript 沒有 thinking 原文）與 hide 模式沒東西可載，不給點（#721）
       const n = row.chars != null ? ` · ${Number(row.chars).toLocaleString()} 字` : "";
-      body = `<span class="lbl">think</span> <span class="o">（思考${n}，點開載入）</span>`;
-      detail = row.loadError ?? (row.loading ? "載入中…" : "點一下載入思考內容");
+      if (row.chars === 0) {
+        body = '<span class="lbl">think</span> <span class="o">（思考）</span>';
+      } else if (thinkingMode === "hide") {
+        body = `<span class="lbl">think</span> <span class="o">（思考${n}，這個 collector 不對遠端提供）</span>`;
+      } else {
+        body = `<span class="lbl">think</span> <span class="o">（思考${n}，點開載入）</span>`;
+        detail = row.loadError ?? (row.loading ? "載入中…" : "點一下載入思考內容");
+      }
     } else {
       body = `<span class="lbl">think</span> ${esc(firstLine(row.text))}`;
       detail = row.text || null;

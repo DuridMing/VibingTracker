@@ -152,3 +152,17 @@ test("串流前綴（#663）：hub 時每行最前面標 [host]；沒給 hostTag
   assert.ok(tagged.html.startsWith('<span class="hst" title="build-01">[build-01]</span><span class="pj"'), tagged.html);
   assert.equal(fmtRow(row, { hostTag: () => null }).html.includes("hst"), false);
 });
+
+test("hide 模式與 0 字的思考佔位不寫「點開載入」、不可展開（#721）", () => {
+  const hide = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 227 }, { thinkingMode: "hide" });
+  assert.match(hide.html, /227 字，這個 collector 不對遠端提供/);
+  assert.doesNotMatch(hide.html, /點開載入/);
+  assert.equal(hide.detail, null);
+  const zero = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 0 }, { thinkingMode: "on_demand" });
+  assert.match(zero.html, /（思考）/);
+  assert.doesNotMatch(zero.html, /點開載入|0 字/);
+  assert.equal(zero.detail, null);
+  const od = formatRow({ ...base, type: "thinking", text: "", deferred: true, chars: 5 }, { thinkingMode: "on_demand" });
+  assert.match(od.html, /點開載入/);
+  assert.equal(od.detail, "點一下載入思考內容");
+});
