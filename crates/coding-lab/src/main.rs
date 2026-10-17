@@ -31,10 +31,33 @@ enum Command {
     Healthz,
     /// 請執行中的 collector 正常結束（放掉埠、寫完紀錄）；沒在跑也 exit 0
     Stop,
-    /// 安裝或移除常駐服務
-    Service,
+    /// 常駐服務（#662）：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
+    Service(ServiceArgs),
     /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
     Key(KeyArgs),
+}
+
+#[derive(Args)]
+struct ServiceArgs {
+    #[command(subcommand)]
+    command: ServiceCommand,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// 寫 unit 檔並啟用：開機（登入）後 collector 自動起來、不會閒置結束
+    Install {
+        /// 只印出會寫的檔與會跑的指令，不執行
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 停掉並移除常駐服務（只刪 install 寫的檔）
+    Uninstall {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// 有沒有裝、collector 現在有沒有在跑
+    Status,
 }
 
 #[derive(Args)]
@@ -124,11 +147,126 @@ fn main() -> ExitCode {
         Command::Healthz => healthz(),
         Command::Stop => stop(),
         Command::Prune => prune(),
-        Command::Service => {
-            eprintln!("coding-lab：此子命令尚未實作");
+        Command::Service(args) => service(args.command),
+        Command::Key(args) => key(args.command),
+    }
+}
+
+/// `coding-lab service …`（#662）：Plan 由 service.rs 算，這裡只負責環境、印出與執行。
+fn service(cmd: ServiceCommand) -> ExitCode {
+    match service_inner(cmd) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("coding-lab：{e}");
             ExitCode::FAILURE
         }
-        Command::Key(args) => key(args.command),
+    }
+}
+
+fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
+    use coding_lab::service::{self, Platform};
+    let cfg = Config::load(&Overrides::default())?;
+    let platform = Platform::current().ok_or_else(|| {
+        format!(
+            "{} 沒有常駐服務的做法；請自己用系統的方式跑 coding-lab serve --idle-exit-seconds 0",
+            std::env::consts::OS
+        )
+    })?;
+    let ctx = service::Ctx::detect(&cfg.home)?;
+    let describe = |plan: &service::Plan| {
+        for (p, _) in &plan.files {
+            println!("寫入 {}", p.display());
+        }
+        for p in &plan.removes {
+            println!("刪除 {}", p.display());
+        }
+        for c in &plan.commands {
+            println!("執行 {}", c.join(" "));
+        }
+    };
+    match cmd {
+        ServiceCommand::Install { dry_run } => {
+            if let Some(w) = cfg.plugin_warning() {
+                eprintln!("coding-lab：{w}");
+            }
+            let plan = service::plan_install(platform, &ctx);
+            describe(&plan);
+            if dry_run {
+                for (p, c) in &plan.files {
+                    println!("\n--- {} ---\n{c}", p.display());
+                }
+                return Ok(());
+            }
+            // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束
+            if std::process::Command::new(&ctx.exe)
+                .arg("stop")
+                .env("CODING_LAB_HOME", &cfg.home)
+                .status()
+                .map(|s| !s.success())
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "coding-lab：舊的 collector 沒有停下來，服務可能綁不到埠；稍後用 service status 確認"
+                );
+            }
+            if platform == Platform::Macos && service::installed(platform, &ctx) {
+                // 重裝：先卸掉舊的（沒裝過時 bootout 會失敗，所以只在檔案在時做）
+                let _ = service::run_command(&service::plan_uninstall(platform, &ctx).commands[0]);
+            }
+            service::apply(&plan, &mut service::run_command)?;
+            println!(
+                "已安裝常駐服務；web 入口 {}，hook 入口 {}",
+                cfg.web_bind, cfg.hook_bind
+            );
+            for n in &plan.notes {
+                println!("・{n}");
+            }
+            Ok(())
+        }
+        ServiceCommand::Uninstall { dry_run } => {
+            let plan = service::plan_uninstall(platform, &ctx);
+            describe(&plan);
+            if dry_run {
+                return Ok(());
+            }
+            if !service::installed(platform, &ctx) {
+                println!(
+                    "沒有裝過常駐服務（{}）",
+                    service::files_for(platform, &ctx)[0].display()
+                );
+            }
+            // 停掉／取消註冊失敗（例如早就被手動移除）不該擋住刪檔：指令錯誤只印出來
+            let mut warn = Vec::new();
+            service::apply(&plan, &mut |c| {
+                if let Err(e) = service::run_command(c) {
+                    warn.push(format!("{} 失敗：{e}", c.join(" ")));
+                }
+                Ok(())
+            })?;
+            for w in warn {
+                eprintln!("coding-lab：{w}（略過）");
+            }
+            for n in &plan.notes {
+                println!("・{n}");
+            }
+            Ok(())
+        }
+        ServiceCommand::Status => {
+            let files = service::files_for(platform, &ctx);
+            let on = service::installed(platform, &ctx);
+            println!(
+                "常駐服務：{}（{}）",
+                if on { "已安裝" } else { "未安裝" },
+                files[0].display()
+            );
+            let running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            println!(
+                "collector：{}（hook 入口 {}）",
+                if running { "執行中" } else { "沒有在跑" },
+                cfg.hook_bind
+            );
+            Ok(())
+        }
     }
 }
 

@@ -188,6 +188,16 @@ coding-lab stop                                                   # 讓下一個
 
 多人共用的伺服器上，其他使用者也連得到 127.0.0.1，這時設 `auth = "always"`，連本機（含 SSH 通道）都要金鑰。
 
+**讓伺服器重開機後 collector 自己起來**：平常 collector 由第一個 session 的 `ensure` 拉起、閒置 10 分鐘退出；伺服器上想隨時都看得到（含沒有 session 在跑的時候），裝成常駐服務：
+
+```bash
+coding-lab service install      # Linux：systemd user unit；macOS：LaunchAgent；Windows：工作排程器（登入時啟動）
+coding-lab service status
+coding-lab service uninstall
+```
+
+服務用 `serve --idle-exit-seconds 0` 跑、不會閒置結束，設定仍讀 `~/.coding-lab/config.toml`。Linux 要在沒人登入時就起來，再執行一次 `loginctl enable-linger $USER`。`install --dry-run` 只印出會寫的檔與會跑的指令。TLS 不內建：需要 https 時前置 Caddy 或 nginx 反向代理到 127.0.0.1:4801。
+
 規劃中：一次看多台伺服器的 `coding-lab hub`。
 
 ## 子命令
@@ -203,8 +213,7 @@ coding-lab stop                                                   # 讓下一個
 | `coding-lab key create --name <名稱> [--scope view\|operate] [--expires 90d\|12h\|30m\|never]` | 建一把遠端查看用的金鑰，明文只印這一次；`view` 只能看，`operate` 另外可按「已確認」、改通知設定 |
 | `coding-lab key list`、`coding-lab key revoke <id>` | 列出金鑰（不含 secret）、撤銷（立即失效，不必重啟 collector） |
 | `coding-lab key login-link [--key <id>]` | 印一個 5 分鐘內只能用一次的登入網址（金鑰不經過網址列與瀏覽紀錄） |
-
-`coding-lab service`（安裝成常駐服務）還沒有實作。
+| `coding-lab service install [--dry-run]`、`service uninstall`、`service status` | 裝成開機（登入）自動啟動、不閒置結束的常駐服務：Linux systemd user unit、macOS LaunchAgent、Windows 工作排程器；`uninstall` 只刪 `install` 寫的檔 |
 
 ## 卸載
 

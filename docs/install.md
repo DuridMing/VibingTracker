@@ -10,10 +10,12 @@
 2. [編譯並放好 collector](#編譯並放好-collector)
 3. [安裝 plugin](#安裝-plugin)
 4. [確認有在追蹤](#確認有在追蹤)
-5. [看過去的 session（回放）](#看過去的-session回放)
-6. [更新](#更新)
-7. [疑難排解](#疑難排解)
-8. [卸載](#卸載)
+5. [讓 collector 常駐（伺服器重開機後自己起來）](#讓-collector-常駐伺服器重開機後自己起來)
+6. [同一台機器上有好幾個專案](#同一台機器上有好幾個專案)
+7. [看過去的 session（回放）](#看過去的-session回放)
+8. [更新](#更新)
+9. [疑難排解](#疑難排解)
+10. [卸載](#卸載)
 
 ## 需要的東西
 
@@ -112,6 +114,29 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
 
 遠端看不到命中敏感規則的工具輸出，thinking 預設點開才載入。撤銷金鑰：`coding-lab key revoke <id>`（`key list` 看 id）。綁公開 IP 會被拒絕啟動，除非自己前置 TLS 並設 `allow_insecure = true`——明文 http 上的金鑰會被同網段竊聽。
+
+## 讓 collector 常駐（伺服器重開機後自己起來）
+
+平常 collector 由每個 session 的 SessionStart 拉起，沒有 session 再閒置 10 分鐘就退出；要從別台電腦隨時看、或重開機後不必先開一個 session，就把它裝成使用者層級的常駐服務（不需要 root）：
+
+```bash
+~/.coding-lab/bin/coding-lab service install
+```
+
+| 平台 | 寫哪裡 | 怎麼啟動 |
+| --- | --- | --- |
+| Linux | `~/.config/systemd/user/coding-lab.service` | `systemctl --user enable --now`；沒人登入也要跑的話再執行一次 `loginctl enable-linger $USER` |
+| macOS | `~/Library/LaunchAgents/io.coding-lab.collector.plist` | `launchctl bootstrap gui/<uid>`；第一次會跳「允許在背景執行」，允許即可 |
+| Windows | `%USERPROFILE%\.coding-lab\coding-lab-task.xml` | 工作排程器的 `CodingLab` 工作，登入時啟動、隱藏視窗（要在沒人登入時跑，在工作排程器裡改成「不論使用者登入與否均執行」） |
+
+安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0` 跑，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows `schtasks /End /TN CodingLab` 再 `schtasks /Run /TN CodingLab`）。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
+
+- `service status`：有沒有裝、collector 現在有沒有在跑。
+- `service install --dry-run`：只印會寫的檔與會跑的指令。
+- `service uninstall`：停掉、取消註冊、刪掉上面那個檔；之後又回到由 session 拉起的模式。
+- 更新執行檔時先 `service uninstall` 或停掉服務再覆蓋，覆蓋完再 `service install`（Windows 不能覆蓋執行中的 .exe）。
+
+https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801，或走 tailnet、SSH 通道（見上一節）。
 
 ## 同一台機器上有好幾個專案
 
@@ -245,9 +270,10 @@ claude plugin uninstall coding-lab@coding-lab
 claude plugin marketplace remove coding-lab
 ```
 
-接著結束 collector，再刪掉執行檔、網頁、設定與所有追蹤紀錄：
+接著結束 collector（有裝常駐服務的先移除），再刪掉執行檔、網頁、設定與所有追蹤紀錄：
 
 ```bash
+~/.coding-lab/bin/coding-lab service uninstall   # 只在裝過常駐服務時需要
 ~/.coding-lab/bin/coding-lab stop
 rm -rf ~/.coding-lab
 ```

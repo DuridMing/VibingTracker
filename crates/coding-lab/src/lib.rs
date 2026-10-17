@@ -16,6 +16,7 @@ pub mod prices;
 pub mod rules;
 pub mod sensitive;
 pub mod serve;
+pub mod service;
 pub mod status;
 pub mod store;
 pub mod transcript;
