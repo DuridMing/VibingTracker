@@ -35,6 +35,8 @@ HOME = WORK / "home"
 PLUGIN = WORK / "plugin"
 ROUNDS = 3
 MORE_LIMIT = 500
+# 一輪 claude -p 之間的空檔遠短於這個時間；中間有 session 開著時 collector 也不會閒置結束
+IDLE_EXIT_SECONDS = 120
 
 
 def free_port():
@@ -44,14 +46,17 @@ def free_port():
 
 
 def setup():
-    """獨立的資料目錄與埠；plugin 的 hook url 改指到這個埠。回傳 (hook 埠, web 埠)。"""
+    """獨立的資料目錄與埠；plugin 的 hook url 改指到這個埠。回傳 (hook 埠, web 埠)。
+    上一次被中斷的腳本可能留下 collector：先依它的 collector.json 停掉，再清資料目錄（清掉就找不到它了）。"""
+    stop_collector()
     shutil.rmtree(HOME, ignore_errors=True)
     shutil.rmtree(PLUGIN, ignore_errors=True)
     HOME.mkdir(parents=True)
     hook, web = free_port(), free_port()
     (HOME / "config.toml").write_text(
         f'[hook]\nbind = "127.0.0.1:{hook}"\n[web]\nbind = "127.0.0.1:{web}"\n'
-        "[collector]\nidle_exit_seconds = 0\n"
+        # 腳本被 SIGKILL、沒跑到 stop_collector 時，collector 閒置一陣子會自己結束（#688）
+        f"[collector]\nidle_exit_seconds = {IDLE_EXIT_SECONDS}\n"
     )
     shutil.copytree(ROOT / "plugin", PLUGIN)
     hooks = PLUGIN / "hooks" / "hooks.json"
@@ -61,19 +66,37 @@ def setup():
     return hook, web
 
 
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def stop_collector():
+    """停掉這個資料目錄的 collector：先 SIGTERM，5 秒內沒結束就 SIGKILL。"""
     info = HOME / "collector.json"
     if not info.exists():
         return
-    pid = json.loads(info.read_text())["pid"]
+    try:
+        pid = json.loads(info.read_text())["pid"]
+    except (ValueError, KeyError):
+        return
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         return
     for _ in range(50):
-        if not info.exists():
+        if not alive(pid):
             return
         time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def claude(args, prompt):

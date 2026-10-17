@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use common::{arrivals, read_jsonl, sample_sessions, sessions_in};
@@ -84,14 +84,7 @@ fn load(dir: &Path) -> Option<Sample> {
             written_at[i] = t;
         }
     } else {
-        // 沒有到達紀錄的行（hook-capture 提早停止記錄）當成和前一行同時寫入；行號從 1 起算，0 是壞資料
-        let mut t = arrived.values().copied().min().unwrap_or(0);
-        for (i, w) in written_at.iter_mut().enumerate() {
-            if let Some(&ts) = arrived.get(&(i as u64 + 1)) {
-                t = ts;
-            }
-            *w = t;
-        }
+        written_at = written_from_arrivals(lines.len(), &arrived);
     }
     Some(Sample {
         name: dir.file_name()?.to_string_lossy().to_string(),
@@ -99,6 +92,25 @@ fn load(dir: &Path) -> Option<Sample> {
         lines,
         written_at,
     })
+}
+
+/// 依 hook-capture 的到達紀錄算每行寫進檔案的時間。沒有紀錄的行（hook-capture 提早停止記錄）當成和前一行同時寫入；
+/// 行號從 1 起算，0 是壞資料。
+fn written_from_arrivals(len: usize, arrived: &HashMap<u64, u64>) -> Vec<u64> {
+    // 第 1 行就沒有紀錄時，用行號最小的有效行（≥ 1）的時間
+    let mut t = arrived
+        .iter()
+        .filter(|(no, _)| **no >= 1)
+        .min_by_key(|(no, _)| **no)
+        .map_or(0, |(_, ts)| *ts);
+    (1..=len as u64)
+        .map(|no| {
+            if let Some(&ts) = arrived.get(&no) {
+                t = ts;
+            }
+            t
+        })
+        .collect()
 }
 
 /// 模擬 collector 的主 transcript tail：Start(Beginning) 從第 1 行、Start(End) 從當下檔尾，
@@ -356,4 +368,12 @@ fn samples_without_lifecycle_are_skipped() {
         return;
     };
     assert_eq!(check_samples(&sessions_in(&root)), 0);
+}
+
+/// 第 1 行沒有到達紀錄時，用第一筆有效行（line_no ≥ 1）的時間，不吃 line_no 0 這種壞資料的時間戳；
+/// 否則那一行會被當成在所有 hook 之前寫入（#688）。
+#[test]
+fn first_line_without_arrival_takes_the_first_valid_time() {
+    let arrived = HashMap::from([(0, 1), (2, 500), (3, 600)]);
+    assert_eq!(written_from_arrivals(3, &arrived), [500, 500, 600]);
 }
