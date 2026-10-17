@@ -1468,3 +1468,55 @@ fn kpi_does_not_count_denied_or_failed_changes() {
         (Some(1), Some(0))
     );
 }
+
+/// R15 的 danger 接手（#681）只是為了顯示：KPI 的 dangers 一張卡片只算一次，
+/// 接手來的 danger 不再計入。
+#[test]
+fn carried_danger_is_not_counted_again_in_kpi() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let danger = json!({"rule": "rm-rf", "level": "danger", "why": "x"});
+    let called = b.ev(
+        "s1",
+        "tool.called",
+        "main",
+        DAY,
+        true,
+        json!({"toolUseId": "t1", "tool": "Bash", "input": {"command": "rm -rf x"},
+               "status": "pending", "placement": "stream", "danger": null}),
+    );
+    let up = |b: &mut B, ts, status: &str, danger: Option<&Value>| {
+        let mut p = json!({"toolUseId": "t1", "status": status, "durationMs": null, "error": null, "interrupted": null});
+        if let Some(d) = danger {
+            p["danger"] = d.clone();
+        }
+        b.ev("s1", "tool.updated", "main", ts, false, p)
+    };
+    let first = up(&mut b, DAY + 1, "running", Some(&danger));
+    apply_all(&mut l, &[called, first]);
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY + 1)["kpi"]["dangers"], 1);
+    let later = [
+        up(&mut b, DAY + 2, "done", None),
+        up(&mut b, DAY + 3, "failed", None),
+    ];
+    apply_all(&mut l, &later);
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY + 3)["kpi"]["dangers"], 1);
+}
+
+/// 同一毫秒的狀態行與帶 pos 的 Event：snapshot 的順序要和即時 append（依 seq）一樣。
+#[test]
+fn status_line_tie_follows_seq_like_live_append() {
+    let mut b = B::new();
+    let line = b.ev(
+        "s1",
+        "prompt.submitted",
+        "main",
+        DAY + 5,
+        false,
+        json!({"text": "hi", "promptId": null}),
+    );
+    let t = b.text("s1", DAY + 5);
+    let out = coding_lab::live::assemble_stream(vec![t], vec![line], None);
+    let seqs: Vec<u64> = out.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [1, 2], "即時 append 是 prompt（seq 1）在前");
+}
