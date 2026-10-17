@@ -548,6 +548,70 @@ fn session_boundaries_and_prompt() {
     assert_eq!([a[0].seq, b[0].seq, c[0].seq], [1, 2, 3]);
 }
 
+/// #710：session 開到一半才裝 plugin，永遠收不到 SessionStart。第一個 main agent 的 hook 帶的 cwd 就當路徑基準，
+/// 並補一個 `session.started`（source late），store、檔案樹、專案回放才歸得到專案。
+#[test]
+fn late_session_takes_its_base_from_the_first_main_hook() {
+    let mut m = merger();
+    let a = m.handle(Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "UserPromptSubmit", "prompt": "修 bug", "prompt_id": "p1",
+            "cwd": "/p", "transcript_path": "/t.jsonl",
+        })),
+        ts_seen: 1,
+    });
+    assert_eq!(types(&a)[..2], ["session.started", "prompt.submitted"]);
+    assert_eq!(a[0].payload["cwd"], "/p");
+    assert_eq!(a[0].payload["source"], "late");
+    assert_eq!(a[0].payload["transcriptPath"], "/t.jsonl");
+    assert_eq!(a[0].payload["model"], Value::Null);
+    // 之後的 file.* 相對這個基準
+    let b = m.handle(pre("t1", "Read", json!({"file_path": "/p/src/a.rs"}), 2));
+    let read = b.iter().find(|e| e.kind == "file.read").unwrap();
+    assert_eq!(read.payload["path"], "src/a.rs");
+    // 第二個 main hook 不再補 session.started
+    let c = m.handle(Input::Hook {
+        hook: hook(json!({ "session_id": S, "hook_event_name": "UserPromptSubmit", "prompt": "再來", "cwd": "/p" })),
+        ts_seen: 3,
+    });
+    assert!(!types(&c).contains(&"session.started"), "{:?}", types(&c));
+    // 之後真的 SessionStart（resume）到了：照 #672 不換基準
+    let d = m.handle(Input::Hook {
+        hook: hook(json!({ "session_id": S, "hook_event_name": "SessionStart", "source": "resume", "cwd": "/q" })),
+        ts_seen: 4,
+    });
+    assert_eq!(d[0].payload["source"], "resume");
+    let e = m.handle(pre("t2", "Read", json!({"file_path": "/p/src/b.rs"}), 5));
+    let read = e.iter().find(|e| e.kind == "file.read").unwrap();
+    assert_eq!(read.payload["path"], "src/b.rs");
+}
+
+/// #710：subagent 與背景 agent 的 hook 不當基準（它們的 cwd 可能已經在 worktree 裡），等 main 的 hook。
+#[test]
+fn late_session_ignores_subagent_hooks_for_its_base() {
+    let mut m = merger();
+    let a = m.handle(agent_hook(
+        "SubagentStart",
+        "a1",
+        Some("Explore"),
+        json!({"cwd": "/wt", "transcript_path": "/t.jsonl"}),
+    ));
+    assert!(!types(&a).contains(&"session.started"), "{:?}", types(&a));
+    let b = m.handle(agent_hook("PreToolUse", "bg1", Some(""), json!({"cwd": "/wt", "tool_name": "Read", "tool_input": {"file_path": "/wt/x"}, "tool_use_id": "u9"})));
+    assert!(!types(&b).contains(&"session.started"), "{:?}", types(&b));
+    let c = m.handle(Input::Hook {
+        hook: hook(
+            json!({ "session_id": S, "hook_event_name": "PreToolUse", "tool_name": "Read",
+            "tool_input": {"file_path": "/p/a.rs"}, "tool_use_id": "t1", "cwd": "/p" }),
+        ),
+        ts_seen: 2,
+    });
+    assert_eq!(types(&c)[0], "session.started");
+    assert_eq!(c[0].payload["cwd"], "/p");
+    let read = c.iter().find(|e| e.kind == "file.read").unwrap();
+    assert_eq!(read.payload["path"], "a.rs");
+}
+
 #[test]
 fn every_event_matches_the_contract() {
     let mut m = Merger::new(Box::new(RmRf));

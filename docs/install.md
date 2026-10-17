@@ -82,7 +82,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 
 ## 確認有在追蹤
 
-1. **開一個新的 Claude Code session**（裝 plugin 之前就開著的 session 不會被追蹤）。CLI 或 Desktop 的 Code 分頁都可以。
+1. **開一個新的 Claude Code session**。CLI 或 Desktop 的 Code 分頁都可以。裝 plugin 之前就開著的 session：Desktop 會從裝好那一刻開始追蹤（之前的工具呼叫不會補）；CLI 要重開一個。
 2. 請 Claude 做一件會用到工具的事，例如「讀 README 的第一行」。
 3. 瀏覽器打開 <http://127.0.0.1:4801>，應該會看到這個 session 和它剛剛做的事。
 
@@ -167,7 +167,7 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 
 **session 開了，網頁卻看不到它**
 
-- 這個 session 是不是在裝 plugin 之前開的？關掉重開一個。
+- 這個 session 是不是在裝 plugin 之前開的？CLI 不會載入新 hook，關掉重開一個；Desktop 會從下一個動作開始追蹤。
 - 在 Claude Code 裡輸入 `/hooks`，要看得到 `SessionStart`（command）與其他事件（送到 `http://127.0.0.1:4800/hook`）。看不到就是 plugin 沒裝上，重做「安裝 plugin」。
 - Windows：沒裝 Git for Windows 的話，`SessionStart` 的啟動腳本跑不起來，collector 不會被拉起。
 

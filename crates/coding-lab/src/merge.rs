@@ -718,6 +718,28 @@ impl Merger {
             .collect()
     }
 
+    /// session.started：第一次的 cwd 當路徑基準（#672），之後的不換；resume 回來結束、中斷與 Stop 不再成立，
+    /// 還開著的注意項目決定新的 status（#679）。
+    fn start_session(
+        &mut self,
+        sid: &str,
+        p: SessionStarted,
+        agent: &str,
+        meta: Meta,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let base = (self.path_base(sid).is_none() && !p.cwd.is_empty()).then(|| p.cwd.clone());
+        let session = self.session(sid);
+        session.ended_at = None;
+        if base.is_some() {
+            session.cwd = base;
+        }
+        let mut out = vec![self.emit(sid, Payload::SessionStarted(p), meta)];
+        let changes = self.tracker(sid).started(ts_seen);
+        out.extend(self.apply(sid, changes, agent, ts_seen));
+        out
+    }
+
     fn tracker(&mut self, sid: &str) -> &mut Tracker {
         &mut self.session(sid).status
     }
@@ -754,26 +776,35 @@ impl Merger {
             let changes = self.tracker(&sid).started(ts_seen);
             out.extend(self.apply(&sid, changes, &agent, ts_seen));
         }
-        match h.event_name() {
-            "SessionStart" => {
-                let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
-                let base = (self.path_base(&sid).is_none() && !cwd.is_empty()).then(|| cwd.clone());
-                let session = self.session(&sid);
-                session.ended_at = None;
-                if base.is_some() {
-                    session.cwd = base;
-                }
+        // 沒收到 SessionStart 的 session（開到一半才裝 plugin，#710）：第一個 main agent 的 hook 帶的 cwd 當路徑基準，
+        // 補一個 session.started（source late），store、檔案樹、專案回放才歸得到專案。subagent／背景 agent 的 cwd
+        // 可能已經在 worktree 裡，不拿來當基準；SessionEnd 沒有東西好歸，不補
+        if agent == "main"
+            && !matches!(h.event_name(), "SessionStart" | "SessionEnd")
+            && self.path_base(&sid).is_none()
+        {
+            let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
+            if !cwd.is_empty() {
                 let p = SessionStarted {
                     cwd,
+                    source: "late".into(),
+                    model: None,
+                    transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),
+                    branch: None,
+                };
+                out.extend(self.start_session(&sid, p, &agent, meta(), ts_seen));
+            }
+        }
+        match h.event_name() {
+            "SessionStart" => {
+                let p = SessionStarted {
+                    cwd: s("cwd").unwrap_or_default().replace('\\', "/"),
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
                     transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),
                     branch: None,
                 };
-                out.push(self.emit(&sid, Payload::SessionStarted(p), meta()));
-                // resume 回來：結束、中斷與 Stop 不再成立；還開著的注意項目決定新的 status（#679）
-                let changes = self.tracker(&sid).started(ts_seen);
-                out.extend(self.apply(&sid, changes, &agent, ts_seen));
+                out.extend(self.start_session(&sid, p, &agent, meta(), ts_seen));
             }
             "UserPromptSubmit" => {
                 let prompt = s("prompt").unwrap_or_default();

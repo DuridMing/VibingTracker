@@ -521,12 +521,16 @@ fn file_outside_the_session_cwd_keeps_its_absolute_path() {
     assert_eq!(edit_path(&e), "/tmp/a.txt");
 }
 
-/// 3. 沒收到 session.started（session 比 collector 早開）：基準未知，存絕對路徑，不拿 hook 的 cwd 當基準。
+/// 3. 沒收到 session.started（session 比 collector 早開）：第一個 main hook 的 cwd 當基準，並補 session.started（late）。
+///    #672 原本存絕對路徑、不拿 hook 的 cwd；#710 推翻：空的 cwd 讓 session 歸不到任何專案，比基準偏了更糟。
 #[test]
-fn without_session_started_paths_are_absolute() {
+fn without_session_started_the_first_main_hook_sets_the_base() {
     let mut m = Merger::new(Box::new(NoDanger));
     let e = handle(&mut m, edit_at("s1", "/r", "/r/a.rs", "e1"), 1);
-    assert_eq!(edit_path(&e), "/r/a.rs");
+    assert_eq!(e[0].kind, "session.started");
+    assert_eq!(e[0].payload["source"], "late");
+    assert_eq!(e[0].payload["cwd"], "/r");
+    assert_eq!(edit_path(&e), "a.rs");
 }
 
 /// 4. merge → store：changes／file_touch 的 (cwd, path) 拼回來就是工具碰的那個檔。
@@ -553,7 +557,8 @@ fn store_cwd_and_path_point_at_the_file_the_tool_touched() {
     assert_eq!(st.touches(&cwd, &c[0].path).unwrap().len(), 1);
 }
 
-/// 5. collector 重啟：基準從 store 交回來；store 也不知道（空字串）就用絕對路徑。
+/// 5. collector 重啟：基準從 store 交回來，不再補 session.started；store 也不知道（空字串，#710 之前存的）
+///    就和沒收到 session.started 一樣，由下一個 main hook 的 cwd 補上。
 #[test]
 fn resumed_session_keeps_its_path_base() {
     let mut m = Merger::new(Box::new(NoDanger));
@@ -564,9 +569,11 @@ fn resumed_session_keeps_its_path_base() {
         edit_at("s1", "/r/worktrees/x", "/r/worktrees/x/README.md", "e1"),
         1,
     );
+    assert!(e.iter().all(|e| e.kind != "session.started"), "{e:?}");
     assert_eq!(edit_path(&e), "worktrees/x/README.md");
     let e = handle(&mut m, edit_at("s2", "/r", "/r/a.rs", "e2"), 2);
-    assert_eq!(edit_path(&e), "/r/a.rs");
+    assert_eq!(e[0].kind, "session.started");
+    assert_eq!(edit_path(&e), "a.rs");
 }
 
 /// 6. 之後的 session.started（例如在 worktree 裡 /compact）不換基準。
