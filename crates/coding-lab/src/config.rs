@@ -86,7 +86,11 @@ impl Config {
                 ));
             }
         };
-        Config::resolve(cli, &env, file.as_deref(), default_home())
+        let mut c = Config::resolve(cli, &env, file.as_deref(), default_home())?;
+        if c.web_root.is_none() {
+            c.web_root = std::env::current_exe().ok().and_then(|e| bundled_web(&e));
+        }
+        Ok(c)
     }
 
     pub fn resolve(
@@ -173,6 +177,12 @@ fn home_dir(
         .clone()
         .or_else(|| env("CODING_LAB_HOME").map(PathBuf::from))
         .unwrap_or(default_home)
+}
+
+/// 二進位旁邊的 `web/`（有 index.html 才算）：wrapper 從 Release 下載時把兩者解在一起（#656）。
+pub fn bundled_web(exe: &Path) -> Option<PathBuf> {
+    let web = exe.parent()?.join("web");
+    web.join("index.html").is_file().then_some(web)
 }
 
 /// `~/.coding-lab`（Windows 是 `%USERPROFILE%\.coding-lab`）。

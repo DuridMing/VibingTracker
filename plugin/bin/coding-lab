@@ -2,13 +2,30 @@
 # coding-lab plugin wrapper：找到本機的 coding-lab 二進位並執行它（SessionStart 呼叫 `ensure`）。
 #
 # 規則（不變式 4、5）：永遠 exit 0、stdout 永遠是空的（SessionStart 的 stdout 會進 Claude 的上下文）。
-# 找不到二進位時只在 stderr 印安裝方式，不擋 Claude Code。
+# 找不到二進位時只在 stderr 說明，不擋 Claude Code。
 #
 # 尋找順序：$CODING_LAB_BIN → ${CODING_LAB_HOME:-~/.coding-lab}/bin/coding-lab → PATH 上的 coding-lab。
-# 自動下載（GitHub Release＋sha256）等第一次發佈後再加。
+# 都沒有、而且設了 CODING_LAB_RELEASE_URL 時，在背景下載對應平台的 Release（#656）：
+#   <url>/coding-lab-<target>.tar.gz（Windows 是 .zip）與 <壓縮檔>.sha256，校驗相符才解到 <home>/bin/
+#   （二進位與 web/ 放在一起）。這次 session 不追蹤，下一個 session 開始。
+#
+# 給人用的子命令（不經 hook）：
+#   install   前景下載並安裝（同上，失敗也 exit 0）
+#   platform  印出這台機器對應的 Release target
 
 self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 home_dir=${CODING_LAB_HOME:-$HOME/.coding-lab}
+
+say() {
+    echo "coding-lab：$*" >&2
+}
+
+manual() {
+    {
+        echo "  手動安裝：在原始碼目錄執行 cargo install --path crates/coding-lab，或把二進位放到 $home_dir/bin/coding-lab"
+        echo "  或設定 CODING_LAB_BIN 指向它。"
+    } >&2
+}
 
 is_self() {
     [ "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" = "$self_dir" ]
@@ -36,12 +53,145 @@ find_bin() {
     return 1
 }
 
+# uname → cargo-dist 的 target；沒有對應的 Release 時回 1
+platform() {
+    os=$(uname -s 2>/dev/null)
+    arch=$(uname -m 2>/dev/null)
+    case "$arch" in
+        x86_64 | amd64) arch=x86_64 ;;
+        aarch64 | arm64) arch=aarch64 ;;
+        *) return 1 ;;
+    esac
+    case "$os" in
+        Linux) echo "$arch-unknown-linux-gnu" ;;
+        Darwin) echo "$arch-apple-darwin" ;;
+        MINGW* | MSYS* | CYGWIN*)
+            [ "$arch" = x86_64 ] || return 1
+            echo "x86_64-pc-windows-msvc"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+fetch() { # url → 檔案
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 300 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 30 -O "$2" "$1"
+    else
+        say "沒有 curl 或 wget，無法下載"
+        return 1
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        return 1
+    fi
+}
+
+# 下載、校驗、解壓到 <home>/bin；成功回 0。暫存檔與鎖一律清掉。
+install() {
+    if [ -z "$CODING_LAB_RELEASE_URL" ]; then
+        say "沒有設定 CODING_LAB_RELEASE_URL，無法自動下載。"
+        manual
+        return 1
+    fi
+    if ! target=$(platform); then
+        say "這個平台（$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)）沒有預先編好的二進位。"
+        manual
+        return 1
+    fi
+    case "$target" in
+        *windows*) archive="coding-lab-$target.zip" exe=coding-lab.exe ;;
+        *) archive="coding-lab-$target.tar.gz" exe=coding-lab ;;
+    esac
+    bin_dir=$home_dir/bin
+    mkdir -p "$bin_dir" || return 1
+    lock=$bin_dir/.installing
+    # 同時開的幾個 session 只下載一次；超過 10 分鐘的鎖當成上次中斷留下的
+    if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+        rmdir "$lock" 2>/dev/null
+    fi
+    if ! mkdir "$lock" 2>/dev/null; then
+        say "另一個 session 正在下載"
+        return 1
+    fi
+    work=$bin_dir/.download.$$
+    trap 'rm -rf "$work"; rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    mkdir -p "$work" || return 1
+    base=${CODING_LAB_RELEASE_URL%/}
+    if ! fetch "$base/$archive" "$work/$archive" || ! fetch "$base/$archive.sha256" "$work/sum"; then
+        say "下載 $base/$archive 失敗（離線或沒有這個版本）。"
+        manual
+        return 1
+    fi
+    want=$(cut -d' ' -f1 <"$work/sum" | tr 'A-F' 'a-f')
+    got=$(sha256_of "$work/$archive") || {
+        say "沒有 sha256sum／shasum／openssl，無法校驗，不安裝。"
+        manual
+        return 1
+    }
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        say "sha256 不符（預期 $want，實際 $got），不安裝。"
+        manual
+        return 1
+    fi
+    case "$archive" in
+        *.zip) unzip -q "$work/$archive" -d "$work/x" ;;
+        *) mkdir -p "$work/x" && tar -xzf "$work/$archive" -C "$work/x" ;;
+    esac || {
+        say "解壓 $archive 失敗。"
+        manual
+        return 1
+    }
+    # cargo-dist 的壓縮檔最上層是 coding-lab-<target>/；也接受直接放在根目錄
+    src=$work/x/coding-lab-$target
+    [ -d "$src" ] || src=$work/x
+    if [ ! -f "$src/$exe" ]; then
+        say "$archive 裡沒有 $exe。"
+        manual
+        return 1
+    fi
+    chmod +x "$src/$exe"
+    if [ -d "$src/web" ]; then
+        rm -rf "$bin_dir/web.old"
+        [ -d "$bin_dir/web" ] && mv "$bin_dir/web" "$bin_dir/web.old"
+        mv "$src/web" "$bin_dir/web" && rm -rf "$bin_dir/web.old"
+    fi
+    # 二進位最後才放：wrapper 看到它就表示整套裝好了
+    mv "$src/$exe" "$bin_dir/$exe.new" && mv -f "$bin_dir/$exe.new" "$bin_dir/$exe" || return 1
+    say "已安裝 $bin_dir/$exe（$target）"
+    return 0
+}
+
+case "$1" in
+    platform)
+        platform || say "這個平台（$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)）沒有預先編好的二進位"
+        exit 0
+        ;;
+    install)
+        install
+        exit 0
+        ;;
+esac
+
 if ! bin=$(find_bin); then
-    {
-        echo "coding-lab：找不到 collector 二進位，這次 session 不會被追蹤（Claude Code 照常運作）。"
-        echo "  安裝：在原始碼目錄執行 cargo install --path crates/coding-lab，或把二進位放到 $home_dir/bin/coding-lab"
-        echo "  或設定 CODING_LAB_BIN 指向它。"
-    } >&2
+    if [ -n "$CODING_LAB_RELEASE_URL" ] && target=$(platform); then
+        # hook 有 5 秒限制：背景下載，所有輸出都導開，Claude Code 不會等它
+        mkdir -p "$home_dir" 2>/dev/null
+        nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
+        say "還沒有 collector 二進位，已在背景下載（$target，紀錄在 $home_dir/install.log）；這次 session 不會被追蹤，下一個 session 開始。"
+    else
+        say "找不到 collector 二進位，這次 session 不會被追蹤（Claude Code 照常運作）。"
+        manual
+    fi
     exit 0
 fi
 

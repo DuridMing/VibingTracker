@@ -58,7 +58,12 @@ export function createSessionPane(session = null) {
     return out;
   }
 
-  function take(events) {
+  // older：往前翻到的一段（載入更多、回放），比已知的都舊：commit 放前面，
+  // 最後一筆 commit、思考條、工具狀態不被舊的蓋掉
+  function take(events, older = false) {
+    const commits = [];
+    const status = new Map();
+    let thinking = null;
     for (const e of events ?? []) {
       if (e.session !== p.session) continue;
       if (e.type === "git.op") {
@@ -66,17 +71,25 @@ export function createSessionPane(session = null) {
         const key = g.toolUseId ?? `${e.seq}`;
         if (g.op !== "commit" || !g.ok || seen.has(key)) continue;
         seen.add(key);
-        const c = { hash: g.hash, message: g.message, agent: e.agent, branch: g.branch ?? null };
-        p.git.commits.push(c);
-        p.git.last = c;
+        commits.push({ hash: g.hash, message: g.message, agent: e.agent, branch: g.branch ?? null });
       } else if (e.type === "file.edit" || e.type === "file.write") {
         touchFile(e);
       } else if (e.type === "tool.called" || e.type === "tool.updated") {
         const id = e.payload?.toolUseId;
-        if (id && e.payload?.status) toolStatus.set(id, e.payload.status);
+        if (id && e.payload?.status) status.set(id, e.payload.status);
       } else if (e.type === "assistant.thinking") {
-        p.thinking = { text: e.payload?.text ?? "", agent: e.agent, summarized: !!e.payload?.summarized };
+        thinking = { text: e.payload?.text ?? "", agent: e.agent, summarized: !!e.payload?.summarized };
       }
+    }
+    for (const [id, st] of status) if (!older || !toolStatus.has(id)) toolStatus.set(id, st);
+    if (older) {
+      p.git.commits.unshift(...commits);
+      p.git.last ??= commits.at(-1) ?? null;
+      p.thinking ??= thinking;
+    } else {
+      p.git.commits.push(...commits);
+      if (commits.length) p.git.last = commits.at(-1);
+      if (thinking) p.thinking = thinking;
     }
   }
 
@@ -102,6 +115,15 @@ export function createSessionPane(session = null) {
     return ops;
   };
 
+  // 載入更多與回放（#653）：collector 依 pos 排好的一段（舊到新），比畫面上的都舊
+  p.prepend = (events) => {
+    const mine = (events ?? []).filter((e) => e.session === p.session);
+    const ops = p.stream.prepend([mine]);
+    p.changes.prepend(mine);
+    take(mine, true);
+    return ops;
+  };
+
   // 換到另一個 session（同一個 pane 重用，畫面那層只建一次）；等新的 snapshot 再填內容
   // 這個 session 碰過的檔案：正在改（工具還沒結束）的在前，其餘依最近一次改動由新到舊
   p.files = () => {
@@ -115,6 +137,12 @@ export function createSessionPane(session = null) {
   };
 
   return p;
+}
+
+// 回放（#653）：session 已從 live 移除（結束 2 小時後，contracts §6）時，session 頻道的 snapshot
+// 沒有它的串流，改用「載入更多」從 JSONL 由最新往前讀
+export function needsReplay(session, { stream = [] } = {}) {
+  return !stream.some((e) => e.session === session && e.pos != null);
 }
 
 const STATE_TEXT = { wait: "等你回應", done: "回合結束，等你確認", fail: "連續失敗，等你處理", danger: "危險指令", idle: "已中斷", ended: "已結束" };

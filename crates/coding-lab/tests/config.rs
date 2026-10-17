@@ -144,3 +144,29 @@ fn hook_port_other_than_the_plugins_is_warned() {
     let w = c.plugin_warning().expect("要警告");
     assert!(w.contains("4800") && w.contains("4900"), "{w}");
 }
+
+/// 沒設定 web root 時用二進位旁邊的 web/（wrapper 下載的 Release 把兩者解在一起，#656）。
+#[test]
+fn bundled_web_is_next_to_the_binary() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("config-web-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let exe = dir.join("bin/coding-lab");
+    assert_eq!(
+        coding_lab::config::bundled_web(&exe),
+        None,
+        "沒有 web/ 就不設"
+    );
+    std::fs::create_dir_all(dir.join("bin/web")).unwrap();
+    assert_eq!(
+        coding_lab::config::bundled_web(&exe),
+        None,
+        "空的 web/（沒有 index.html）不算"
+    );
+    std::fs::write(dir.join("bin/web/index.html"), "<!doctype html>").unwrap();
+    assert_eq!(
+        coding_lab::config::bundled_web(&exe),
+        Some(dir.join("bin/web"))
+    );
+}

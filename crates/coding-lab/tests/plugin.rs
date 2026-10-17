@@ -201,3 +201,261 @@ fn wrapper_runs_the_binary_and_keeps_stdout_empty() {
         "要用 $CODING_LAB_HOME/bin 的二進位"
     );
 }
+
+// ── wrapper 下載二進位（#656）：第一次沒有二進位時，從 Release 下載對應平台的壓縮檔、校驗 sha256，
+// 解到 $CODING_LAB_HOME/bin/。Release 的位置來自 CODING_LAB_RELEASE_URL；測試用 file:// 的假 Release。
+
+#[cfg(unix)]
+mod download {
+    use super::plugin_dir;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Output, Stdio};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    static N: AtomicU32 = AtomicU32::new(0);
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "plugin-dl-{name}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn exec(p: &Path, body: &str) {
+        std::fs::write(p, body).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// PATH 上的假 uname：-s、-m 照環境變數回答。
+    fn stub_uname(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        exec(
+            &dir.join("uname"),
+            "#!/bin/sh\ncase \"$1\" in -s) echo \"$FAKE_UNAME_S\";; -m) echo \"$FAKE_UNAME_M\";; *) echo \"$FAKE_UNAME_S\";; esac\n",
+        );
+    }
+
+    /// 假 Release：`coding-lab-<target>.tar.gz`（cargo-dist 的格式：最上層是同名目錄，裡面是二進位與 web/）
+    /// 與 `<壓縮檔>.sha256`。`bad_sum` 時校驗值故意寫錯。
+    fn fake_release(dir: &Path, target: &str, bad_sum: bool) {
+        let name = format!("coding-lab-{target}");
+        let stage = dir.join("stage").join(&name);
+        std::fs::create_dir_all(stage.join("web")).unwrap();
+        exec(
+            &stage.join("coding-lab"),
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/ran\"\n",
+        );
+        std::fs::write(stage.join("web/index.html"), "<!doctype html>").unwrap();
+        let archive = dir.join(format!("{name}.tar.gz"));
+        let ok = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir.join("stage"))
+            .arg(&name)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let sum = Command::new("sha256sum").arg(&archive).output().unwrap();
+        let hex = String::from_utf8_lossy(&sum.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        let hex = if bad_sum { "0".repeat(64) } else { hex };
+        std::fs::write(
+            dir.join(format!("{name}.tar.gz.sha256")),
+            format!("{hex} *{name}.tar.gz\n"),
+        )
+        .unwrap();
+    }
+
+    struct Env {
+        home: PathBuf,
+        stubs: PathBuf,
+        release: PathBuf,
+    }
+
+    fn env(name: &str) -> Env {
+        let root = tmp(name);
+        let e = Env {
+            home: root.join("home"),
+            stubs: root.join("stubs"),
+            release: root.join("release"),
+        };
+        std::fs::create_dir_all(&e.home).unwrap();
+        std::fs::create_dir_all(&e.release).unwrap();
+        stub_uname(&e.stubs);
+        e
+    }
+
+    fn run(e: &Env, args: &[&str], uname: (&str, &str), url: Option<&str>) -> Output {
+        let mut c = Command::new(plugin_dir().join("bin/coding-lab"));
+        c.args(args)
+            .env_remove("CODING_LAB_BIN")
+            .env_remove("CODING_LAB_RELEASE_URL")
+            .env("CODING_LAB_HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("FAKE_UNAME_S", uname.0)
+            .env("FAKE_UNAME_M", uname.1)
+            .stdin(Stdio::null());
+        if let Some(u) = url {
+            c.env("CODING_LAB_RELEASE_URL", u);
+        }
+        c.output().unwrap()
+    }
+
+    fn url(e: &Env) -> String {
+        format!("file://{}", e.release.display())
+    }
+
+    #[test]
+    fn platform_maps_uname_to_release_targets() {
+        let e = env("platform");
+        for (s, m, want) in [
+            ("Linux", "x86_64", "x86_64-unknown-linux-gnu"),
+            ("Linux", "aarch64", "aarch64-unknown-linux-gnu"),
+            ("Linux", "arm64", "aarch64-unknown-linux-gnu"),
+            ("Darwin", "x86_64", "x86_64-apple-darwin"),
+            ("Darwin", "arm64", "aarch64-apple-darwin"),
+            ("MINGW64_NT-10.0-22631", "x86_64", "x86_64-pc-windows-msvc"),
+            ("MSYS_NT-10.0", "x86_64", "x86_64-pc-windows-msvc"),
+        ] {
+            let out = run(&e, &["platform"], (s, m), None);
+            assert!(out.status.success());
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), want, "{s} {m}");
+        }
+        // 沒有對應的 Release：不印任何平台、照樣 exit 0，stderr 說明
+        for (s, m) in [
+            ("FreeBSD", "x86_64"),
+            ("Linux", "riscv64"),
+            ("MINGW64_NT-10.0", "aarch64"),
+        ] {
+            let out = run(&e, &["platform"], (s, m), None);
+            assert!(out.status.success(), "{s} {m}");
+            assert!(out.stdout.is_empty(), "{s} {m}");
+            assert!(!out.stderr.is_empty(), "{s} {m}");
+        }
+    }
+
+    /// wrapper 認得的平台與 cargo-dist 出的 target 一致：少一個就有人下載不到，多一個就是死碼。
+    #[test]
+    fn platform_targets_match_the_dist_config() {
+        let text = std::fs::read_to_string(plugin_dir().join("../dist-workspace.toml")).unwrap();
+        let cfg: toml::Value = toml::from_str(&text).unwrap();
+        let mut dist: Vec<String> = cfg["dist"]["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t.as_str().unwrap().to_string())
+            .collect();
+        dist.sort();
+        let e = env("targets");
+        let mut ours: Vec<String> = [
+            ("Linux", "x86_64"),
+            ("Linux", "aarch64"),
+            ("Darwin", "x86_64"),
+            ("Darwin", "arm64"),
+            ("MINGW64_NT-10.0", "x86_64"),
+        ]
+        .iter()
+        .map(|uname| {
+            let out = run(&e, &["platform"], *uname, None);
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        })
+        .collect();
+        ours.sort();
+        assert_eq!(ours, dist);
+        assert_eq!(cfg["dist"]["unix-archive"].as_str(), Some(".tar.gz"));
+        assert_eq!(cfg["dist"]["windows-archive"].as_str(), Some(".zip"));
+        assert_eq!(cfg["dist"]["checksum"].as_str(), Some("sha256"));
+    }
+
+    #[test]
+    fn install_downloads_verifies_and_unpacks_binary_with_web() {
+        let e = env("install");
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        let bin = e.home.join("bin/coding-lab");
+        assert!(bin.exists(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            e.home.join("bin/web/index.html").exists(),
+            "web/ 跟二進位放在一起"
+        );
+        // 裝好之後 wrapper 就用它
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(e.home.join("bin/ran"))
+                .unwrap()
+                .trim(),
+            "ensure"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_archive_whose_sha256_does_not_match() {
+        let e = env("badsum");
+        fake_release(&e.release, "aarch64-apple-darwin", true);
+        let out = run(&e, &["install"], ("Darwin", "arm64"), Some(&url(&e)));
+        assert!(out.status.success(), "失敗也 exit 0");
+        assert!(out.stdout.is_empty());
+        assert!(!e.home.join("bin/coding-lab").exists(), "校驗不符不能裝");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("sha256"), "{err}");
+        // 暫存的下載也要清掉
+        let left: Vec<_> = std::fs::read_dir(e.home.join("bin"))
+            .map(|d| d.flatten().map(|x| x.file_name()).collect())
+            .unwrap_or_default();
+        assert!(left.is_empty(), "留下了 {left:?}");
+    }
+
+    #[test]
+    fn install_failure_exits_zero_and_prints_manual_instructions() {
+        let e = env("offline");
+        // Release 裡沒有這個平台的檔（等同下載失敗、斷網）
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cargo install"), "{err}");
+        assert!(!e.home.join("bin/coding-lab").exists());
+    }
+
+    #[test]
+    fn ensure_without_a_binary_starts_the_download_in_the_background() {
+        let e = env("bg");
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let started = Instant::now();
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("下載"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "不能等下載完才回"
+        );
+        // 背景的下載完成後二進位出現（這個 session 不追蹤，下一個開始）
+        let bin = e.home.join("bin/coding-lab");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !bin.exists() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(bin.exists(), "背景下載沒有完成");
+    }
+}

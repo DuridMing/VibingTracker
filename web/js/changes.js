@@ -92,6 +92,21 @@ export function createChanges({ cap = CAP } = {}) {
     ch.selectedKey = ch.list[0]?.key ?? null;
   };
 
+  // 載入更多／回放：比現有的都舊的一段（舊到新），接在清單尾端，不改選取
+  ch.prepend = (events) => {
+    const older = [];
+    for (const ev of events ?? []) {
+      const e = entryOf(ev);
+      if (!e || keys.has(e.key)) continue;
+      keys.add(e.key);
+      older.unshift(e);
+    }
+    ch.list.push(...older);
+    trim();
+    if (ch.following) ch.selectedKey = ch.list[0]?.key ?? null;
+    return older.length > 0;
+  };
+
   ch.select = (key) => {
     if (!keys.has(key)) return;
     ch.selectedKey = key;
