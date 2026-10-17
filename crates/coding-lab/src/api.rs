@@ -197,10 +197,8 @@ pub async fn events(
     ) {
         Ok(events) => {
             let mut body = json!({ "session": id, "beforePos": before, "events": events });
-            // 遠端連線剝除敏感輸出（#654，不變式 6）
-            if crate::ws::is_remote(peer) {
-                crate::sensitive::redact_remote(&mut body);
-            }
+            // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+            state.redact_for_peer(peer, &mut body);
             ok(&body)
         }
         Err(e) => store_error(e),
@@ -247,7 +245,7 @@ pub async fn project_events(
     let Some(store) = state.store().cloned() else {
         return ok(&json!({ "cwd": cwd, "events": [], "next": null }));
     };
-    let remote = crate::ws::is_remote(peer);
+    let state2 = state.clone();
     // SQLite 與讀 JSONL 都會阻塞，放到 blocking 執行緒
     tokio::task::spawn_blocking(move || {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -256,10 +254,8 @@ pub async fn project_events(
                 let next = next.map(|k| json!({ "ts": k.ts, "session": k.session, "pos": k.pos }));
                 let mut body =
                     json!({ "cwd": cwd, "from": from, "to": to, "events": events, "next": next });
-                // 遠端連線剝除敏感輸出（#654，不變式 6）
-                if remote {
-                    crate::sensitive::redact_remote(&mut body);
-                }
+                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+                state2.redact_for_peer(peer, &mut body);
                 ok(&body)
             }
             Err(e) => store_error(e),

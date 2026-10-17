@@ -332,3 +332,28 @@ async fn sensitive_redaction_still_applies_alongside_thinking() {
     assert!(!text.contains("SECRET=1"), "敏感輸出要剝除：{text}");
     assert!(text.contains("\"redacted\":true"), "{text}");
 }
+
+/// REST 的回放／載入更多（`/api/sessions/<id>/events`、`/api/projects/events`）對遠端也要剝除 thinking，
+/// 不然遠端用 API 就能繞過 WS 的佔位（#715 實機驗收找到）。
+#[tokio::test]
+async fn rest_events_to_remote_are_deferred_like_ws() {
+    for (mode, deferred) in [
+        (RemoteThinking::OnDemand, true),
+        (RemoteThinking::Hide, true),
+        (RemoteThinking::Show, false),
+    ] {
+        let s = start(mode, true).await;
+        let (code, body) = get(s.addr, "/api/sessions/s1/events?limit=10").await;
+        assert_eq!(code, 200, "{mode:?}：{body}");
+        let rows = thinking_rows(&body);
+        if deferred {
+            assert_deferred(&rows, &format!("REST events {mode:?}"));
+        } else {
+            assert_full(&rows, &format!("REST events {mode:?}"));
+        }
+    }
+    // 本機不剝除
+    let s = start(RemoteThinking::Hide, false).await;
+    let (_, body) = get(s.addr, "/api/sessions/s1/events?limit=10").await;
+    assert_full(&thinking_rows(&body), "REST events 本機");
+}

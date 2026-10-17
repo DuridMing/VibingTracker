@@ -555,6 +555,20 @@ async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
     socket.send(Message::Text(text.into())).await.is_ok()
 }
 
+impl WebState {
+    /// HTTP API 回應送給遠端前的剝除：敏感輸出（#654）＋依 `remote_thinking` 的 thinking（#668）。
+    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。
+    pub fn redact_for_peer(&self, peer: SocketAddr, body: &mut Value) {
+        if !self.remote_peer(peer) {
+            return;
+        }
+        crate::sensitive::redact_remote(body);
+        if self.remote_thinking() != RemoteThinking::Show {
+            defer_thinking(body);
+        }
+    }
+}
+
 /// 把送出副本裡所有 `assistant.thinking` 的 `text` 換成空字串，加 `deferred: true` 與 `chars`（佔位要顯示長度）。
 /// frame、snapshot、載入更多的形狀不同，所以整個走一遍；只改送出的副本，JSONL 與 store 不變。
 pub fn defer_thinking(v: &mut Value) {
