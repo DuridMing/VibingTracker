@@ -208,10 +208,39 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        no_inherit_std_handles();
     }
     cmd.spawn()
         .map(|_| ())
         .map_err(|e| format!("拉不起 collector：{e}"))
+}
+
+/// Windows 的 `Command` 一律用 `bInheritHandles = TRUE`：ensure 自己的 stdin／stdout／stderr 如果是呼叫端給的
+/// 可繼承 pipe，會被複製進 collector，呼叫端要等到 collector 結束才收到 EOF（#712）。上面給 collector 的
+/// NUL／log 只決定它自己的三個標準 handle，擋不住這個繼承，所以 spawn 前先把 ensure 這個程序的三個 handle
+/// 標成不可繼承。只改旗標、不關 handle；失敗（例如 handle 無效）就照舊，不影響 ensure exit 0。
+///
+/// `unsafe`：stable Rust 沒有安全 API 能改 handle 的繼承旗標（`raw_attribute` 對應的
+/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 還在 nightly），只有這一個 FFI 呼叫、只在 Windows 編譯；
+/// 不拉 `windows-sys`（Cargo.lock 已有兩個版本，不想再多一個直接依賴）。理由寫在 PLAN.md「跨平台」。
+#[cfg(windows)]
+fn no_inherit_std_handles() {
+    use std::os::windows::io::AsRawHandle;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+    for h in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if !h.is_null() {
+            // SAFETY：h 是這個程序自己還開著的標準 handle；只改旗標，不關、不複製
+            unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
 }
 
 /// 把 SessionStart 轉送到 `/hook`（實測 SessionStart 不送 http hook）。

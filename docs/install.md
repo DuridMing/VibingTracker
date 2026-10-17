@@ -193,7 +193,7 @@ xattr -d com.apple.quarantine ~/.coding-lab/bin/coding-lab
 
 **Claude Code 顯示 `SessionStart hook timed out`（Windows）**
 
-`SessionStart` 的啟動腳本要先開 Git Bash、再拉起 collector，上限 5 秒。Git Bash 冷啟動和 Windows Defender 第一次掃描新編好的執行檔可能超過。偶爾一次不用理；每次都超時的話，把 `plugin/hooks/hooks.json` 裡 `SessionStart` 的 `timeout` 從 5 改成 10，重開 session。
+`SessionStart` 的啟動腳本要先開 Git Bash、再拉起 collector，上限 5 秒。Git Bash 冷啟動和 Windows Defender 第一次掃描新編好的執行檔可能超過。正常情況下這個 hook 約 0.6 秒，很少出現；偶爾一次不用理，每次都超時的話，把 `plugin/hooks/hooks.json` 裡 `SessionStart` 的 `timeout` 從 5 改成 10，重開 session。啟動腳本自己的錯誤寫在 `~/.coding-lab/ensure.log`，collector 的在 `collector.log`。
 
 **collector 綁不到埠，每個 session 都顯示 `ECONNREFUSED`（Windows）**
 

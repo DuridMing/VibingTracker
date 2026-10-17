@@ -213,5 +213,18 @@ if ! bin=$(find_bin); then
     exit 0
 fi
 
-"$bin" "$@" >&2
+if [ "$1" = ensure ]; then
+    # Windows 的子程序會繼承所有可繼承的 handle：ensure 拉起的 collector 會握著 ensure 的 stdin／stdout／stderr，
+    # 呼叫端（Claude Code、`| cat`）要等到 collector 結束才收到 EOF（#712）。所以不把 Claude Code 給的 pipe 交給
+    # 二進位：payload 先讀進來再用自己的 pipe 餵、stdout 丟掉（ensure 本來就不印 stdout）、stderr 寫進 ensure.log
+    # （ensure 的錯誤本來就寫 collector.log，stderr 只剩 panic 之類的意外）。
+    payload=$(cat)
+    if mkdir -p "$home_dir" 2>/dev/null; then
+        printf '%s' "$payload" | "$bin" "$@" >/dev/null 2>>"$home_dir/ensure.log"
+    else
+        printf '%s' "$payload" | "$bin" "$@" >/dev/null 2>&1
+    fi
+else
+    "$bin" "$@" >&2
+fi
 exit 0

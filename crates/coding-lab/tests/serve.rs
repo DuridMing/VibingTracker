@@ -290,7 +290,14 @@ fn ensure(e: &Env, stdin: &str) -> std::process::Output {
     c.wait_with_output().unwrap()
 }
 
+/// 收掉測試拉起的 collector。Windows 沒有 `kill` 指令，不收的話每跑一次測試就漏一個 collector，
+/// target/tmp 被它鎖住刪不掉（#712）。
 fn kill_pid(pid: u64) {
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .output();
+    #[cfg(not(windows))]
     let _ = Command::new("kill").arg(pid.to_string()).status();
 }
 
@@ -1048,4 +1055,114 @@ fn stop_without_a_collector_exits_zero() {
     assert!(out.status.success());
     assert!(out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("沒有在跑"));
+}
+
+// ── ensure 不能把呼叫端的 std handle 交給 collector（#712）
+
+/// 像 Claude Code 或 `| cat` 那樣，stdin／stdout／stderr 三個都接 pipe 跑指令：
+/// 回 (結束狀態, stdout 收到 EOF 的時間, stderr 收到 EOF 的時間)；3 秒內沒收到 EOF 的是 `None`。
+/// 現有的 `cmd()` 把 stderr 設成 null，測不出 stderr 外洩，所以另外寫。
+fn run_piped(
+    mut c: Command,
+    stdin: &str,
+) -> (std::process::ExitStatus, Option<Duration>, Option<Duration>) {
+    let t = Instant::now();
+    let mut child = c
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let eof_of = |mut r: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.read_to_end(&mut buf);
+            let _ = tx.send((t.elapsed(), buf));
+        });
+        rx
+    };
+    let out = eof_of(Box::new(child.stdout.take().unwrap()));
+    let err = eof_of(Box::new(child.stderr.take().unwrap()));
+    let status = child.wait().unwrap();
+    let wait = Duration::from_secs(3);
+    let out = out.recv_timeout(wait).ok();
+    let err = err.recv_timeout(wait).ok();
+    assert!(
+        out.as_ref().is_none_or(|(_, b)| b.is_empty()),
+        "stdout 會進 Claude 的上下文，必須是空的"
+    );
+    (status, out.map(|(d, _)| d), err.map(|(d, _)| d))
+}
+
+fn assert_pipes_released(
+    e: &Env,
+    status: std::process::ExitStatus,
+    out: Option<Duration>,
+    err: Option<Duration>,
+) {
+    assert!(status.success());
+    assert!(
+        out.is_some(),
+        "stdout 3 秒內要收到 EOF：collector 握著 stdout 的寫入端"
+    );
+    assert!(
+        err.is_some(),
+        "stderr 3 秒內要收到 EOF：collector 握著 stderr 的寫入端"
+    );
+    let c = collector(e).expect("ensure 拉起的 collector 要還在跑");
+    assert!(
+        http(e.web, "GET", "/healthz", "").starts_with("HTTP/1.1 200"),
+        "collector {} 要還活著",
+        c["pid"]
+    );
+    let stop = cmd(e, &["stop"]).output().unwrap();
+    assert!(stop.status.success());
+    wait_for("stop 後 collector 結束、移除 collector.json", || {
+        collector(e).is_none()
+    });
+}
+
+/// Windows 的子程序會繼承所有可繼承的 handle：ensure 拉起 collector 時，呼叫端給 ensure 的 pipe
+/// 不能跟著進 collector，否則呼叫端要等到 collector 結束才收到 EOF（#712）。Linux 與 macOS 本來就會過。
+#[test]
+fn ensure_releases_the_callers_std_pipes_while_the_collector_keeps_running() {
+    let e = env(30);
+    let start =
+        json!({"session_id": "s712", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t712.jsonl"), "cwd": "/p"})
+        .to_string();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_coding-lab"));
+    c.arg("ensure").env("CODING_LAB_HOME", &e.home);
+    let (status, out, err) = run_piped(c, &start);
+    assert_pipes_released(&e, status, out, err);
+}
+
+/// 同一件事經過 plugin 的 wrapper（Claude Code 實際的呼叫路徑）：wrapper 自己也不能把 pipe 交給 ensure。
+/// 沒有 `sh` 的機器（沒裝 Git Bash 的 Windows）跳過。
+#[test]
+fn wrapper_ensure_releases_the_callers_std_pipes_too() {
+    if Command::new("sh").arg("-c").arg("true").status().is_err() {
+        eprintln!("沒有 sh，跳過");
+        return;
+    }
+    let e = env(30);
+    let start =
+        json!({"session_id": "s713", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("t713.jsonl"), "cwd": "/p"})
+        .to_string();
+    let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/bin/coding-lab");
+    let mut c = Command::new("sh");
+    c.arg(&wrapper)
+        .arg("ensure")
+        .env("CODING_LAB_BIN", env!("CARGO_BIN_EXE_coding-lab"))
+        .env("CODING_LAB_HOME", &e.home);
+    let (status, out, err) = run_piped(c, &start);
+    assert_pipes_released(&e, status, out, err);
 }
