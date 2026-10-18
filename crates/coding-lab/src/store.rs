@@ -370,6 +370,14 @@ pub fn restrict_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// [`Store::last_prompt_and_pos_reads`] 讀出來的 prompt 填進文字欄位。
+pub fn fill_last_prompts(out: &mut HashMap<String, LastSeen>, prompts: Vec<Event>) {
+    for e in prompts {
+        let text = e.payload["text"].as_str().map(str::to_string);
+        out.entry(e.session).or_default().0 = text;
+    }
+}
+
 /// 開 store 之前先檢查會讓它起不來的情況（L-1）：index.sqlite 打不開、schema 比支援的新。唯讀、不拿 store 鎖，
 /// 上一個 collector 還在寫的時候也可以查；serve 在綁 hook 埠之前呼叫，失敗的話一個 hook 都還沒收。
 pub fn preflight(home: &Path) -> Result<(), StoreError> {
@@ -399,7 +407,99 @@ pub fn preflight(home: &Path) -> Result<(), StoreError> {
     }
 }
 
+/// 鎖內查好的「要讀 JSONL 的哪些行」：依 session 分組的 offset，順序就是結果的順序（X1）。
+#[derive(Clone, Debug, Default)]
+pub struct Reads {
+    groups: Vec<(String, Vec<i64>)>,
+}
+
+impl Reads {
+    fn one(session: &str, offsets: Vec<i64>) -> Reads {
+        Reads {
+            groups: vec![(session.to_string(), offsets)],
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.groups.iter().all(|(_, o)| o.is_empty())
+    }
+}
+
+/// 不拿 store 鎖讀 JSONL（X1、#740）：JSONL 只會 append，索引裡的 offset 一定指向已經寫完的行
+/// （先寫 JSONL、後寫索引），所以 web 端在鎖內查好 [`Reads`]、放掉鎖再讀，主迴圈的寫入不必等它。
+#[derive(Clone, Debug)]
+pub struct EventsReader {
+    events_dir: PathBuf,
+}
+
+impl EventsReader {
+    pub fn read(&self, reads: &Reads) -> Result<Vec<Event>, StoreError> {
+        let mut out = Vec::new();
+        for (session, offsets) in &reads.groups {
+            self.read_session(session, offsets, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// 一個 session 檔裡依序讀這些 offset 的行（E-S3）：offset 多半是接續或往後的，不 seek 就不會丟掉
+    /// BufReader 的緩衝（`seek` 一定會清空它，原本每行都重讀 8 KB）；行的 String 重複使用。
+    fn read_session(
+        &self,
+        session: &str,
+        offsets: &[i64],
+        out: &mut Vec<Event>,
+    ) -> Result<(), StoreError> {
+        if offsets.is_empty() {
+            return Ok(());
+        }
+        let file = File::open(self.events_dir.join(file_name(session)))?;
+        let mut file = BufReader::with_capacity(64 * 1024, file);
+        let mut at: u64 = 0;
+        let mut line = String::new();
+        for &off in offsets {
+            let off = off.max(0) as u64;
+            if off != at {
+                // 往前、或往後在緩衝內：seek_relative 不清空緩衝
+                file.seek_relative(off as i64 - at as i64)?;
+            }
+            line.clear();
+            let n = file.read_line(&mut line)?;
+            at = off + n as u64;
+            if let Ok(e) = Event::from_json_line(line.trim_end()) {
+                out.push(e);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Store {
+    /// 鎖外讀 JSONL 用的讀取器（X1）。
+    pub fn reader(&self) -> EventsReader {
+        EventsReader {
+            events_dir: self.events_dir.clone(),
+        }
+    }
+
+    /// [`Store::stream_before`] 的 offset（鎖內）；交給 [`EventsReader::read`]。
+    pub fn stream_before_reads(
+        &self,
+        session: &str,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Reads, StoreError> {
+        let before = before.map_or(i64::MAX, |b| b as i64);
+        let mut stmt = self.db.prepare_cached(
+            "SELECT offset FROM events WHERE session = ?1 AND pos IS NOT NULL AND pos < ?2
+             ORDER BY pos DESC LIMIT ?3",
+        )?;
+        let mut offsets: Vec<i64> = stmt
+            .query_map(params![session, before, limit as i64], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        offsets.reverse();
+        Ok(Reads::one(session, offsets))
+    }
+
     /// 開啟（或建立）資料目錄：`<home>/events/`、`<home>/index.sqlite`。
     pub fn open(home: &Path) -> Result<Store, StoreError> {
         let events_dir = home.join("events");
@@ -569,12 +669,19 @@ impl Store {
         for (e, off) in &self.unindexed {
             index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
         }
-        for ((sid, file), no) in &self.read_lines {
-            tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+        // 有 Event 沒寫進 JSONL（放回 pending）時，tail 讀到的行號先不記（C15）：記了之後在下次成功前當掉，
+        // 重啟會從這個行號之後讀，沒寫進去的那些行就永遠不會再進來。留到寫成功的那次一起記
+        let lines_ok = failure.is_none();
+        if lines_ok {
+            for ((sid, file), no) in &self.read_lines {
+                tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+            }
         }
         tx.commit()?;
         self.unindexed.clear();
-        self.read_lines.clear();
+        if lines_ok {
+            self.read_lines.clear();
+        }
         match failure {
             Some(e) => Err(e.into()),
             None => Ok(()),
@@ -697,28 +804,8 @@ impl Store {
         before: Option<u64>,
         limit: usize,
     ) -> Result<Vec<Event>, StoreError> {
-        let before = before.map_or(i64::MAX, |b| b as i64);
-        let mut stmt = self.db.prepare(
-            "SELECT offset FROM events WHERE session = ?1 AND pos IS NOT NULL AND pos < ?2
-             ORDER BY pos DESC LIMIT ?3",
-        )?;
-        let offsets: Vec<i64> = stmt
-            .query_map(params![session, before, limit as i64], |r| r.get(0))?
-            .collect::<Result<_, _>>()?;
-        let mut out = Vec::with_capacity(offsets.len());
-        if offsets.is_empty() {
-            return Ok(out);
-        }
-        let mut file = BufReader::new(File::open(self.events_dir.join(file_name(session)))?);
-        for off in offsets.into_iter().rev() {
-            file.seek(SeekFrom::Start(off as u64))?;
-            let mut line = String::new();
-            file.read_line(&mut line)?;
-            if let Ok(e) = Event::from_json_line(line.trim_end()) {
-                out.push(e);
-            }
-        }
-        Ok(out)
+        self.reader()
+            .read(&self.stream_before_reads(session, before, limit)?)
     }
 
     /// 主頁時間軸回放（#729、#742）：專案根 `root` 底下（含 worktree、子目錄；cwd 的 `\` 和 `/api/sessions` 一樣當 `/`，C11）
@@ -738,6 +825,20 @@ impl Store {
         until: u64,
         limit: usize,
     ) -> Result<(Vec<Event>, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
+        let (reads, acks, cut) = self.timeline_reads(root, since, at, until, limit)?;
+        Ok((self.reader().read(&reads)?, acks, cut))
+    }
+
+    /// [`Store::timeline`] 的鎖內部分（X1、C3）：Event 的 offset、確認時間與 `cut`；Event 由 [`EventsReader`] 鎖外讀。
+    #[allow(clippy::type_complexity)]
+    pub fn timeline_reads(
+        &self,
+        root: &str,
+        since: u64,
+        at: u64,
+        until: u64,
+        limit: usize,
+    ) -> Result<(Reads, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
         let root = root.replace('\\', "/");
         let root = root.trim_end_matches('/');
         let ms = |t: u64| t.min(i64::MAX as u64) as i64;
@@ -753,7 +854,7 @@ impl Store {
             .query_map(params![root, ms(until), ms(since)], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         if ids.is_empty() {
-            return Ok((Vec::new(), Vec::new(), None));
+            return Ok((Reads::default(), Vec::new(), None));
         }
         // 兩個 IN 清單用同一組編號（?1..?n）；混用匿名的 ? 會接著往後編號
         let list = (1..=ids.len())
@@ -779,7 +880,7 @@ impl Store {
             .flatten();
         let cut = cut.map(|c| c as u64).filter(|c| *c <= until);
         let stop = cut.map_or(ms(until).saturating_add(1), ms);
-        let mut events = Vec::new();
+        let mut reads = Reads::default();
         let mut acks = Vec::new();
         for id in &ids {
             let offsets: Vec<i64> = self
@@ -791,7 +892,7 @@ impl Store {
                 )?
                 .query_map(params![id, stop], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
-            events.extend(self.read_at(id, offsets)?);
+            reads.groups.push((id.clone(), offsets));
             let rows = self
                 .db
                 .prepare(
@@ -808,7 +909,7 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?;
             acks.extend(rows);
         }
-        Ok((events, acks, cut))
+        Ok((reads, acks, cut))
     }
 
     /// 某 session 在 seq 範圍（含兩端）內的所有 Event，依 seq 排序。
@@ -818,13 +919,24 @@ impl Store {
         from: u64,
         to: u64,
     ) -> Result<Vec<Event>, StoreError> {
-        let mut stmt = self.db.prepare(
+        self.reader()
+            .read(&self.events_by_seq_reads(session, from, to)?)
+    }
+
+    /// [`Store::events_by_seq`] 的 offset（鎖內）。
+    pub fn events_by_seq_reads(
+        &self,
+        session: &str,
+        from: u64,
+        to: u64,
+    ) -> Result<Reads, StoreError> {
+        let mut stmt = self.db.prepare_cached(
             "SELECT offset FROM events WHERE session = ?1 AND seq BETWEEN ?2 AND ?3 ORDER BY seq",
         )?;
         let offsets: Vec<i64> = stmt
             .query_map(params![session, from as i64, to as i64], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        self.read_at(session, offsets)
+        Ok(Reads::one(session, offsets))
     }
 
     /// 某 session 在 seq 範圍（含兩端）內、不帶 pos、種類是 `kinds` 之一的 Event，依 seq 排序。
@@ -836,6 +948,18 @@ impl Store {
         to: u64,
         kinds: impl IntoIterator<Item = &'a str>,
     ) -> Result<Vec<Event>, StoreError> {
+        self.reader()
+            .read(&self.unplaced_by_seq_reads(session, from, to, kinds)?)
+    }
+
+    /// [`Store::unplaced_by_seq`] 的 offset（鎖內）。
+    pub fn unplaced_by_seq_reads<'a>(
+        &self,
+        session: &str,
+        from: u64,
+        to: u64,
+        kinds: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Reads, StoreError> {
         let kinds: Vec<&str> = kinds.into_iter().collect();
         let list = (0..kinds.len())
             .map(|i| format!("?{}", i + 4))
@@ -858,7 +982,7 @@ impl Store {
         let offsets: Vec<i64> = stmt
             .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        self.read_at(session, offsets)
+        Ok(Reads::one(session, offsets))
     }
 
     /// `pos` 之後的第一個帶 pos 的 Event：(seq, ts_seen)。
@@ -902,8 +1026,9 @@ impl Store {
 
     /// `ts_seen` ≥ `since` 的所有 Event，依 (ts_seen, session, seq)：collector 重啟時重建 live 狀態用。
     pub fn recent_events(&self, since: u64) -> Result<Vec<Event>, StoreError> {
+        // 依主鍵（session, seq）讀：同一個 session 的列連在一起，每個檔只開一次（E-S4）；最後再依時間排
         let mut stmt = self.db.prepare(
-            "SELECT session, offset FROM events WHERE ts_seen >= ?1 ORDER BY ts_seen, session, seq",
+            "SELECT session, offset FROM events WHERE ts_seen >= ?1 ORDER BY session, seq",
         )?;
         let rows: Vec<(String, i64)> = stmt
             .query_map(params![since as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -952,18 +1077,7 @@ impl Store {
 
     fn read_at(&self, session: &str, offsets: Vec<i64>) -> Result<Vec<Event>, StoreError> {
         let mut out = Vec::with_capacity(offsets.len());
-        if offsets.is_empty() {
-            return Ok(out);
-        }
-        let mut file = BufReader::new(File::open(self.events_dir.join(file_name(session)))?);
-        for off in offsets {
-            file.seek(SeekFrom::Start(off as u64))?;
-            let mut line = String::new();
-            file.read_line(&mut line)?;
-            if let Ok(e) = Event::from_json_line(line.trim_end()) {
-                out.push(e);
-            }
-        }
+        self.reader().read_session(session, &offsets, &mut out)?;
         Ok(out)
     }
 
@@ -1010,14 +1124,15 @@ impl Store {
             .map(|v| v as u64))
     }
 
-    /// 這些 session 各自最後一個 `prompt.submitted` 的文字與串流最後一個 `pos`，兩句查詢批次取（#683，Sessions tab）。
-    pub fn last_prompt_and_pos(
+    /// [`Store::last_prompt_and_pos`] 的鎖內部分：pos 已經填好，prompt 的文字要讀 [`Reads`] 後用
+    /// [`fill_last_prompts`] 補上。兩句查詢批次取。
+    pub fn last_prompt_and_pos_reads(
         &self,
         ids: &[String],
-    ) -> Result<HashMap<String, LastSeen>, StoreError> {
+    ) -> Result<(HashMap<String, LastSeen>, Reads), StoreError> {
         let mut out: HashMap<String, LastSeen> = HashMap::new();
         if ids.is_empty() {
-            return Ok(out);
+            return Ok((out, Reads::default()));
         }
         let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
         // SQLite 的 MAX() 聚合時，同列的其他欄位取自最大值那一列
@@ -1029,13 +1144,9 @@ impl Store {
         let prompts: Vec<(String, i64)> = stmt
             .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
-        for (session, off) in prompts {
-            let text = self
-                .read_at(&session, vec![off])?
-                .pop()
-                .and_then(|e| e.payload["text"].as_str().map(str::to_string));
-            out.entry(session).or_default().0 = text;
-        }
+        let reads = Reads {
+            groups: prompts.into_iter().map(|(s, o)| (s, vec![o])).collect(),
+        };
         let mut stmt = self.db.prepare(
             "SELECT session, MAX(pos) FROM events
              WHERE pos IS NOT NULL AND session IN (SELECT value FROM json_each(?1))
@@ -1047,23 +1158,46 @@ impl Store {
         for (session, pos) in rows {
             out.entry(session).or_default().1 = Some(pos as u64);
         }
+        Ok((out, reads))
+    }
+
+    /// 這些 session 各自最後一個 `prompt.submitted` 的文字與串流最後一個 `pos`（#683，Sessions tab）。
+    pub fn last_prompt_and_pos(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, LastSeen>, StoreError> {
+        let (mut out, reads) = self.last_prompt_and_pos_reads(ids)?;
+        fill_last_prompts(&mut out, self.reader().read(&reads)?);
         Ok(out)
     }
 
     /// 某 session 這些 type 的 Event，依 seq 排序。
     pub fn events_of_types(&self, session: &str, types: &[&str]) -> Result<Vec<Event>, StoreError> {
+        self.reader()
+            .read(&self.events_of_types_reads(session, types)?)
+    }
+
+    /// [`Store::events_of_types`] 的 offset（鎖內）。
+    pub fn events_of_types_reads(
+        &self,
+        session: &str,
+        types: &[&str],
+    ) -> Result<Reads, StoreError> {
         let mut out = Vec::new();
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT seq, offset FROM events WHERE session = ?1 AND type = ?2")?;
         for t in types {
-            let mut stmt = self
-                .db
-                .prepare("SELECT seq, offset FROM events WHERE session = ?1 AND type = ?2")?;
             let rows: Vec<(i64, i64)> = stmt
                 .query_map(params![session, t], |r| Ok((r.get(0)?, r.get(1)?)))?
                 .collect::<Result<_, _>>()?;
             out.extend(rows);
         }
         out.sort();
-        self.read_at(session, out.into_iter().map(|(_, o)| o).collect())
+        Ok(Reads::one(
+            session,
+            out.into_iter().map(|(_, o)| o).collect(),
+        ))
     }
 
     /// 某 session 最後一個這種 type 的 Event。

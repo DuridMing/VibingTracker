@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
@@ -41,6 +40,8 @@ pub const VIA_HEADER: &str = "x-coding-lab-via";
 pub const STOP_HEADER: &str = "x-coding-lab-stop";
 /// 放掉埠時最多等進行中的請求多久
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// hook 的 body 上限（#740 L-2）：Edit 的 PostToolUse 帶整份 originalFile
+pub const BODY_MAX: usize = 64 * 1024 * 1024;
 /// Edit／Write 讀檔探測最多等多久（#762 W-M5）：逾時就不帶探測結果，hook 照常處理
 pub const PROBE_LIMIT: Duration = Duration::from_millis(300);
 
@@ -49,8 +50,8 @@ struct HookState {
     closing: Arc<AtomicBool>,
     /// `POST /stop` 來過（permit 會留著，主迴圈晚一點等也等得到）
     stop: Arc<Notify>,
-    /// merge 的 channel 滿了而丟掉的 hook 數（之後給 /healthz）
-    dropped: AtomicU64,
+    /// merge 的 channel 滿了而丟掉的 hook 數（/healthz 的 dropped）
+    dropped: Arc<AtomicU64>,
     /// 讀檔探測的時限（毫秒）
     probe_limit_ms: Arc<AtomicU64>,
 }
@@ -61,6 +62,7 @@ pub struct HookServer {
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
     probe_limit_ms: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -69,6 +71,11 @@ impl HookServer {
     /// 決定要結束（或取消結束）：結束中 ensure 轉送的 hook 回 503，其他 hook 照收。
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    /// 啟動以來因 merge 的佇列滿而丟掉的 hook 數。
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// 讀檔探測的時限（預設 [`PROBE_LIMIT`]，0 表示不讀檔；測試用）。
@@ -110,11 +117,13 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     let closing = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(Notify::new());
     let probe_limit_ms = Arc::new(AtomicU64::new(PROBE_LIMIT.as_millis() as u64));
+    let dropped = Arc::new(AtomicU64::new(0));
     let app = router_with(
         tx,
         closing.clone(),
         stop_flag.clone(),
         probe_limit_ms.clone(),
+        dropped.clone(),
     );
     let (shutdown, stop) = oneshot::channel::<()>();
     let stop = async move {
@@ -135,6 +144,7 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
         closing,
         stop: stop_flag,
         probe_limit_ms,
+        dropped,
         shutdown: Some(shutdown),
         task,
     })
@@ -145,12 +155,13 @@ fn router_with(
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
     probe_limit_ms: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 ) -> Router {
     let state = Arc::new(HookState {
         tx,
         closing,
         stop,
-        dropped: AtomicU64::new(0),
+        dropped,
         probe_limit_ms,
     });
     Router::new()
@@ -191,7 +202,7 @@ async fn handle_stop(State(state): State<Arc<HookState>>, headers: HeaderMap) ->
 async fn handle(
     State(state): State<Arc<HookState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: axum::body::Body,
 ) -> StatusCode {
     let ts_seen = crate::now_ms();
     if from_browser(&headers) {
@@ -209,6 +220,26 @@ async fn handle(
     {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
+    // body 自己讀、自己限大小（L-2）：axum 的 Bytes 預設 2 MB、超過回 413，Claude Code 會顯示 hook 錯誤。
+    // 超過上限的一律 200 加 log（不變式 4）；宣告的長度就超過時不讀
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > BODY_MAX) {
+        crate::logging::log(&format!("hooks：body 超過 {} MB，略過", BODY_MAX >> 20));
+        return StatusCode::OK;
+    }
+    let body = match axum::body::to_bytes(body, BODY_MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            crate::logging::log(&format!(
+                "hooks：讀不到 body（或超過 {} MB）：{e}",
+                BODY_MAX >> 20
+            ));
+            return StatusCode::OK;
+        }
+    };
     match HookInput::from_json(&body) {
         Ok(mut hook) => {
             // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）。
