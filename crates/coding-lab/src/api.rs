@@ -1276,39 +1276,39 @@ fn session_changes(
     store: &std::sync::Mutex<Store>,
     id: &str,
 ) -> Result<Option<Changes>, crate::store::StoreError> {
-    // 鎖內只查 offset，讀 JSONL 時放掉鎖（L-7、X1）
-    let (reads, reader) = {
+    // 改了哪些檔查 changes 表（被拒或失敗的已經刪掉，#682）；只有「是不是新檔」要看 file.write 的 Event，
+    // 所以只讀 file.write、不讀整個 session 的 Edit 與 tool.updated（E-H8）。鎖內只查，讀 JSONL 時放掉鎖（L-7）
+    let (rows, reads, reader) = {
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         if s.session(id)?.is_none() {
             return Ok(None);
         }
-        (
-            s.events_of_types_reads(id, &["file.edit", "file.write", "tool.updated"])?,
-            s.reader(),
-        )
+        let rows = s.session_change_rows(id)?;
+        let reads = rows
+            .iter()
+            .any(|(_, kind, _)| kind == "write")
+            .then(|| s.events_of_types_reads(id, &["file.write"]))
+            .transpose()?;
+        (rows, reads, s.reader())
     };
-    let mut out: Changes = BTreeMap::new();
-    let events = reader.read(&reads)?;
-    // 被拒或失敗的 Edit／Write 不算改動（contracts §4，#682）
-    let failed: std::collections::HashSet<&str> = events
-        .iter()
-        .filter(|e| e.kind == "tool.updated" && e.payload["status"] == "failed")
-        .filter_map(|e| e.payload["toolUseId"].as_str())
-        .collect();
-    for e in &events {
-        if e.payload["toolUseId"]
-            .as_str()
-            .is_some_and(|t| failed.contains(t))
-        {
-            continue;
+    let kept: std::collections::HashSet<u64> = rows.iter().map(|(_, _, seq)| *seq).collect();
+    let mut new_files = std::collections::HashSet::new();
+    if let Some(reads) = reads {
+        for e in reader.read(&reads)? {
+            if kept.contains(&e.seq)
+                && let Ok(Some(Payload::FileWrite(p))) = e.payload_typed()
+                && p.is_new
+            {
+                new_files.insert(norm(&p.path));
+            }
         }
-        let (path, new) = match e.payload_typed() {
-            Ok(Some(Payload::FileEdit(p))) => (p.path, false),
-            Ok(Some(Payload::FileWrite(p))) => (p.path, p.is_new),
-            _ => continue,
-        };
-        let entry = out.entry(norm(&path)).or_insert_with(|| ("M".into(), None));
-        if new {
+    }
+    let mut out: Changes = BTreeMap::new();
+    for (path, _, _) in rows {
+        let path = norm(&path);
+        let status = if new_files.contains(&path) { "A" } else { "M" };
+        let entry = out.entry(path).or_insert_with(|| ("M".into(), None));
+        if status == "A" {
             entry.0 = "A".into();
         }
     }

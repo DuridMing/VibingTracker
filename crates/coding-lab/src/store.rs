@@ -1230,6 +1230,23 @@ impl Store {
     }
 
     /// 改動紀錄：最新在前。
+    /// 某 session 留下的改動：(path, kind, seq)，依 seq。被拒或失敗的已經從表裡刪掉（#682）。
+    /// `/api/files` 的 session 基準用它，不必把整個 session 的 Edit／Write／tool.updated 都從 JSONL 讀出來（E-H8）。
+    pub fn session_change_rows(
+        &self,
+        session: &str,
+    ) -> Result<Vec<(String, String, u64)>, StoreError> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT path, kind, seq FROM changes WHERE session = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![session], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn recent_changes(&self, cwd: &str, limit: usize) -> Result<Vec<Change>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT session, seq, tool_use_id, path, kind, agent, ts, added, removed FROM changes
