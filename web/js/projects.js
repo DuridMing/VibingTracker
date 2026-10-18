@@ -5,8 +5,7 @@
 
 import { PALETTE_SIZE, sessionColorIndex } from "./color.js";
 
-const norm = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
-const under = (p, base) => p === base || p.startsWith(`${base}/`);
+import { norm, same, under } from "./paths.js";
 
 // cwd → 色票索引。每個專案先取雜湊色（和重新整理前、別的視窗一致），撞色時依 cwd 排序後面的往後找空位；
 // 同一組專案不論順序都得到同樣的結果，新加一個專案不會動到既有的（除非它撞到的是新的那個）。
@@ -77,13 +76,21 @@ export function projectOf(cwd, roots) {
 }
 
 // 單一專案時的 session 篩選：null＝全部不篩。還不知道 cwd 的 session（WS 列還沒到）不藏，免得漏看
+// 每次排版都會對每一行呼叫：roots 先正規化一次，每個 session 的結果記住（cwd 不會變）；cwd 還不知道的不記（#757 E-F1）
 export function sessionFilterFor(project, roots, cwdOf) {
   if (!project) return null;
   const p = norm(project);
+  const normRoots = (roots ?? []).map(norm);
+  const memo = new Map();
   return (id) => {
+    const hit = memo.get(id);
+    if (hit !== undefined) return hit;
     const cwd = cwdOf(id);
     if (!cwd) return true;
-    return projectOf(cwd, roots) === p;
+    const pr = projectOf(cwd, normRoots);
+    const ok = pr != null && same(pr, p);
+    memo.set(id, ok);
+    return ok;
   };
 }
 

@@ -18,6 +18,7 @@ import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
 import { mergeSessions, projectRoots, canReplay, fitTabs } from "./sessions.js";
 import { projectColors, projectColor, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "./projects.js";
 import { degradedNotice } from "./degraded.js";
+import { norm as normPath } from "./paths.js";
 import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices, layoutGraph, withWip } from "./branches.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -699,7 +700,6 @@ const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?
 // 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
 const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
 const apiFetch = (url, { signal } = {}) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin", signal }).then(toLogin));
-const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 function allSessions() {
   return mergeSessions([...store.sessions.values()], left.fetched);
@@ -834,7 +834,7 @@ async function loadFiles(cwd = null) {
     if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
     // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
-    if (ent.tree.root == null || normRoot(body.root) === ent.tree.root) ent.tree.setFiles(body);
+    if (ent.tree.root == null || normPath(body.root) === ent.tree.root) ent.tree.setFiles(body);
     const n = body.changes?.length ?? 0;
     const cf = (body.changes ?? []).filter((c) => c.conflict).length;
     const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";

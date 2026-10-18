@@ -5,13 +5,9 @@
 
 export const LAZY_THRESHOLD = 5000;
 
-const norm = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+import { norm, relUnder as under } from "./paths.js";
+
 const isAbs = (p) => p.startsWith("/") || /^[A-Za-z]:\//.test(p);
-// p 在 base 底下時回傳相對的部分（等於 base 是 ""），否則 null
-function under(p, base) {
-  if (p === base) return "";
-  return p.startsWith(base + "/") ? p.slice(base.length + 1) : null;
-}
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 function ancestors(path) {
