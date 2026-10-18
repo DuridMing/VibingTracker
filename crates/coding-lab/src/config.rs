@@ -362,10 +362,13 @@ fn home_dir(
     env: &dyn Fn(&str) -> Option<String>,
     default_home: PathBuf,
 ) -> PathBuf {
-    cli.home
+    let home = cli
+        .home
         .clone()
         .or_else(|| env("CODING_LAB_HOME").map(PathBuf::from))
-        .unwrap_or(default_home)
+        .unwrap_or(default_home);
+    // 重組 components 會拿掉結尾的分隔符號（W-M6）：Windows 的 `"C:\x\"` 在命令列上會把引號跳脫掉
+    home.components().collect()
 }
 
 /// 二進位旁邊的 `web/`（有 index.html 才算）：wrapper 從 Release 下載時把兩者解在一起（#656）。
@@ -374,10 +377,28 @@ pub fn bundled_web(exe: &Path) -> Option<PathBuf> {
     web.join("index.html").is_file().then_some(web)
 }
 
+/// 使用者的家目錄：Windows 先看 `USERPROFILE`、其他平台先看 `HOME`，空字串當作沒設（W-L10-4）。
+/// Git Bash 會設 HOME（可能是 `/c/Users/u` 或別的位置），PowerShell 與工作排程器拉起的程序只有 USERPROFILE，
+/// HOME 優先的話同一個人會用到兩個資料目錄。
+pub fn user_home_from(env: &dyn Fn(&str) -> Option<String>, windows: bool) -> Option<PathBuf> {
+    let order = if windows {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    order
+        .iter()
+        .filter_map(|k| env(k))
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// 這台的家目錄（[`user_home_from`] 讀真正的環境變數）。
+pub fn user_home() -> Option<PathBuf> {
+    user_home_from(&|k| std::env::var(k).ok(), cfg!(windows))
+}
+
 /// `~/.coding-lab`（Windows 是 `%USERPROFILE%\.coding-lab`）。
 pub fn default_home() -> PathBuf {
-    let base = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .unwrap_or_default();
-    Path::new(&base).join(".coding-lab")
+    user_home().unwrap_or_default().join(".coding-lab")
 }

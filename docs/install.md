@@ -113,7 +113,7 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 
 1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。SSH 通道也要繼續用的話寫成陣列：`bind = ["127.0.0.1:4801", "100.x.x.x:4801"]`，通道進來的仍免金鑰、直連的要金鑰。
 2. 建一把金鑰：`~/.coding-lab/bin/coding-lab key create --name laptop --scope view --expires 90d`。印出來的 `clk_…` 只會出現這一次，先複製。
-3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
+3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。裝了常駐服務（見下一節）的話，stop 也會停掉服務、而且它不會自己回來，改用服務的重啟：`systemctl --user restart coding-lab.service`（Linux）、`launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`（macOS）；Windows 先 `stop` 再 `schtasks /Run /TN CodingLab`。
 4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
 
 伺服器是 Windows 時，防火牆預設擋下其他機器連進來的連線：綁 tailnet 或區網 IP 之後，在系統管理員的 PowerShell 開放 4801，只開給 tailnet 的網段：

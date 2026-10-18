@@ -711,7 +711,9 @@ fn spawn_collector(cfg: &Config) -> Result<(), String> {
     let log = coding_lab::store::open_private_append(&cfg.home.join("collector.log"))
         .map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
+    // 工作目錄用 home，不沿用第一個 session 的專案目錄：Windows 上程序的 cwd 會鎖住那個資料夾（L-9）
     cmd.arg("serve")
+        .current_dir(&cfg.home)
         .env("CODING_LAB_HOME", &cfg.home)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -931,6 +933,7 @@ fn stop() -> ExitCode {
         };
         if done {
             eprintln!("coding-lab：collector 已結束");
+            service_start_hint(&cfg.home);
             return ExitCode::SUCCESS;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -941,6 +944,24 @@ fn stop() -> ExitCode {
         cfg.home.join("collector.log").display()
     );
     ExitCode::FAILURE
+}
+
+/// 裝了常駐服務時，stop 停掉的就是它，而且不會自己回來（R-6）：提示怎麼叫回來。服務管理員自己呼叫
+/// （systemd 的 ExecStop）時 stderr 不是終端機，不印。
+fn service_start_hint(home: &std::path::Path) {
+    use coding_lab::service::{self, Platform};
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let (Some(platform), Ok(ctx)) = (Platform::current(), service::Ctx::detect(home)) else {
+        return;
+    };
+    if service::installed(platform, &ctx) {
+        eprintln!(
+            "coding-lab：常駐服務也跟著停了，不會自己回來；要叫回來：{}（之後的 session 也會照常拉起一個閒置會結束的 collector）",
+            service::start_command(platform, &ctx).join(" ")
+        );
+    }
 }
 
 fn healthz() -> ExitCode {

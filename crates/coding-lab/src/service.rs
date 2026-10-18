@@ -50,10 +50,8 @@ impl Ctx {
     /// 從真正的環境組出來；`home` 用設定算出的資料目錄
     pub fn detect(home: &Path) -> Result<Ctx, String> {
         let exe = std::env::current_exe().map_err(|e| format!("找不到自己的路徑：{e}"))?;
-        let user_home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .ok_or("沒有 HOME／USERPROFILE，不知道家目錄在哪")?;
+        let user_home =
+            crate::config::user_home().ok_or("沒有 HOME／USERPROFILE，不知道家目錄在哪")?;
         let config_home = std::env::var_os("XDG_CONFIG_HOME")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -142,14 +140,44 @@ fn xml_escape(t: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// systemd 的 ExecStart 用空白分隔參數：路徑有空白要加引號
-fn systemd_quote(p: &Path) -> String {
-    let t = p.to_string_lossy();
-    if t.contains(' ') {
-        format!("\"{}\"", t.replace('"', "\\\""))
-    } else {
-        t.into_owned()
+/// unit 檔裡的一個路徑值（R-15）：systemd 會展開 `%` 指定符，所以寫成 `%%`；Exec 行還會展開 `$` 變數，
+/// 寫成 `$$`（Environment= 不展開 `$`）。Exec 行用空白分隔參數：有空白、引號、反斜線、`;` 的加引號，
+/// 裡面的 `\` 與 `"` 跳脫。
+fn systemd_value(p: &Path, exec: bool) -> String {
+    let mut t = p.to_string_lossy().replace('%', "%%");
+    if exec {
+        t = t.replace('$', "$$");
     }
+    if t.contains(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | ';')) {
+        format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        t
+    }
+}
+
+/// Windows 命令列的一個參數（W-M6）：一律加引號；照 `CommandLineToArgvW` 的規則，接在 `"` 前面的
+/// 反斜線（含結尾的）要加倍，否則 `"C:\x\"` 的引號會被跳脫、後面的參數全黏進來。
+fn windows_arg(t: &str) -> String {
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in t.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
 }
 
 pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
@@ -161,10 +189,11 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  [Unit]\n\
                  Description=Coding Lab collector（Claude Code session 追蹤）\n\
                  After=network.target\n\
+                 StartLimitIntervalSec=0\n\
                  \n\
                  [Service]\n\
                  Type=simple\n\
-                 Environment=CODING_LAB_HOME={home}\n\
+                 Environment=CODING_LAB_HOME={env_home}\n\
                  ExecStart={exe} serve --home {home} --idle-exit-seconds 0\n\
                  ExecStop={exe} stop\n\
                  Restart=on-failure\n\
@@ -172,8 +201,9 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  \n\
                  [Install]\n\
                  WantedBy=default.target\n",
-                exe = systemd_quote(&ctx.exe),
-                home = systemd_quote(&ctx.home),
+                exe = systemd_value(&ctx.exe, true),
+                home = systemd_value(&ctx.home, true),
+                env_home = systemd_value(&ctx.home, false),
             );
             Plan {
                 files: vec![(unit_path(ctx), unit)],
@@ -278,13 +308,15 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  \x20 </Settings>\r\n\
                  \x20 <Actions Context=\"Author\">\r\n\
                  \x20   <Exec>\r\n\
-                 \x20     <Command>{exe}</Command>\r\n\
-                 \x20     <Arguments>serve --home \"{home}\" --idle-exit-seconds 0</Arguments>\r\n\
+                 \x20     <Command>%SystemRoot%\\System32\\conhost.exe</Command>\r\n\
+                 \x20     <Arguments>--headless {exe} serve --home {home} --idle-exit-seconds 0</Arguments>\r\n\
                  \x20   </Exec>\r\n\
                  \x20 </Actions>\r\n\
                  </Task>\r\n",
-                exe = xml_escape(&ctx.exe.to_string_lossy()),
-                home = xml_escape(&home),
+                // L-12：console 程式直接當 Exec，登入時會開出主控台視窗、關掉就殺掉 collector；
+                // 經 headless 的 conhost 跑沒有視窗（`<Hidden>` 只是在工作排程器的清單裡隱藏）
+                exe = xml_escape(&windows_arg(&ctx.exe.to_string_lossy())),
+                home = xml_escape(&windows_arg(&home)),
                 // 一般使用者只能建「自己登入時、以自己身分跑」的工作：trigger 與 principal 都要填目前使用者（#719）
                 user_trigger = ctx
                     .user
@@ -377,6 +409,19 @@ pub fn apply(
 }
 
 /// 問系統「這個服務有沒有登記」的指令（#719）：install 失敗後檔案可能還在，所以 status 以這個為準
+/// 把裝好的常駐服務叫起來的指令（R-6）：`coding-lab stop` 讓它正常結束，三個平台都不算失敗、不會自己重啟。
+pub fn start_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
+    match platform {
+        Platform::Linux => s(&["systemctl", "--user", "start", LINUX_UNIT]),
+        Platform::Macos => s(&[
+            "launchctl",
+            "kickstart",
+            &format!("gui/{}/{MACOS_LABEL}", ctx.uid.unwrap_or(501)),
+        ]),
+        Platform::Windows => s(&["schtasks", "/Run", "/TN", WINDOWS_TASK]),
+    }
+}
+
 pub fn status_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
     match platform {
         Platform::Linux => s(&["systemctl", "--user", "is-enabled", LINUX_UNIT]),

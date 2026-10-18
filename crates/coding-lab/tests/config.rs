@@ -81,6 +81,59 @@ fn home_comes_from_cli_then_env() {
     );
 }
 
+/// W-M6（#739）：home 結尾的分隔符號拿掉。Windows 的 `"C:\x\"` 在命令列上會把結尾的引號跳脫掉，
+/// 工作排程器的 `<Arguments>` 因此壞掉；collector.json 的位址、log 的路徑也跟著一致。
+/// （`PathBuf` 的 `==` 不看結尾的分隔符號，所以比字串）
+#[test]
+fn home_has_no_trailing_separator() {
+    let c = resolve(
+        Overrides::default(),
+        &[("CODING_LAB_HOME", "/tmp/x/")],
+        None,
+    )
+    .unwrap();
+    assert_eq!(c.home.to_str(), Some("/tmp/x"));
+    let cli = Overrides {
+        home: Some("/tmp/y//".into()),
+        ..Overrides::default()
+    };
+    assert_eq!(
+        resolve(cli, &[], None).unwrap().home.to_str(),
+        Some("/tmp/y")
+    );
+    let root = Overrides {
+        home: Some("/".into()),
+        ..Overrides::default()
+    };
+    assert_eq!(resolve(root, &[], None).unwrap().home.to_str(), Some("/"));
+}
+
+/// W-L10-4（#739）：家目錄在 Windows 先看 USERPROFILE、其他平台先看 HOME。Git Bash 會設 HOME，
+/// 和 PowerShell、工作排程器（只有 USERPROFILE）拉起的 collector 會用到不同的資料目錄。空字串當作沒設。
+#[test]
+fn user_home_prefers_userprofile_on_windows_and_home_elsewhere() {
+    use coding_lab::config::user_home_from;
+    let pick = |vars: &[(&str, &str)], windows: bool| {
+        let m: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        user_home_from(&|k: &str| m.get(k).cloned(), windows)
+    };
+    let both = [("HOME", "/c/Users/u"), ("USERPROFILE", r"C:\Users\u")];
+    assert_eq!(pick(&both, true), Some(PathBuf::from(r"C:\Users\u")));
+    assert_eq!(pick(&both, false), Some(PathBuf::from("/c/Users/u")));
+    assert_eq!(
+        pick(&[("HOME", "/home/u")], true),
+        Some(PathBuf::from("/home/u"))
+    );
+    assert_eq!(
+        pick(&[("HOME", "/home/u"), ("USERPROFILE", "")], true),
+        Some(PathBuf::from("/home/u"))
+    );
+    assert_eq!(pick(&[("HOME", "")], false), None);
+}
+
 #[test]
 fn web_auth_keys_parse_with_defaults() {
     use coding_lab::config::{AuthMode, RemoteThinking};
