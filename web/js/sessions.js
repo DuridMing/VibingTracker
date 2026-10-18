@@ -34,13 +34,6 @@ export function projectRoots(sessions) {
   return [...out.values()].sort((a, b) => (a.cwd < b.cwd ? -1 : a.cwd > b.cwd ? 1 : 0));
 }
 
-// 使用者選過、而且還在就用它；否則選進行中 session 最多的
-export function pickProject(roots, prev) {
-  if (!roots.length) return null;
-  if (prev && roots.some((r) => r.cwd === prev)) return prev;
-  return roots.reduce((a, b) => (b.live > a.live ? b : a)).cwd;
-}
-
 // session tab 列放不下時（#704）：widths 是每個 tab 的寬（含間距），avail 是可用寬，moreW 是「+N」按鈕的寬。
 // 從前面放到放不下為止；選中的（selected）被收起來時換上來，從最後一個看得到的開始擠掉。回 { shown, hidden }（索引，遞增）
 export function fitTabs(widths, avail, moreW, selected) {

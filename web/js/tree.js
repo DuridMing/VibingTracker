@@ -353,10 +353,7 @@ export function createFileTree() {
   t.mark = (path) => git.get(path) ?? null;
 
   const isOpen = (dir) => (user.has(dir) ? user.get(dir) : activeDirs.has(dir) || gitDirs.has(dir));
-  t.isOpen = isOpen;
   t.toggle = (dir) => user.set(dir, !isOpen(dir));
-
-  t.isDir = hasDir;
 
   t.materialized = () => memo.size;
 

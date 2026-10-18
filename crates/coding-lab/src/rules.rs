@@ -4,7 +4,7 @@
 //! 同 id 取代、新 id 放在最前面（使用者規則優先）、`disable` 停用。檔案壞掉或任何 pattern 編譯失敗，
 //! 整份不用、退回內建並回傳警告讓呼叫端寫 log。
 //!
-//! Bash 依 `&&`／`;`／`|`／換行切段（引號內不切），每段各取「第一條命中」的規則，整條指令取最嚴重的等級；
+//! 指令型工具（[`COMMAND_TOOLS`]：Bash、PowerShell）依 `&&`／`;`／`|`／換行切段（引號內不切），每段各取「第一條命中」的規則，整條指令取最嚴重的等級；
 //! 所以 `rm -rf target && rm -rf /` 會被判 danger。`scope: command` 的規則（如 `curl … | sh`）比對整條指令。
 //! 段落另外去掉 `sudo`、`env`、`VAR=值` 等前綴再比一次，`sudo rm -rf x` 兩種都看得到。
 
@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::derive::shell_segments;
-use crate::event::{Danger, DangerLevel};
+use crate::event::{COMMAND_TOOLS, COMMAND_TOOLS_ALIAS, Danger, DangerLevel, is_command_tool};
 use crate::merge::DangerRules;
 
 const BUILTIN: &str = include_str!("rules/builtin.json");
@@ -31,12 +31,12 @@ struct RuleFile {
 #[derive(Clone, Deserialize)]
 struct RuleSpec {
     id: String,
-    /// 套用的工具；也接受單數 `tool`（使用者手寫時常見）
+    /// 套用的工具；也接受單數 `tool`（使用者手寫時常見）。`@command` 代表所有指令型工具
     #[serde(default)]
     tools: Vec<String>,
     #[serde(default)]
     tool: Option<String>,
-    /// 比對 `tool_input` 的哪個欄位；預設 Bash 是 `command`、其他工具是 `file_path`
+    /// 比對 `tool_input` 的哪個欄位；預設指令型工具是 `command`、其他工具是 `file_path`
     field: Option<String>,
     #[serde(default)]
     scope: Scope,
@@ -124,14 +124,19 @@ fn compile(specs: Vec<RuleSpec>) -> Result<RuleSet, String> {
             if spec.tools.is_empty() {
                 return Err(format!("規則 {} 沒有指定 tools", spec.id));
             }
-            // Bash 只比對指令（依段切開）；設成別的欄位以前會默默永不命中（#687 R17）
-            if spec.tools.iter().any(|t| t == "Bash")
+            if let Some(i) = spec.tools.iter().position(|t| t == COMMAND_TOOLS_ALIAS) {
+                spec.tools.remove(i);
+                for t in COMMAND_TOOLS {
+                    if !spec.tools.iter().any(|x| x == t) {
+                        spec.tools.push(t.to_string());
+                    }
+                }
+            }
+            // 指令型工具只比對指令（依段切開）；設成別的欄位以前會默默永不命中（#687 R17）
+            if let Some(t) = spec.tools.iter().find(|t| is_command_tool(t))
                 && spec.field.as_deref().is_some_and(|f| f != "command")
             {
-                return Err(format!(
-                    "規則 {} 套用在 Bash，field 只能是 command",
-                    spec.id
-                ));
+                return Err(format!("規則 {} 套用在 {t}，field 只能是 command", spec.id));
             }
             let re = Regex::new(&spec.pattern).map_err(|e| format!("規則 {}：{e}", spec.id))?;
             Ok(Rule { spec, re })
@@ -185,7 +190,7 @@ impl RuleSet {
             .iter()
             .filter(|r| r.spec.scope == scope && r.spec.tools.iter().any(|t| t == tool || t == "*"))
             .filter(|r| {
-                r.spec.field.as_deref().unwrap_or(if tool == "Bash" {
+                r.spec.field.as_deref().unwrap_or(if is_command_tool(tool) {
                     "command"
                 } else {
                     "file_path"
@@ -283,10 +288,10 @@ impl RuleSet {
 }
 
 impl DangerRules for RuleSet {
-    /// 非 Bash 的工具：每條規則比對它自己的 `field`（預設 `file_path`，例如 Write 的 `content`），
+    /// 不是指令型的工具：每條規則比對它自己的 `field`（預設 `file_path`，例如 Write 的 `content`），
     /// 依規則順序取第一個命中的（使用者規則在前）。
     fn check(&self, tool: &str, input: &Value) -> Option<Danger> {
-        if tool == "Bash" {
+        if is_command_tool(tool) {
             return self.check_command(tool, input["command"].as_str()?, 0);
         }
         self.rules

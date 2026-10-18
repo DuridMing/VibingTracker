@@ -7,6 +7,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false
+repository = "https://github.com/DuridMing/VibingTracker"
+# File::try_lock 要 1.89（let-chains 1.88、edition 2024 1.85）；clippy 的 incompatible_msrv 會擋新於這版的 API（#733 R-19）
+rust-version = "1.89"
 
 # 二進位瘦身（PLAN.md「二進位大小與拆分」）
 [profile.release]
@@ -15,3 +18,7 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# cargo-dist 用的 profile：和 release 相同（#733 R-2：沒有它 `dist build` 直接失敗）
+[profile.dist]
+inherits = "release"
