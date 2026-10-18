@@ -538,7 +538,7 @@ impl Live {
             Payload::FileEdit(_) => counts.edits += 1,
             Payload::FileWrite(w) if w.is_new => counts.writes += 1,
             Payload::ToolCalled(c) => {
-                if c.tool == "Bash" {
+                if crate::event::is_command_tool(&c.tool) {
                     counts.commands += 1;
                 }
                 if c.danger
@@ -1320,7 +1320,7 @@ fn describe(tool: &str, input: &Value, cwd: &str) -> String {
             .unwrap_or_default()
     };
     match tool {
-        "Bash" => {
+        t if crate::event::is_command_tool(t) => {
             let cmd = input["command"].as_str().unwrap_or_default();
             let first = cmd.lines().next().unwrap_or_default();
             format!("$ {}", first.chars().take(80).collect::<String>())

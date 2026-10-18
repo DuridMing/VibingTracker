@@ -633,3 +633,47 @@ fn write_carries_the_full_line_count() {
     assert_eq!(p["truncated"], true);
     assert_eq!(p["lines"], 5000);
 }
+
+/// C7（#744）：Edit 的 new_string 很大時，file.edit.hunk.lines 合計也不超過 8 KB：放不下的行丟掉，
+/// 最後一行截在字元邊界，標 truncated；oldLines／newLines 保留原值，+N／−M 照算。
+#[test]
+fn edit_hunk_is_bounded_in_bytes() {
+    let dir = tmpdir();
+    let f = dir.join("a.txt");
+    std::fs::write(&f, "a\nOLD\nb\n").unwrap();
+    let path = f.to_str().unwrap();
+    let mut m = Merger::new(Box::new(NoDanger));
+    let edit = |new: String, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+               "tool_input": {"file_path": path, "old_string": "OLD", "new_string": new}, "tool_use_id": id})
+    };
+    // 一行 1.5 MB
+    let evs = handle(&mut m, edit("中".repeat(500_000), "e1"), 1);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    let lines: Vec<&str> = fe["hunk"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert!(lines.iter().map(|l| l.len()).sum::<usize>() <= 8 * 1024);
+    assert_eq!(fe["truncated"], true);
+    assert_eq!(fe["hunk"]["newLines"], 3, "a、新行、b");
+    // 很多行
+    let many: Vec<String> = (0..5000).map(|i| format!("line {i}")).collect();
+    let evs = handle(&mut m, edit(many.join("\n"), "e2"), 2);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    let n = fe["hunk"]["lines"].as_array().unwrap().len();
+    assert!(n < 5000, "{n}");
+    assert_eq!(fe["truncated"], true);
+    assert_eq!(fe["hunk"]["newLines"], 5002);
+    // 小改動照舊，不輸出 truncated
+    let evs = handle(&mut m, edit("NEW".into(), "e3"), 3);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert!(fe.get("truncated").is_none());
+    assert_eq!(
+        fe["hunk"]["lines"].as_array().unwrap().len(),
+        4,
+        "a、-OLD、+NEW、b"
+    );
+}

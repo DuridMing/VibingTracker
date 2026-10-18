@@ -1710,3 +1710,62 @@ fn same_hook_for_a_different_tool_is_not_a_duplicate() {
         .feed(fail("t2", 1300));
     assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
 }
+
+// ── PowerShell（W-H3）：連續失敗與 git 操作和 Bash 一樣
+
+fn ps_pre(id: &str, cmd: &str, ts: u64) -> Input {
+    hook(
+        "PreToolUse",
+        json!({ "tool_name": "PowerShell", "tool_input": { "command": cmd }, "tool_use_id": id }),
+        ts,
+    )
+}
+
+fn ps_fail(id: &str, ts: u64) -> Input {
+    hook(
+        "PostToolUseFailure",
+        json!({ "tool_name": "PowerShell", "tool_use_id": id, "duration_ms": 10,
+                "error": "Exit code 1\nboom", "is_interrupt": false }),
+        ts,
+    )
+}
+
+#[test]
+fn powershell_failing_twice_raises_fail() {
+    let mut r = Run::new();
+    r.feed(ps_pre("p1", "cargo test", 1000))
+        .feed(ps_fail("p1", 1100))
+        .feed(ps_pre("p2", "cargo test", 1200))
+        .feed(ps_fail("p2", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "p2")]);
+}
+
+#[test]
+fn powershell_git_commit_is_a_git_op() {
+    let mut r = Run::new();
+    r.feed(ps_pre("p1", "git commit -m fix", 1000)).feed(hook(
+        "PostToolUse",
+        json!({ "tool_name": "PowerShell", "tool_use_id": "p1", "duration_ms": 10,
+                "tool_input": { "command": "git commit -m fix" },
+                "tool_response": { "stdout": "[main 1a2b3c4] fix\n 1 file changed", "stderr": "" } }),
+        1100,
+    ));
+    let ops: Vec<&Event> = r.evs.iter().filter(|e| e.type_name() == "git.op").collect();
+    assert_eq!(
+        ops.len(),
+        1,
+        "{:?}",
+        r.evs.iter().map(|e| e.type_name()).collect::<Vec<_>>()
+    );
+    assert_eq!(ops[0].payload["op"], "commit");
+}
+
+#[test]
+fn powershell_danger_enters_the_queue() {
+    let mut r = Run {
+        m: Merger::new(Box::new(coding_lab::rules::RuleSet::builtin())),
+        evs: Vec::new(),
+    };
+    r.feed(ps_pre("p1", "Remove-Item C:\\proj -Recurse -Force", 1000));
+    assert_eq!(r.attention(), [a("raised", "danger", "p1")]);
+}

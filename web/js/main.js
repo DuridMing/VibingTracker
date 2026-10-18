@@ -1,7 +1,6 @@
 import { createClient } from "./client.js";
 import { createStore, applySnapshot, applyFrame } from "./store.js";
 import { sessionColor, shortId } from "./color.js";
-import { installMock } from "./mock-feed.js";
 import { createStream } from "./stream.js";
 import { createStreamView } from "./stream-view.js";
 import { formatRow, esc } from "./format.js";
@@ -493,10 +492,24 @@ function renderAttention() {
   }), other ?? "");
 }
 
+// 送出 ack：沒連上就直接說，不讓那一列卡在「確認中…」；送出後 10 秒還沒被刪掉（斷線、hub 的上游離線）就解除（#747 F-2）
+const ACK_TIMEOUT_MS = 10_000;
+function sendAck(r) {
+  if (!client.ack({ session: r.session, kind: r.kind, ref: r.ref })) {
+    ui.ackError = "沒有連上 collector，連上之後再按";
+    return;
+  }
+  ackPending.add(r.id);
+  setTimeout(() => {
+    if (!ackPending.delete(r.id) || !store.attention.has(r.id)) return;
+    ui.ackError = "確認沒有回應（collector 或 hub 的上游沒有回覆），請再按一次";
+    render(true);
+  }, ACK_TIMEOUT_MS);
+}
+
 function ackRow(r) {
   ui.ackError = null;
-  ackPending.add(r.id);
-  client.ack({ session: r.session, kind: r.kind, ref: r.ref });
+  sendAck(r);
   render(true);
 }
 
@@ -510,10 +523,7 @@ function onServerError(m) {
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
   ui.ackError = null;
-  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) {
-    ackPending.add(r.id);
-    client.ack({ session: r.session, kind: r.kind, ref: r.ref });
-  }
+  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) sendAck(r);
   render(true);
 });
 
@@ -1358,6 +1368,8 @@ const pane = createSessionPane();
 const thinkingModeOf = (sessionId) => store.sessions.get(sessionId)?.thinking ?? ui.welcome?.thinking ?? null;
 pane.thinkingMode = thinkingModeOf;
 let paneMoreReq = null;
+// 逾時之後才到的回覆：對得上最後一次請求就照樣套用，不丟（#747 F-10）
+let paneMoreLate = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
 const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
 
@@ -1366,12 +1378,19 @@ function paneMore(replay = false) {
   if (paneMoreReq || !isSessionTab(ui.tab)) return;
   const beforePos = replay ? null : pane.stream.minPos().get(pane.session);
   if (!replay && !(beforePos > 1)) return;
-  paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
+  paneMoreLate = null;
+  paneMoreReq = {
+    session: pane.session,
+    beforePos,
+    // 逾時：放開「載入更多」讓使用者可以再按，晚到的回覆仍接受
+    timer: setTimeout(() => { paneMoreLate = paneMoreReq; paneMoreReq = null; paneHasMore(); }, MORE_TIMEOUT_MS),
+  };
   client.more({ session: pane.session, beforePos, limit: 200 });
 }
 function onPaneMore(m) {
-  clearTimeout(paneMoreReq.timer);
+  if (paneMoreReq) clearTimeout(paneMoreReq.timer);
   paneMoreReq = null;
+  paneMoreLate = null;
   paneView.prepended(pane.prepend(m.events));
   paneHasMore();
 }
@@ -1503,7 +1522,7 @@ function renderPaneFiles(id) {
   h("span", { class: "ag" }, f.agents.map(who).join("、")))) : [h("div", { class: "none" }, "尚無改動")]));
   $("#spFb").hidden = !sel;
   if (sel) {
-    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT −${sel.removed} +${sel.added} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
+    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT ${sel.countLabel ?? `−${sel.removed} +${sel.added}`} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
     $("#spFbPath").textContent = sel.path;
     $("#spFbBody").innerHTML = diffHtml(sel);
   }
@@ -1522,7 +1541,9 @@ function renderChanges() {
     return;
   }
   const row = (c) => {
-    const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
+    const n = c.kind === "edit"
+      ? c.countLabel ? h("span", { class: "n" }, c.countLabel) : h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`))
+      : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
     return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
       h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
       h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
@@ -1549,7 +1570,7 @@ function renderDiff() {
   $("#gfbNone").hidden = !!c;
   if (!c) return;
   const who = `${shortId(c.session)} · ${agentWho(c.session, c.agent, agentName)}`;
-  $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
+  $("#fbKind").textContent = c.kind === "edit" ? `EDIT ${c.countLabel ?? `−${c.removed} +${c.added}`} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
   $("#fbPath").textContent = c.path;
   $("#fbPath").title = c.path;
   $("#fbBody").innerHTML = diffHtml(c);
@@ -1558,7 +1579,7 @@ function renderDiff() {
 
 // 修改情形的內容（全部串流的右欄與單 session 的檔案變更共用）
 function diffHtml(c) {
-  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource) : writeRows(c.content, c.truncated);
+  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource, c) : writeRows(c.content, c.truncated, c.redacted);
   const no = (v) => (v == null ? "" : String(v));
   return rows.map((r) => {
     if (r.type === "hunk") return `<div class="hunk">${esc(r.text)}</div>`;
@@ -1688,7 +1709,8 @@ $("#brWinClose").addEventListener("click", () => brWin.close());
 
 // 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
 const MORE_LIMIT = 200;
-const MORE_TIMEOUT_MS = 3000;
+// 回放或大量讀取時 collector 可能要好幾秒才回（C3），3 秒就丟太早（#747 F-10）
+const MORE_TIMEOUT_MS = 15_000;
 let moreReq = null;
 
 function requestMore() {
@@ -1996,7 +2018,8 @@ bench.on = mockN > 0 && params.has("bench");
 bench.isolate = bench.on && params.has("isolate");
 // &prefill：mock 先產生一段歷史（每個 session 約 220 個 pos），用來試「載入更多」與 3000 行上限
 // &bigtree：檔案樹超過懶載入門檻（#642）
-const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
+// mock 只在 ?mock 時才載入（38 KB，正式環境用不到，#757 E-F11）
+const mock = mockN ? (await import("./mock-feed.js")).installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));
@@ -2010,7 +2033,8 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; notifier.connected(); loadSessions(); render(true); },
+    // 重連：斷線前送出的 ack 不知道有沒有到，待確認的全部解除，由新的 snapshot 決定哪些還在（#747 F-2）
+    welcome: (m) => { ui.welcome = m; ackPending.clear(); notifier.connected(); loadSessions(); render(true); },
     snapshot: (m) => {
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
@@ -2049,7 +2073,10 @@ const client = createClient({
       }
       render();
     },
-    more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
+    more: (m) => {
+      const req = paneMoreReq ?? paneMoreLate;
+      return req && m.session === req.session && m.beforePos === req.beforePos && pane.session === req.session ? onPaneMore(m) : onMore(m);
+    },
     onStatus: (s) => {
       if (ui.conn !== "incompatible") ui.conn = s;
       // WS 握手被 401 拒絕（cookie 過期、金鑰被撤銷）在瀏覽器只看得到斷線：用一個 API 請求確認，是就導去登入

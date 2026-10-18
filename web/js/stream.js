@@ -4,7 +4,7 @@
 // - 超過上限從最舊的丟；往上「載入更多」時暫時保留（holding），回到底部再 trim。
 // - 篩選只影響可見性，不改順序。
 
-import { countHunk } from "./changes.js";
+import { editCounts } from "./changes.js";
 
 export const CAP = 3000;
 
@@ -63,6 +63,8 @@ export function createStream({ cap = CAP } = {}) {
     const r = cardRow.get(id);
     if (r) {
       r.v++;
+      // 展開中的行內容變了（例如結果到了）：高度要重量，否則下面的行會疊上來（#747 F-1）
+      if (r.expanded) r.h = 0;
       ops.updated.add(r.key);
     } else if (st.staged.has(id)) {
       ops.stagedChanged = true;
@@ -124,7 +126,7 @@ export function createStream({ cap = CAP } = {}) {
         touch(id, ops);
         break;
       case "file.edit":
-        card(id, ev).edit = { path: p.path, ...countHunk(p.hunk?.lines) };
+        card(id, ev).edit = { path: p.path, ...editCounts(p) };
         touch(id, ops);
         break;
       case "file.write":
@@ -215,8 +217,10 @@ export function createStream({ cap = CAP } = {}) {
     if (out.stagedChanged) ops.stagedChanged = true;
     st.rows.push(...out);
     ops.appended = out.length;
-    if (!st.holding && st.rows.length > st.cap) {
-      ops.droppedRows = dropFront(st.rows.length - st.cap);
+    // 停在上方（holding，看載入更多的內容）時放寬到 3 倍，但不能沒有上限：開著不動也會一直長（#766 F-4）
+    const limit = st.holding ? st.cap * 3 : st.cap;
+    if (st.rows.length > limit) {
+      ops.droppedRows = dropFront(st.rows.length - limit);
       ops.dropped = ops.droppedRows.length;
     }
     return ops;

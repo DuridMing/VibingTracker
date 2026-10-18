@@ -17,14 +17,21 @@ export function countHunk(lines) {
   return { added, removed };
 }
 
+// file.edit 的 +／−：遠端剝除（lines 是空的）、截斷（lines 不完整）、多處取代（沒有 hunk）時數不出來，
+// countsKnown=false、countLabel 寫原因，畫面顯示原因而不是 +0 −0（#734 C8、#744 C7、#745 D7）
+export function editCounts(p) {
+  const label = p?.redacted ? "敏感" : p?.replaceAll ? "多處取代" : p?.truncated ? "已截斷" : null;
+  return { ...countHunk(p?.hunk?.lines), countsKnown: label == null, countLabel: label };
+}
+
 function entryOf(ev) {
   const p = ev.payload ?? {};
   const base = { key: `${ev.session}:${ev.seq}`, session: ev.session, agent: ev.agent, ts: ev.ts_seen, toolUseId: p.toolUseId, path: p.path ?? "" };
   if (ev.type === "file.edit") {
-    return { ...base, kind: "edit", hunk: p.hunk ?? null, hunkSource: p.hunkSource ?? "none", ...countHunk(p.hunk?.lines) };
+    return { ...base, kind: "edit", hunk: p.hunk ?? null, hunkSource: p.hunkSource ?? "none", redacted: !!p.redacted, replaceAll: !!p.replaceAll, truncated: !!p.truncated, ...editCounts(p) };
   }
   if (ev.type === "file.write") {
-    return { ...base, kind: "write", isNew: !!p.isNew, content: p.content ?? "", truncated: !!p.truncated };
+    return { ...base, kind: "write", isNew: !!p.isNew, content: p.content ?? "", truncated: !!p.truncated, redacted: !!p.redacted };
   }
   return null;
 }
@@ -124,9 +131,12 @@ export function createChanges({ cap = CAP } = {}) {
 }
 
 // unified diff 的行：雙行號。hunk 的 start 同時是舊檔與新檔的起始行（hunk 前面的行沒有變）。
-export function diffRows(hunk, hunkSource = "none") {
+const REDACTED_NOTE = "敏感檔案（例如 .env）：遠端連線不顯示內容，請在本機看";
+
+export function diffRows(hunk, hunkSource = "none", { redacted = false, replaceAll = false, truncated = false } = {}) {
+  if (redacted && !hunk?.lines?.length) return [...(hunk ? [{ type: "hunk", text: `@@ -${hunk.start},${hunk.oldLines} +${hunk.start},${hunk.newLines} @@` }] : []), { type: "note", text: REDACTED_NOTE }];
   if (!hunk) {
-    const why = hunkSource === "none" ? "檔案太大或讀不到，沒有 diff" : "沒有 diff";
+    const why = replaceAll ? "多處取代（replace_all）：每一處都改了，不畫 diff" : hunkSource === "none" ? "檔案太大或讀不到，沒有 diff" : "沒有 diff";
     return [{ type: "note", text: why }];
   }
   const rows = [{ type: "hunk", text: `@@ -${hunk.start},${hunk.oldLines} +${hunk.start},${hunk.newLines} @@` }];
@@ -139,11 +149,13 @@ export function diffRows(hunk, hunkSource = "none") {
     else if (mark === "-") rows.push({ type: "del", old: o++, new: null, text });
     else rows.push({ type: "ctx", old: o++, new: n++, text });
   }
+  if (truncated) rows.push({ type: "note", text: "…diff 超過 8 KB，後面省略，全文在 transcript" });
   return rows;
 }
 
 // Write 全文（collector 已截 200 行）
-export function writeRows(content, truncated) {
+export function writeRows(content, truncated, redacted = false) {
+  if (redacted) return [{ type: "note", text: REDACTED_NOTE }];
   const lines = String(content ?? "").replace(/\n$/, "").split("\n");
   const rows = lines.map((text, i) => ({ type: "line", new: i + 1, text }));
   if (truncated) rows.push({ type: "note", text: "…只顯示前 200 行，全文在 transcript" });

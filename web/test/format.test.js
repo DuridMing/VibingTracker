@@ -175,3 +175,17 @@ test("Write／Edit 的計數一律當數字：hub 原樣轉送上游的 JSON，�
   const e = formatRow(tool({ tool: "Edit", input: { file_path: "a.ts" }, edit: { added: evil, removed: evil } })).html;
   assert.doesNotMatch(e, /<img/);
 });
+
+test("PowerShell 和 Bash 一樣是指令型工具：$ 指令、git 標記、展開看指令與輸出（#763、contracts §4 指令型工具）", () => {
+  const ps = formatRow(tool({ tool: "PowerShell", input: { command: "git commit -m x" }, git: { op: "commit", hash: "abc1234" } }));
+  assert.match(ps.html, /<span class="p">\$<\/span> <span class="c">git commit -m x<\/span>/);
+  assert.match(ps.html, /⎇ commit abc1234/);
+  const out = formatRow(tool({ tool: "PowerShell", input: { command: "Get-ChildItem" }, result: { ok: true, exitCode: 0, output: "a\nb" } }));
+  assert.equal(out.detail, "$ Get-ChildItem\na\nb");
+});
+
+test("不知道 +／− 的 Edit（遠端剝除、多處取代）在卡片上標原因，不寫 +0 −0", () => {
+  const f = formatRow(tool({ tool: "Edit", input: { file_path: ".env" }, edit: { path: ".env", added: 0, removed: 0, countsKnown: false, countLabel: "敏感" } })).html;
+  assert.doesNotMatch(f, /\+0/);
+  assert.match(f, /敏感/);
+});

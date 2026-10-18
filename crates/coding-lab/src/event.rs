@@ -124,7 +124,8 @@ macro_rules! payloads {
         impl Payload {
             pub fn parse(kind: &str, v: &Value) -> Result<Option<Payload>, serde_json::Error> {
                 Ok(Some(match kind {
-                    $($name => Payload::$variant(serde_json::from_value(v.clone())?),)*
+                    // `&Value` 本身就能反序列化，不必先 clone 整棵 payload（E-M6）
+                    $($name => Payload::$variant(<$ty as serde::Deserialize>::deserialize(v)?),)*
                     _ => return Ok(None),
                 }))
             }
@@ -383,6 +384,9 @@ pub struct FileEdit {
     pub path: String,
     pub hunk: Option<Hunk>,
     pub hunk_source: HunkSource,
+    /// hunk.lines 合計超過 8 KB，放不下的行丟掉、最後一行截在字元邊界（C7、#744）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
     /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,

@@ -1,7 +1,7 @@
 //! 敏感輸出（#654）：讀 `.env`、金鑰、憑證設定這類工具的輸出標 `sensitive`，WS／API 對遠端連線一律剝除
 //! （不變式 6、contracts §4）。只影響送出的副本，本機 JSONL 照存（截 8 KB）。
 //!
-//! 判斷只看路徑與指令，不看輸出內容：檔案工具看 `file_path`／`path`／`notebook_path`；Bash 依 `&&`／`|` 等切段，
+//! 判斷只看路徑與指令，不看輸出內容：檔案工具看 `file_path`／`path`／`notebook_path`；指令型工具（Bash、PowerShell）依 `&&`／`|` 等切段，
 //! 任何一段的參數是敏感路徑、或是 `printenv`／單獨的 `env`／`export -p`（把整個環境印出來）就算。
 
 use std::sync::OnceLock;
@@ -9,7 +9,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::derive::shell_segments;
+use crate::derive::{normalize_command, shell_segments};
+use crate::event::is_command_tool;
 
 /// 檔名（basename）規則；`.env` 的範本（example／sample／template／dist）不算。
 const NAME_PATTERNS: &[&str] = &[
@@ -57,7 +58,9 @@ pub fn is_sensitive_path(path: &str) -> bool {
 /// 這個工具呼叫的輸出會不會含機密。
 pub fn is_sensitive(tool: &str, input: &Value) -> bool {
     match tool {
-        "Bash" => input["command"].as_str().is_some_and(command_is_sensitive),
+        t if is_command_tool(t) => input["command"]
+            .as_str()
+            .is_some_and(|c| command_is_sensitive(t, &normalize_command(t, c))),
         // Glob 只回檔名，不回內容
         "Glob" => false,
         _ => ["file_path", "path", "notebook_path"]
@@ -67,7 +70,24 @@ pub fn is_sensitive(tool: &str, input: &Value) -> bool {
     }
 }
 
-fn command_is_sensitive(command: &str) -> bool {
+/// PowerShell 讀環境變數磁碟機（`Get-ChildItem env:`、`Get-Content env:X`）的指令
+const PS_ENV_READERS: &[&str] = &[
+    "get-childitem",
+    "gci",
+    "dir",
+    "ls",
+    "get-item",
+    "gi",
+    "get-content",
+    "gc",
+    "cat",
+    "type",
+];
+
+fn command_is_sensitive(tool: &str, command: &str) -> bool {
+    if tool == "PowerShell" && powershell_dumps_env(command) {
+        return true;
+    }
     shell_segments(command).iter().any(|seg| {
         // 去掉 sudo 前綴
         let words: Vec<&str> = seg
@@ -80,6 +100,25 @@ fn command_is_sensitive(command: &str) -> bool {
             _ => words.iter().skip(1).any(|w| is_sensitive_path(w)),
         }
     })
+}
+
+/// PowerShell 把環境變數印出來：列舉或讀 `env:` 磁碟機、單獨一個 `$env:X` 運算式（印出值）、
+/// `[Environment]::GetEnvironmentVariables()`。
+fn powershell_dumps_env(command: &str) -> bool {
+    let lower = command.to_lowercase();
+    if lower.contains("environment]::getenvironmentvariables") {
+        return true;
+    }
+    shell_segments(&lower)
+        .iter()
+        .any(|seg| match seg.as_slice() {
+            [only] => only.starts_with("$env:"),
+            [first, rest @ ..] => {
+                PS_ENV_READERS.contains(&first.as_str())
+                    && rest.iter().any(|w| w.starts_with("env:"))
+            }
+            [] => false,
+        })
 }
 
 /// 遠端連線送出前剝除：所有 `sensitive` 的 `tool.result` 把 `output` 換成 `""`、加 `redacted: true`。

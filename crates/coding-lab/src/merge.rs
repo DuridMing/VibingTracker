@@ -12,9 +12,9 @@ use crate::derive;
 use crate::event::{
     AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
-    FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
-    SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped, Usage,
+    FileRead, FileWrite, Hunk, HunkSource, LineRef, ModelChanged, Payload, Placement,
+    PromptSubmitted, SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus,
+    ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
@@ -992,9 +992,9 @@ impl Merger {
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
-                let output = response_text(h.field("tool_response"));
-                out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                let output = || response_text(h.field("tool_response"), OUTPUT_LIMIT);
+                out.extend(self.result_once(&sid, &id, true, None, output, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta));
                 // Agent／Task 的結果帶 agentId（背景 agent 啟動時、前景 agent 結束時）：subagent 對應哪個呼叫（#680）
                 if matches!(h.str_field("tool_name"), Some("Agent" | "Task"))
                     && let Some(a) = h
@@ -1022,8 +1022,12 @@ impl Merger {
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let code = exit_code(&error);
-                out.extend(self.result_once(&sid, &id, false, code, &error, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, None, false, meta()));
+                let output = || {
+                    let (kept, cut) = text::truncate_bytes(&error, OUTPUT_LIMIT);
+                    (kept.to_string(), cut)
+                };
+                out.extend(self.result_once(&sid, &id, false, code, output, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, None, false, meta));
                 let interrupt = h.field("is_interrupt").and_then(Value::as_bool) == Some(true);
                 let ok = (!interrupt).then_some(false);
                 out.extend(self.tool_ended(h, &sid, &id, &agent, ok, ts_seen));
@@ -1103,10 +1107,9 @@ impl Merger {
                 out.extend(self.finish_agent(&sid, p, meta()));
             }
             "PermissionRequest" => {
-                let tool = h.str_field("tool_name").unwrap_or_default().to_string();
-                let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
-                self.tracker(&sid)
-                    .permission_request(&tool, &input, ts_seen);
+                let tool = h.str_field("tool_name").unwrap_or_default();
+                let input = h.field("tool_input").unwrap_or(&Value::Null);
+                self.tracker(&sid).permission_request(tool, input, ts_seen);
             }
             "PostToolBatch" => {
                 let changes = self.tracker(&sid).batch_done(&agent, ts_seen);
@@ -1291,7 +1294,9 @@ impl Merger {
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
         match (ok, h.str_field("tool_name")) {
-            (Some(ok), Some("Bash")) => changes.extend(t.bash_result(agent, id, ok, ts_seen)),
+            (Some(ok), Some(tool)) if is_command_tool(tool) => {
+                changes.extend(t.bash_result(agent, id, ok, ts_seen))
+            }
             // subagent 失敗（#674）：Agent／Task 工具失敗；Esc 中斷（ok 為 None）不算
             (Some(false), Some("Agent" | "Task")) => t.signal(Signal::SubagentFail, ts_seen),
             _ => {}
@@ -1398,13 +1403,13 @@ impl Merger {
             return Vec::new();
         };
         let tool = h.str_field("tool_name").unwrap_or_default().to_string();
-        let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
-        let danger = self.danger.check(&tool, &input);
-        let sensitive = crate::sensitive::is_sensitive(&tool, &input);
+        let input = h.field("tool_input").unwrap_or(&Value::Null);
+        let danger = self.danger.check(&tool, input);
+        let sensitive = crate::sensitive::is_sensitive(&tool, input);
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
-        session.status.tool_started(&id, &tool, &input, &agent);
+        session.status.tool_started(&id, &tool, input, &agent);
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {
@@ -1438,7 +1443,7 @@ impl Merger {
             session.staged.insert((ts_seen, id.clone()));
             // tool.called 的 input：每個超過 OUTPUT_LIMIT 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）。
             // Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
-            let (input, input_truncated) = text::truncated_clone(&input, OUTPUT_LIMIT);
+            let (input, input_truncated) = text::truncated_clone(input, OUTPUT_LIMIT);
             let p = ToolCalled {
                 tool_use_id: id.clone(),
                 tool,
@@ -1485,7 +1490,7 @@ impl Merger {
         ts_seen: u64,
     ) -> Vec<Event> {
         let tool = h.str_field("tool_name").unwrap_or_default();
-        let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
+        let input = h.field("tool_input").unwrap_or(&Value::Null);
         let meta = || Meta {
             agent: agent.to_string(),
             ts_seen,
@@ -1507,7 +1512,13 @@ impl Merger {
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
             "Edit" => path().map(|path| {
-                let hunk = h.probe().and_then(|p| p.hunk.clone());
+                let (hunk, truncated) = match h.probe().and_then(|p| p.hunk.as_ref()) {
+                    Some(hunk) => {
+                        let (hunk, cut) = bounded_hunk(hunk, OUTPUT_LIMIT);
+                        (Some(hunk), cut)
+                    }
+                    None => (None, false),
+                };
                 let hunk_source = if hunk.is_some() {
                     HunkSource::Pre
                 } else {
@@ -1519,6 +1530,7 @@ impl Merger {
                     hunk,
                     hunk_source,
                     sensitive,
+                    truncated,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1531,12 +1543,14 @@ impl Merger {
                 {
                     content.push('\n');
                 }
+                // 行數之外也限 bytes：一行就很大的檔（minified bundle）不能整份進 JSONL、live 與 snapshot（C7）
+                let cut = text::truncate_string(&mut content, OUTPUT_LIMIT);
                 Payload::FileWrite(FileWrite {
                     tool_use_id,
                     path,
                     is_new: !h.probe().is_some_and(|p| p.exists),
                     content,
-                    truncated: total > WRITE_PREVIEW_LINES,
+                    truncated: total > WRITE_PREVIEW_LINES || cut,
                     lines: Some(total as u64),
                     sensitive,
                 })
@@ -1591,22 +1605,31 @@ impl Merger {
         id: &str,
         response: Option<&Value>,
         ok: bool,
-        meta: Meta,
+        meta: impl FnOnce() -> Meta,
     ) -> Option<Event> {
-        if h.str_field("tool_name") != Some("Bash") {
-            return None;
-        }
+        let tool = h.str_field("tool_name").filter(|t| is_command_tool(t))?;
         let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
-        let mut op = derive::git_op_from(command, response, ok)?;
+        let mut op = derive::git_op_from(&derive::normalize_command(tool, command), response, ok)?;
         op.tool_use_id = id.to_string();
-        Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
+        // Meta（含 raw 的 clone）確定有 git 操作才建（E-M8）
+        Some(self.emit(
+            sid,
+            Payload::GitOp(op),
+            Meta {
+                raw: None,
+                ..meta()
+            },
+        ))
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1617,19 +1640,23 @@ impl Merger {
         id: &str,
         ok: bool,
         exit_code: Option<i32>,
-        output: &str,
+        output: impl FnOnce() -> (String, bool),
         agent: &str,
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         if card.result_sent {
             return None;
         }
         card.result_sent = true;
         let agent = card.agent.clone();
         let sensitive = card.sensitive;
-        let (output, truncated) = truncate(output, OUTPUT_LIMIT);
+        // 確定要送才組輸出，而且邊組邊截 8 KB：Edit／Read 的 tool_response 帶整個檔案（E-M1）
+        let (output, truncated) = output();
         let p = ToolResult {
             tool_use_id: id.to_string(),
             ok,
@@ -1727,7 +1754,7 @@ impl Merger {
         let changes = if agent == "main" && v["type"] == "assistant" && block["type"] == "text" {
             let r = Some(message_id.as_str())
                 .filter(|m| !m.is_empty())
-                .or(v["uuid"].as_str())
+                .or_else(|| v["uuid"].as_str())
                 .map_or_else(|| format!("line-{no}"), str::to_string);
             self.tracker(sid).assistant_text(&r, ts_seen)
         } else {
@@ -1770,7 +1797,10 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
+                        let card = s
+                            .cards
+                            .entry(id.clone())
+                            .or_insert_with(|| Card::new(&agent));
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
@@ -1796,14 +1826,13 @@ impl Merger {
                     return out;
                 };
                 let ok = !block["is_error"].as_bool().unwrap_or(false);
-                let output = content_text(&block["content"]);
                 let mut evs = Vec::new();
                 // 執行中按 Esc（或在權限詢問按 Esc）沒有任何 hook，tool_result 是唯一的結束訊號
                 if self.mark_finished(sid, id, &agent) {
                     let rejected = v["toolUseResult"].as_str() == Some(USER_REJECTED);
-                    let error = (!ok).then(|| {
-                        let why = v["toolUseResult"].as_str().unwrap_or(&output);
-                        truncate(why, MESSAGE_LIMIT).0
+                    let error = (!ok).then(|| match v["toolUseResult"].as_str() {
+                        Some(why) => truncate(why, MESSAGE_LIMIT).0,
+                        None => content_text(&block["content"], MESSAGE_LIMIT).0,
                     });
                     let p = ToolUpdated {
                         tool_use_id: id.to_string(),
@@ -1821,7 +1850,7 @@ impl Merger {
                         .sessions
                         .get(sid)
                         .and_then(|s| s.cards.get(id))
-                        .map_or(agent.clone(), |c| c.agent.clone());
+                        .map_or_else(|| agent.clone(), |c| c.agent.clone());
                     let m = Meta {
                         agent,
                         ts_seen,
@@ -1829,7 +1858,9 @@ impl Merger {
                     };
                     evs.push(self.emit(sid, Payload::ToolUpdated(p), m));
                 }
-                evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
+                // hook 永遠先到：結果通常已經送過，用到才組輸出（E-M2）
+                let output = || content_text(&block["content"], OUTPUT_LIMIT);
+                evs.extend(self.result_once(sid, id, ok, None, output, &agent, ts_seen));
                 // Esc 拒絕或中斷時這是唯一的結束訊號；只解除 wait／danger，不算失敗
                 if !ok {
                     self.drop_pending_agent(sid, id);
@@ -1874,32 +1905,79 @@ fn truncate(s: &str, max: usize) -> (String, bool) {
 }
 
 /// PostToolUse 的 `tool_response`：Bash 取 stdout（＋stderr），其他工具用精簡 JSON。
-fn response_text(v: Option<&Value>) -> String {
-    match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(r) if r.get("stdout").is_some() => {
-            let out = r["stdout"].as_str().unwrap_or_default();
-            match r["stderr"].as_str().filter(|e| !e.is_empty()) {
-                Some(err) => format!("{out}\n{err}"),
-                None => out.to_string(),
+/// hunk 的行合計不超過 `max` bytes：放不下的行丟掉、最後一行截在字元邊界；行號與 +／− 的行數不動，
+/// 改動紀錄的 +N／−M 照算（C7）。回傳是否有截。
+fn bounded_hunk(hunk: &Hunk, max: usize) -> (Hunk, bool) {
+    let mut room = max;
+    let mut lines = Vec::new();
+    let mut cut = false;
+    for l in &hunk.lines {
+        let (kept, c) = text::truncate_bytes(l, room);
+        if c {
+            if !kept.is_empty() {
+                lines.push(kept.to_string());
             }
+            cut = true;
+            break;
         }
-        Some(r) => r.to_string(),
+        room -= l.len();
+        lines.push(l.clone());
+    }
+    let out = Hunk {
+        lines,
+        start: hunk.start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    };
+    (out, cut)
+}
+
+/// 截到 `max` bytes 以內，回傳是否有截。
+fn response_text(v: Option<&Value>, max: usize) -> (String, bool) {
+    match v {
+        None | Some(Value::Null) => (String::new(), false),
+        Some(Value::String(s)) => {
+            let (kept, cut) = text::truncate_bytes(s, max);
+            (kept.to_string(), cut)
+        }
+        Some(r) if r.get("stdout").is_some() => {
+            let mut out = String::new();
+            let mut cut =
+                text::push_bounded(&mut out, r["stdout"].as_str().unwrap_or_default(), max);
+            if let Some(err) = r["stderr"].as_str().filter(|e| !e.is_empty()) {
+                cut = text::push_bounded(&mut out, "\n", max) || cut;
+                cut = text::push_bounded(&mut out, err, max) || cut;
+            }
+            (out, cut)
+        }
+        Some(r) => text::json_bounded(r, max),
     }
 }
 
 /// transcript tool_result 的 content：字串，或 `[{type: text, text}]`。
-fn content_text(v: &Value) -> String {
+/// 截到 `max` bytes 以內，回傳是否有截。
+fn content_text(v: &Value, max: usize) -> (String, bool) {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::String(s) => {
+            let (kept, cut) = text::truncate_bytes(s, max);
+            (kept.to_string(), cut)
+        }
+        Value::Array(parts) => {
+            let mut out = String::new();
+            let mut cut = false;
+            for (i, t) in parts.iter().filter_map(|p| p["text"].as_str()).enumerate() {
+                if i > 0 {
+                    cut = text::push_bounded(&mut out, "\n", max) || cut;
+                }
+                cut = text::push_bounded(&mut out, t, max) || cut;
+                if cut {
+                    break;
+                }
+            }
+            (out, cut)
+        }
+        Value::Null => (String::new(), false),
+        other => text::json_bounded(other, max),
     }
 }
 

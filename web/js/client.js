@@ -19,8 +19,11 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
 
   const status = (s) => handlers.onStatus?.(s);
   const isOpen = () => ws !== null && ws.readyState === 1;
+  // 回傳有沒有送出：沒連上時直接丟掉（重連後 snapshot 會帶最新狀態），呼叫端要知道（#747 F-2）
   const send = (msg) => {
-    if (isOpen()) ws.send(JSON.stringify(msg));
+    if (!isOpen()) return false;
+    ws.send(JSON.stringify(msg));
+    return true;
   };
 
   function connect() {
@@ -104,7 +107,7 @@ export function createClient({ url, WebSocket, setTimeout, clearTimeout, handler
       send({ op: "unsubscribe", channel });
     },
     ack({ session, kind, ref }) {
-      send({ op: "ack", session, kind, ref });
+      return send({ op: "ack", session, kind, ref });
     },
     more({ session, beforePos, limit }) {
       send({ op: "more", session, beforePos, limit: Math.min(limit, MORE_LIMIT_MAX) });

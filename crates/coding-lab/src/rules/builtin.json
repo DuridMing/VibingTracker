@@ -1,5 +1,5 @@
 {
-  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。tools 寫 \"@command\" 代表所有指令型工具（Bash、PowerShell）。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭）或 command（整條指令）。",
+  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。tools 寫 \"@command\" 代表所有指令型工具（Bash、PowerShell）與 cmd /c 裡的指令；\"cmd\" 只在 cmd /c、cmd.exe /c 裡比對。PowerShell 的反引號跳脫先去掉、反斜線換成 /，再比對。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭）或 command（整條指令）。",
   "rules": [
     {
       "id": "rm-rf-build",
@@ -22,7 +22,7 @@
     {
       "id": "git-push-force",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*push\\b.*\\s(-f|--force)(\\s|$)",
       "level": "danger",
@@ -31,7 +31,7 @@
     {
       "id": "git-reset-hard",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*reset\\b.*\\s--hard(\\s|$)",
       "level": "danger",
@@ -40,7 +40,7 @@
     {
       "id": "git-clean-f",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*clean\\b.*\\s-[a-zA-Z]*f",
       "level": "danger",
@@ -49,7 +49,7 @@
     {
       "id": "sql-drop",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "(?i)\\bdrop\\s+(table|database|schema)\\b",
       "level": "danger",
@@ -58,7 +58,7 @@
     {
       "id": "sql-truncate",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "(?i)\\btruncate\\s+(table\\s+)?[a-z_\\\"`]",
       "level": "danger",
@@ -86,7 +86,7 @@
     {
       "id": "package-publish",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "^(npm|pnpm|yarn|cargo)\\s+publish\\b",
       "level": "danger",
@@ -95,11 +95,49 @@
     {
       "id": "container-rm-f",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "^(docker|podman)\\s+(container\\s+)?rm\\b.*\\s-[a-zA-Z]*f",
       "level": "danger",
       "why": "強制移除執行中的容器"
+    },
+    {
+      "id": "ps-remove-recurse-force",
+      "tools": [
+        "PowerShell"
+      ],
+      "pattern": "(?i)^(?:remove-item|ri|rm|del|erase|rd|rmdir)\\s(?:.*\\s)?(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\\$true)?\\s(?:.*\\s)?-fo(?:r(?:c(?:e)?)?)?(?::\\$true)?(?:\\s|$)|-fo(?:r(?:c(?:e)?)?)?(?::\\$true)?\\s(?:.*\\s)?-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\\$true)?(?:\\s|$))",
+      "level": "danger",
+      "why": "遞迴強制刪除（-Recurse -Force），刪錯無法復原"
+    },
+    {
+      "id": "cmd-rd-s-q",
+      "tools": [
+        "cmd",
+        "PowerShell"
+      ],
+      "pattern": "(?i)^(?:rd|rmdir)\\s(?:.*\\s)?(?:/s\\s(?:.*\\s)?/q|/q\\s(?:.*\\s)?/s)(?:\\s|$)",
+      "level": "danger",
+      "why": "遞迴刪除整個目錄且不詢問（/s /q）"
+    },
+    {
+      "id": "cmd-del-s-q",
+      "tools": [
+        "cmd"
+      ],
+      "pattern": "(?i)^(?:del|erase)\\s(?:.*\\s)?(?:/s\\s(?:.*\\s)?/q|/q\\s(?:.*\\s)?/s)(?:\\s|$)",
+      "level": "danger",
+      "why": "遞迴刪除子目錄裡的檔案且不詢問（/s /q）"
+    },
+    {
+      "id": "ps-download-exec",
+      "tools": [
+        "PowerShell"
+      ],
+      "scope": "command",
+      "pattern": "(?i)(?:\\b(?:iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod)\\b[^|]*\\|\\s*(?:iex|invoke-expression)\\b|\\b(?:iex|invoke-expression)\\b\\s*\\(+\\s*(?:iwr|irm|invoke-webrequest|invoke-restmethod|new-object\\s+(?:system\\.)?net\\.webclient)\\b)",
+      "level": "danger",
+      "why": "下載後直接執行（Invoke-Expression），內容沒有經過檢查"
     },
     {
       "id": "sudo",
@@ -113,7 +151,7 @@
     {
       "id": "env-file-bash",
       "tools": [
-        "Bash"
+        "@command"
       ],
       "pattern": "(^|[\\s/])\\.env(\\.(local|dev|development|prod|production|staging|test))?(\\s|$)",
       "level": "warn",
