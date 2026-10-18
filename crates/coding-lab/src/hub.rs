@@ -1135,6 +1135,10 @@ async fn resolve_owner(state: &HubState, sid: &str) -> Option<String> {
     None
 }
 
+/// `/api/sessions` 合併後的預設與最大筆數（同 collector 的 `/api/sessions`）
+const SESSIONS_DEFAULT: usize = 100;
+const SESSIONS_MAX: usize = 1000;
+
 /// 擁有這個目錄的上游（C13）：先看 live 快取與記下的對照；都沒有就逐台問上線的上游
 /// `/api/sessions?cwd=<目錄>&limit=1`，有列的那台就是，記下來。已結束、被移出 live 的專案（回放舊的工作）靠這個找到。
 async fn resolve_cwd_owner(state: &HubState, cwd: &str) -> Option<String> {
@@ -1416,19 +1420,23 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
             None => state.ups.iter().collect(),
         };
         let online = state.hub().online();
+        // 並行問各台（E-H7）：某台卡住時不用一台一台等到逾時
+        let pq = pq.as_str();
+        let asks = targets
+            .into_iter()
+            .filter(|u| online.iter().any(|(n, on)| *n == u.up.name && *on))
+            .map(|u| async move { (u, http_get(&u.up.url, pq, u.up.key.as_deref()).await) });
         let mut rows = Vec::new();
-        for u in targets {
-            if !online.iter().any(|(n, on)| *n == u.up.name && *on) {
-                continue;
-            }
-            match http_get(&u.up.url, &pq, u.up.key.as_deref()).await {
+        for (u, res) in futures_util::future::join_all(asks).await {
+            match res {
                 Ok(r) if r.status == 200 => {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&r.body) {
-                        for s in v["sessions"].as_array().into_iter().flatten() {
+                    if let Ok(mut v) = serde_json::from_slice::<Value>(&r.body)
+                        && let Value::Array(list) = v["sessions"].take()
+                    {
+                        for mut s in list {
                             if let Some(id) = s["id"].as_str() {
                                 state.remember(id, &u.up.name);
                             }
-                            let mut s = s.clone();
                             set_host(&mut s, &u.up.name);
                             rows.push(s);
                         }
@@ -1440,7 +1448,20 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
                 }
             }
         }
-        rows.sort_by_key(|s| std::cmp::Reverse(s["startedAt"].as_u64().unwrap_or(0)));
+        // 依開始時間由新到舊（同時間依 host、id，結果穩定），合併後截到 limit：每台各給 limit 筆，合起來會超過
+        let key = |s: &Value| {
+            (
+                std::cmp::Reverse(s["startedAt"].as_u64().unwrap_or(0)),
+                s["host"].as_str().unwrap_or_default().to_string(),
+                s["id"].as_str().unwrap_or_default().to_string(),
+            )
+        };
+        rows.sort_by_cached_key(key);
+        let limit = query_param(&uri, "limit")
+            .and_then(|l| l.parse::<usize>().ok())
+            .unwrap_or(SESSIONS_DEFAULT)
+            .clamp(1, SESSIONS_MAX);
+        rows.truncate(limit);
         return json_response(StatusCode::OK, &json!({ "sessions": rows }));
     }
     let owner = if let Some(rest) = path.strip_prefix("/api/sessions/") {

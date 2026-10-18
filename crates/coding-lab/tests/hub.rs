@@ -1107,3 +1107,88 @@ fn chunked_parser_rejects_truncated_and_huge_chunks_without_panicking() {
         assert!(matches!(r, Ok(Err(_))), "{body:?}：要回 Err、不能 panic");
     }
 }
+
+/// 每條新連線先等 `delay` 再接到 `to` 的 TCP 代理（模擬回應慢的上游）。
+async fn slow_proxy(to: SocketAddr, delay: Duration) -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = l.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut out) = TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// E-H7（#756）：hub 的 /api/sessions 並行問各台（不是一台一台等），合併排序後截到 limit。
+#[tokio::test]
+async fn hub_sessions_asks_upstreams_in_parallel_and_respects_limit() {
+    let mk = |name: &str, ids: &[&str]| {
+        let evs: Vec<Event> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| started(id, 1, 1000 + i as u64, &format!("/{name}")))
+            .collect();
+        let mut s = Store::open(&tmp(name)).unwrap();
+        for e in &evs {
+            s.append(e.clone());
+        }
+        s.flush().unwrap();
+        let web = WebState::new(Some(Arc::new(Mutex::new(s))), None, 64);
+        web.apply(&evs);
+        web.flush(2000);
+        web
+    };
+    let (a, b) = (mk("pa", &["a1", "a2", "a3"]), mk("pb", &["b1", "b2", "b3"]));
+    let delay = Duration::from_millis(800);
+    let addr_a = slow_proxy(upstream(&a).await, delay).await;
+    let addr_b = slow_proxy(upstream(&b).await, delay).await;
+    let ups = vec![
+        Upstream {
+            name: "alpha".into(),
+            url: format!("http://{addr_a}"),
+            key: None,
+        },
+        Upstream {
+            name: "beta".into(),
+            url: format!("http://{addr_b}"),
+            key: None,
+        },
+    ];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let (_, h) = http_get(hub_addr, "/healthz").await;
+        if h["upstreams"]
+            .as_array()
+            .is_some_and(|u| u.iter().all(|x| x["online"] == true))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 每台的每個請求都慢 0.8 秒：依序問要 1.6 秒以上，並行約 0.8 秒
+    let t = std::time::Instant::now();
+    let (st, body) = http_get(hub_addr, "/api/sessions?limit=4").await;
+    let took = t.elapsed();
+    assert_eq!(st, 200, "{body}");
+    assert!(took < Duration::from_millis(1400), "逐台等待：{took:?}");
+    let ids: Vec<&str> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "合併後截到 limit：{ids:?}");
+    assert_eq!(
+        &ids[..2],
+        ["a3", "b3"],
+        "依開始時間由新到舊，同時間依 host：{ids:?}"
+    );
+}
