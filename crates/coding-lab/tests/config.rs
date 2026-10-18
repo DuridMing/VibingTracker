@@ -290,7 +290,7 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
     let many = resolve(
         Overrides::default(),
         &[],
-        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.77.241:4801\"]\n"),
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.1.5:4801\"]\n"),
     )
     .unwrap();
     assert_eq!(
@@ -303,7 +303,7 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
             .iter()
             .map(|a| a.to_string())
             .collect::<Vec<_>>(),
-        ["127.0.0.1:4801", "192.168.77.241:4801"]
+        ["127.0.0.1:4801", "192.168.1.5:4801"]
     );
 
     let env = resolve(

@@ -142,8 +142,8 @@ fn redact_remote_blanks_sensitive_results_anywhere_in_a_frame() {
 /// #720：遠端送出的副本裡，這個系統自己發的金鑰（`clk_<8 碼>_<43 碼>`）不論出現在哪個字串欄位都只留 id。
 #[test]
 fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
-    let k1 = "clk_HWYrRkbl_ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
-    let k2 = "clk_xka2cp5X_BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD";
+    let k1 = "clk_TestKey1_FakeSecretForTestsOnly000000000000000000000";
+    let k2 = "clk_TestKey2_AnotherFakeSecretForTests111111111111111111";
     let mut v = json!({
         "events": [
             {"type": "assistant.text", "payload": {"text": format!("金鑰是 {k1}，另一把 {k2}。")}},
@@ -159,23 +159,23 @@ fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
     redact_keys(&mut v);
     let text = v.to_string();
     assert!(
-        !text.contains("ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8"),
+        !text.contains("FakeSecretForTestsOnly000000000000000000000"),
         "{text}"
     );
     assert!(
-        !text.contains("BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD"),
+        !text.contains("AnotherFakeSecretForTests111111111111111111"),
         "{text}"
     );
     assert_eq!(
         v["events"][0]["payload"]["text"],
-        "金鑰是 clk_HWYrRkbl_…，另一把 clk_xka2cp5X_…。"
+        "金鑰是 clk_TestKey1_…，另一把 clk_TestKey2_…。"
     );
     assert_eq!(
         v["events"][1]["payload"]["input"]["command"],
-        "curl -H 'Authorization: Bearer clk_HWYrRkbl_…' http://x"
+        "curl -H 'Authorization: Bearer clk_TestKey1_…' http://x"
     );
-    assert_eq!(v["rows"]["agents"][0]["current"], "clk_xka2cp5X_…");
-    assert_eq!(v["rows"]["sessions"][0]["doing"], "正在貼 clk_HWYrRkbl_…");
+    assert_eq!(v["rows"]["agents"][0]["current"], "clk_TestKey2_…");
+    assert_eq!(v["rows"]["sessions"][0]["doing"], "正在貼 clk_TestKey1_…");
     assert_eq!(
         v["keep"][0],
         "clk_abc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

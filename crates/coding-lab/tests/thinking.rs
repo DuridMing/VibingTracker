@@ -361,8 +361,8 @@ async fn rest_events_to_remote_are_deferred_like_ws() {
 /// #720：遠端的 WS、REST events、thinking API 都不能露出 clk_ 金鑰的 secret；本機照常。
 #[tokio::test]
 async fn remote_copies_mask_clk_keys_but_local_keeps_them() {
-    let key = "clk_HWYrRkbl_ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
-    let secret = "ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
+    let key = "clk_TestKey1_FakeSecretForTestsOnly000000000000000000000";
+    let secret = "FakeSecretForTestsOnly000000000000000000000";
     let evs = vec![
         ev(
             "s1",
@@ -413,7 +413,7 @@ async fn remote_copies_mask_clk_keys_but_local_keeps_them() {
             if remote {
                 assert!(!text.contains(secret), "遠端 {what} 不能有 secret：{text}");
                 assert!(
-                    text.contains("clk_HWYrRkbl_…"),
+                    text.contains("clk_TestKey1_…"),
                     "遠端 {what} 要留 id：{text}"
                 );
             } else {

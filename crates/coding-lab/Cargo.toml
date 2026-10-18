@@ -5,15 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-
-# 二進位拆分（PLAN「網路綁定、部署形態、二進位拆分」）：發佈出 core（預設）與 full 兩種。
-# hub、tls、notify、summary 還沒做；做出來時各自是一個 feature，掛進 full。
-[features]
-default = ["collector"]
-collector = []
-full = ["collector"]
+repository.workspace = true
+rust-version.workspace = true
 
 [package.metadata.dist]
+# publish = false 的 crate 預設不發佈，要明講（#733 R-1：不然 `dist plan` 說沒有東西可以發佈）
+dist = true
 # 前端不內嵌：web/ 跟二進位放進同一個壓縮檔，collector 預設用二進位旁邊的 web/（config::bundled_web）
 include = ["../../web"]
 
@@ -29,12 +26,17 @@ regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = "0.11.1"
-# Windows 子程序（schtasks）的輸出是 OEM code page（cp950 等），要解成可讀文字（#724）
-encoding_rs = "0.8.42"
+# 0.10 與 axum 的 sha1 共用 digest 0.10，不重複編兩版（#772）
+sha2 = "0.10"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
-tokio-tungstenite = "0.30.0"
+# 跟 axum 0.8 的 ws 用同一版，不重複編兩版（#772）
+tokio-tungstenite = "0.29.0"
 toml = "1.1.8"
+
+# Windows 子程序（schtasks）的輸出是 OEM code page（cp950 等），要解成可讀文字（#724）；
+# 其他平台用不到，只在 Windows 編（#758 E-B9：Windows 二進位大小不變，Linux／macOS 少編一個 crate）
+[target.'cfg(windows)'.dependencies]
+encoding_rs = "0.8.42"
 
 [dev-dependencies]
 

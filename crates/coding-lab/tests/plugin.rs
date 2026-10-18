@@ -85,8 +85,10 @@ fn http_hooks_post_to_the_loopback_hook_port_with_a_short_timeout() {
         assert_eq!(h["type"], "http", "{event}");
         assert_eq!(h["url"], url.as_str(), "{event}");
         let t = h["timeout"].as_u64().unwrap_or(600);
+        // collector 沒在跑時每個 hook 都等到逾時（Windows 連沒在聽的埠約 2 秒才回拒絕，#776 EW7）；
+        // 單位是秒、文件沒說收不收小數，所以用整數 1
         assert!(
-            t <= 2,
+            t <= 1,
             "{event}：collector 沒跑時不能拖慢 Claude Code（timeout {t}）"
         );
         assert!(h.get("headers").is_none(), "{event}：hook 入口不驗金鑰");
@@ -138,6 +140,7 @@ fn wrapper(envs: &[(&str, &Path)]) -> std::process::Output {
         .env_remove("CODING_LAB_BIN")
         .env("CODING_LAB_HOME", &home)
         .env("PATH", "/usr/bin:/bin") // PATH 上沒有 coding-lab
+        .env("CODING_LAB_RELEASE_URL", "") // 空字串＝不自動下載（預設會連 GitHub）
         .stdin(Stdio::null());
     for (k, v) in envs {
         c.env(k, v);
@@ -156,6 +159,19 @@ fn wrapper_without_a_binary_exits_zero_and_prints_instructions_to_stderr() {
         err.contains("coding-lab") && err.contains("cargo install"),
         "{err}"
     );
+    // cargo install 只裝二進位，沒有 web/：提示要說怎麼放（#733 R-13）
+    assert!(err.contains("web/"), "{err}");
+}
+
+/// wrapper 寫死的版號要和 crate、plugin.json 一致：預設 Release URL 與版本比對都靠它（#733 R-3、R-4）
+#[test]
+fn wrapper_version_matches_the_crate() {
+    let text = std::fs::read_to_string(plugin_dir().join("bin/coding-lab")).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("VERSION="))
+        .expect("wrapper 要有 VERSION=");
+    assert_eq!(line, format!("VERSION={}", env!("CARGO_PKG_VERSION")));
 }
 
 #[cfg(unix)]
@@ -201,6 +217,79 @@ fn wrapper_runs_the_binary_and_keeps_stdout_empty() {
         dir.join("args").exists(),
         "要用 $CODING_LAB_HOME/bin 的二進位"
     );
+}
+
+/// ensure 不在 wrapper 讀 payload，stdin 直接交給二進位（#776 EW1）：二進位拿得到 SessionStart 的 payload；
+/// 呼叫端的 stdin 一直沒關（終端機直接跑 `sh <wrapper> ensure`，R-9）時 wrapper 也不會卡在讀 stdin。
+#[cfg(unix)]
+#[test]
+fn wrapper_hands_stdin_to_the_binary_and_never_waits_for_it() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("plugin-stdin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // 讀 stdin 的假二進位：payload 寫進檔案
+    let reader = dir.join("reader");
+    std::fs::write(
+        &reader,
+        format!("#!/bin/sh\ncat > '{}/payload'\n", dir.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&reader, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(plugin_dir().join("bin/coding-lab"))
+        .arg("ensure")
+        .env("CODING_LAB_BIN", &reader)
+        .env("CODING_LAB_HOME", &home)
+        .env("CODING_LAB_RELEASE_URL", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"SessionStart"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("payload")).unwrap(),
+        r#"{"hook_event_name":"SessionStart"}"#
+    );
+
+    // 不讀 stdin 的假二進位，stdin 一直開著：wrapper 要跟著二進位馬上結束
+    let quick = dir.join("quick");
+    std::fs::write(&quick, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(plugin_dir().join("bin/coding-lab"))
+        .arg("ensure")
+        .env("CODING_LAB_BIN", &quick)
+        .env("CODING_LAB_HOME", &home)
+        .env("CODING_LAB_RELEASE_URL", "")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _keep_open = child.stdin.take();
+    let started = Instant::now();
+    let done = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            break None;
+        }
+        std::thread::yield_now();
+    };
+    if done.is_none() {
+        let _ = child.kill();
+    }
+    assert!(done.is_some_and(|s| s.success()), "wrapper 卡在讀 stdin");
 }
 
 // ── wrapper 下載二進位（#656）：第一次沒有二進位時，從 Release 下載對應平台的壓縮檔、校驗 sha256，
@@ -307,6 +396,15 @@ mod download {
             format!("{hex} *{name}.zip\n"),
         )
         .unwrap();
+    }
+
+    /// PATH 上的假 curl：把參數記到 $FAKE_CURL_LOG 後失敗（測試不連網路）。
+    fn stub_curl(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        exec(
+            &dir.join("curl"),
+            "#!/bin/sh\necho \"$@\" >> \"$FAKE_CURL_LOG\"\nexit 22\n",
+        );
     }
 
     /// 只有 wrapper 安裝時用得到的工具、**沒有 unzip** 的 PATH 目錄（模擬標準的 Git for Windows）。
@@ -582,6 +680,108 @@ mod download {
             .map(|d| d.flatten().map(|x| x.file_name()).collect())
             .unwrap_or_default();
         assert!(left.is_empty(), "留下了 {left:?}");
+    }
+
+    /// 沒設 CODING_LAB_RELEASE_URL 時，從 GitHub Release 下載**和 plugin 同版**的二進位（#733 R-3）
+    #[test]
+    fn install_defaults_to_the_github_release_of_the_plugin_version() {
+        let e = env("default-url");
+        stub_curl(&e.stubs);
+        let log = e.home.join("curl.log");
+        let out = Command::new(plugin_dir().join("bin/coding-lab"))
+            .arg("install")
+            .env_remove("CODING_LAB_BIN")
+            .env_remove("CODING_LAB_RELEASE_URL")
+            .env("CODING_LAB_HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("FAKE_UNAME_S", "Linux")
+            .env("FAKE_UNAME_M", "x86_64")
+            .env("FAKE_CURL_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stdout.is_empty());
+        let urls = std::fs::read_to_string(&log).unwrap_or_default();
+        let want = format!(
+            "https://github.com/DuridMing/VibingTracker/releases/download/v{}/coding-lab-x86_64-unknown-linux-gnu.tar.gz",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(urls.contains(&want), "{urls}");
+    }
+
+    /// 下載只接受 https（和測試用的 file://）：http 會被中間人換掉壓縮檔與 .sha256（#733 R-12）
+    #[test]
+    fn install_refuses_a_plain_http_release_url() {
+        let e = env("http");
+        stub_curl(&e.stubs);
+        let log = e.home.join("curl.log");
+        let out = Command::new(plugin_dir().join("bin/coding-lab"))
+            .arg("install")
+            .env_remove("CODING_LAB_BIN")
+            .env("CODING_LAB_RELEASE_URL", "http://example.invalid/rel")
+            .env("CODING_LAB_HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("FAKE_UNAME_S", "Linux")
+            .env("FAKE_UNAME_M", "x86_64")
+            .env("FAKE_CURL_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(!log.exists(), "不能用 http 下載");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("https"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// wrapper 裝的二進位版本落後 plugin 時，背景下載新版（這個 session 照用舊的）；同版不下載（#733 R-4）
+    #[test]
+    fn an_installed_binary_older_than_the_plugin_is_updated_in_the_background() {
+        let e = env("update");
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stamp = e.home.join("bin/coding-lab.version");
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            env!("CARGO_PKG_VERSION"),
+            "安裝時記下版本"
+        );
+
+        // 同版：照常執行、不下載
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("更新"));
+
+        // 舊版：這次照用舊的，同時在背景更新
+        std::fs::write(&stamp, "0.0.1\n").unwrap();
+        std::fs::remove_file(e.home.join("bin/ran")).unwrap();
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("更新"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(e.home.join("bin/ran").exists(), "這個 session 照用舊的");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(&stamp).unwrap_or_default().trim()
+            != env!("CARGO_PKG_VERSION")
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            env!("CARGO_PKG_VERSION"),
+            "背景更新沒有完成"
+        );
     }
 
     #[test]
