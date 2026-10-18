@@ -1783,3 +1783,94 @@ fn resumed_staged_card_falls_back_after_the_usual_wait() {
     assert_eq!(p.payload["placement"], "fallback");
     assert_eq!(p.pos, Some(pos + 1), "接著重啟前的位置");
 }
+
+/// C7（#744）：file.write 的預覽除了 200 行，也不超過 8 KB；一行 1.5 MB 的 bundle 不再整份進 JSONL、live 與 snapshot。
+#[test]
+fn write_preview_is_bounded_in_bytes_too() {
+    let mut m = merger();
+    let big = "x".repeat(1_500_000);
+    let w = m.handle(pre(
+        "w1",
+        "Write",
+        json!({"file_path": "/p/bundle.min.js", "content": big}),
+        1000,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    assert!(fw.payload["content"].as_str().unwrap().len() <= 8 * 1024);
+    assert_eq!(fw.payload["truncated"], true);
+    assert_eq!(fw.payload["lines"], 1, "全文行數照算");
+    // 多位元組字元不切壞
+    let wide = "中".repeat(10_000);
+    let w = m.handle(pre(
+        "w2",
+        "Write",
+        json!({"file_path": "/p/zh.txt", "content": wide}),
+        1100,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    let c = fw.payload["content"].as_str().unwrap();
+    assert!(c.len() <= 8 * 1024 && c.chars().all(|ch| ch == '中'));
+    // 小檔照舊
+    let w = m.handle(pre(
+        "w3",
+        "Write",
+        json!({"file_path": "/p/a.rs", "content": "fn a() {}\n"}),
+        1200,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    assert_eq!(fw.payload["content"], "fn a() {}\n");
+    assert_eq!(fw.payload["truncated"], false);
+}
+
+fn post_with(id: &str, tool: &str, response: Value, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "PostToolUse", "tool_name": tool,
+            "tool_use_id": id, "tool_response": response,
+        })),
+        ts_seen: ts,
+    }
+}
+
+/// E-M1：大的 tool_response（Edit 帶整個原檔、Read 帶全文）邊序列化邊截；結果和「整份序列化再截 8 KB」一樣。
+#[test]
+fn large_tool_response_is_cut_to_the_same_8_kb() {
+    let mut m = merger();
+    let resp =
+        json!({"filePath": "/p/a.rs", "originalFile": "中".repeat(400_000), "structuredPatch": []});
+    m.handle(pre(
+        "e1",
+        "Edit",
+        json!({"file_path": "/p/a.rs", "old_string": "a", "new_string": "b"}),
+        1000,
+    ));
+    let a = m.handle(post_with("e1", "Edit", resp.clone(), 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    let full = resp.to_string();
+    let (want, _) = coding_lab::text::truncate_bytes(&full, 8 * 1024);
+    assert_eq!(r.payload["output"], want);
+    assert_eq!(r.payload["truncated"], true);
+
+    // Bash：stdout 很長時 stderr 放不進去；短時兩者用換行接起來
+    m.handle(pre("b1", "Bash", json!({"command": "x"}), 1200));
+    let out = "o".repeat(9000);
+    let a = m.handle(post_with(
+        "b1",
+        "Bash",
+        json!({"stdout": out, "stderr": "boom"}),
+        1300,
+    ));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["output"], "o".repeat(8 * 1024));
+    assert_eq!(r.payload["truncated"], true);
+    m.handle(pre("b2", "Bash", json!({"command": "x"}), 1400));
+    let a = m.handle(post_with(
+        "b2",
+        "Bash",
+        json!({"stdout": "out", "stderr": "err"}),
+        1500,
+    ));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["output"], "out\nerr");
+    assert_eq!(r.payload["truncated"], false);
+}

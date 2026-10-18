@@ -1,7 +1,8 @@
 //! 共用截斷工具（E-D6）：bytes 截在字元邊界、依字元截、截短 Value 裡的長字串。
 
 use coding_lab::text::{
-    floor_boundary, truncate_bytes, truncate_chars, truncate_string, truncated_clone,
+    floor_boundary, json_bounded, push_bounded, truncate_bytes, truncate_chars, truncate_string,
+    truncated_clone,
 };
 use serde_json::{Value, json};
 
@@ -92,4 +93,57 @@ fn truncated_clone_without_long_strings_is_an_exact_copy() {
     let (out, cut) = truncated_clone(&json!("剛好十個bytes"), "剛好十個bytes".len());
     assert!(!cut, "剛好在上限不算截斷");
     assert_eq!(out, "剛好十個bytes");
+}
+
+/// E-M1：先序列化整份再截，和邊序列化邊截（寫到上限就停）結果要一樣。
+#[test]
+fn json_bounded_matches_serializing_everything_then_cutting() {
+    let values = [
+        json!({"originalFile": "中".repeat(5000), "filePath": "/p/a.rs", "structuredPatch": [{"lines": ["+x"]}]}),
+        json!({"file": {"content": "x".repeat(20_000)}}),
+        json!({"stdoutLines": 3, "note": "😀".repeat(3000)}),
+        json!({"small": true}),
+        json!("只是字串"),
+        Value::Null,
+    ];
+    for v in &values {
+        let full = v.to_string();
+        for max in [
+            0,
+            1,
+            7,
+            8,
+            9,
+            100,
+            8 * 1024,
+            full.len() - 1,
+            full.len(),
+            full.len() + 1,
+        ] {
+            let (want, want_cut) = truncate_bytes(&full, max);
+            assert_eq!(
+                json_bounded(v, max),
+                (want.to_string(), want_cut),
+                "max={max} {full:.40}"
+            );
+        }
+    }
+}
+
+#[test]
+fn push_bounded_stops_at_the_limit() {
+    let mut s = String::new();
+    assert!(!push_bounded(&mut s, "ab", 5));
+    assert!(!push_bounded(&mut s, "\n", 5));
+    assert!(
+        push_bounded(&mut s, "中文", 5),
+        "剩 2 bytes，一個「中」都放不下"
+    );
+    assert_eq!(s, "ab\n");
+    assert!(!push_bounded(&mut s, "xy", 5), "剛好放滿");
+    assert!(push_bounded(&mut s, "z", 5), "已經滿了就不再加");
+    assert_eq!(s, "ab\nxy");
+    let mut t = String::new();
+    assert!(!push_bounded(&mut t, "abc", 3), "剛好放滿不算截斷");
+    assert!(!push_bounded(&mut t, "", 3), "空字串不算截斷");
 }

@@ -76,3 +76,51 @@ pub fn truncated_clone(v: &Value, max: usize) -> (Value, bool) {
         other => (other.clone(), false),
     }
 }
+
+/// `v` 的 JSON 文字，截到 `max` bytes 以內（同 [`truncate_bytes`]）；邊序列化邊截，寫到上限就停，
+/// 不必先把整份（可能是整個檔案）序列化出來（E-M1）。
+pub fn json_bounded(v: &Value, max: usize) -> (String, bool) {
+    /// 收到 `max + 1` bytes 就回錯誤讓序列化停下（多收的一個 byte 用來判斷切點與有沒有超過）
+    struct Capped {
+        buf: Vec<u8>,
+        limit: usize,
+        over: bool,
+    }
+    impl std::io::Write for Capped {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let room = self.limit - self.buf.len();
+            if room == 0 {
+                self.over = true;
+                return Err(std::io::Error::other("已到上限"));
+            }
+            let n = room.min(data.len());
+            self.buf.extend_from_slice(&data[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = Capped {
+        buf: Vec::new(),
+        limit: max.saturating_add(1),
+        over: false,
+    };
+    let _ = serde_json::to_writer(&mut w, v);
+    // 最後可能停在多位元組字元中間：只留完整的部分，再照一般的規則截
+    let valid = match std::str::from_utf8(&w.buf) {
+        Ok(_) => w.buf.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    w.buf.truncate(valid);
+    let mut text = String::from_utf8(w.buf).unwrap_or_default();
+    let cut = truncate_string(&mut text, max) || w.over;
+    (text, cut)
+}
+
+/// 把 `s` 接到 `out` 後面，總長不超過 `max` bytes、不切壞 UTF-8；回傳是否有放不下的部分。
+pub fn push_bounded(out: &mut String, s: &str, max: usize) -> bool {
+    let (kept, cut) = truncate_bytes(s, max.saturating_sub(out.len()));
+    out.push_str(kept);
+    cut
+}
