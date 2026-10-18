@@ -149,7 +149,7 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .sess button .id{font-family:var(--mono);font-size:11px;font-weight:600}
 .sess button .pr{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sess button small{display:block;color:var(--muted);font-size:11px}
-.sess button .r{text-align:right;color:var(--muted);font-weight:500;font-size:11px}
+.sess button .r{text-align:right;color:var(--muted);font-weight:500;font-size:11px;white-space:nowrap}
 .sess button .mdl{font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-left:4px}
 .sess button.ended{opacity:.75}
 .sess .srow{display:flex;gap:4px;align-items:center}
@@ -242,7 +242,7 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 .sside{display:flex;flex-direction:column;gap:10px;min-width:0;min-height:0}
 .sblk{display:flex;flex-direction:column;gap:6px;min-height:0;flex:1}
 .chg,.agall{display:flex;flex-direction:column;gap:4px;overflow:auto;flex:1;min-height:100px;max-height:300px;font-size:11.5px}
-.agrow{display:grid;grid-template-columns:76px 1fr;gap:8px;align-items:start;padding:4px 6px;border-radius:6px;border:1px solid var(--line-soft)}
+.agrow{display:grid;grid-template-columns:76px 1fr;gap:8px;align-items:start;padding:4px 6px;border-radius:6px;border:1px solid var(--line-soft);contain:layout paint style}
 .agrow .ss{font-family:var(--mono);font-size:11px;font-weight:600}
 .agrow .ags{display:flex;flex-wrap:wrap;gap:4px;min-width:0}
 .agc{display:inline-flex;align-items:center;gap:5px;padding:1px 7px;border-radius:999px;background:var(--panel-2);font-size:11px;color:var(--muted);max-width:100%}
@@ -261,12 +261,11 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 
 /* 其他每幀會變的面板也限制排版範圍，避免它們的變動拖累串流（同上，不支援就忽略） */
 .agall,.chg,.att{contain:strict}
-.kpis,.stabs{contain:layout paint style}
+.kpis{contain:layout paint style}
 /* 每幀會變的小地方給固定大小＋contain:strict，變動只在框內重排，不會引發整頁排版 */
 .stabs{height:34px;contain:strict}
 .kpi b{display:block;width:3.6em;height:22px;line-height:22px;contain:strict;white-space:nowrap}
 #liveN{display:inline-block;width:3ch;height:1.4em;text-align:right;contain:strict;vertical-align:bottom}
-.agrow{contain:layout paint style}
 
 /* 改動紀錄（中欄）與修改情形（右欄） */
 .chg button{display:grid;grid-template-columns:auto auto minmax(0,1fr) auto auto;gap:8px;text-align:left;padding:3px 6px;border-radius:6px;color:var(--ink);font-family:var(--mono);font-size:11px;align-items:center;min-height:22px}
@@ -386,10 +385,10 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 #tlTime{font-size:12px;white-space:nowrap}
 #replayblk .tinfo{display:block;padding:0 12px 6px}
 body.replaying #allTitle{color:var(--accent)}
-#replayblk .rptag,.stab.rp{color:var(--accent)}
+.stab.rp{color:var(--accent)}
 .rpform{gap:6px;align-items:center}
 .rpform select,.rpform input{font:inherit;font-size:12px}
-#replayblk .rptag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft)}
+#replayblk .rptag{color:var(--accent);font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft)}
 .spane .ph .rptag{font-size:11px;padding:1px 6px;border-radius:6px;background:var(--accent-soft);color:var(--accent)}
 body.monitor .kpis,body.monitor .col-tree,body.monitor .stabs,body.monitor #allblk,body.monitor #spPop{display:none!important}
 body.monitor .main{grid-template-columns:1fr}
@@ -429,7 +428,6 @@ body.monitor .top{grid-template-columns:auto 1fr}
 .spane .ph .doing{grid-column:1/4;font-size:12px}
 .spane .ph .doing[hidden]{display:none}
 .sess button > span:nth-child(2){min-width:0;overflow:hidden}
-.sess button .r{white-space:nowrap}
 .glast.pick{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}
 .glast.pick:hover{color:var(--accent)}
 
