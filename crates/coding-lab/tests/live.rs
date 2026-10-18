@@ -1897,3 +1897,55 @@ fn frame_is_serialized_once_per_channel_offset_and_mode() {
     f.text_for(&s1, 480, Wire::Local);
     assert_eq!(f.serializations(), 4);
 }
+
+/// E-L9（#754）：「載入更多」只讀伴隨 Event 與狀態行，組出來的串流和讀範圍內每一行時完全相同（samples 回放）。
+#[test]
+fn more_reads_only_companions_and_status_lines_with_the_same_result() {
+    let dirs = common::sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("沒有 samples，略過");
+        return;
+    }
+    let mut compared = 0;
+    for (n, dir) in dirs.iter().enumerate() {
+        let Some(m) = common::merged_events(dir) else {
+            continue;
+        };
+        let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("live-more-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut store = coding_lab::store::Store::open(&home).unwrap();
+        for e in &m.events {
+            store.append(e.clone());
+        }
+        store.flush().unwrap();
+        let last_pos = m.events.iter().filter_map(|e| e.pos).max().unwrap_or(0);
+        let mut before = Some(last_pos + 1);
+        while let Some(b) = before {
+            let window = store.stream_before(&m.session, Some(b), 20).unwrap();
+            let (Some(first), Some(last)) = (window.first().cloned(), window.last().cloned())
+            else {
+                break;
+            };
+            let (from, to) = (first.seq.saturating_sub(1000), last.seq + 1000);
+            let all = store.events_by_seq(&m.session, from, to).unwrap();
+            let only = store
+                .unplaced_by_seq(&m.session, from, to, coding_lab::live::pool_kinds())
+                .unwrap();
+            assert!(only.len() <= all.len());
+            let until = store
+                .next_pos_after(&m.session, last.pos.unwrap())
+                .unwrap()
+                .map(|(_, ts)| ts);
+            assert_eq!(
+                coding_lab::live::assemble_stream(window.clone(), only, until),
+                coding_lab::live::assemble_stream(window, all, until),
+                "{}：窗口 {b}",
+                dir.display()
+            );
+            compared += 1;
+            before = first.pos.filter(|p| *p > 1);
+        }
+    }
+    eprintln!("比較了 {compared} 個窗口");
+}

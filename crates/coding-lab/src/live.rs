@@ -49,6 +49,11 @@ const STATUS_LINES: &[&str] = &[
     "session.started",
 ];
 
+/// 「載入更多」組串流時會用到的不帶 pos 的 Event 種類：卡片的伴隨 Event 與狀態行（E-L9：store 只讀這些）。
+pub fn pool_kinds() -> impl Iterator<Item = &'static str> {
+    COMPANIONS.iter().chain(STATUS_LINES).copied()
+}
+
 /// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact）才算。startup 與 clear
 /// 都是新 session 的第一行，不標（`/clear` 換 session id、舊 session 收到 SessionEnd reason clear，#688 實測）。
 fn is_status_line(e: &Event) -> bool {
