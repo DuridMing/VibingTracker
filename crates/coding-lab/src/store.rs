@@ -299,7 +299,7 @@ pub struct Store {
     /// 已寫進 JSONL、還沒進索引的 (Event, offset)：索引寫入失敗時留到下次 flush
     unindexed: Vec<(Event, u64)>,
     /// tail 讀到的行（(session, file) → 行號），下次 flush 和 Event 同一個交易寫進 `tails`（#713）
-    read_lines: BTreeMap<(String, String), u64>,
+    read_lines: BTreeMap<String, BTreeMap<String, u64>>,
     /// 開啟時 recover 讀了多少 bytes
     recover_bytes: u64,
 }
@@ -615,9 +615,20 @@ impl Store {
 
     /// tail 讀到第 `no` 行（不論這行有沒有產生 Event）：下次 flush 寫進 `tails`，重啟從它之後接著讀（#713）。
     /// 和同一批 Event 同一個交易寫入，當掉時位置不會跑在 Event 前面。
+    /// 每行都會呼叫：已有的 (session, file) 只更新行號，不配置字串（E-S10）。
     pub fn saw_line(&mut self, session: &str, file: &str, no: u64) {
+        if let Some(n) = self
+            .read_lines
+            .get_mut(session)
+            .and_then(|m| m.get_mut(file))
+        {
+            *n = no;
+            return;
+        }
         self.read_lines
-            .insert((session.to_string(), file.to_string()), no);
+            .entry(session.to_string())
+            .or_default()
+            .insert(file.to_string(), no);
     }
 
     /// 寫入失敗時不丟資料（#683）：JSONL 寫不進去的 Event 放回緩衝、寫到一半的檔截回原長度；
@@ -701,8 +712,10 @@ impl Store {
         batch.finish(&tx)?;
         let added = batch.added;
         if lines_ok {
-            for ((sid, file), no) in &self.read_lines {
-                exec(&tx, UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+            for (sid, files) in &self.read_lines {
+                for (file, no) in files {
+                    exec(&tx, UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+                }
             }
         }
         tx.commit()?;
@@ -1621,13 +1634,13 @@ struct IndexBatch<'a> {
     added: HashSet<String>,
     last_seq: HashMap<String, u64>,
     /// 這次 flush 最後會整批寫的 tail 行號（`read_lines`）：同一個檔不必每筆 Event 各寫一次
-    lines_later: Option<&'a BTreeMap<(String, String), u64>>,
+    lines_later: Option<&'a BTreeMap<String, BTreeMap<String, u64>>>,
 }
 
 impl<'a> IndexBatch<'a> {
     fn new(
         known: &'a HashSet<String>,
-        lines_later: Option<&'a BTreeMap<(String, String), u64>>,
+        lines_later: Option<&'a BTreeMap<String, BTreeMap<String, u64>>>,
     ) -> Self {
         IndexBatch {
             known,
@@ -1679,7 +1692,8 @@ fn index_event(
     if let Some(l) = &e.line {
         let later = batch
             .lines_later
-            .is_some_and(|r| r.contains_key(&(sid.to_string(), l.file.clone())));
+            .and_then(|r| r.get(sid))
+            .is_some_and(|m| m.contains_key(&l.file));
         if !later {
             exec(tx, UPSERT_TAIL_LINE, params![sid, l.file, l.no as i64])?;
         }

@@ -159,10 +159,11 @@ impl TailReader {
 
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = Vec::new();
-        f.take(meta.len() - self.offset).read_to_end(&mut buf)?;
-        self.offset += buf.len() as u64;
-        self.pending.extend_from_slice(&buf);
+        // 直接接在半行後面讀，大行不多一份拷貝（E-S9）
+        let want = meta.len() - self.offset;
+        self.pending.reserve(usize::try_from(want).unwrap_or(0));
+        let got = f.take(want).read_to_end(&mut self.pending)?;
+        self.offset += got as u64;
 
         let mut start = 0;
         self.scanned += (self.pending.len() - self.searched) as u64;
@@ -196,6 +197,27 @@ impl TailReader {
     pub fn scanned_bytes(&self) -> u64 {
         self.scanned
     }
+
+    /// 檔案裡還沒讀的 bytes（檔案不見或變短時是 0）。
+    pub fn backlog(&self) -> u64 {
+        fs::metadata(&self.path).map_or(0, |m| m.len().saturating_sub(self.offset))
+    }
+}
+
+/// 讀一次。新增超過 [`BIG_LINE`] 時（Read 大檔整個進一行：實測 release 2 MB 約 20 ms、100 MB 約 1 秒）
+/// 在 blocking 執行緒讀與解析，不佔住 runtime 的 worker（hook 要 100 ms 內回，E-S9）。
+/// blocking 執行緒沒回來（runtime 正在關）時回 None，tail 就此結束。
+async fn poll_reader(mut reader: TailReader) -> Option<(TailReader, io::Result<Poll>)> {
+    if reader.backlog() <= BIG_LINE as u64 {
+        let polled = reader.poll();
+        return Some((reader, polled));
+    }
+    tokio::task::spawn_blocking(move || {
+        let polled = reader.poll();
+        (reader, polled)
+    })
+    .await
+    .ok()
 }
 
 /// 一般的行整個解析；大行用 [`Capped`] 邊解析邊截短長字串，記憶體不隨行長倍數成長（#684 R21）。
@@ -396,14 +418,20 @@ async fn run(
     };
 
     loop {
-        out.send(reader.poll()).await;
+        let Some((r, polled)) = poll_reader(reader).await else {
+            return;
+        };
+        reader = r;
+        out.send(polled).await;
         tokio::select! {
             _ = &mut stop => break,
             _ = wake.notified() => {}
             _ = tokio::time::sleep(opts.poll_every) => {}
         }
     }
-    out.send(reader.poll()).await;
+    if let Some((_, polled)) = poll_reader(reader).await {
+        out.send(polled).await;
+    }
 }
 
 /// 整個 collector 共用的 notify watcher（E-S6）。每個 tail 各開一個時，每個就是一條 OS 執行緒加一個
@@ -710,8 +738,12 @@ pub struct TailPlanner {
     agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// 這一輪結束過的 subagent：晚到的 hook 不再重開
     stopped: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    /// (session, file) → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)
-    read: std::collections::HashMap<(String, String), (Option<String>, u64)>,
+    /// session → file → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)。分兩層：每行都要找，
+    /// 用 `&str` 就找得到，不必先組 key（E-S10）
+    read:
+        std::collections::HashMap<String, std::collections::HashMap<String, (Option<String>, u64)>>,
+    /// session → file → 現在 tail 的路徑（`/` 分隔），開 tail 時算好，每行不再重組（E-S10）
+    paths: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
     /// 已結束的 session（SessionEnd，或 merge 判定 abandoned）：下一個 SessionStart 之前不再開 tail（C12、L-8）
     ended: std::collections::HashSet<String>,
 }
@@ -728,28 +760,42 @@ fn subagent_path(main: &Path, file: &str) -> PathBuf {
 impl TailPlanner {
     /// collector 重啟時交入 store 記的行號（`tails` 表）；`path` 是記錄時的檔案路徑（`/` 分隔，不知道時 None）。
     pub fn seed(&mut self, session: &str, file: &str, path: Option<&str>, line_no: u64) {
-        self.read.insert(
-            (session.to_string(), file.to_string()),
+        self.read.entry(session.to_string()).or_default().insert(
+            file.to_string(),
             (path.map(|p| p.replace('\\', "/")), line_no),
         );
     }
 
     /// tail 讀到第 `no` 行（serve 每收到一行就告訴 planner），之後重開同一個檔時從這裡接著讀。
+    /// 每行都會呼叫：已有記錄時只更新行號（路徑變了才換），不配置字串（E-S10）。
     pub fn saw_line(&mut self, session: &str, file: &str, no: u64) {
-        let path = self.main.get(session).map(|m| {
-            if file == "main" {
-                slash(m)
-            } else {
-                slash(&subagent_path(m, file))
+        let path = self.paths.get(session).and_then(|m| m.get(file));
+        if let Some(entry) = self.read.get_mut(session).and_then(|m| m.get_mut(file)) {
+            entry.1 = no;
+            if entry.0.as_ref() != path {
+                entry.0 = path.cloned();
             }
+            return;
+        }
+        // 不是經過這裡開的 tail（測試直接餵行）：照主檔推出路徑
+        let path = path.cloned().or_else(|| {
+            self.main.get(session).map(|m| {
+                if file == "main" {
+                    slash(m)
+                } else {
+                    slash(&subagent_path(m, file))
+                }
+            })
         });
         self.read
-            .insert((session.to_string(), file.to_string()), (path, no));
+            .entry(session.to_string())
+            .or_default()
+            .insert(file.to_string(), (path, no));
     }
 
     /// 重開 `file` 時從哪裡讀：有這個檔的記錄（路徑相同或記錄沒有路徑）就接著讀，否則用 `default`。
     fn resume_from(&self, session: &str, file: &str, path: &Path, default: Start) -> Start {
-        match self.read.get(&(session.to_string(), file.to_string())) {
+        match self.read.get(session).and_then(|m| m.get(file)) {
             Some((recorded, n)) if recorded.as_deref().is_none_or(|r| r == slash(path)) => {
                 Start::After(*n)
             }
@@ -761,6 +807,7 @@ impl TailPlanner {
     /// 不停的話 tail 與它的 watcher 會一直留著，常駐服務（不閒置結束）下只增不減。
     pub fn on_session_ended(&mut self, session: &str) -> Vec<TailAction> {
         self.ended.insert(session.to_string());
+        self.paths.remove(session);
         let had_main = self.main.remove(session).is_some();
         let had_agents = self.agents.remove(session).is_some_and(|a| !a.is_empty());
         self.stopped.remove(session);
@@ -779,6 +826,26 @@ impl TailPlanner {
     }
 
     pub fn on_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
+        let out = self.plan_hook(h);
+        // 開 tail 時把路徑記下，之後每行的 saw_line 直接用（E-S10）
+        for a in &out {
+            if let TailAction::Start {
+                session,
+                file,
+                path,
+                ..
+            } = a
+            {
+                self.paths
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(file.clone(), slash(path));
+            }
+        }
+        out
+    }
+
+    fn plan_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
         let sid = h.session_id().to_string();
         let event = h.event_name();
         let mut out = Vec::new();

@@ -606,3 +606,33 @@ async fn tails_share_one_watcher_and_release_it_on_stop() {
     }
     assert_eq!((w.watched_files(), w.watched_dirs()), (0, 0));
 }
+
+/// E-S9（#755）：新增超過 BIG_LINE 的那次讀取在 blocking 執行緒做（Read 大檔整個進一行，解析要幾十 ms 到 1 秒），
+/// 行照樣依序、帶正確的行號送出，之後的小行照常。
+#[tokio::test]
+async fn big_lines_are_read_in_order_off_the_runtime() {
+    let p = tmpfile("");
+    let (tx, mut rx) = mpsc::channel(64);
+    let h = spawn_tail(
+        p.clone(),
+        "s1".into(),
+        "main".into(),
+        Start::Beginning,
+        tx,
+        opts(false),
+    );
+    let big = format!(
+        "{}\n",
+        json!({"type": "user", "uuid": "big", "message": {"content": [{"type": "tool_result",
+               "tool_use_id": "t", "content": "x".repeat(coding_lab::transcript::BIG_LINE * 2)}]}})
+    );
+    append(&p, &(big + &line("small")));
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        if let Input::Line { no, value, .. } = next(&mut rx).await {
+            got.push((no, value["uuid"].as_str().unwrap_or_default().to_string()));
+        }
+    }
+    assert_eq!(got, [(1, "big".to_string()), (2, "small".to_string())]);
+    h.stop().await;
+}
