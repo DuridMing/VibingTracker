@@ -49,19 +49,27 @@ pub struct Merged {
     pub message_of_line: HashMap<(String, u64), String>,
 }
 
-/// 把一個樣本目錄餵過 merge（照到達時間；同一毫秒 hook 先）。
-/// 沒有到達時間（`transcript-arrivals.jsonl`）的樣本回 None。
-pub fn merged_events(dir: &Path) -> Option<Merged> {
-    use coding_lab::event::Danger;
-    use coding_lab::hook::HookInput;
-    use coding_lab::merge::{DangerRules, Input, Merger};
-
-    struct NoDanger;
-    impl DangerRules for NoDanger {
-        fn check(&self, _tool: &str, _input: &Value) -> Option<Danger> {
-            None
-        }
+/// 不判斷危險的規則（回放測試只看管線）。
+pub struct NoDanger;
+impl coding_lab::merge::DangerRules for NoDanger {
+    fn check(&self, _tool: &str, _input: &Value) -> Option<coding_lab::event::Danger> {
+        None
     }
+}
+
+pub struct SampleInputs {
+    pub session: String,
+    /// (到達時間, 輸入)：照到達時間排好，同一毫秒 hook 先
+    pub inputs: Vec<(u64, coding_lab::merge::Input)>,
+    /// (transcript 檔名, 行號) → message.id（只有 assistant 行）
+    pub message_of_line: HashMap<(String, u64), String>,
+}
+
+/// 一個樣本目錄的 hook 與 transcript 行，照到達時間排成 merge 的輸入。
+/// 沒有到達時間（`transcript-arrivals.jsonl`）的樣本回 None。
+pub fn sample_inputs(dir: &Path) -> Option<SampleInputs> {
+    use coding_lab::hook::HookInput;
+    use coding_lab::merge::Input;
 
     let hooks = read_jsonl(&dir.join("hooks.jsonl"));
     if read_jsonl(&dir.join("transcript-arrivals.jsonl")).is_empty() {
@@ -126,15 +134,26 @@ pub fn merged_events(dir: &Path) -> Option<Merged> {
         }
     }
     inputs.sort_by_key(|(ts, kind, _)| (*ts, *kind));
-    let mut m = Merger::new(Box::new(NoDanger));
+    Some(SampleInputs {
+        session,
+        inputs: inputs.into_iter().map(|(ts, _, i)| (ts, i)).collect(),
+        message_of_line,
+    })
+}
+
+/// 把一個樣本目錄餵過 merge（照到達時間；同一毫秒 hook 先）。
+/// 沒有到達時間（`transcript-arrivals.jsonl`）的樣本回 None。
+pub fn merged_events(dir: &Path) -> Option<Merged> {
+    let s = sample_inputs(dir)?;
+    let mut m = coding_lab::merge::Merger::new(Box::new(NoDanger));
     let mut events = Vec::new();
-    for (ts, _, input) in inputs {
+    for (ts, input) in s.inputs {
         events.extend(m.tick(ts));
         events.extend(m.handle(input));
     }
     Some(Merged {
-        session,
+        session: s.session,
         events,
-        message_of_line,
+        message_of_line: s.message_of_line,
     })
 }
