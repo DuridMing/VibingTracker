@@ -26,6 +26,8 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use crate::http_util::{json as json_response, percent_decode, query_param};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
@@ -1361,15 +1363,6 @@ async fn on_client_message(
 
 // ── 本機 web：HTTP ─────────────────────────────────────────────────────────
 
-fn json_response(status: StatusCode, body: &Value) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
-}
-
 async fn healthz(State(state): State<Arc<HubState>>) -> Response {
     let online = state.hub().online();
     let ups: Vec<Value> = state
@@ -1385,42 +1378,6 @@ async fn healthz(State(state): State<Arc<HubState>>) -> Response {
         StatusCode::OK,
         &json!({ "version": env!("CARGO_PKG_VERSION"), "protocol": crate::ws::PROTOCOL, "hub": true, "upstreams": ups }),
     )
-}
-
-fn query_param(uri: &Uri, name: &str) -> Option<String> {
-    uri.query()?.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| percent_decode(v))
-    })
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn relay(r: HttpResponse) -> Response {

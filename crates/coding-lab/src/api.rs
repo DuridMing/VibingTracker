@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use axum::Extension;
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{StatusCode, Uri, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::event::Payload;
+use crate::http_util::query;
 use crate::live::{clip, short_model};
 use crate::store::{SessionRow, Store};
 use crate::ws::{MORE_LIMIT, Remote, WebState, more_events};
@@ -25,12 +26,7 @@ const EVENTS_DEFAULT: usize = 200;
 const TREE_MAX: usize = 20_000;
 
 fn reply(code: StatusCode, body: &Value) -> Response {
-    (
-        code,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    crate::http_util::json(code, body)
 }
 
 fn ok(body: &Value) -> Response {
@@ -44,42 +40,6 @@ fn error(code: StatusCode, msg: impl Into<String>) -> Response {
 fn store_error(e: impl std::fmt::Display) -> Response {
     crate::logging::log(&format!("web：API 讀取 store 失敗：{e}"));
     error(StatusCode::INTERNAL_SERVER_ERROR, "讀取資料失敗")
-}
-
-/// 查詢字串（`application/x-www-form-urlencoded`）；同名參數取最後一個。
-fn query(uri: &Uri) -> HashMap<String, String> {
-    uri.query()
-        .unwrap_or_default()
-        .split('&')
-        .filter(|kv| !kv.is_empty())
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (decode(k), decode(v))
-        })
-        .collect()
-}
-
-fn decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    Err(_) => out.push(b'%'),
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn limit(q: &HashMap<String, String>, default: usize, max: usize) -> usize {

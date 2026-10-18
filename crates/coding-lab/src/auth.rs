@@ -150,28 +150,8 @@ pub fn same_origin(headers: &HeaderMap) -> bool {
 pub fn form_value(body: &str, name: &str) -> Option<String> {
     body.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-        (k == name).then(|| percent_decode(&v.replace('+', " ")))
+        (k == name).then(|| crate::http_util::form_decode(v))
     })
-}
-
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let Some(hex) = s.get(i + 1..i + 3)
-            && let Ok(v) = u8::from_str_radix(hex, 16)
-        {
-            out.push(v);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ── 一次性登入連結 ────────────────────────────────────────────────────────

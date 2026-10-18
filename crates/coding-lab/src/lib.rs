@@ -8,6 +8,7 @@ pub mod doing;
 pub mod event;
 pub mod hook;
 pub mod hooks;
+pub mod http_util;
 pub mod hub;
 pub mod keys;
 pub mod live;
