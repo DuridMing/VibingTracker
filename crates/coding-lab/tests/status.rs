@@ -2,6 +2,8 @@
 //!
 //! 全部透過 merge 的 `handle`／`tick` 驅動，時間由輸入帶入（假時鐘），不 sleep。
 
+mod common;
+
 use coding_lab::event::{AttentionKind, Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{DangerRules, Input, Merger};
@@ -891,10 +893,13 @@ fn replay_merger(name: &str) -> Option<(Merger, Vec<Event>, u64)> {
 /// 同 [`replay_merger`]，回放前先設好費用基準（#675）。
 fn replay_with(name: &str, cost_baseline: Option<f64>) -> Option<(Merger, Vec<Event>, u64)> {
     use std::collections::HashMap;
-    use std::path::PathBuf;
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../samples/sessions")
-        .join(name);
+    // samples/ 或 fixture 裡找；找不到就是指名的樣本只有真的 samples/ 才有
+    // （CODING_LAB_REQUIRE_SAMPLES=1 而且沒有 samples/ 時 full_samples 直接失敗）
+    let dir = common::samples_root().join("sessions").join(name);
+    if !dir.is_dir() {
+        common::full_samples();
+        return None;
+    }
     let read = |f: &str| -> Vec<Value> {
         std::fs::read_to_string(dir.join(f))
             .unwrap_or_default()
@@ -1004,7 +1009,7 @@ fn samples_background_task_is_marked_and_withdraws_done() {
 /// #706：真實 session（互動的、`-p` 的、Esc、背景 agent）回放時，「等你」的推測一次都不會發。
 #[test]
 fn samples_never_raise_a_guessed_wait() {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
+    let dir = common::samples_root().join("sessions");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("略過：沒有 samples/sessions");
         return;

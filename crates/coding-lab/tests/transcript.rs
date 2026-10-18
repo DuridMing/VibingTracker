@@ -1,5 +1,7 @@
 //! transcript tail（#631）。檔案都在這個 worktree 的 target/tmp/。
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -214,7 +216,7 @@ async fn stop_drains_lines_written_before_stop() {
 /// 從 #625 移來：真實 transcript（含 subagent 檔）全部能讀、沒有壞行、行數與檔案一致。沒有 samples/ 時略過。
 #[test]
 fn every_sample_transcript_reads_cleanly() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
+    let root = common::samples_root().join("sessions");
     let Ok(dirs) = std::fs::read_dir(&root) else {
         eprintln!("略過：沒有 samples/sessions");
         return;
@@ -294,7 +296,7 @@ async fn stop_all_keeps_draining_so_a_full_queue_cannot_hang_shutdown() {
 /// 平行的多個工具呼叫也是 tool_use、tool_result 各自一行。格式改了這裡會紅。沒有 samples/ 時略過。
 #[test]
 fn every_sample_message_line_has_a_single_content_block() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions");
+    let root = common::samples_root().join("sessions");
     let Ok(dirs) = std::fs::read_dir(&root) else {
         eprintln!("略過：沒有 samples/sessions");
         return;

@@ -1,5 +1,7 @@
 //! hooks 入口（#630）與 TailPlanner。
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -128,7 +130,7 @@ async fn p95_latency_under_50ms() {
 /// samples/hooks 重放（從 #624 的樣本）；沒有 samples/ 時略過。
 #[tokio::test]
 async fn every_sample_hook_replays() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/hooks");
+    let dir = common::samples_root().join("hooks");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("略過：沒有 samples/hooks");
         return;

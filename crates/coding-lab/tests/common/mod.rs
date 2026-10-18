@@ -1,4 +1,10 @@
-//! 回放測試共用的樣本載入（#688）：samples/ 不進 git，沒有時各測試自己略過。
+//! 回放測試共用的樣本載入（#688）。
+//!
+//! samples/（遮蔽後的真實樣本）不進 git。沒有它時，通用的回放與契約測試改用 git 裡的極小 fixture
+//! （`tests/fixtures/samples/`：一個專門跑的計算器小專案 session，經 scripts/redact-samples.py 遮蔽，
+//! 含 Read／Edit／Write、成功與失敗的 Bash、subagent、resume，#749 T-1／D9），乾淨 clone 與 CI 也會真的跑。
+//! 指名特定 session 的測試（例如背景 agent、Esc）只有真的 samples/ 才有，用 [`full_samples`]：
+//! 沒有時略過，但設了 `CODING_LAB_REQUIRE_SAMPLES=1` 就直接失敗，本機確認有真的跑到。
 
 #![allow(dead_code)] // 每個測試檔只用到其中幾個
 
@@ -7,9 +13,32 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-/// `samples/sessions/` 底下的每個樣本目錄（排序後）；沒有 samples 時是空的。
+/// 樣本的根目錄：有 samples/ 就用它，否則用 git 裡的 fixture。
+pub fn samples_root() -> PathBuf {
+    let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+    if real.join("sessions").is_dir() {
+        real
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/samples")
+    }
+}
+
+/// 只有真的 samples/ 才有的樣本（指名特定 session 的測試用）。沒有時回 None，
+/// 但設了 `CODING_LAB_REQUIRE_SAMPLES=1` 就直接失敗（不讓「略過」看起來像「通過」，#749 T-1）。
+pub fn full_samples() -> Option<PathBuf> {
+    let real = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples");
+    if real.join("sessions").is_dir() {
+        return Some(real);
+    }
+    if std::env::var("CODING_LAB_REQUIRE_SAMPLES").as_deref() == Ok("1") {
+        panic!("CODING_LAB_REQUIRE_SAMPLES=1 但沒有 samples/（scripts/redact-samples.py 產生）");
+    }
+    None
+}
+
+/// 樣本的每個 session 目錄（排序後）：samples/ 或 fixture。
 pub fn sample_sessions() -> Vec<PathBuf> {
-    sessions_in(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/sessions"))
+    sessions_in(&samples_root().join("sessions"))
 }
 
 /// `root` 底下的每個樣本目錄（排序後）。

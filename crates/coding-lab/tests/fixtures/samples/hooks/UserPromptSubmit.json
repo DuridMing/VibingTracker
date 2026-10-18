@@ -1,0 +1,10 @@
+{
+  "cwd": "/home/user/fixture-lab",
+  "hook_event_name": "UserPromptSubmit",
+  "permission_mode": "default",
+  "prompt": "依序做這幾件事，每一步都要真的用工具：1. 讀 calc.py。2. 用 Edit 在 calc.py 最後加一個 mul(a, b) 函式。3. 用 Write 建立 notes.md，寫一行說明這個專案。4. 執行 python3 test_calc.py。5. 執行 python3 -c 'import sys; sys.exit(3)'（這一步預期會失敗，失敗就繼續）。6. 用 Task 派一個 subagent 讀 test_calc.py，回報有幾個 assert。最後用一句話總結。",
+  "prompt_id": "a592e386-96e5-4944-8d2b-4fc1b808cdad",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f/scratchpad",
+  "session_id": "9addaaff-fe09-4395-b5e6-86eca2de8c6f",
+  "transcript_path": "/home/user/.claude/projects/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f.jsonl"
+}

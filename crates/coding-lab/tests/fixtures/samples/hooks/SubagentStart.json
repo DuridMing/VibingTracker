@@ -1,0 +1,10 @@
+{
+  "agent_id": "a2ae31d4a7d83015b",
+  "agent_type": "general-purpose",
+  "cwd": "/home/user/fixture-lab",
+  "hook_event_name": "SubagentStart",
+  "prompt_id": "a592e386-96e5-4944-8d2b-4fc1b808cdad",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f/scratchpad",
+  "session_id": "9addaaff-fe09-4395-b5e6-86eca2de8c6f",
+  "transcript_path": "/home/user/.claude/projects/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f.jsonl"
+}
