@@ -142,6 +142,10 @@ pub struct Tracker {
     /// 重啟或移出記憶體後種回：store／live 的 status 可能和這裡算的不同（例如已確認的 done 不會種回），
     /// 下一次重算不論有沒有變都送一次（K-6）
     report_next: bool,
+    /// 重啟或移出記憶體後回來：store 的狀態是 done／fail，但那個注意項目已經確認、沒有種回（ack 不是 Event，
+    /// 沒重啟時 merge 不知道 ack，那一項一直開著）。在沒重啟也會解除它的事件之前照樣是這個狀態，
+    /// 上一輪晚到的行或工具結束不能把它算成 run（#749 長情境）
+    seeded: Option<SessionState>,
     signals: Vec<(Signal, u64)>,
     /// 最近 24 小時的 (時間, 費用)，CostSpike 用（#675）
     recent_cost: std::collections::VecDeque<(u64, f64)>,
@@ -168,6 +172,7 @@ impl Default for Tracker {
             idle: false,
             ended: false,
             report_next: false,
+            seeded: None,
             signals: Vec::new(),
             recent_cost: Default::default(),
             recent_total: 0.0,
@@ -226,6 +231,7 @@ impl Tracker {
         let mut out = Vec::new();
         if ok {
             *streak = 0;
+            self.unseed(SessionState::Fail);
             if let Some(r) = self.fail_open.remove(agent) {
                 out.extend(self.clear(AttentionKind::Fail, &r));
             }
@@ -243,6 +249,7 @@ impl Tracker {
     /// subagent（含背景 agent）結束：之後不會再有它的 Bash 成功來解除它的連續失敗，跟著結束一起清掉（K-1）。
     pub fn agent_finished(&mut self, agent: &str, now: u64) -> Vec<Change> {
         self.fail_streak.remove(agent);
+        self.unseed(SessionState::Fail);
         let mut out = Vec::new();
         if let Some(r) = self.fail_open.remove(agent) {
             out.extend(self.clear(AttentionKind::Fail, &r));
@@ -320,6 +327,7 @@ impl Tracker {
         for r in done {
             out.extend(self.clear(AttentionKind::Done, &r));
         }
+        self.unseed(SessionState::Done);
         self.stop_at = None;
         self.stopped = false;
         self.idle = false;
@@ -337,9 +345,10 @@ impl Tracker {
             .filter(|o| o.kind == AttentionKind::Done)
             .map(|o| o.reference.clone())
             .collect();
-        if !self.stopped && done.is_empty() {
+        if !self.stopped && done.is_empty() && self.seeded != Some(SessionState::Done) {
             return Vec::new();
         }
+        self.unseed(SessionState::Done);
         self.stop_at = None;
         self.stopped = false;
         let mut out: Vec<Change> = done
@@ -411,6 +420,25 @@ impl Tracker {
         self.idle = idle;
         let _ = self.recompute(0);
         self.report_next = true;
+    }
+
+    /// 種回 store 的狀態（只有 done、fail 有意義，見 `seeded`）。在 [`Tracker::seed_state`] 之前呼叫。
+    pub fn seed_status(&mut self, status: SessionState) {
+        if matches!(status, SessionState::Done | SessionState::Fail) {
+            self.seeded = Some(status);
+        }
+    }
+
+    /// 移出記憶體時交給下一次的 [`Tracker::seed_status`]。
+    pub fn seeded_status(&self) -> Option<SessionState> {
+        self.seeded
+    }
+
+    /// 沒重啟時會解除那一項的事件到了：done 是新的 prompt 或 main 開始新的工具（K-4），fail 是 Bash 成功或 agent 結束。
+    fn unseed(&mut self, which: SessionState) {
+        if self.seeded == Some(which) {
+            self.seeded = None;
+        }
     }
 
     /// 是否中斷中（使用者按 Esc 之後、下一個 prompt 之前）。
@@ -614,8 +642,11 @@ impl Tracker {
                 Some(AttentionKind::Fail) => SessionState::Fail,
                 Some(AttentionKind::Wait) => SessionState::Wait,
                 Some(AttentionKind::Done) => SessionState::Done,
-                _ if self.idle => SessionState::Idle,
-                _ => SessionState::Run,
+                _ => match self.seeded {
+                    Some(s) => s,
+                    None if self.idle => SessionState::Idle,
+                    None => SessionState::Run,
+                },
             }
         };
         if next == self.state && !self.report_next {
