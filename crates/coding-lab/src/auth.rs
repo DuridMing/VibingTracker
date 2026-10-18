@@ -411,7 +411,7 @@ impl Auth {
     }
 
     /// 驗一個完整的金鑰；成功回 (id, scope) 並記下 last_used（每把最多每分鐘一次）。
-    /// last_used 寫在 `keys-used.json`、在金鑰快取的鎖外寫：collector 從不寫 `keys.json`，CLI 的撤銷不會被蓋掉
+    /// last_used 寫在 `keys-usage.json`、在金鑰快取的鎖外寫：collector 從不寫 `keys.json`，CLI 的撤銷不會被蓋掉
     /// （S-3），驗證也不用等寫檔與 sync（E-H10）。
     pub fn verify_token(&self, token: &str, now_ms: u64) -> Result<(String, Scope), String> {
         let verified = self

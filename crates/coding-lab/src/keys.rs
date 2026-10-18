@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 pub const FILE_NAME: &str = "keys.json";
 /// 每把金鑰最後一次用到的時間（collector 寫）。和 `keys.json` 分開：`keys.json` 只有 CLI 的 create／revoke 會寫，
 /// collector 寫回 last_used 就不會蓋掉剛撤銷的金鑰（#743 S-3）。
-pub const USED_FILE: &str = "keys-used.json";
+pub const USED_FILE: &str = "keys-usage.json";
 pub const TOKEN_PREFIX: &str = "clk_";
 pub const ID_LEN: usize = 8;
 /// 32 bytes 以 base62 表示固定補到 43 個字元（⌈256 / log2 62⌉）。
@@ -266,7 +266,7 @@ impl KeyStore {
         let server_secret = hex_decode32(&f.server_secret)
             .ok_or_else(|| format!("{} 的 server_secret 不是 32 bytes 十六進位", path.display()))?;
         let mut keys = f.keys;
-        // last_used 另存在 keys-used.json；兩邊取較晚的（舊版 collector 寫在 keys.json 裡的也算）
+        // last_used 另存在 keys-usage.json；兩邊取較晚的（舊版 collector 寫在 keys.json 裡的也算）
         let used = read_used(home);
         for k in &mut keys {
             if let Some(t) = used.get(&k.id) {
@@ -300,7 +300,7 @@ fn read_used(home: &Path) -> std::collections::HashMap<String, u64> {
         .unwrap_or_default()
 }
 
-/// 記下這把金鑰在 `now_ms` 用過（寫 `keys-used.json`，不碰 `keys.json`）。同一個程序內依序寫，不會互相蓋掉。
+/// 記下這把金鑰在 `now_ms` 用過（寫 `keys-usage.json`，不碰 `keys.json`）。同一個程序內依序寫，不會互相蓋掉。
 pub fn record_used(home: &Path, id: &str, now_ms: u64) -> Result<(), String> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
