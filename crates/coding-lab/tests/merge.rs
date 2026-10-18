@@ -333,6 +333,24 @@ fn duplicate_transcript_lines_are_ignored() {
     assert!(m.handle(line(1, thinking("u1", "m1"), 1001)).is_empty());
 }
 
+/// uuid 去重存成數字（E-M5）：標準格式的 uuid 只差一個字也不能當成同一行；不是標準格式的照樣去重。
+#[test]
+fn uuid_dedup_tells_close_uuids_apart_and_keeps_other_formats() {
+    let mut m = merger();
+    let a = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e6f";
+    let b = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e60";
+    assert_eq!(m.handle(line(1, thinking(a, "m1"), 1000)).len(), 1);
+    assert_eq!(m.handle(line(2, thinking(b, "m1"), 1001)).len(), 1);
+    assert!(m.handle(line(1, thinking(a, "m1"), 1002)).is_empty());
+    let upper = a.to_uppercase();
+    assert_eq!(
+        m.handle(line(3, thinking(&upper, "m1"), 1003)).len(),
+        1,
+        "大小寫不同就是不同的字串，和以前一樣"
+    );
+    assert!(m.handle(line(3, thinking(&upper, "m1"), 1004)).is_empty());
+}
+
 /// 完成的卡片（已進串流、已結束、結果已送）留 [`CARD_KEEP_MS`] 給重複的 hook（K-3），之後釋放；
 /// 沒完成的不動（K-12：長開的 session 不再一直累積卡片）。
 #[test]

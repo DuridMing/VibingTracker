@@ -143,6 +143,49 @@ impl Card {
     }
 }
 
+/// 已處理過的行的 uuid。transcript 的 uuid 都是小寫的標準格式，存成 `u128`（一個 String 的約 1/4，E-M5）；
+/// 不是這個格式的退回存字串，比對結果和存字串一樣。
+#[derive(Default)]
+struct SeenUuids {
+    packed: HashSet<u128>,
+    other: HashSet<String>,
+}
+
+impl SeenUuids {
+    /// 第一次看到回 true
+    fn insert(&mut self, uuid: &str) -> bool {
+        match pack_uuid(uuid) {
+            Some(n) => self.packed.insert(n),
+            None => self.other.insert(uuid.to_string()),
+        }
+    }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`（小寫 16 進位）→ 128 位元；其他格式回 None。
+/// 只收小寫，`ABC…` 與 `abc…` 才不會被當成同一個（和存字串時一樣）。
+fn pack_uuid(s: &str) -> Option<u128> {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return None;
+    }
+    let mut n: u128 = 0;
+    for (i, c) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        n = (n << 4) | u128::from(d);
+    }
+    Some(n)
+}
+
 /// 檢查完成卡片的間隔：tick 不必每次走過所有卡片（E-M4）
 const CARD_SWEEP_EVERY_MS: u64 = 60_000;
 
@@ -165,7 +208,8 @@ struct Session {
     /// 還在暫存區的卡片 (暫存時間, tool_use_id)：tick 的逾時降級與 Degraded 只看這裡，不走過所有卡片（E-M4）。
     /// 卡片的 `staged_at` 有值 ⇔ 在這裡
     staged: BTreeSet<(u64, String)>,
-    seen_uuids: HashSet<String>,
+    /// 已處理過的行的 uuid：重讀被替換或截短的檔時不重複（session 存在期間都要留，見 [`SeenUuids`]）
+    seen_uuids: SeenUuids,
     degraded: HashSet<String>,
     /// TailReset 之後有效的 tail 編號下限（每個檔、整個 session）：比它舊的 tail 送來的降級訊號不理（#684 R20）
     tail_floor: HashMap<String, u64>,
@@ -1741,7 +1785,7 @@ impl Merger {
     fn on_line(&mut self, sid: &str, file: &str, no: u64, v: &Value, ts_seen: u64) -> Vec<Event> {
         let s = self.session(sid);
         if let Some(uuid) = v["uuid"].as_str()
-            && !s.seen_uuids.insert(uuid.to_string())
+            && !s.seen_uuids.insert(uuid)
         {
             return Vec::new();
         }
