@@ -1671,3 +1671,138 @@ fn prune_keeps_the_index_when_the_file_cannot_be_deleted() {
     assert!(s.session("s1").unwrap().is_none());
     assert!(!events.join("s1.jsonl").exists());
 }
+
+// ---------- W-M10（#781）：store 一直寫不進去 ----------
+
+/// 寫不進去時退避（1 秒起、加倍到 30 秒），log 只在開始失敗、每 5 分鐘、恢復時各一行；
+/// storeError 帶訊息、開始時間、待寫與丟掉的筆數，恢復後是 None。時間注入，不 sleep。
+#[test]
+fn failing_flushes_back_off_and_log_only_at_the_edges() {
+    use coding_lab::store::FlushGate;
+    let mut g = FlushGate::default();
+    let mut logs = Vec::new();
+    let mut tries = 0;
+    // 40 秒、每 100 ms 一個 tick（和 serve 的 flush 間隔一樣），只在 ready 時才真的試
+    for t in (0..40_000).step_by(100) {
+        if g.ready(t) {
+            tries += 1;
+            logs.extend(g.record(Err("disk full".into()), t, 600, 0));
+        }
+    }
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(
+        logs[0].contains("disk full") && logs[0].contains("600"),
+        "{logs:?}"
+    );
+    // 1、2、4、8、16 秒後各一次，之後每 30 秒：0、1、3、7、15、31 秒
+    assert!(tries <= 7, "退避後只試了 {tries} 次");
+    let e = g.error(600, 2).unwrap();
+    assert_eq!(e["message"], "disk full");
+    assert_eq!(e["since"], 0);
+    assert_eq!(e["pending"], 600);
+    assert_eq!(e["dropped"], 2);
+
+    // 5 分鐘後再報一次（附待寫筆數）
+    let mut later = Vec::new();
+    for t in (40_000..331_000).step_by(100) {
+        if g.ready(t) {
+            later.extend(g.record(Err("disk full".into()), t, 900, 0));
+        }
+    }
+    assert_eq!(later.len(), 1, "{later:?}");
+    assert!(
+        later[0].contains("仍然") && later[0].contains("900"),
+        "{later:?}"
+    );
+
+    let back = g.record(Ok(()), 331_000, 0, 0);
+    assert!(back.is_some_and(|l| l.contains("恢復")));
+    assert!(g.error(0, 0).is_none());
+    assert!(g.ready(331_001), "恢復後不再退避");
+    assert!(
+        g.record(Ok(()), 331_100, 0, 0).is_none(),
+        "平常成功不寫 log"
+    );
+}
+
+#[cfg(unix)]
+fn lock_events_file(h: &std::path::Path, sid: &str, locked: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if locked { 0o400 } else { 0o600 };
+    std::fs::set_permissions(
+        h.join(format!("events/{sid}.jsonl")),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .unwrap();
+}
+
+/// pending 設上限：一直寫不進去時超過的丟最舊的、計數，記憶體不會無限長。
+#[test]
+#[cfg(unix)]
+fn pending_is_capped_and_drops_the_oldest() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started_at("s1", "/t/s1.jsonl"));
+    s.flush().unwrap();
+    s.set_pending_limit(2_000);
+    lock_events_file(&h, "s1", true);
+    for seq in 2..100 {
+        s.append(ev(
+            "s1",
+            seq,
+            "tool.called",
+            None,
+            seq,
+            json!({"toolUseId": format!("t{seq}"), "tool": "Bash", "input": {}}),
+        ));
+    }
+    let r = s.flush();
+    lock_events_file(&h, "s1", false);
+    assert!(r.is_err(), "前提：寫不進去");
+    assert!(s.pending_len() < 98, "要丟掉一些：還有 {}", s.pending_len());
+    assert_eq!(s.pending_len() as u64 + s.dropped(), 98);
+    s.flush().unwrap();
+    let text = std::fs::read_to_string(h.join("events/s1.jsonl")).unwrap();
+    assert!(text.contains("\"t99\""), "最新的留著");
+    assert!(!text.contains("\"t2\""), "最舊的丟掉");
+}
+
+/// 結束時還寫不進去：hook 來的 Event（`line` 是 null）寫進 `<home>/pending-<時間>.jsonl`，下次開 store 補回並刪檔；
+/// transcript 來的不寫（C15 之後它們的行號沒 commit，重啟時 tail 會重讀，寫進去會變兩份）。
+#[test]
+#[cfg(unix)]
+fn pending_hook_events_survive_a_shutdown_while_the_store_is_unwritable() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.flush().unwrap();
+        lock_events_file(&h, "s1", true);
+        s.append(ev(
+            "s1",
+            2,
+            "tool.called",
+            None,
+            2,
+            json!({"toolUseId": "hook-1", "tool": "Bash", "input": {}}),
+        ));
+        s.append(at_line("s1", 3, "main", 7));
+        s.saw_line("s1", "main", 7);
+        assert!(s.flush().is_err(), "前提：寫不進去");
+        let (saved, skipped) = s.dump_pending(&h).unwrap();
+        assert_eq!((saved, skipped), (1, 1));
+        lock_events_file(&h, "s1", false);
+    }
+    let dumps: Vec<_> = std::fs::read_dir(&h)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pending-"))
+        .collect();
+    assert_eq!(dumps.len(), 1);
+    let s = Store::open(&h).unwrap();
+    let text = std::fs::read_to_string(h.join("events/s1.jsonl")).unwrap();
+    assert!(text.contains("hook-1"), "hook 的 Event 補回來了：{text}");
+    assert!(!text.contains("\"no\":7"), "transcript 的不寫（會重讀）");
+    assert!(s.events_by_seq("s1", 2, 1).is_ok());
+    assert!(!dumps[0].path().exists(), "補完就刪");
+}

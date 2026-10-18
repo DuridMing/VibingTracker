@@ -302,7 +302,18 @@ pub struct Store {
     read_lines: BTreeMap<String, BTreeMap<String, u64>>,
     /// 開啟時 recover 讀了多少 bytes
     recover_bytes: u64,
+    /// 寫不進去時 `pending` 最多留多少 bytes（序列化後），超過的丟最舊的（W-M10）
+    pending_limit: u64,
+    /// 因為超過 `pending_limit` 丟掉的 Event 數（啟動以來）
+    dropped: u64,
+    /// 開啟時補回的 `pending-*.jsonl`：寫進去之後才刪
+    replayed: Vec<PathBuf>,
 }
+
+/// `pending` 的上限（W-M10）：磁碟滿、檔案被鎖很久時記憶體不會無限長
+pub const PENDING_LIMIT_BYTES: u64 = 50 * 1024 * 1024;
+/// 結束時還寫不進去的 hook Event 存在這種檔（`<home>/pending-<epoch ms>.jsonl`），下次開 store 補回
+pub const PENDING_DUMP_PREFIX: &str = "pending-";
 
 // ── 權限（S-6、contracts §5）：資料目錄與底下的檔只給目前使用者（Claude Code 自己的 transcript 也是 0600）
 
@@ -539,6 +550,9 @@ impl Store {
             unindexed: Vec::new(),
             read_lines: BTreeMap::new(),
             recover_bytes: 0,
+            pending_limit: PENDING_LIMIT_BYTES,
+            dropped: 0,
+            replayed: Vec::new(),
         };
         {
             let mut stmt = store.db.prepare("SELECT id, cwd FROM sessions")?;
@@ -554,7 +568,88 @@ impl Store {
             store.backfill_tails()?;
         }
         store.recover()?;
+        store.replay_pending_dumps(home);
         Ok(store)
+    }
+
+    /// 上次結束時沒寫進去的 hook Event（[`Store::dump_pending`]）補回去（W-M10）。在 recover 之後、
+    /// serve 讀計數之前做，seq 才接得上。補不進去就留著檔，之後哪次 flush 成功再刪。
+    fn replay_pending_dumps(&mut self, home: &Path) {
+        let Ok(dir) = fs::read_dir(home) else {
+            return;
+        };
+        let mut files: Vec<PathBuf> = dir
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with(PENDING_DUMP_PREFIX) && n.ends_with(".jsonl")
+                })
+            })
+            .collect();
+        files.sort();
+        for f in files {
+            match fs::read_to_string(&f) {
+                Ok(text) => {
+                    self.pending
+                        .extend(text.lines().filter_map(|l| Event::from_json_line(l).ok()));
+                    self.replayed.push(f);
+                }
+                Err(e) => crate::logging::log(&format!("store：讀不到 {}：{e}", f.display())),
+            }
+        }
+        if self.replayed.is_empty() {
+            return;
+        }
+        let n = self.pending.len();
+        match self.flush() {
+            Ok(()) => {
+                crate::logging::log(&format!("store：補回上次結束時沒寫進去的 {n} 筆 hook 事件"))
+            }
+            Err(e) => crate::logging::log(&format!(
+                "store：上次結束時沒寫進去的 {n} 筆 hook 事件還是寫不進去（{e}），檔案留著，之後再試"
+            )),
+        }
+    }
+
+    /// `pending` 的上限（bytes，測試用）。
+    pub fn set_pending_limit(&mut self, bytes: u64) {
+        self.pending_limit = bytes;
+    }
+
+    /// 還沒寫進 JSONL 的 Event 數。
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 啟動以來因 `pending` 超過上限丟掉的 Event 數。
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// 結束時 flush 還失敗：把 hook 來的 Event（`line` 是 null）寫進 `<home>/pending-<時間>.jsonl`，下次開 store
+    /// 補回（W-M10）。transcript 來的不寫：寫不進 JSONL 時它們的行號不 commit（C15），重啟時 tail 會重讀，
+    /// 寫進去會變兩份。回傳（存下的, 略過的 transcript Event）；寫不了檔回錯誤，呼叫端寫 log 說丟了幾筆。
+    pub fn dump_pending(&mut self, home: &Path) -> io::Result<(usize, usize)> {
+        let (hook, transcript): (Vec<&Event>, Vec<&Event>) =
+            self.pending.iter().partition(|e| e.line.is_none());
+        let counts = (hook.len(), transcript.len());
+        if !hook.is_empty() {
+            let mut buf = String::new();
+            for e in hook {
+                buf.push_str(&e.to_json_line());
+                buf.push('\n');
+            }
+            let path = home.join(format!("{PENDING_DUMP_PREFIX}{}.jsonl", crate::now_ms()));
+            write_private(&path, buf.as_bytes())?;
+        }
+        // 補回來又沒寫進去的那些也在這次的檔裡了，舊檔不刪的話下次會補兩次
+        for f in std::mem::take(&mut self.replayed) {
+            let _ = fs::remove_file(f);
+        }
+        self.pending.clear();
+        Ok(counts)
     }
 
     /// v2 → v3 升級時掃一次全部 JSONL，回填每個 transcript 檔讀到的行號（只在升級那次做）。
@@ -643,6 +738,7 @@ impl Store {
         let mut batches: Vec<Batch> = Vec::new();
         let mut members: Vec<Vec<usize>> = Vec::new();
         let mut offset_of = vec![0u64; pending.len()];
+        let mut size_of = vec![0u64; pending.len()];
         for (i, e) in pending.iter().enumerate() {
             let name = file_name(&e.session);
             let b = match batches.iter().position(|b| b.name == name) {
@@ -665,7 +761,9 @@ impl Store {
             };
             let batch = &mut batches[b];
             offset_of[i] = batch.base + batch.buf.len() as u64;
-            batch.buf.extend_from_slice(e.to_json_line().as_bytes());
+            let line = e.to_json_line();
+            size_of[i] = line.len() as u64 + 1;
+            batch.buf.extend_from_slice(line.as_bytes());
             batch.buf.push(b'\n');
             members[b].push(i);
         }
@@ -685,13 +783,31 @@ impl Store {
                 Err(e) => failure = Some(e),
             }
         }
+        let mut back = Vec::new();
         for (i, e) in pending.into_iter().enumerate() {
             if written[i] {
                 self.unindexed.push((e, offset_of[i]));
             } else {
-                self.pending.push(e);
+                back.push((e, size_of[i]));
             }
         }
+        // 放回 pending 的超過上限：丟最舊的、計數（W-M10）
+        let mut total: u64 = back.iter().map(|(_, n)| n).sum();
+        let mut skip = 0;
+        while total > self.pending_limit && skip < back.len() {
+            total -= back[skip].1;
+            skip += 1;
+        }
+        if skip > 0 {
+            self.dropped += skip as u64;
+            crate::logging::log(&format!(
+                "store：寫不進去的待寫資料超過 {} KB，丟掉最舊的 {skip} 筆（啟動以來共 {} 筆）",
+                self.pending_limit / 1024,
+                self.dropped
+            ));
+        }
+        self.pending
+            .extend(back.into_iter().skip(skip).map(|(e, _)| e));
 
         // 2. 再寫索引（同一個交易）；失敗時交易回滾，整批留到下次
         // 有 Event 沒寫進 JSONL（放回 pending）時，tail 讀到的行號先不記（C15）：記了之後在下次成功前當掉，
@@ -726,7 +842,13 @@ impl Store {
         }
         match failure {
             Some(e) => Err(e.into()),
-            None => Ok(()),
+            None => {
+                // 補回的 pending-*.jsonl 都寫進去了
+                for f in std::mem::take(&mut self.replayed) {
+                    let _ = fs::remove_file(f);
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1922,4 +2044,94 @@ fn index_event(
 /// 執行一句 SQL；語句快取在連線上，每筆 Event 不必重新 prepare（#683）。
 fn exec(tx: &Transaction<'_>, sql: &str, p: impl rusqlite::Params) -> rusqlite::Result<usize> {
     tx.prepare_cached(sql)?.execute(p)
+}
+
+/// store 寫入的退避與對外狀態（W-M10）。寫不進去時從 1 秒退避、加倍到 30 秒；log 只在開始失敗、
+/// 每 5 分鐘、恢復時各一行（原本每個 hook、每 100 ms 一行，9 小時就把 5 個輪替檔灌滿）。時間由呼叫端給（測試注入）。
+#[derive(Default)]
+pub struct FlushGate {
+    failing: Option<Failing>,
+    next_try: u64,
+    backoff: u64,
+}
+
+struct Failing {
+    since: u64,
+    message: String,
+    reported: u64,
+}
+
+const BACKOFF_FIRST_MS: u64 = 1_000;
+const BACKOFF_MAX_MS: u64 = 30_000;
+const REPORT_EVERY_MS: u64 = 5 * 60 * 1000;
+
+impl FlushGate {
+    /// 現在可以試著 flush（失敗中時要等退避時間到）。
+    pub fn ready(&self, now: u64) -> bool {
+        now >= self.next_try
+    }
+
+    /// 記下一次 flush 的結果；要寫的 log 回傳（沒有就 None）。
+    pub fn record(
+        &mut self,
+        result: Result<(), String>,
+        now: u64,
+        pending: usize,
+        dropped: u64,
+    ) -> Option<String> {
+        match (result, &mut self.failing) {
+            (Ok(()), None) => None,
+            (Ok(()), Some(f)) => {
+                let secs = now.saturating_sub(f.since) / 1000;
+                self.failing = None;
+                self.next_try = 0;
+                self.backoff = 0;
+                Some(format!(
+                    "store 恢復寫入（寫不進去了 {secs} 秒，待寫的都補上了）"
+                ))
+            }
+            (Err(e), failing) => {
+                self.backoff = (self.backoff * 2).clamp(BACKOFF_FIRST_MS, BACKOFF_MAX_MS);
+                self.next_try = now + self.backoff;
+                let drop_note = if dropped > 0 {
+                    format!("、超過上限丟掉 {dropped} 筆")
+                } else {
+                    String::new()
+                };
+                match failing {
+                    None => {
+                        self.failing = Some(Failing {
+                            since: now,
+                            message: e.clone(),
+                            reported: now,
+                        });
+                        Some(format!(
+                            "store 寫不進去：{e}；待寫 {pending} 筆{drop_note}。之後退避重試（最長每 {} 秒），每 5 分鐘報一次",
+                            BACKOFF_MAX_MS / 1000
+                        ))
+                    }
+                    Some(f) => {
+                        f.message = e.clone();
+                        if now.saturating_sub(f.reported) < REPORT_EVERY_MS {
+                            return None;
+                        }
+                        f.reported = now;
+                        Some(format!(
+                            "store 仍然寫不進去（{} 秒）：{e}；待寫 {pending} 筆{drop_note}",
+                            now.saturating_sub(f.since) / 1000
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    /// `/healthz`、welcome、snapshot 的 `storeError`（contracts §6、§7）；正常時 None。
+    pub fn error(&self, pending: usize, dropped: u64) -> Option<serde_json::Value> {
+        self.failing.as_ref().map(|f| {
+            serde_json::json!({
+                "message": f.message, "since": f.since, "pending": pending, "dropped": dropped,
+            })
+        })
+    }
 }

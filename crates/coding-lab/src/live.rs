@@ -232,6 +232,8 @@ pub struct Frame {
     agents: Vec<(String, Value)>,
     attention: Vec<(String, Value)>,
     kpi: BTreeMap<i32, Value>,
+    /// storeError 改變了（W-M10）：Some(null) 是恢復；None 是這個 frame 不帶
+    store_error: Option<Value>,
     /// 序列化好的結果（E-L4）：(頻道, offset, 模式) → 送出的文字；None＝這種連線沒有內容
     texts: std::sync::Mutex<HashMap<(String, i32, u8), Option<axum::extract::ws::Utf8Bytes>>>,
     serialized: std::sync::atomic::AtomicUsize,
@@ -245,6 +247,8 @@ struct FrameOut<'a> {
     ch: String,
     events: Vec<&'a Event>,
     rows: Value,
+    #[serde(rename = "storeError", skip_serializing_if = "Option::is_none")]
+    store_error: Option<&'a Value>,
 }
 
 /// frame 送給哪一種連線：本機原樣，遠端依 `remote_thinking` 剝除（[`crate::ws::redact_remote_copy`]）。
@@ -307,7 +311,10 @@ impl Frame {
         {
             obj.insert("kpi".into(), k);
         }
-        if events.is_empty() && rows.as_object().is_none_or(|o| o.is_empty()) {
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
             return None;
         }
         serde_json::to_string(&FrameOut {
@@ -316,6 +323,7 @@ impl Frame {
             ch: ch.name(),
             events,
             rows,
+            store_error: self.store_error.as_ref(),
         })
         .ok()
     }
@@ -361,12 +369,17 @@ impl Frame {
         {
             obj.insert("kpi".into(), k);
         }
-        if events.is_empty() && rows.as_object().is_none_or(|o| o.is_empty()) {
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
             return None;
         }
-        Some(
-            json!({ "t": "frame", "frame": self.no, "ch": ch.name(), "events": events, "rows": rows }),
-        )
+        let mut v = json!({ "t": "frame", "frame": self.no, "ch": ch.name(), "events": events, "rows": rows });
+        if let Some(e) = &self.store_error {
+            v["storeError"] = e.clone();
+        }
+        Some(v)
     }
 }
 
@@ -443,6 +456,9 @@ struct AttentionLive {
 
 #[derive(Default)]
 pub struct Live {
+    /// store 寫不進去的狀態（W-M10，contracts §6）：snapshot 一定帶，frame 只在改變時帶
+    store_error: Option<Value>,
+    store_error_dirty: bool,
     sessions: BTreeMap<String, SessionLive>,
     agents: BTreeMap<String, AgentLive>,
     attention: BTreeMap<String, AttentionLive>,
@@ -1107,11 +1123,14 @@ impl Live {
             })
             .collect();
 
+        let store_error = std::mem::take(&mut self.store_error_dirty)
+            .then(|| self.store_error.clone().unwrap_or(Value::Null));
         if events.is_empty()
             && sessions.is_empty()
             && agents.is_empty()
             && attention.is_empty()
             && kpi.is_empty()
+            && store_error.is_none()
         {
             return None;
         }
@@ -1123,6 +1142,7 @@ impl Live {
             agents,
             attention,
             kpi,
+            store_error,
             texts: Default::default(),
             serialized: Default::default(),
         });
@@ -1147,6 +1167,19 @@ impl Live {
             return None;
         }
         Some(self.history.iter().filter(|f| f.no > no).cloned().collect())
+    }
+
+    /// 目前的 storeError（welcome 用）；正常時 null。
+    pub fn store_error(&self) -> Value {
+        self.store_error.clone().unwrap_or(Value::Null)
+    }
+
+    /// serve 每次試著寫 store 之後呼叫（W-M10）；和上次不同才送。
+    pub fn set_store_error(&mut self, e: Option<Value>) {
+        if e != self.store_error {
+            self.store_error = e;
+            self.store_error_dirty = true;
+        }
     }
 
     pub fn snapshot(&self, ch: &Channel, offset_min: i32, now: u64) -> Value {
@@ -1221,6 +1254,7 @@ impl Live {
             "t": "snapshot", "ch": ch.name(), "frame": self.frame_no,
             "sessions": sessions, "agents": agents, "attention": attention,
             "staged": staged, "stream": stream,
+            "storeError": self.store_error.clone().unwrap_or(Value::Null),
         });
         if *ch == Channel::All {
             snap["kpi"] = self.kpi(offset_min, now);

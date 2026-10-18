@@ -2113,3 +2113,45 @@ fn more_reads_only_companions_and_status_lines_with_the_same_result() {
     }
     eprintln!("比較了 {compared} 個窗口");
 }
+
+/// W-M10（#781）：storeError 在 snapshot 的最外層一定有（正常時 null）；frame 只在改變時帶，恢復時帶 null，
+/// 沒有其他變化的 frame 也可以只帶它；每個頻道、本機與遠端都一樣（contracts §6）。
+#[test]
+fn store_error_is_in_every_snapshot_and_in_frames_when_it_changes() {
+    use coding_lab::live::Wire;
+    let mut l = Live::new();
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY)["storeError"], Value::Null);
+    assert!(
+        l.snapshot(&Channel::All, 0, DAY)
+            .as_object()
+            .unwrap()
+            .contains_key("storeError")
+    );
+    l.flush(DAY);
+
+    let err = json!({"message": "disk full", "since": 5, "pending": 3, "dropped": 0});
+    l.set_store_error(Some(err.clone()));
+    let f = l.flush(DAY + 1).expect("只有 storeError 也要送");
+    for ch in [Channel::All, Channel::Session("s1".into())] {
+        for wire in [
+            Wire::Local,
+            Wire::Remote(coding_lab::config::RemoteThinking::Hide),
+        ] {
+            let v: Value = serde_json::from_str(&f.text_for(&ch, 0, wire).unwrap()).unwrap();
+            assert_eq!(v["storeError"], err, "{ch:?} {wire:?}");
+        }
+    }
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY + 1)["storeError"], err);
+
+    l.set_store_error(Some(err.clone()));
+    assert!(l.flush(DAY + 2).is_none(), "沒變就不送");
+
+    l.set_store_error(None);
+    let f = l.flush(DAY + 3).expect("恢復也要送");
+    let v: Value =
+        serde_json::from_str(&f.text_for(&Channel::All, 0, Wire::Local).unwrap()).unwrap();
+    assert!(
+        v.as_object().unwrap().contains_key("storeError") && v["storeError"].is_null(),
+        "{v}"
+    );
+}

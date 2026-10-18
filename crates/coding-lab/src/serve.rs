@@ -21,7 +21,7 @@ use crate::hooks::{HookServer, serve_hooks};
 use crate::merge::{Input, Merger};
 use crate::prices::Prices;
 use crate::rules::RuleSet;
-use crate::store::Store;
+use crate::store::{FlushGate, Store};
 use crate::transcript::{
     SharedWatcher, TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail, stop_all,
 };
@@ -180,9 +180,69 @@ fn write_info(home: &Path, me: u32, hooks: &HookServer, webs: &[SocketAddr], clo
     }
 }
 
-/// `/healthz` 的動態部分（contracts §7）：`dropped` 是啟動以來因 hook 佇列滿丟掉的數量（L-6、E-D3）。
-fn health(tails: usize, lag_ms: u64, hooks: &HookServer) -> serde_json::Value {
-    json!({ "tails": tails, "schedLagMs": lag_ms, "dropped": hooks.dropped(), "user": hooks.user() })
+/// `/healthz` 的動態部分（contracts §7）：`dropped` 是啟動以來因 hook 佇列滿丟掉的數量（L-6、E-D3）；
+/// `storeError` 是 store 寫不進去的狀態，正常時 null（W-M10）。
+fn health(
+    tails: usize,
+    lag_ms: u64,
+    hooks: &HookServer,
+    store_error: &Option<serde_json::Value>,
+) -> serde_json::Value {
+    json!({ "tails": tails, "schedLagMs": lag_ms, "dropped": hooks.dropped(), "user": hooks.user(),
+            "storeError": store_error })
+}
+
+/// 試著把 store 的緩衝寫進去（W-M10）：寫不進去時照 [`FlushGate`] 退避，log 只在開始、每 5 分鐘、恢復時寫；
+/// storeError 交給 live（snapshot、frame），也回傳給 `/healthz`。
+fn flush_store(
+    store: &Mutex<Store>,
+    gate: &mut FlushGate,
+    web: &WebState,
+) -> Option<serde_json::Value> {
+    let now = crate::now_ms();
+    let (result, pending, dropped) = {
+        let mut s = store.lock().unwrap_or_else(|e| e.into_inner());
+        if !gate.ready(now) {
+            return gate.error(s.pending_len(), s.dropped());
+        }
+        let r = s.flush().map_err(|e| e.to_string());
+        (r, s.pending_len(), s.dropped())
+    };
+    if let Some(line) = gate.record(result, now, pending, dropped) {
+        log(&line);
+    }
+    let error = gate.error(pending, dropped);
+    web.live().set_store_error(error.clone());
+    error
+}
+
+/// 結束前的最後一次寫入不管退避。還是寫不進去：hook 來的 Event 存進 `pending-*.jsonl` 下次補回，
+/// 存不了也要寫 log 說丟了幾筆（W-M10）。
+fn final_flush(store: &mut Store, home: &Path, gate: &mut FlushGate) {
+    let r = store.flush();
+    let pending = store.pending_len();
+    if let Some(line) = gate.record(
+        r.as_ref().map(|_| ()).map_err(|e| e.to_string()),
+        crate::now_ms(),
+        pending,
+        store.dropped(),
+    ) {
+        log(&line);
+    }
+    let Err(e) = r else {
+        return;
+    };
+    match store.dump_pending(home) {
+        Ok((0, 0)) => {}
+        Ok((saved, skipped)) => log(&format!(
+            "結束時 store 還是寫不進去（{e}）：{saved} 筆 hook 事件存進 {}*.jsonl，下次啟動補回；\
+             {skipped} 筆 transcript 的事件下次會從 transcript 重讀",
+            crate::store::PENDING_DUMP_PREFIX
+        )),
+        Err(d) => log(&format!(
+            "結束時 store 寫不進去（{e}），待寫的也存不了（{d}）：丟掉 {pending} 筆事件"
+        )),
+    }
 }
 
 /// 綁 hook 埠（這也是單例鎖）。被佔用時分三種：上一個 collector 正在結束（collector.json 標 closing，#685）
@@ -409,6 +469,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut tick = tokio::time::interval(TICK);
     // transcript 行的 Event 批次寫（可從 transcript 補回來）；hook 事件處理完立刻寫，見下面（#713）
     let mut flush = tokio::time::interval(Duration::from_millis(cfg.store_flush_ms));
+    // store 寫不進去時的退避與對外狀態（W-M10）
+    let mut gate = FlushGate::default();
+    let mut store_error: Option<serde_json::Value> = None;
     let mut rescore = tokio::time::interval(SCORE_EVERY);
     let mut prune = tokio::time::interval(PRUNE_EVERY);
     prune.tick().await; // 第一次立即觸發，啟動時已經清過
@@ -465,7 +528,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                         sink(merger.handle(action.reset(crate::now_ms(), id)));
                         apply_tail(action, id, &mut tails, &tx, &watcher);
                     }
-                    web.set_health(health(tails.len(), 0, &hooks));
+                    web.set_health(health(tails.len(), 0, &hooks, &store_error));
                 }
             }
             sink(merger.handle(input));
@@ -487,9 +550,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 }
                 // hook 事件沒有別的來源可以補（transcript 的行有）：處理完立刻寫進 store，不等批次（#713）。
                 // hook 的 200 早在 try_send 時就回了，這裡的寫入不在 Claude Code 的等待路徑上
-                if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
-                    log(&format!("寫入 store 失敗：{e}"));
-                }
+                store_error = flush_store(&store, &mut gate, &web);
             }
             Some(input) = rx.recv() => process!(input),
             scheduled = tick.tick() => {
@@ -512,7 +573,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                         apply_tail(action, id, &mut tails, &tx, &watcher);
                     }
                 }
-                web.set_health(health(tails.len(), lag.as_millis() as u64, &hooks));
+                web.set_health(health(tails.len(), lag.as_millis() as u64, &hooks, &store_error));
                 let quiet = last_hook.elapsed();
                 let idle_now = !idle.is_zero()
                     && quiet >= idle
@@ -569,9 +630,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 web.set_scores(&merger.scores(crate::now_ms()));
             }
             _ = flush.tick() => {
-                if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
-                    log(&format!("寫入 store 失敗：{e}"));
-                }
+                store_error = flush_store(&store, &mut gate, &web);
             }
             _ = &mut shutdown => {
                 log("收到結束訊號");
@@ -601,9 +660,11 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         sink(merger.handle(input))
     })
     .await;
-    if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
-        log(&format!("寫入 store 失敗：{e}"));
-    }
+    final_flush(
+        &mut store.lock().unwrap_or_else(|e| e.into_inner()),
+        &cfg.home,
+        &mut gate,
+    );
     for task in std::iter::once(flusher).chain(web_tasks) {
         task.abort();
         let _ = task.await;
