@@ -299,6 +299,28 @@ impl Tracker {
         out
     }
 
+    /// main 開始新的工具（K-4）：Stop hook 回 block 時 Claude Code 會接著工作、不經 UserPromptSubmit，
+    /// 所以這輪還沒完成：靜默期取消、已發的 done 撤回。之後的 Stop（帶 `stop_hook_active`）照常計時。
+    pub fn main_tool_started(&mut self, now: u64) -> Vec<Change> {
+        let done: Vec<String> = self
+            .open
+            .iter()
+            .filter(|o| o.kind == AttentionKind::Done)
+            .map(|o| o.reference.clone())
+            .collect();
+        if !self.stopped && done.is_empty() {
+            return Vec::new();
+        }
+        self.stop_at = None;
+        self.stopped = false;
+        let mut out: Vec<Change> = done
+            .iter()
+            .filter_map(|r| self.clear(AttentionKind::Done, r))
+            .collect();
+        out.extend(self.recompute(now));
+        out
+    }
+
     /// main agent 的 Stop（subagent、背景 agent 不會呼叫）。
     pub fn stop(&mut self, now: u64) -> Vec<Change> {
         let mut out = self.clear_waits();
@@ -318,12 +340,22 @@ impl Tracker {
     }
 
     /// SessionStart：resume／compact／clear 接回同一個 session 時，結束、中斷與 Stop 的狀態都不再成立。
+    /// 之前還在跑的工具已經跟著舊的程序結束、不會再有 Post：它們的 danger／wait 一起解除，
+    /// 也不再算「有工具在跑」（K-2）。
     pub fn started(&mut self, now: u64) -> Vec<Change> {
         self.ended = false;
         self.idle = false;
         self.stop_at = None;
         self.stopped = false;
-        self.recompute(now).into_iter().collect()
+        self.pending_wait.clear();
+        let mut out = Vec::new();
+        for r in std::mem::take(&mut self.running) {
+            for kind in [AttentionKind::Wait, AttentionKind::Danger] {
+                out.extend(self.clear(kind, &r.id));
+            }
+        }
+        out.extend(self.recompute(now));
+        out
     }
 
     /// 種回還開著的注意項目（不發 Event：live 與 store 已經有這些列與狀態）。

@@ -1346,6 +1346,11 @@ impl Merger {
             }
         }
         out.extend(self.derive_from_pre(h, sid, &id, &agent, ts_seen));
+        // main 開始新的工具：這輪還沒完成（Stop hook 回 block 時不經 UserPromptSubmit，K-4）
+        if agent == "main" {
+            let changes = self.tracker(sid).main_tool_started(ts_seen);
+            out.extend(self.apply(sid, changes, &agent, ts_seen));
+        }
         // 危險不等 transcript：PreToolUse 一到就進注意佇列；warn 只在串流標示
         if let Some(d) = danger.filter(|d| d.level == DangerLevel::Danger) {
             let changes = self.tracker(sid).danger(&id, d.why, ts_seen);

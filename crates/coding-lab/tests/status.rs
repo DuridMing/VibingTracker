@@ -315,6 +315,52 @@ fn prompt_within_silence_cancels_done() {
     assert!(r.attention().is_empty());
 }
 
+/// Stop hook 回 block 時 Claude Code 接著工作，之後的 Stop 帶 `stop_hook_active`；中間沒有 UserPromptSubmit。
+/// main 開始新的工具就表示這輪還沒完成（K-4）。
+#[test]
+fn main_tool_after_stop_cancels_the_silence_period() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .feed(pre("t1", "cargo fmt", 2000))
+        .tick(6500);
+    assert!(r.attention().is_empty(), "{:?}", r.attention());
+    assert_eq!(r.last_status(), "run");
+    // 做完再 Stop 一次：照常 5 秒後完成
+    r.feed(ok("t1", 3000))
+        .feed(hook("Stop", json!({ "stop_hook_active": true }), 4000))
+        .tick(8999);
+    assert!(r.attention().is_empty());
+    r.tick(9000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
+}
+
+#[test]
+fn main_tool_after_done_withdraws_it() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .tick(6000)
+        .feed(pre("t1", "cargo fmt", 7000));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "done", "p0"), a("cleared", "done", "p0")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn subagent_tool_after_stop_does_not_cancel_done() {
+    // 背景 agent 在 main 的 Stop 之後還會跑工具；那不是 main 這一輪沒完成
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(subagent_start("a1", 500))
+        .feed(stop(1000))
+        .feed(pre_agent("t1", "ls", "a1", 2000))
+        .tick(6000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
+}
+
 #[test]
 fn prompt_after_done_withdraws_it() {
     let mut r = Run::new();
@@ -1292,6 +1338,43 @@ fn start(source: &str, ts: u64) -> Input {
 
 fn end(ts: u64) -> Input {
     hook("SessionEnd", json!({ "reason": "exit" }), ts)
+}
+
+/// 危險指令還在跑（或等權限）時 session 就結束了，沒有 Post 也沒有 tool_result：resume 之後那個工具
+/// 已經不存在，它的 danger／wait 不能一直蓋住新一輪的狀態（K-2）。
+#[test]
+fn danger_of_a_tool_that_died_with_the_session_is_cleared_on_resume() {
+    let mut r = Run::with_rules();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("x", 1_100))
+        .feed(pre("t1", "rm -rf build/x", 1_200))
+        .feed(end(5_000));
+    assert_eq!(r.last_status(), "ended");
+    r.feed(start("resume", 60_000));
+    assert!(
+        r.attention().contains(&a("cleared", "danger", "t1")),
+        "{:?}",
+        r.attention()
+    );
+    r.feed(prompt("y", 61_000)).feed(stop(62_000)).tick(70_000);
+    assert_eq!(r.last_status(), "done", "{:?}", r.statuses());
+}
+
+/// 同上，等權限中的工具：resume 後不能留著 running，否則 #706 的「等你」推測永遠不會觸發。
+#[test]
+fn wait_of_a_tool_that_died_with_the_session_is_cleared_on_resume() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("x", 1_100))
+        .feed(pre("t1", "git push", 1_200))
+        .feed(ask("git push", 1_300))
+        .tick(2_500);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(end(5_000)).feed(start("resume", 60_000));
+    assert_eq!(r.last_status(), "run", "{:?}", r.statuses());
+    // 沒有在跑的工具：main 的文字之後 N 秒沒有動靜要推測「等你」
+    r.feed(said(1, "m1", "main", 61_000)).tick(61_000 + 120_000);
+    assert_eq!(r.last_status(), "wait", "{:?}", r.attention());
 }
 
 #[test]
