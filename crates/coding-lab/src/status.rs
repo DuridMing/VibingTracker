@@ -548,10 +548,6 @@ impl Tracker {
         score(&self.cfg, &open, &self.signals, now)
     }
 
-    pub fn state(&self) -> SessionState {
-        self.state
-    }
-
     fn is_open(&self, kind: AttentionKind, r: &str) -> bool {
         self.open.iter().any(|o| o.kind == kind && o.reference == r)
     }
