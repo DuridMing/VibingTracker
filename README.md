@@ -155,12 +155,12 @@ wait_guess_seconds = 30   # Claude 最後寫了一段話、之後這麼久沒有
 { "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cacheRead": 0.2 } }
 ```
 
-`rules.json` 和內建規則同格式：同 `id` 的取代內建、新的 `id` 優先比對、`disable` 列出要停用的內建規則。`pattern` 是正則，Bash 預設比對依 `&&`、`;`、`|`、換行切開後的每一段（`"scope": "command"` 改成比對整條指令），其他工具預設比對 `file_path`（可用 `field` 指定）。改完重啟 collector 才生效；格式或正則有錯時整份不用、退回內建規則，並在日誌寫一行警告。危險只標示，不會攔截。
+`rules.json` 和內建規則同格式：同 `id` 的取代內建、新的 `id` 優先比對、`disable` 列出要停用的內建規則。`pattern` 是正則。指令型工具（Bash、PowerShell；`tools` 寫 `"@command"` 代表全部，`cmd /c …` 裡的指令也算）比對的是**分詞後**依 `&&`、`;`、`|`、換行切開的每一段：引號裡的符號不算分隔、反斜線續行接回同一段、heredoc 的本文當成字面文字不當指令、`$(…)` 與 `bash -c`、`cmd /c` 的內容另外檢查，`sudo`、`env`、`timeout` 等包裝先去掉（`"scope": "command"` 改成比對接回來的整條指令）。其他工具預設比對 `file_path`（可用 `field` 指定）。選填的 `unless` 也是正則，`pattern` 命中而 `unless` 也命中時不算，例如排除 `--dry-run`。改完重啟 collector 才生效；格式或正則有錯時整份不用、退回內建規則，並在日誌寫一行警告。危險只標示，不會攔截。
 
 ```json
 {
   "rules": [
-    { "id": "kubectl-delete", "tools": ["Bash"], "pattern": "^kubectl\\s+delete\\b", "level": "danger", "why": "刪除叢集資源" }
+    { "id": "kubectl-delete", "tools": ["@command"], "pattern": "^kubectl\\s+delete\\b", "unless": "\\s--dry-run(=|\\s|$)", "level": "danger", "why": "刪除叢集資源" }
   ],
   "disable": ["rm-rf-build"]
 }
