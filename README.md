@@ -201,7 +201,7 @@ coding-lab service status
 coding-lab service uninstall
 ```
 
-服務用 `serve --idle-exit-seconds 0` 跑、不會閒置結束，設定仍讀 `~/.coding-lab/config.toml`。Linux 要在沒人登入時就起來，再執行一次 `loginctl enable-linger $USER`。`install --dry-run` 只印出會寫的檔與會跑的指令。TLS 不內建：需要 https 時前置 Caddy 或 nginx 反向代理到 127.0.0.1:4801。
+服務用 `serve --idle-exit-seconds 0` 跑、不會閒置結束，設定仍讀 `~/.coding-lab/config.toml`。Linux 要在沒人登入時就起來，再執行一次 `loginctl enable-linger $USER`。`install --dry-run` 只印出會寫的檔與會跑的指令。TLS 不內建：需要 https 時前置 Caddy 或 nginx 反向代理到 127.0.0.1:4801，並設 `[web].auth = "always"`（反代轉來的連線一律當遠端、要金鑰；細節見安裝手冊）。
 
 **一次看多台伺服器（hub）**：每台伺服器各跑自己的 collector（上面的形態），本機跑 `coding-lab hub` 把它們合成一頁：
 

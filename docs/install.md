@@ -139,6 +139,13 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 
 https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801，或走 tailnet、SSH 通道（見上一節）。
 
+架反向代理時：
+
+- 在 `config.toml` 的 `[web]` 設 `auth = "always"`。
+- 請求帶了 `X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto` 或 `Forwarded`，collector 就把它當成遠端連線：一律要金鑰，敏感輸出與 thinking 照遠端的規則遮蔽。nginx、Caddy 預設都會帶其中幾個。
+- 登入失敗的限流（每個來源每分鐘 10 次）在反代後面是以反代的 IP 計算，所有人共用同一個額度。用 `Authorization: Bearer` 帶金鑰不限流，因為 256 位元的亂數猜不到。
+- hub 沒有金鑰驗證，不要放在反代後面：帶轉發標頭的連線一律回 403。
+
 ## 一次看多台伺服器（hub）
 
 幾台伺服器各自跑 Claude Code 與 collector，想在自己的電腦上一頁看完：每台照上一節設成常駐、給本機一把金鑰（tailnet）或開 SSH 通道，然後在本機：

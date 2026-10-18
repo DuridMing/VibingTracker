@@ -1568,6 +1568,55 @@ fn reading_secrets_marks_the_result_sensitive() {
     );
 }
 
+/// C8（#761）：敏感的 Write／Edit 在 tool.called、file.write、file.edit 也標 sensitive（hunk 的前後文是從實際檔案
+/// 讀的，會帶出 .env 原有的秘密）；判斷和 tool.result 一樣；沒命中時不輸出這個欄位。
+#[test]
+fn writing_secrets_marks_the_call_and_the_file_event_sensitive() {
+    let mut m = merger();
+    let w = m.handle(pre(
+        "t1",
+        "Write",
+        json!({"file_path": "/p/.env", "content": "TOKEN=abc\n"}),
+        1000,
+    ));
+    let e = m.handle(pre(
+        "t2",
+        "Edit",
+        json!({"file_path": "/p/.env", "old_string": "abc", "new_string": "xyz"}),
+        1100,
+    ));
+    let n = m.handle(pre(
+        "t3",
+        "Write",
+        json!({"file_path": "/p/src/a.rs", "content": "fn a() {}\n"}),
+        1200,
+    ));
+    let of = |evs: &[Event], t: &str| {
+        evs.iter()
+            .find(|e| e.type_name() == t)
+            .unwrap()
+            .payload
+            .clone()
+    };
+    assert_eq!(of(&w, "tool.called")["sensitive"], true);
+    assert_eq!(of(&w, "file.write")["sensitive"], true);
+    assert_eq!(of(&e, "tool.called")["sensitive"], true);
+    assert_eq!(of(&e, "file.edit")["sensitive"], true);
+    assert!(of(&n, "tool.called").get("sensitive").is_none());
+    assert!(of(&n, "file.write").get("sensitive").is_none());
+    // 本機照存
+    assert_eq!(of(&w, "file.write")["content"], "TOKEN=abc\n");
+}
+
+/// C8：讀敏感檔的指令型工具，tool.called 也標（輸入裡的指令本身通常不是秘密，但和 tool.result 一致）。
+#[test]
+fn reading_secrets_with_a_command_marks_the_call_sensitive() {
+    let mut m = merger();
+    let a = m.handle(pre("t1", "Bash", json!({"command": "cat .env"}), 1000));
+    let c = a.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert_eq!(c.payload["sensitive"], true);
+}
+
 /// #654（R22）：tool.called 的 input 裡過長的字串截到 8 KB，標 inputTruncated；短的不動。
 #[test]
 fn long_tool_input_strings_are_truncated() {
@@ -1602,4 +1651,135 @@ fn output_truncation_keeps_utf8_intact() {
     assert!(out.len() <= 8 * 1024);
     assert!(out.ends_with('a'), "不留下半個字");
     assert_eq!(r.payload["truncated"], true);
+}
+
+/// K-8：PreToolUse 到了、transcript 的 tool_use 行還沒到時 collector 重啟。重啟前的暫存卡要種回 merge：
+/// tool_use 行到了照常放進串流（不再發第二筆 tool.called，KPI 不重複），等不到就照常降級，不留幽靈卡。
+#[test]
+fn samples_restart_between_pre_tool_use_and_its_line() {
+    let mut tried = 0;
+    for dir in sample_sessions() {
+        let Some(first) = common::sample_inputs(&dir) else {
+            continue;
+        };
+        let sid = first.session.clone();
+        // 重啟點：PreToolUse 剛處理完（它的 tool_use 行一定還沒到）；每個樣本最多 5 個
+        let points: Vec<usize> = first
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, i))| {
+                matches!(i, Input::Hook { hook, .. } if hook.event_name() == "PreToolUse")
+            })
+            .map(|(n, _)| n + 1)
+            .take(5)
+            .collect();
+        for cut in points {
+            let mut it = common::sample_inputs(&dir).unwrap().inputs.into_iter();
+            let mut a = Merger::new(Box::new(common::NoDanger));
+            let (mut before, mut last_ts) = (Vec::new(), 0);
+            for (ts, input) in it.by_ref().take(cut) {
+                before.extend(a.tick(ts));
+                before.extend(a.handle(input));
+                last_ts = ts;
+            }
+            // 重啟：和 serve 一樣，從 store 種回 seq／pos／路徑基準與最近的 Event
+            let mut b = Merger::new(Box::new(common::NoDanger));
+            let seq = before.iter().map(|e| e.seq).max().unwrap_or(0);
+            let pos = before.iter().filter_map(|e| e.pos).max().unwrap_or(0);
+            let cwd = before
+                .iter()
+                .find(|e| e.type_name() == "session.started")
+                .and_then(|e| e.payload["cwd"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            b.resume(&sid, seq, pos, &cwd);
+            b.resume_staged(&before, last_ts);
+            let (mut after, mut end) = (Vec::new(), last_ts);
+            for (ts, input) in it {
+                after.extend(b.tick(ts));
+                after.extend(b.handle(input));
+                end = ts;
+            }
+            after.extend(b.tick(end + 60_000));
+            let all: Vec<&Event> = before.iter().chain(&after).collect();
+            let of = |t: &str, id: &str| {
+                all.iter()
+                    .filter(|e| e.type_name() == t && e.payload["toolUseId"] == id)
+                    .count()
+            };
+            let called: Vec<&Event> = all
+                .iter()
+                .copied()
+                .filter(|e| e.type_name() == "tool.called")
+                .collect();
+            for c in &called {
+                let id = c.payload["toolUseId"].as_str().unwrap();
+                assert_eq!(
+                    of("tool.called", id),
+                    1,
+                    "{} 在第 {cut} 個輸入後重啟：{id} 發了兩次 tool.called",
+                    dir.display()
+                );
+                if c.payload["placement"] == "staged" {
+                    assert_eq!(
+                        of("tool.placed", id),
+                        1,
+                        "{} 在第 {cut} 個輸入後重啟：暫存卡 {id} 沒有（或不只一次）放進串流",
+                        dir.display()
+                    );
+                }
+            }
+            tried += 1;
+        }
+    }
+    if tried == 0 {
+        eprintln!("略過：沒有 samples");
+    }
+}
+
+/// K-8：種回的暫存卡等不到 tool_use 行時，從重啟起算 FALLBACK_AFTER_MS 後照常降級，只放一次；
+/// 已經放進串流的不種回；重啟後再收到同一個 PreToolUse 也不重發 tool.called。
+#[test]
+fn resumed_staged_card_falls_back_after_the_usual_wait() {
+    let mut a = merger();
+    let mut before = a.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
+    before.extend(a.handle(pre("t2", "Bash", json!({"command": "pwd"}), 1001)));
+    before.extend(a.tick(1001 + FALLBACK_AFTER_MS)); // t1、t2 都降級了
+    before.extend(a.handle(pre("t3", "Bash", json!({"command": "id"}), 20_000)));
+    let placed = |evs: &[Event], id: &str| {
+        evs.iter()
+            .filter(|e| e.type_name() == "tool.placed" && e.payload["toolUseId"] == id)
+            .count()
+    };
+    assert_eq!(placed(&before, "t1"), 1, "前提");
+    assert_eq!(placed(&before, "t3"), 0, "前提");
+
+    let mut b = merger();
+    let seq = before.iter().map(|e| e.seq).max().unwrap();
+    let pos = before.iter().filter_map(|e| e.pos).max().unwrap();
+    b.resume(S, seq, pos, "/p");
+    b.resume_staged(&before, 30_000);
+    let mut after = b.handle(pre("t3", "Bash", json!({"command": "id"}), 30_001));
+    assert!(
+        after.is_empty(),
+        "同一個 PreToolUse 不重發：{:?}",
+        types(&after)
+    );
+    after.extend(b.tick(30_000 + FALLBACK_AFTER_MS - 1));
+    assert_eq!(placed(&after, "t3"), 0, "從重啟起算還沒滿");
+    after.extend(b.tick(30_000 + FALLBACK_AFTER_MS));
+    after.extend(b.tick(30_000 + 3 * FALLBACK_AFTER_MS));
+    assert_eq!(placed(&after, "t3"), 1);
+    assert_eq!(
+        placed(&after, "t1") + placed(&after, "t2"),
+        0,
+        "已放進串流的不種回"
+    );
+    let p = after
+        .iter()
+        .find(|e| e.type_name() == "tool.placed")
+        .unwrap();
+    assert_eq!(p.payload["placement"], "fallback");
+    assert_eq!(p.pos, Some(pos + 1), "接著重啟前的位置");
 }

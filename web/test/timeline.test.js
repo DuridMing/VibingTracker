@@ -90,3 +90,38 @@ test("快用完時要下一段：有 next、沒在載入、佇列裡剩下的不
   tl.seek(5000);
   assert.equal(tl.appended(more, { frames: [frame(1800)], next: null }), false, "拖動之後才回來的接續段丟掉");
 });
+
+test("下一段還在載入時時鐘停在已載入的範圍，載入後接著播，最後一段也會套到（#765 C4）", () => {
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 600_000 });
+  const req = tl.seek(0);
+  // 第一段放到 500 s（next＝最後放進來的時間點），範圍到 600 s
+  tl.loaded(req, { snapshot: {}, frames: [frame(250_000), frame(500_000)], next: 500_000 });
+  tl.play(600);
+  const got = tl.tick(1000).map((f) => f.ts); // 600× 一秒＝600 s，超過已載入的部分
+  assert.deepEqual(got, [250_000, 500_000]);
+  assert.equal(tl.t, 500_000, "時鐘不能跑到還沒載入的地方");
+  assert.equal(tl.playing, true, "還沒播完，等下一段");
+  assert.equal(tl.ended, false);
+  const more = tl.loadingMore();
+  assert.deepEqual(tl.tick(1000), [], "載入中不前進");
+  assert.equal(tl.t, 500_000);
+  tl.appended(more, { frames: [frame(550_000)], next: null });
+  assert.deepEqual(tl.tick(1000).map((f) => f.ts), [550_000], "晚到的那段照樣套用");
+  assert.equal(tl.t, 600_000);
+  assert.equal(tl.ended, true);
+});
+
+test("讀取失敗之後不開始播放（#765 C14）", () => {
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 10_000 });
+  const req = tl.seek(5000);
+  tl.failed(req, "HTTP 500");
+  tl.play();
+  assert.equal(tl.playing, false, "沒有資料可播，不能假裝在播");
+  // 重新 seek 成功後可以播
+  const again = tl.seek(5000);
+  tl.loaded(again, { snapshot: {}, frames: [], next: null });
+  tl.play();
+  assert.equal(tl.playing, true);
+});

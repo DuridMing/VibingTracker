@@ -213,8 +213,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     }
     // 還沒解除的注意項目種回 merge（#679）：否則之後的 prompt、工具結束解不掉重啟前的列
     resume_attention(&mut merger, &open_attention, &recent);
-    // 費用暴增（#675）：基準＋補回各 session 最近 24 小時的花費
     let now = crate::now_ms();
+    // 還在暫存區的卡片種回（K-8）：tool_use 行在重啟後才到時不再發第二筆 tool.called
+    merger.resume_staged(&recent, now);
+    // 費用暴增（#675）：基準＋補回各 session 最近 24 小時的花費
     let usage = cost_usage(&store, now);
     merger.set_cost_baseline(crate::status::cost_baseline(&usage, now));
     for (sid, at, usd) in usage.iter().filter(|(_, at, _)| at + DAY_MS >= now) {

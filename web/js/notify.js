@@ -79,10 +79,15 @@ export function createNotifier({ now, setTimeout, clearTimeout, emit, windowMs =
       known.clear();
       baseline = now();
     },
+    // 同一條連線上的 snapshot（例如離開回放時重訂 `*`）：合併中、還在 snapshot 裡的照發，不在的（已確認、已刪）丟掉。
+    // 重新連線時 connected() 已經先清掉待發的，所以不會補響（#765 C5）
     snapshot(rows) {
-      reset();
+      const ids = new Set();
+      for (const r of rows ?? []) if (r?.id != null) ids.add(r.id);
+      pending = pending.filter((x) => ids.has(x.id));
+      if (!pending.length) reset();
       known.clear();
-      for (const r of rows ?? []) if (r?.id != null) known.add(r.id);
+      for (const id of ids) known.add(id);
     },
     frame(rows) {
       for (const r of rows ?? []) {
