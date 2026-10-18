@@ -8,7 +8,18 @@ import unittest
 import lifecycle
 from lifecycle import compare
 
-L_BIN_EXISTS = lifecycle.BIN.exists()
+
+def _bin_is_fresh():
+    """target/release 的二進位存在，而且比 crates/coding-lab 的原始碼新（舊的二進位會驗到舊的行為，#749 T-3）"""
+    if not lifecycle.BIN.exists():
+        return False
+    built = lifecycle.BIN.stat().st_mtime
+    src = lifecycle.ROOT / "crates" / "coding-lab"
+    newest = max((p.stat().st_mtime for p in src.rglob("*") if p.is_file() and "target" not in p.parts), default=0)
+    return built >= newest
+
+
+L_BIN_EXISTS = _bin_is_fresh()
 
 
 def assistant(block, model="claude-opus-5-5"):
@@ -91,7 +102,7 @@ class Setup(unittest.TestCase):
         self.assertFalse(self.L.alive(p.pid))
         self.assertTrue(self.L.alive(os.getpid()))
 
-    @unittest.skipUnless(L_BIN_EXISTS, "要有 target/release/coding-lab（tests/scripts/lifecycle.sh 會先建）")
+    @unittest.skipUnless(L_BIN_EXISTS, "要有比原始碼新的 target/release/coding-lab（tests/scripts/lifecycle.sh 會先建）")
     def test_stop_collector_stops_a_running_collector_without_signals(self):
         # #711：stop_collector 走 `coding-lab stop`（#700），三平台都通；Windows 沒有 SIGTERM 可送
         import subprocess

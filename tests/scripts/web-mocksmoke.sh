@@ -5,4 +5,4 @@ set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 web=$(cd "${WEB_DIR:-$root/web}" && pwd)
 exec podman run --rm -v "$web:/web:Z,ro" -v "$root/tests/e2e/web:/e2e:Z,ro" \
-  docker.io/library/node:22-alpine node /e2e/mocksmoke.mjs
+  docker.io/library/node:22.23.3-alpine node /e2e/mocksmoke.mjs
