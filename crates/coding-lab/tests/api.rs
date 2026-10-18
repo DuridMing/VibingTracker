@@ -1776,3 +1776,26 @@ async fn project_events_api_is_gone() {
     .await;
     assert_eq!(get(addr, "/api/projects/events?cwd=%2Fp").await.0, 404);
 }
+
+/// E-H2（#767）：/api/files 回 treeHash；請求帶 have＝目前的 treeHash 時省略 tree（其他欄位照給），不同時照給。
+#[tokio::test]
+async fn files_omits_the_tree_when_the_client_already_has_it() {
+    let r = repo();
+    let addr = files_server(&r).await;
+    let cwd = enc(&s(&r.x));
+    let (code, full) = get(addr, &format!("/api/files?cwd={cwd}")).await;
+    assert_eq!(code, 200);
+    let hash = full["treeHash"]
+        .as_str()
+        .expect("要有 treeHash")
+        .to_string();
+    assert_eq!(hash.len(), 16);
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(full["tree"].as_array().is_some_and(|t| !t.is_empty()));
+    let (_, same) = get(addr, &format!("/api/files?cwd={cwd}&have={hash}")).await;
+    assert!(same.get("tree").is_none(), "have 相同時不送 tree：{same}");
+    assert_eq!(same["treeHash"], hash.as_str());
+    assert_eq!(same["changes"], full["changes"], "其他欄位照給");
+    let (_, other) = get(addr, &format!("/api/files?cwd={cwd}&have=0000000000000000")).await;
+    assert_eq!(other["tree"], full["tree"]);
+}

@@ -7,7 +7,7 @@
 //! （否則使用者瀏覽器裡任何網頁都能連 `ws://127.0.0.1:4801` 讀走 transcript；沒帶 `Origin` 的 wscat、curl 放行）。
 //! 遠端或 `auth = "always"` 的連線每個請求都要金鑰（[`crate::auth`]）：Bearer 或登入 cookie。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +56,8 @@ pub struct WebState {
     remote_thinking: Mutex<RemoteThinking>,
     /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
     force_remote: std::sync::atomic::AtomicBool,
+    /// /api/files 最近的結果（E-H2）：(cwd, base) → (算好的時間, 回應)，約 1 秒內共用
+    files_memo: Mutex<HashMap<(String, String), (Instant, Value)>>,
     /// 進行中的回放請求數與上限（#742 B-N1）
     replays: std::sync::atomic::AtomicUsize,
     max_replays: std::sync::atomic::AtomicUsize,
@@ -64,6 +66,9 @@ pub struct WebState {
 /// 同一個 collector 同時最多幾個回放請求（#742 B-N1）：回放要讀整段 JSONL、重放、佔記憶體，
 /// 連續拖動滑桿或遠端送大範圍不能把 collector 拖垮。
 pub const MAX_REPLAYS: usize = 2;
+
+/// /api/files 的結果共用多久（E-H2）：前端每 3 秒輪詢一次，晚 1 秒內可以接受
+const FILES_MEMO: Duration = Duration::from_secs(1);
 
 /// 一個回放名額；drop 時還回去。
 pub(crate) struct ReplaySlot(Arc<WebState>);
@@ -120,6 +125,7 @@ impl WebState {
             auth,
             remote_thinking: Mutex::new(RemoteThinking::OnDemand),
             force_remote: std::sync::atomic::AtomicBool::new(false),
+            files_memo: Mutex::new(HashMap::new()),
             replays: std::sync::atomic::AtomicUsize::new(0),
             max_replays: std::sync::atomic::AtomicUsize::new(MAX_REPLAYS),
         })
@@ -142,6 +148,20 @@ impl WebState {
             .remote_thinking
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 約 [`FILES_MEMO`] 內算過的 /api/files 結果（E-H2）。
+    pub(crate) fn recent_files(&self, key: &(String, String)) -> Option<Value> {
+        let memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.get(key)
+            .filter(|(at, _)| at.elapsed() < FILES_MEMO)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub(crate) fn remember_files(&self, key: (String, String), body: Value) {
+        let mut memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.retain(|_, (at, _)| at.elapsed() < FILES_MEMO);
+        memo.insert(key, (Instant::now(), body));
     }
 
     /// 同時進行的回放請求上限（預設 [`MAX_REPLAYS`]）；測試用。

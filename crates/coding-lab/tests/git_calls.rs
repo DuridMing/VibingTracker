@@ -142,9 +142,44 @@ async fn filter_drivers_are_looked_up_once_per_directory_per_request() {
             *lookups.entry(dir.to_string()).or_default() += 1;
         }
     }
+    eprintln!("一次 /api/files（2 個 worktree）：{total} 個 git 程序");
     assert!(!lookups.is_empty(), "要有 filter 查詢：{calls}");
+    // E-H2（#767）：未追蹤檔每個目錄只掃一次（樹的 ls-files 一併分出來，主工作樹算改動時不再掃）
+    let mut others: BTreeMap<String, usize> = BTreeMap::new();
+    for line in calls
+        .lines()
+        .filter(|l| l.contains("ls-files") && l.contains("--others"))
+    {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let dir = words
+            .iter()
+            .position(|w| *w == "-C")
+            .and_then(|i| words.get(i + 1))
+            .copied()
+            .unwrap_or("?");
+        *others.entry(dir.to_string()).or_default() += 1;
+    }
+    assert!(
+        others.values().all(|n| *n == 1),
+        "未追蹤檔掃了不只一次：{others:?}"
+    );
     assert!(
         lookups.values().all(|n| *n == 1),
         "同一個目錄查了不只一次（共 {total} 個 git 程序）：{lookups:?}"
     );
+    // E-H2：約 1 秒內同一個 (cwd, base) 共用結果，不再跑 git（多個分頁同時輪詢）
+    let _ = std::fs::remove_file(&log);
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut again = String::new();
+    s.read_to_string(&mut again).await.unwrap();
+    assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+    let n = std::fs::read_to_string(&log)
+        .map(|c| c.lines().count())
+        .unwrap_or(0);
+    assert_eq!(n, 0, "1 秒內的同一個請求不該再跑 git（跑了 {n} 個）");
 }

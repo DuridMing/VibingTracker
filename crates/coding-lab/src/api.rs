@@ -352,8 +352,13 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
+    let have = q.get("have").cloned();
+    let memo_key = (
+        cwd.clone(),
+        q.get("base").cloned().unwrap_or_else(|| "main".into()),
+    );
     // git 與 SQLite 都會阻塞，整段放到 blocking 執行緒
-    spawn_git(move || files_blocking(&store, &cwd, base))
+    spawn_git(move || files_blocking(&state, &store, &cwd, base, memo_key, have))
         .await
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -377,9 +382,20 @@ fn cwd_allowed(known: &[String], cwd: &str) -> bool {
         .any(|k| worktrees(Path::new(k)).first().map(|(p, _)| p.as_str()) == Some(cwd))
 }
 
-fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Response {
+fn files_blocking(
+    state: &WebState,
+    store: &std::sync::Mutex<Store>,
+    cwd: &str,
+    base: Base,
+    memo_key: (String, String),
+    have: Option<String>,
+) -> Response {
     if let Some(resp) = guard(store, cwd) {
         return resp;
+    }
+    // 約 1 秒內的同一個 (cwd, base) 共用結果（E-H2）：多個分頁各自每 3 秒輪詢時不用每個都重跑一遍 git
+    if let Some(body) = state.recent_files(&memo_key) {
+        return ok(&without_known_tree(body, have));
     }
     let session_paths = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
@@ -398,19 +414,29 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
     let root_path = root.clone().unwrap_or_else(|| cwd.to_string());
     let (tree, truncated) = match &root {
         Some(r) => {
-            let mut t = nul_split(
-                &git(
-                    Path::new(r),
-                    &[
-                        "ls-files",
-                        "-z",
-                        "--cached",
-                        "--others",
-                        "--exclude-standard",
-                    ],
-                )
-                .unwrap_or_default(),
-            );
+            // -t 標出每個路徑的狀態（`? ` 是未追蹤）：樹與未追蹤檔一次拿到，算改動時不再掃一次（E-H2）
+            let listing = git(
+                Path::new(r),
+                &[
+                    "ls-files",
+                    "-z",
+                    "-t",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+            )
+            .unwrap_or_default();
+            let mut t = Vec::new();
+            let mut untracked = Vec::new();
+            for entry in listing.split('\0').filter(|e| e.len() > 2) {
+                let path = norm(&entry[2..]);
+                if entry.starts_with("? ") {
+                    untracked.push(path.clone());
+                }
+                t.push(path);
+            }
+            UNTRACKED.with(|u| u.borrow_mut().insert(norm(r), untracked));
             t.sort();
             t.dedup();
             let truncated = t.len() > TREE_MAX;
@@ -477,11 +503,31 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
         },
     };
 
-    ok(&json!({
+    let tree_hash = tree_hash(&tree, truncated);
+    let body = json!({
         "root": root_path, "base": base_name, "baseRef": base_ref,
-        "tree": tree, "treeTruncated": truncated, "changes": merge_sources(&sources),
+        "tree": tree, "treeHash": tree_hash, "treeTruncated": truncated, "changes": merge_sources(&sources),
         "worktrees": wts.iter().map(|(path, branch)| json!({ "path": path, "branch": branch })).collect::<Vec<_>>(),
-    }))
+    });
+    state.remember_files(memo_key, body.clone());
+    ok(&without_known_tree(body, have))
+}
+
+/// `tree` 的雜湊（16 碼十六進位，E-H2）：前端帶回 `have`，相同就不用再送 2 萬筆路徑。
+fn tree_hash(tree: &[String], truncated: bool) -> String {
+    let mut text = tree.join("\n");
+    text.push_str(if truncated { "\n…" } else { "" });
+    crate::keys::sha256_hex(text.as_bytes())[..16].to_string()
+}
+
+/// 前端手上已經有這份樹（`have` 等於 `treeHash`）時拿掉 `tree`，其他欄位照給。
+fn without_known_tree(mut body: Value, have: Option<String>) -> Value {
+    if have.is_some_and(|h| body["treeHash"].as_str() == Some(h.as_str()))
+        && let Some(o) = body.as_object_mut()
+    {
+        o.remove("tree");
+    }
+    body
 }
 
 // ── /api/branches、/api/branch-diff（#696）
@@ -1168,9 +1214,16 @@ fn git_changes(dir: &Path, range: &[&str]) -> Changes {
     let mut args = vec!["diff", "--name-status", "-z"];
     args.extend(range);
     let mut out = parse_name_status(&git(dir, &args).unwrap_or_default());
-    let others =
-        git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default();
-    for p in nul_split(&others) {
+    let key = norm(&dir.to_string_lossy());
+    let others = UNTRACKED
+        .with(|u| u.borrow().get(&key).cloned())
+        .unwrap_or_else(|| {
+            nul_split(
+                &git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])
+                    .unwrap_or_default(),
+            )
+        });
+    for p in others {
         out.entry(p).or_insert_with(|| ("?".to_string(), None));
     }
     out
@@ -1266,6 +1319,9 @@ thread_local! {
     /// 這個 blocking 執行緒上正在處理的請求的 filter driver 快取（目錄 → driver 名稱）；請求之外是 None。
     static FILTERS: std::cell::RefCell<Option<HashMap<std::path::PathBuf, Vec<String>>>> =
         const { std::cell::RefCell::new(None) };
+    /// 同一個請求裡已經掃過的未追蹤檔（目錄 → 路徑）：樹的 ls-files 一併分出來，算改動時不再掃一次（E-H2）
+    static UNTRACKED: std::cell::RefCell<HashMap<String, Vec<String>>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// 一個請求內的 git 快取（E-H1、W-L7）：每個 git 指令前原本都多跑一次 `git config` 查 filter driver，行程數加倍；
@@ -1282,6 +1338,7 @@ impl GitCtx {
 impl Drop for GitCtx {
     fn drop(&mut self) {
         FILTERS.with(|f| *f.borrow_mut() = None);
+        UNTRACKED.with(|u| u.borrow_mut().clear());
     }
 }
 
