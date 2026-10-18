@@ -373,6 +373,22 @@ fn ensure_starts_the_collector_in_its_home() {
     assert_eq!(cwd, e.home.canonicalize().unwrap());
 }
 
+/// EW9（#760）：主 runtime 的 worker 最多 4 條。預設是邏輯核心數（Windows 實機 24 核閒置 29 條執行緒），
+/// collector 的工作量用不到；hook 入口另有自己的執行緒（L-7）。用 /proc 數，只在 Linux 跑。
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_uses_at_most_four_runtime_workers() {
+    let e = env(0);
+    let _c = start_serve(&e);
+    let pid = collector(&e).unwrap()["pid"].as_u64().unwrap();
+    let workers = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|c| c.trim() == "tokio-rt-worker")
+        .count();
+    assert!((1..=4).contains(&workers), "worker {workers} 條");
+}
+
 #[test]
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
     // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走

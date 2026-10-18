@@ -232,6 +232,7 @@ fn hub_inner(args: HubArgs) -> Result<(), String> {
                 return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
             }
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads())
                 .enable_all()
                 .build()
                 .map_err(|e| format!("無法建立 runtime：{e}"))?;
@@ -593,6 +594,7 @@ fn run_serve(overrides: &Overrides) -> ExitCode {
         }
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
         .enable_all()
         .build()
     {
@@ -874,6 +876,12 @@ fn http_once(addr: SocketAddr, request: &str) -> std::io::Result<Vec<u8>> {
 
 /// 執行中 collector 的位址（contracts §5）：拿著鎖、collector.json 有寫才算；啟動或結束到一半時等 `wait`。
 /// 沒有 collector.json 時不退回設定裡的預設埠：那可能是別的資料目錄的 collector（R-11）。
+/// serve 與 hub 的 tokio worker 數：核心數，最多 4（EW9）。預設等於邏輯核心數（24 核的機器閒置 29 條執行緒），
+/// collector 用不到；hook 入口另有自己的執行緒（L-7）。
+fn worker_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+}
+
 fn running_info(cfg: &Config, wait: Duration) -> Option<coding_lab::serve::Info> {
     use coding_lab::serve::State;
     let deadline = Instant::now() + wait;
