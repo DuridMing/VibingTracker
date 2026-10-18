@@ -121,32 +121,6 @@ fn powershell_dumps_env(command: &str) -> bool {
         })
 }
 
-/// 遠端連線送出前剝除：所有 `sensitive` 的 `tool.result` 把 `output` 換成 `""`、加 `redacted: true`。
-/// frame、snapshot、載入更多的形狀不同，所以整個走一遍。
-pub fn redact_remote(v: &mut Value) {
-    match v {
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("tool.result")
-                && let Some(Value::Object(p)) = map.get_mut("payload")
-                && p.get("sensitive").and_then(Value::as_bool) == Some(true)
-            {
-                p.insert("output".into(), Value::String(String::new()));
-                p.insert("redacted".into(), Value::Bool(true));
-                return;
-            }
-            for child in map.values_mut() {
-                redact_remote(child);
-            }
-        }
-        Value::Array(items) => {
-            for child in items {
-                redact_remote(child);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// 這個系統自己發的金鑰（#666）：`clk_<8 碼 base62>_<43 碼 base62>`。
 fn key_pattern() -> &'static regex::Regex {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();

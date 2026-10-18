@@ -68,13 +68,6 @@ impl Doing {
         .into_iter()
         .find_map(|(src, v)| v.as_deref().map(|s| (src, s)))
     }
-
-    /// 遠端連線看到的：來源是 thinking 時改用下一順位（P6 接上遠端時使用）。
-    pub fn remote(&self) -> Option<&str> {
-        [&self.text, &self.tool, &self.prompt]
-            .into_iter()
-            .find_map(|v| v.as_deref())
-    }
 }
 
 /// 第一句：去掉 markdown 標記、換行壓成空白，截 80 個字元（code point）加「…」。
