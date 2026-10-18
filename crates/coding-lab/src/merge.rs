@@ -4,7 +4,7 @@
 //! 串流位置 `pos` 只在 transcript 的行到達（或逾時降級）時配給，每個 session 只增不減，
 //! 所以已經顯示的東西永遠不會被往後擠。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -149,6 +149,9 @@ struct Session {
     seq: u64,
     pos: u64,
     cards: HashMap<String, Card>,
+    /// 還在暫存區的卡片 (暫存時間, tool_use_id)：tick 的逾時降級與 Degraded 只看這裡，不走過所有卡片（E-M4）。
+    /// 卡片的 `staged_at` 有值 ⇔ 在這裡
+    staged: BTreeSet<(u64, String)>,
     seen_uuids: HashSet<String>,
     degraded: HashSet<String>,
     /// TailReset 之後有效的 tail 編號下限（每個檔、整個 session）：比它舊的 tail 送來的降級訊號不理（#684 R20）
@@ -401,7 +404,12 @@ impl Merger {
                 for item in r.open {
                     s.status.seed_open(item);
                 }
-                s.cards.extend(r.cards);
+                for (id, card) in r.cards {
+                    if let Some(t) = card.staged_at {
+                        s.staged.insert((t, id.clone()));
+                    }
+                    s.cards.insert(id, card);
+                }
                 s.status.seed_state(r.ended_at.is_some(), r.idle);
             }
             s
@@ -488,7 +496,11 @@ impl Merger {
                         ..Meta::default()
                     },
                 ));
-                out.extend(self.fall_back(&session, |c| file_of(&c.agent) == file_name, ts_seen));
+                out.extend(self.fall_back(
+                    &session,
+                    |_, c| file_of(&c.agent) == file_name,
+                    ts_seen,
+                ));
                 out
             }
             Input::Recovered {
@@ -695,30 +707,31 @@ impl Merger {
                 }
                 None => Vec::new(),
             };
-            out.extend(self.fall_back(
-                &sid,
-                |c| c.staged_at.is_some_and(|t| t + FALLBACK_AFTER_MS <= now),
-                now,
-            ));
+            out.extend(self.fall_back(&sid, |t, _| t + FALLBACK_AFTER_MS <= now, now));
             out.extend(self.apply(&sid, changes, "main", now));
             out.extend(self.agents_tick(&sid, now));
         }
         out
     }
 
-    /// 把 `due` 選中的暫存卡片依暫存先後放進串流末端。
-    fn fall_back(&mut self, sid: &str, due: impl Fn(&Card) -> bool, ts_seen: u64) -> Vec<Event> {
+    /// 把 `due`（暫存時間, 卡片）選中的暫存卡片依暫存先後放進串流末端。
+    fn fall_back(
+        &mut self,
+        sid: &str,
+        due: impl Fn(u64, &Card) -> bool,
+        ts_seen: u64,
+    ) -> Vec<Event> {
         let Some(s) = self.sessions.get(sid) else {
             return Vec::new();
         };
-        let mut ids: Vec<(u64, String)> = s
-            .cards
+        let ids: Vec<String> = s
+            .staged
             .iter()
-            .filter_map(|(id, c)| c.staged_at.filter(|_| due(c)).map(|t| (t, id.clone())))
+            .filter(|(t, id)| s.cards.get(id).is_some_and(|c| due(*t, c)))
+            .map(|(_, id)| id.clone())
             .collect();
-        ids.sort();
         let mut out = Vec::new();
-        for (_, id) in ids {
+        for id in ids {
             out.push(self.place(sid, &id, Placement::Fallback, None, None, ts_seen));
         }
         out
@@ -737,7 +750,9 @@ impl Merger {
         let s = self.session(sid);
         let agent = match s.cards.get_mut(id) {
             Some(card) => {
-                card.staged_at = None;
+                if let Some(t) = card.staged_at.take() {
+                    s.staged.remove(&(t, id.to_string()));
+                }
                 card.agent.clone()
             }
             None => "main".into(),
@@ -1420,6 +1435,7 @@ impl Merger {
                     ..Card::new(&agent)
                 },
             );
+            session.staged.insert((ts_seen, id.clone()));
             // tool.called 的 input：每個超過 OUTPUT_LIMIT 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）。
             // Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
             let (input, input_truncated) = text::truncated_clone(&input, OUTPUT_LIMIT);
