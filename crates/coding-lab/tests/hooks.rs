@@ -695,12 +695,16 @@ async fn stop_needs_its_own_header_and_no_origin() {
         .unwrap();
     let addr = server.addr;
     let stop = server.stop_requested();
+    // #777：標頭的值要等於這次啟動的 stopToken（寫在 0600 的 collector.json 裡，只有同一個帳號讀得到）
+    let token = server.stop_token().to_string();
+    assert!(token.len() >= 32, "隨機值：{token}");
     for headers in [
-        "",
-        "Content-Type: text/plain\r\n",
-        "Origin: https://attacker.example\r\nX-Coding-Lab-Stop: 1\r\n",
+        "".to_string(),
+        "Content-Type: text/plain\r\n".to_string(),
+        "X-Coding-Lab-Stop: 1\r\n".to_string(),
+        format!("Origin: https://attacker.example\r\nX-Coding-Lab-Stop: {token}\r\n"),
     ] {
-        let resp = raw(addr, stop_req(headers)).await;
+        let resp = raw(addr, stop_req(&headers)).await;
         assert!(resp.starts_with("HTTP/1.1 403"), "{headers:?}：{resp}");
     }
     assert!(
@@ -709,7 +713,7 @@ async fn stop_needs_its_own_header_and_no_origin() {
             .is_err(),
         "被拒的 stop 不能觸發結束"
     );
-    let resp = raw(addr, stop_req("X-Coding-Lab-Stop: 1\r\n")).await;
+    let resp = raw(addr, stop_req(&format!("X-Coding-Lab-Stop: {token}\r\n"))).await;
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     tokio::time::timeout(Duration::from_secs(2), stop.notified())
         .await
@@ -876,4 +880,70 @@ fn hooks_are_answered_while_every_main_worker_is_stuck() {
     // 不變式 4 的預算是 100 ms；測的是「不用等那 3 秒」，負載高的機器上留一點餘裕
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     drop(rt);
+}
+
+// ── 多帳號（#777 W-M7）：4800 是整台機器共用的，第二個帳號的 hook 會送進第一個帳號的 collector。
+// plugin 的 hook 帶 X-Coding-Lab-User（${USER}）與 X-Coding-Lab-Username（${USERNAME}）
+
+async fn server_as(user: &str) -> (SocketAddr, mpsc::Receiver<Input>) {
+    let (tx, rx) = mpsc::channel(32);
+    let server =
+        coding_lab::hooks::serve_hooks_as("127.0.0.1:0".parse().unwrap(), tx, Some(user.into()))
+            .await
+            .unwrap();
+    (server.addr, rx)
+}
+
+#[tokio::test]
+async fn hooks_of_another_account_are_ignored() {
+    let (addr, mut rx) = server_as("alice").await;
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    for headers in [
+        "X-Coding-Lab-User: bob\r\n",
+        "X-Coding-Lab-Username: bob\r\n",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: bob\r\n",
+        "X-Coding-Lab-User: ${USER}\r\nX-Coding-Lab-Username: bob\r\n",
+    ] {
+        let resp = raw(
+            addr,
+            hook_req(
+                &format!("Content-Type: application/json\r\n{headers}"),
+                &body,
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "照樣回 200：{resp}");
+        assert!(
+            rx.try_recv().is_err(),
+            "別的帳號的 hook 要丟掉：{headers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hooks_of_the_same_account_or_without_a_user_are_kept() {
+    let (addr, mut rx) = server_as("alice").await;
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    for headers in [
+        "X-Coding-Lab-User: alice\r\n",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: alice\r\n",
+        // 舊版 plugin、設定擋掉環境變數：沒有、空的、原樣留下的 ${…}
+        "",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: \r\n",
+        "X-Coding-Lab-User: ${USER}\r\nX-Coding-Lab-Username: $USERNAME\r\n",
+    ] {
+        let resp = raw(
+            addr,
+            hook_req(
+                &format!("Content-Type: application/json\r\n{headers}"),
+                &body,
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            matches!(rx.try_recv(), Ok(Input::Hook { .. })),
+            "要照收：{headers:?}"
+        );
+    }
 }

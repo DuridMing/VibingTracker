@@ -107,6 +107,8 @@ pub struct Info {
     pub web: Option<SocketAddr>,
     /// 正在結束（#685）：hook 埠放掉後新的 collector 可以接手
     pub closing: bool,
+    /// `POST /stop` 要帶的值（#777）；舊版沒寫時是 None
+    pub stop_token: Option<String>,
 }
 
 pub fn read_info(home: &Path) -> Option<Info> {
@@ -118,6 +120,7 @@ pub fn read_info(home: &Path) -> Option<Info> {
         hook: addr("hook"),
         web: addr("web"),
         closing: v["closing"].as_bool().unwrap_or(false),
+        stop_token: v["stopToken"].as_str().map(str::to_string),
     })
 }
 
@@ -160,11 +163,13 @@ pub fn failed_since(home: &Path, since: u64) -> Option<String> {
     (v["ts"].as_u64()? >= since).then(|| v["error"].as_str().unwrap_or("").to_string())
 }
 
-fn write_info(home: &Path, me: u32, hook: SocketAddr, webs: &[SocketAddr], closing: bool) {
+fn write_info(home: &Path, me: u32, hooks: &HookServer, webs: &[SocketAddr], closing: bool) {
+    let hook = hooks.addr;
     let v = json!({
         "pid": me, "hook": hook.to_string(), "web": webs.first().map(|a| a.to_string()),
         "webs": webs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(), "closing": closing,
+        "stopToken": hooks.stop_token(),
     });
     if let Err(e) = crate::store::write_private(&home.join(INFO_FILE), v.to_string().as_bytes()) {
         log(&format!("寫不了 {INFO_FILE}：{e}"));
@@ -173,7 +178,7 @@ fn write_info(home: &Path, me: u32, hook: SocketAddr, webs: &[SocketAddr], closi
 
 /// `/healthz` 的動態部分（contracts §7）：`dropped` 是啟動以來因 hook 佇列滿丟掉的數量（L-6、E-D3）。
 fn health(tails: usize, lag_ms: u64, hooks: &HookServer) -> serde_json::Value {
-    json!({ "tails": tails, "schedLagMs": lag_ms, "dropped": hooks.dropped() })
+    json!({ "tails": tails, "schedLagMs": lag_ms, "dropped": hooks.dropped(), "user": hooks.user() })
 }
 
 /// 綁 hook 埠（這也是單例鎖）。被佔用時分三種：上一個 collector 正在結束（collector.json 標 closing，#685）
@@ -191,7 +196,9 @@ async fn bind_hooks(cfg: &Config, tx: &mpsc::Sender<Input>) -> io::Result<Option
                     if down_since.get_or_insert_with(Instant::now).elapsed() >= FOREIGN_PORT_AFTER {
                         return Err(io::Error::new(
                             e.kind(),
-                            format!("{e}（沒有 collector 在跑，埠被別的程式佔用）"),
+                            format!(
+                                "{e}（這個帳號沒有 collector 在跑：埠被別的帳號的 collector 或別的程式佔用，這個帳號的 session 不會被追蹤）"
+                            ),
                         ));
                     }
                 }
@@ -326,7 +333,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let flusher = web.spawn_flusher();
 
     let me = std::process::id();
-    write_info(&cfg.home, me, hook_addr, &web_addrs, false);
+    write_info(&cfg.home, me, &hooks, &web_addrs, false);
     let _ = std::fs::remove_file(cfg.home.join(FAILED_FILE));
     log(&format!(
         "hook {hook_addr}、web {}、資料 {}",
@@ -487,13 +494,13 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     }
                     Some(_) => {
                         hooks.set_closing(false);
-                        write_info(&cfg.home, me, hook_addr, &web_addrs, false);
+                        write_info(&cfg.home, me, &hooks, &web_addrs, false);
                         closing_since = None;
                     }
                     None if idle_now => {
                         hooks.set_closing(true);
                         // 新的 collector 看到 closing 才會等這個埠放掉、接手（#685）
-                        write_info(&cfg.home, me, hook_addr, &web_addrs, true);
+                        write_info(&cfg.home, me, &hooks, &web_addrs, true);
                         closing_since = Some(Instant::now());
                     }
                     None => {}
@@ -513,7 +520,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     }
                 }
                 if still.len() < before {
-                    write_info(&cfg.home, me, hook_addr, &web_addrs, closing_since.is_some());
+                    write_info(&cfg.home, me, &hooks, &web_addrs, closing_since.is_some());
                 }
                 web_pending = still;
             }
@@ -550,7 +557,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
 
     // 先放掉 hook 埠：ensure 會拉起新的 collector，它看到 closing 就等這個埠、綁上之後收 hook、等 store 鎖（#685）
     hooks.set_closing(true);
-    write_info(&cfg.home, me, hook_addr, &web_addrs, true);
+    write_info(&cfg.home, me, &hooks, &web_addrs, true);
     let dropped = hooks.dropped();
     hooks.close().await;
     // 埠放掉前已經收下（回了 200）的 hook 不能丟

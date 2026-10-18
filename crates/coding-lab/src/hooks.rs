@@ -35,8 +35,12 @@ pub const HOOK_PATH: &str = "/hook";
 pub const STOP_PATH: &str = "/stop";
 /// `ensure` 轉送時帶的標頭（值是 `ensure`）
 pub const VIA_HEADER: &str = "x-coding-lab-via";
-/// `POST /stop` 要帶的標頭（值是 `1`）：瀏覽器的 no-cors 請求帶不了自訂標頭
+/// `POST /stop` 要帶的標頭（值是 collector.json 的 `stopToken`，#777）：瀏覽器的 no-cors 請求帶不了自訂標頭，
+/// 別的帳號讀不到這個帳號的 collector.json
 pub const STOP_HEADER: &str = "x-coding-lab-stop";
+/// plugin 的 http hook 帶的使用者（`${USER}`、`${USERNAME}`，#777）
+pub const USER_HEADER: &str = "x-coding-lab-user";
+pub const USERNAME_HEADER: &str = "x-coding-lab-username";
 /// 放掉埠時最多等進行中的請求多久
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// hook 的 body 上限（#740 L-2）：Edit 的 PostToolUse 帶整份 originalFile
@@ -53,6 +57,12 @@ struct HookState {
     dropped: Arc<AtomicU64>,
     /// 讀檔探測的時限（毫秒）
     probe_limit_ms: Arc<AtomicU64>,
+    /// `POST /stop` 要帶的值（#777）
+    stop_token: String,
+    /// 這個 collector 的帳號；hook 帶的使用者標頭不符就丟掉（#777）
+    user: Option<String>,
+    /// 別的帳號的 hook 只寫一次 log
+    foreign_logged: AtomicBool,
 }
 
 /// 執行中的 hook 入口。
@@ -62,6 +72,8 @@ pub struct HookServer {
     stop: Arc<Notify>,
     probe_limit_ms: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    stop_token: String,
+    user: Option<String>,
     shutdown: Option<oneshot::Sender<()>>,
     /// 不再等進行中的請求、直接收掉（close 等過 [`CLOSE_GRACE`] 之後）
     force: Option<oneshot::Sender<()>>,
@@ -73,6 +85,16 @@ impl HookServer {
     /// 決定要結束（或取消結束）：結束中 ensure 轉送的 hook 回 503，其他 hook 照收。
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    /// 這次啟動的 `/stop` 隨機值（寫進 0600 的 collector.json，只有同一個帳號讀得到；#777）。
+    pub fn stop_token(&self) -> &str {
+        &self.stop_token
+    }
+
+    /// 這個 collector 的帳號（hook 標頭比對用；不知道時是 None）。
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// 啟動以來因 merge 的佇列滿而丟掉的 hook 數。
@@ -114,6 +136,23 @@ impl HookServer {
 /// worker（例如在 async 裡等 store 的鎖）時，hook 照樣在 100 ms 內回 200（不變式 4）。它只做 try_send 與
 /// 讀檔探測（blocking pool），一條執行緒就夠。
 pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Result<HookServer> {
+    serve_hooks_as(addr, tx, current_user()).await
+}
+
+/// 跑這個程序的帳號名稱（`USER`，Windows 是 `USERNAME`）。
+pub fn current_user() -> Option<String> {
+    ["USER", "USERNAME", "LOGNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .find(|v| !v.is_empty())
+}
+
+/// 和 [`serve_hooks`] 一樣，但指定這個 collector 的帳號（`None`：不比對，照收所有 hook）。
+pub async fn serve_hooks_as(
+    addr: SocketAddr,
+    tx: mpsc::Sender<Input>,
+    user: Option<String>,
+) -> io::Result<HookServer> {
     if !addr.ip().is_loopback() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -130,13 +169,21 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     let stop_flag = Arc::new(Notify::new());
     let probe_limit_ms = Arc::new(AtomicU64::new(PROBE_LIMIT.as_millis() as u64));
     let dropped = Arc::new(AtomicU64::new(0));
-    let app = router_with(
+    let stop_token = random_token()?;
+    let state = Arc::new(HookState {
         tx,
-        closing.clone(),
-        stop_flag.clone(),
-        probe_limit_ms.clone(),
-        dropped.clone(),
-    );
+        closing: closing.clone(),
+        stop: stop_flag.clone(),
+        dropped: dropped.clone(),
+        probe_limit_ms: probe_limit_ms.clone(),
+        stop_token: stop_token.clone(),
+        user: user.clone(),
+        foreign_logged: AtomicBool::new(false),
+    });
+    let app = Router::new()
+        .route(HOOK_PATH, post(handle))
+        .route(STOP_PATH, post(handle_stop))
+        .with_state(state);
     let (shutdown, stop) = oneshot::channel::<()>();
     let stop = async move {
         if stop.await.is_err() {
@@ -175,30 +222,39 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
         stop: stop_flag,
         probe_limit_ms,
         dropped,
+        stop_token,
+        user,
         shutdown: Some(shutdown),
         force: Some(force),
         done,
     })
 }
 
-fn router_with(
-    tx: mpsc::Sender<Input>,
-    closing: Arc<AtomicBool>,
-    stop: Arc<Notify>,
-    probe_limit_ms: Arc<AtomicU64>,
-    dropped: Arc<AtomicU64>,
-) -> Router {
-    let state = Arc::new(HookState {
-        tx,
-        closing,
-        stop,
-        dropped,
-        probe_limit_ms,
-    });
-    Router::new()
-        .route(HOOK_PATH, post(handle))
-        .route(STOP_PATH, post(handle_stop))
-        .with_state(state)
+/// 16 bytes 的密碼學亂數，十六進位。
+fn random_token() -> io::Result<String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
+/// hook 帶的使用者（#777）：`X-Coding-Lab-User`（`${USER}`）、`X-Coding-Lab-Username`（`${USERNAME}`）裡
+/// 非空、而且不是原樣留下的 `$…` 的那個。沒列進 allowedEnvVars 的變數會變成空字串，「列了但沒設定」的
+/// 會變成什麼文件沒寫，兩種都當作沒帶。
+fn claimed_user(headers: &HeaderMap) -> Option<&str> {
+    [USER_HEADER, USERNAME_HEADER]
+        .iter()
+        .filter_map(|h| headers.get(*h).and_then(|v| v.to_str().ok()))
+        .map(str::trim)
+        .find(|v| !v.is_empty() && !v.starts_with('$'))
+}
+
+/// 帳號名稱相同（Windows 不分大小寫）。
+fn same_user(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// 瀏覽器送的請求：帶 `Origin`（Claude Code 的 http hook 與 ensure、stop 都不帶）。
@@ -220,9 +276,11 @@ async fn handle_stop(State(state): State<Arc<HookState>>, headers: HeaderMap) ->
     if from_browser(&headers)
         || headers
             .get(STOP_HEADER)
-            .is_none_or(|v| v.as_bytes() != b"1")
+            .is_none_or(|v| v.as_bytes() != state.stop_token.as_bytes())
     {
-        crate::logging::log("拒收 stop：帶 Origin 或沒有 X-Coding-Lab-Stop");
+        crate::logging::log(
+            "拒收 stop：帶 Origin，或 X-Coding-Lab-Stop 不是 collector.json 的 stopToken",
+        );
         return StatusCode::FORBIDDEN;
     }
     crate::logging::log("收到 stop");
@@ -243,6 +301,17 @@ async fn handle(
     if !is_json(&headers) {
         crate::logging::log("拒收 hook：Content-Type 不是 application/json");
         return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+    }
+    // 4800 是整台機器共用的：別的帳號的 hook 丟掉、照樣回 200（#777 W-M7）
+    if let (Some(me), Some(them)) = (state.user.as_deref(), claimed_user(&headers))
+        && !same_user(me, them)
+    {
+        if !state.foreign_logged.swap(true, Ordering::Relaxed) {
+            crate::logging::log(&format!(
+                "收到其他使用者（{them}）的 hook，已忽略：這台機器的 4800 被 {me} 的 collector 佔著，{them} 不會被追蹤"
+            ));
+        }
+        return StatusCode::OK;
     }
     if state.closing.load(Ordering::SeqCst)
         && headers
