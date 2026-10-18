@@ -140,7 +140,7 @@ New-NetFirewallRule -DisplayName "coding-lab web" -Direction Inbound -Protocol T
 | macOS | `~/Library/LaunchAgents/io.coding-lab.collector.plist` | `launchctl bootstrap gui/<uid>`；第一次會跳「允許在背景執行」，允許即可 |
 | Windows | `%USERPROFILE%\.coding-lab\coding-lab-task.xml` | 工作排程器 `\CodingLab\` 資料夾裡以使用者命名的工作（例如 `\CodingLab\alice`），登入時啟動、隱藏視窗（要在沒人登入時跑，在工作排程器裡改成「不論使用者登入與否均執行」） |
 
-安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0` 跑，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows `schtasks /End /TN \CodingLab\%USERNAME%` 再 `schtasks /Run /TN \CodingLab\%USERNAME%`）。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
+安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0` 跑，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows `schtasks /End /TN \CodingLab\%USERNAME%` 再 `schtasks /Run /TN \CodingLab\%USERNAME%`）。`schtasks` 請在 cmd 或 PowerShell 執行；在 Git Bash 裡，`/TN` 這類參數會被當成路徑改寫，要在前面加 `MSYS_NO_PATHCONV=1`，工作名稱寫成 `'\CodingLab\'"$USERNAME"`。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
 
 - `service status`：有沒有裝、服務用的資料目錄（和目前的是否相同）、collector 現在有沒有在跑。
 - 已經有服務、但用的是別的資料目錄（例如拿 `CODING_LAB_HOME=<測試目錄>` 試服務）時，`service install`／`uninstall` 會拒絕並印出原本的資料目錄，不會換掉或移除正式的服務；確定要換加 `--force`。
