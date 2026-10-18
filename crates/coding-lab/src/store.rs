@@ -669,12 +669,19 @@ impl Store {
         for (e, off) in &self.unindexed {
             index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
         }
-        for ((sid, file), no) in &self.read_lines {
-            tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+        // 有 Event 沒寫進 JSONL（放回 pending）時，tail 讀到的行號先不記（C15）：記了之後在下次成功前當掉，
+        // 重啟會從這個行號之後讀，沒寫進去的那些行就永遠不會再進來。留到寫成功的那次一起記
+        let lines_ok = failure.is_none();
+        if lines_ok {
+            for ((sid, file), no) in &self.read_lines {
+                tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+            }
         }
         tx.commit()?;
         self.unindexed.clear();
-        self.read_lines.clear();
+        if lines_ok {
+            self.read_lines.clear();
+        }
         match failure {
             Some(e) => Err(e.into()),
             None => Ok(()),

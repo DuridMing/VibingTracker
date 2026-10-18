@@ -671,6 +671,38 @@ fn failed_flush_keeps_events_for_the_next_one() {
     );
 }
 
+/// C15（#741）：JSONL 寫入失敗、Event 放回 pending 時，tail 讀到的行號不能照樣 commit：
+/// 下次成功之前當掉的話，重啟從那個行號之後接著讀，那些行就永遠不會再進來。
+#[test]
+#[cfg(unix)]
+fn failed_flush_does_not_advance_the_tail_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.flush().unwrap();
+        s.append(at_line("s1", 2, "main", 5));
+        s.saw_line("s1", "main", 5);
+        let file = h.join("events/s1.jsonl");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let r = s.flush();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.is_err(), "前提：寫不進去");
+    } // 下次 flush 成功之前就當掉
+    let s = Store::open(&h).unwrap();
+    let lines: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.line_no)
+        .collect();
+    assert!(
+        !lines.contains(&5),
+        "沒寫進 JSONL 的行，行號不能先記：{lines:?}"
+    );
+}
+
 /// 同一個 (session, seq) 再索引一次時不重複累加。
 #[test]
 fn duplicate_seq_is_not_counted_twice() {
