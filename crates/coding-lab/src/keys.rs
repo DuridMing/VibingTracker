@@ -291,7 +291,7 @@ impl KeyStore {
             keys: self.keys.clone(),
         };
         let text = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
-        save_private_json(&path, &text)
+        save_secret_json(&path, &text)
     }
 }
 
@@ -317,6 +317,18 @@ pub fn record_used(home: &Path, id: &str, now_ms: u64) -> Result<(), String> {
 pub(crate) fn save_private_json(path: &Path, text: &str) -> Result<(), String> {
     let tmp = path.with_extension("json.tmp");
     write_private(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("寫不了 {}：{e}", path.display())
+    })
+}
+
+/// 寫一個含秘密的 JSON 檔（`keys.json` 的 server secret、一次性登入連結）：同 [`save_private_json`]，
+/// Windows 上另外把暫存檔的 ACL 收成只有目前使用者（停用繼承），再寫內容、rename（同一磁碟區 rename 保留 ACL）。
+/// 不靠資料目錄的 ACL：目錄只在 collector 第一次建立時收緊，使用者先建好的 home 沒有（#735 S-6／W-L3）。
+pub(crate) fn save_secret_json(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("json.tmp");
+    write_secret(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("寫不了 {}：{e}", path.display())
@@ -484,4 +496,45 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
+}
+
+#[cfg(unix)]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_private(path, data)
+}
+
+/// 先建空檔、收緊 ACL，再寫內容：秘密不會出現在權限寬鬆的檔裡。icacls 失敗時寫 log、照樣寫（退回目錄的 ACL）。
+#[cfg(windows)]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let restricted = std::env::var("USERNAME").is_ok_and(|user| {
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !restricted {
+        crate::logging::log(&format!(
+            "收緊 {} 的權限失敗（icacls）；沿用資料目錄的 ACL",
+            path.display()
+        ));
+    }
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_private(path, data)
 }
