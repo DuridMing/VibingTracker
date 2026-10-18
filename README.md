@@ -102,7 +102,7 @@ plugin 更新之後，wrapper 自己裝的二進位比 plugin 舊時，會照用
 
 ### 已知限制：collector 沒在跑時的 hook 錯誤提示
 
-追蹤只會記錄，不會攔截工具，也不會改變 Claude Code 的行為。collector 沒在跑的時候，Claude Code 照常運作、不會變慢，但 **可能會顯示 hook 錯誤提示**，例如互動模式對話裡的 `PreToolUse hook error`，或 `-p` 模式 stderr 的 `SessionEnd hook [http://127.0.0.1:4800/hook] failed: connect ECONNREFUSED`。Claude Code 會把 http hook 連不上視為不阻擋的錯誤，目前沒有設定能關掉這個提示。
+追蹤只會記錄，不會攔截工具，也不會改變 Claude Code 的行為。collector 沒在跑的時候，Claude Code 照常運作，但 **可能會顯示 hook 錯誤提示**。Linux 與 macOS 上連不上會立刻失敗、不會變慢；Windows 連沒在聽的埠要約 2 秒才回拒絕，所以每個 hook 會多等到逾時（1 秒），例如互動模式對話裡的 `PreToolUse hook error`，或 `-p` 模式 stderr 的 `SessionEnd hook [http://127.0.0.1:4800/hook] failed: connect ECONNREFUSED`。Claude Code 會把 http hook 連不上視為不阻擋的錯誤，目前沒有設定能關掉這個提示。
 
 平常不會遇到：新 session 的 `SessionStart` 會自動拉起 collector，collector 也要等**所有 session 都結束**、再閒置 10 分鐘才會自己退出。會看到提示的情況：
 

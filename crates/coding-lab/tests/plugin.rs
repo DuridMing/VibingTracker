@@ -85,8 +85,10 @@ fn http_hooks_post_to_the_loopback_hook_port_with_a_short_timeout() {
         assert_eq!(h["type"], "http", "{event}");
         assert_eq!(h["url"], url.as_str(), "{event}");
         let t = h["timeout"].as_u64().unwrap_or(600);
+        // collector 沒在跑時每個 hook 都等到逾時（Windows 連沒在聽的埠約 2 秒才回拒絕，#776 EW7）；
+        // 單位是秒、文件沒說收不收小數，所以用整數 1
         assert!(
-            t <= 2,
+            t <= 1,
             "{event}：collector 沒跑時不能拖慢 Claude Code（timeout {t}）"
         );
         assert!(h.get("headers").is_none(), "{event}：hook 入口不驗金鑰");

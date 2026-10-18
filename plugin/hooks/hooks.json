@@ -18,7 +18,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -29,7 +29,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -40,7 +40,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -51,7 +51,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -62,7 +62,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -73,7 +73,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -84,7 +84,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -95,7 +95,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -106,7 +106,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -117,7 +117,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -128,7 +128,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -139,7 +139,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -150,7 +150,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -161,7 +161,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
@@ -172,7 +172,7 @@
           {
             "type": "http",
             "url": "http://127.0.0.1:4800/hook",
-            "timeout": 2
+            "timeout": 1
           }
         ]
       }
