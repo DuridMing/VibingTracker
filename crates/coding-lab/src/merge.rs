@@ -994,7 +994,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let output = || response_text(h.field("tool_response"), OUTPUT_LIMIT);
                 out.extend(self.result_once(&sid, &id, true, None, output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta));
                 // Agent／Task 的結果帶 agentId（背景 agent 啟動時、前景 agent 結束時）：subagent 對應哪個呼叫（#680）
                 if matches!(h.str_field("tool_name"), Some("Agent" | "Task"))
                     && let Some(a) = h
@@ -1027,7 +1027,7 @@ impl Merger {
                     (kept.to_string(), cut)
                 };
                 out.extend(self.result_once(&sid, &id, false, code, output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, None, false, meta()));
+                out.extend(self.git_op(h, &sid, &id, None, false, meta));
                 let interrupt = h.field("is_interrupt").and_then(Value::as_bool) == Some(true);
                 let ok = (!interrupt).then_some(false);
                 out.extend(self.tool_ended(h, &sid, &id, &agent, ok, ts_seen));
@@ -1598,20 +1598,31 @@ impl Merger {
         id: &str,
         response: Option<&Value>,
         ok: bool,
-        meta: Meta,
+        meta: impl FnOnce() -> Meta,
     ) -> Option<Event> {
         let tool = h.str_field("tool_name").filter(|t| is_command_tool(t))?;
         let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
         let mut op = derive::git_op_from(&derive::normalize_command(tool, command), response, ok)?;
         op.tool_use_id = id.to_string();
-        Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
+        // Meta（含 raw 的 clone）確定有 git 操作才建（E-M8）
+        Some(self.emit(
+            sid,
+            Payload::GitOp(op),
+            Meta {
+                raw: None,
+                ..meta()
+            },
+        ))
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1627,7 +1638,10 @@ impl Merger {
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         if card.result_sent {
             return None;
         }
@@ -1733,7 +1747,7 @@ impl Merger {
         let changes = if agent == "main" && v["type"] == "assistant" && block["type"] == "text" {
             let r = Some(message_id.as_str())
                 .filter(|m| !m.is_empty())
-                .or(v["uuid"].as_str())
+                .or_else(|| v["uuid"].as_str())
                 .map_or_else(|| format!("line-{no}"), str::to_string);
             self.tracker(sid).assistant_text(&r, ts_seen)
         } else {
@@ -1776,7 +1790,10 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
+                        let card = s
+                            .cards
+                            .entry(id.clone())
+                            .or_insert_with(|| Card::new(&agent));
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
@@ -1826,7 +1843,7 @@ impl Merger {
                         .sessions
                         .get(sid)
                         .and_then(|s| s.cards.get(id))
-                        .map_or(agent.clone(), |c| c.agent.clone());
+                        .map_or_else(|| agent.clone(), |c| c.agent.clone());
                     let m = Meta {
                         agent,
                         ts_seen,

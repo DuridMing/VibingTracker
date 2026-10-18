@@ -124,7 +124,8 @@ macro_rules! payloads {
         impl Payload {
             pub fn parse(kind: &str, v: &Value) -> Result<Option<Payload>, serde_json::Error> {
                 Ok(Some(match kind {
-                    $($name => Payload::$variant(serde_json::from_value(v.clone())?),)*
+                    // `&Value` 本身就能反序列化，不必先 clone 整棵 payload（E-M6）
+                    $($name => Payload::$variant(<$ty as serde::Deserialize>::deserialize(v)?),)*
                     _ => return Ok(None),
                 }))
             }
