@@ -746,6 +746,78 @@ mod download {
         );
     }
 
+    /// collector 還在跑（有 collector.json）時，背景更新不換掉 web/ 與二進位：新的 JS 配舊的二進位會壞，
+    /// Windows 上執行中的 .exe 也換不掉。先放 bin/.staged/，下一次 ensure 而且沒有 collector 在跑時才換（#784 W-R1-5）
+    #[test]
+    fn an_update_while_the_collector_runs_is_staged_until_it_stops() {
+        let e = env("staged");
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stamp = e.home.join("bin/coding-lab.version");
+        // 舊版、而且 collector 在跑
+        std::fs::write(&stamp, "0.0.1\n").unwrap();
+        std::fs::write(e.home.join("bin/web/index.html"), "old").unwrap();
+        std::fs::write(e.home.join("collector.json"), "{}").unwrap();
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.home.join("bin/web/index.html")).unwrap(),
+            "old",
+            "collector 在跑時不能換 web/"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            "0.0.1",
+            "二進位也還沒換"
+        );
+        assert!(e.home.join("bin/.staged").is_dir(), "新版先放 staging");
+        // collector 還在跑：ensure 照用舊的，不換，也不再下載一次（staging 裡已經是同版）
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("更新"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.home.join("bin/web/index.html")).unwrap(),
+            "old"
+        );
+        // collector 停了：下一次 ensure 先換上新版再執行
+        std::fs::remove_file(e.home.join("collector.json")).unwrap();
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success() && out.stdout.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(e.home.join("bin/web/index.html")).unwrap(),
+            "<!doctype html>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(!e.home.join("bin/.staged").exists(), "換完清掉 staging");
+        assert_eq!(
+            std::fs::read_to_string(e.home.join("bin/ran"))
+                .unwrap()
+                .trim(),
+            "ensure",
+            "換上的新版照常執行"
+        );
+    }
+
     /// wrapper 裝的二進位版本落後 plugin 時，背景下載新版（這個 session 照用舊的）；同版不下載（#733 R-4）
     #[test]
     fn an_installed_binary_older_than_the_plugin_is_updated_in_the_background() {

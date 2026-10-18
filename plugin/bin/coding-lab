@@ -195,6 +195,18 @@ install() {
         return 1
     fi
     chmod +x "$src/$exe"
+    # collector 還在跑（有 collector.json）而且這是更新：先放 staging，不換掉它正在用的 web/ 與二進位
+    # （新的 JS 配舊的二進位會壞；Windows 上執行中的 .exe 也換不掉）。下一次 ensure、沒有 collector 在跑時才換（#784 W-R1-5）
+    if [ -f "$home_dir/collector.json" ] && { [ -x "$bin_dir/$exe" ] || [ -d "$bin_dir/web" ]; }; then
+        rm -rf "$bin_dir/.staged.new"
+        mkdir -p "$bin_dir/.staged.new" || return 1
+        [ -d "$src/web" ] && mv "$src/web" "$bin_dir/.staged.new/web"
+        printf '%s\n' "$VERSION" >"$bin_dir/.staged.new/coding-lab.version"
+        mv "$src/$exe" "$bin_dir/.staged.new/$exe" || return 1
+        rm -rf "$bin_dir/.staged" && mv "$bin_dir/.staged.new" "$bin_dir/.staged" || return 1
+        say "collector 正在執行：新版（$target）先放在 $bin_dir/.staged，下一次沒有 collector 在跑時換上"
+        return 0
+    fi
     if [ -d "$src/web" ]; then
         rm -rf "$bin_dir/web.old"
         [ -d "$bin_dir/web" ] && mv "$bin_dir/web" "$bin_dir/web.old"
@@ -218,6 +230,24 @@ case "$1" in
         ;;
 esac
 
+# 背景更新放在 staging 的新版：沒有 collector 在跑時換上（#784 W-R1-5）。只有 wrapper 自己裝的位置才有 staging
+apply_staged() {
+    st=$home_dir/bin/.staged
+    [ -d "$st" ] && [ ! -f "$home_dir/collector.json" ] || return 0
+    for exe in coding-lab coding-lab.exe; do
+        [ -f "$st/$exe" ] || continue
+        if [ -d "$st/web" ]; then
+            rm -rf "$home_dir/bin/web.old"
+            [ -d "$home_dir/bin/web" ] && mv "$home_dir/bin/web" "$home_dir/bin/web.old"
+            mv "$st/web" "$home_dir/bin/web" && rm -rf "$home_dir/bin/web.old"
+        fi
+        [ -f "$st/coding-lab.version" ] && mv -f "$st/coding-lab.version" "$home_dir/bin/coding-lab.version"
+        mv -f "$st/$exe" "$home_dir/bin/$exe" || return 0
+    done
+    rm -rf "$st"
+}
+apply_staged
+
 if ! find_bin; then
     if [ -n "$release_url" ] && target=$(platform); then
         # hook 有 5 秒限制：背景下載，所有輸出都導開，Claude Code 不會等它
@@ -237,7 +267,10 @@ case "$bin" in
     "$home_dir/bin/coding-lab" | "$home_dir/bin/coding-lab.exe")
         installed=
         [ -f "$home_dir/bin/coding-lab.version" ] && read -r installed <"$home_dir/bin/coding-lab.version"
-        if [ -n "$installed" ] && [ "$installed" != "$VERSION" ] && [ -n "$release_url" ] && platform >/dev/null; then
+        # 已經下載好、在 staging 等 collector 停下來的同版，不要每個 SessionStart 再下載一次
+        staged=
+        [ -f "$home_dir/bin/.staged/coding-lab.version" ] && read -r staged <"$home_dir/bin/.staged/coding-lab.version"
+        if [ -n "$installed" ] && [ "$installed" != "$VERSION" ] && [ "$staged" != "$VERSION" ] && [ -n "$release_url" ] && platform >/dev/null; then
             nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
             say "collector 二進位是 $installed、plugin 是 $VERSION：已在背景更新（紀錄在 $home_dir/install.log），下一個 session 用新版。"
         fi

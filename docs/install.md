@@ -97,7 +97,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 
 會印出版本、`user`（這個 collector 是哪個帳號的）、`open`（還開著的 session 數）、`sessions`（記憶體裡的 session 數，含 2 小時內結束的）等資訊。
 
-同一台機器上另一個帳號已經在用 coding-lab 時，4800 被它的 collector 佔著：你這個帳號的 hook 會被它丟掉，這個帳號不會被追蹤，`healthz` 印出「沒在跑」，`~/.coding-lab/collector.log` 有一行說明。目前一台機器只能有一個帳號使用（見 README「多人共用的伺服器」）。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
+同一台機器上另一個帳號已經在用 coding-lab 時，4800 被它的 collector 佔著：你這個帳號的 hook 會被它丟掉，這個帳號不會被追蹤，`healthz` 印出「沒在跑」，`~/.coding-lab/collector.log` 有一行說明。目前一台機器只能有一個帳號使用（見 README「多人共用的伺服器」）。Windows 與它的 WSL2 也算同一台：兩邊共用 4800，只在其中一邊裝 plugin。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
 
 collector 不用自己啟動：每個 session 開始時，plugin 會在它沒在跑時把它拉起來；所有 session 都結束、再閒置 10 分鐘後它會自己退出。
 
