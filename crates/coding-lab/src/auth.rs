@@ -168,7 +168,7 @@ struct OnceLink {
 fn read_links(home: &Path) -> Result<Vec<OnceLink>, String> {
     let path = home.join(LINKS_FILE);
     match std::fs::read_to_string(&path) {
-        Ok(t) => serde_json::from_str(&t).map_err(|e| format!("{} 格式錯誤：{e}", path.display())),
+        Ok(t) => serde_json::from_str(&t).map_err(|e| keys::corrupt(&path, e)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(e) => Err(format!("讀不到 {}：{e}", path.display())),
     }
@@ -177,12 +177,8 @@ fn read_links(home: &Path) -> Result<Vec<OnceLink>, String> {
 fn write_links(home: &Path, links: &[OnceLink]) -> Result<(), String> {
     std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
     let text = serde_json::to_string_pretty(links).map_err(|e| e.to_string())?;
-    keys::save_secret_json(&home.join(LINKS_FILE), &text)
+    keys::save_secret_json_with_backup(&home.join(LINKS_FILE), &text)
 }
-
-/// 一次性連結檔的讀改寫都在這把鎖裡：同時兩個兌換不會都讀到同一個 code（S-7）。
-/// CLI 建連結是另一個程序，不受這把鎖保護，但它只新增、不兌換。
-static LINKS_LOCK: Mutex<()> = Mutex::new(());
 
 /// 建一個 5 分鐘內、只能用一次的登入連結 code（`coding-lab key login-link`）。檔裡只存 code 的 SHA-256。
 pub fn create_once_link(
@@ -192,7 +188,8 @@ pub fn create_once_link(
     rng: &mut dyn Rng,
 ) -> Result<String, String> {
     let code = keys::random_base62(rng);
-    let _guard = LINKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 讀改寫在 keys.lock 裡（跨程序，W-L13）：同時建的連結不會互相蓋掉
+    let _lock = keys::lock_home(home)?;
     let mut links = read_links(home)?;
     links.retain(|l| l.expires_ms > now_ms);
     links.push(OnceLink {
@@ -206,7 +203,8 @@ pub fn create_once_link(
 
 /// 用掉一個 code：找得到而且沒過期回它的 key id；不論結果都把它從檔裡拿掉。
 pub fn consume_once_link(home: &Path, code: &str, now_ms: u64) -> Result<Option<String>, String> {
-    let _guard = LINKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // 同時兩個兌換不會都讀到同一個 code（S-7），也不會蓋掉 CLI 剛建的連結（W-L13）
+    let _lock = keys::lock_home(home)?;
     let mut links = read_links(home)?;
     if links.is_empty() {
         return Ok(None);

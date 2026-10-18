@@ -251,6 +251,7 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 - `coding-lab key list` 的狀態是不是「已撤銷」或「已到期」。
 - 連續失敗 10 次會被擋一分鐘（每個來源 IP 各算）。
 - 伺服器的 `~/.coding-lab/collector.log` 會寫被拒的原因；`keys.json` 權限不是 600 時所有金鑰都會失效，照 log 裡的 `chmod 600` 修。
+- 每次 `key create`／`key revoke` 寫入前，原本的內容會留在 `keys.json.bak`。`keys.json` 壞掉（log 寫「格式錯誤」）時，確認 `.bak` 的內容後把它改名回 `keys.json` 就能還原；`.bak` 是上一版，之後建的那一把要重建。
 
 **SSH 通道進來也被要求登入**
 
