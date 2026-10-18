@@ -392,3 +392,54 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
     .unwrap_err();
     assert!(err.contains("allow_insecure"), "{err}");
 }
+
+/// L-16（#750）：打錯的鍵（`bnd`、`[colector]`、upstream 的 `kye`）原本被 serde 默默略過、用預設值；
+/// 改成照樣啟動（打錯一個字不該讓 collector 起不來、hook 全丟）但每個都列成警告。
+#[test]
+fn unknown_keys_in_config_toml_are_warned() {
+    let file = r#"
+        unknown_top = 1
+        [web]
+        bnd = "127.0.0.1:4801"
+        [colector]
+        idle_exit_seconds = 5
+        [[hub.upstream]]
+        name = "a"
+        url = "http://127.0.0.1:4801"
+        kye = "clk_x"
+    "#;
+    let c = resolve(Overrides::default(), &[], Some(file)).unwrap();
+    let w = c.warnings.join("\n");
+    for key in [
+        "unknown_top",
+        "[web].bnd",
+        "[colector]",
+        "[[hub.upstream]].kye",
+    ] {
+        assert!(w.contains(key), "沒警告 {key}：{w}");
+    }
+    assert_eq!(c.idle_exit_seconds, 600, "打錯的段落不生效");
+
+    let known = r#"
+        [hook]
+        bind = "127.0.0.1:4800"
+        [web]
+        bind = ["127.0.0.1:4801"]
+        root = "/srv/web"
+        auth = "local-open"
+        remote_thinking = "hide"
+        allow_insecure = false
+        [collector]
+        idle_exit_seconds = 5
+        store_flush_ms = 100
+        wait_guess_seconds = 60
+        [hub]
+        bind = "127.0.0.1:4802"
+        [[hub.upstream]]
+        name = "a"
+        url = "http://127.0.0.1:4801"
+        key = "clk_x"
+    "#;
+    let c = resolve(Overrides::default(), &[], Some(known)).unwrap();
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+}
