@@ -14,7 +14,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::derive::shell_segments;
+use crate::derive::{normalize_command, shell_segments};
 use crate::event::{COMMAND_TOOLS, COMMAND_TOOLS_ALIAS, Danger, DangerLevel, is_command_tool};
 use crate::merge::DangerRules;
 
@@ -126,14 +126,14 @@ fn compile(specs: Vec<RuleSpec>) -> Result<RuleSet, String> {
             }
             if let Some(i) = spec.tools.iter().position(|t| t == COMMAND_TOOLS_ALIAS) {
                 spec.tools.remove(i);
-                for t in COMMAND_TOOLS {
+                for t in COMMAND_TOOLS.iter().chain([&CMD]) {
                     if !spec.tools.iter().any(|x| x == t) {
                         spec.tools.push(t.to_string());
                     }
                 }
             }
             // 指令型工具只比對指令（依段切開）；設成別的欄位以前會默默永不命中（#687 R17）
-            if let Some(t) = spec.tools.iter().find(|t| is_command_tool(t))
+            if let Some(t) = spec.tools.iter().find(|t| is_shell(t))
                 && spec.field.as_deref().is_some_and(|f| f != "command")
             {
                 return Err(format!("規則 {} 套用在 {t}，field 只能是 command", spec.id));
@@ -190,7 +190,7 @@ impl RuleSet {
             .iter()
             .filter(|r| r.spec.scope == scope && r.spec.tools.iter().any(|t| t == tool || t == "*"))
             .filter(|r| {
-                r.spec.field.as_deref().unwrap_or(if is_command_tool(tool) {
+                r.spec.field.as_deref().unwrap_or(if is_shell(tool) {
                     "command"
                 } else {
                     "file_path"
@@ -244,15 +244,42 @@ fn nested_commands(command: &str) -> Vec<String> {
 }
 
 /// `bash -c '…'`、`sh -lc "…"` 的指令字串（`tokens` 已去掉引號與 sudo 等前綴）。
-fn shell_c_argument(tokens: &[String]) -> Option<&str> {
-    let shell = tokens.first()?.rsplit('/').next()?;
-    if !matches!(shell, "bash" | "sh" | "zsh" | "dash" | "ksh") {
-        return None;
+fn shell_c_argument(tokens: &[String]) -> Option<(&'static str, String)> {
+    let shell = tokens.first()?.rsplit('/').next()?.to_lowercase();
+    let rest = &tokens[1..];
+    match shell.trim_end_matches(".exe") {
+        "bash" | "sh" | "zsh" | "dash" | "ksh" => {
+            let flag = rest
+                .iter()
+                .position(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('c'))?;
+            Some(("Bash", rest.get(flag + 1)?.clone()))
+        }
+        // `/c`、`/k` 之後整串是指令；Git Bash 裡要寫成 `//c`
+        "cmd" => {
+            let flag = rest
+                .iter()
+                .position(|t| matches!(t.to_lowercase().as_str(), "/c" | "/k" | "//c" | "//k"))?;
+            Some((CMD, rest[flag + 1..].join(" ")))
+        }
+        // `-c`、`-Command` 與它的縮寫，之後整串是指令
+        "powershell" | "pwsh" => {
+            let flag = rest.iter().position(|t| {
+                let t = t.to_lowercase();
+                t.len() >= 2 && "-command".starts_with(&t)
+            })?;
+            Some(("PowerShell", rest[flag + 1..].join(" ")))
+        }
+        _ => None,
     }
-    let flag = tokens[1..]
-        .iter()
-        .position(|t| t.starts_with('-') && !t.starts_with("--") && t.contains('c'))?;
-    tokens.get(flag + 2).map(String::as_str)
+}
+
+/// cmd 不是 Claude Code 的工具：只在 `cmd /c …` 裡比對（D12）；規則的 `tools` 可以寫 `"cmd"`，
+/// `@command` 也包含它。
+const CMD: &str = "cmd";
+
+/// 依段比對 `command` 的工具：指令型工具，加上 `cmd /c` 裡的指令。
+fn is_shell(tool: &str) -> bool {
+    is_command_tool(tool) || tool == CMD
 }
 
 impl RuleSet {
@@ -273,9 +300,10 @@ impl RuleSet {
                 );
             }
             if depth < MAX_NESTING
-                && let Some(inner) = shell_c_argument(stripped)
+                && let Some((inner_tool, inner)) = shell_c_argument(stripped)
             {
-                worst = more_severe(worst, self.check_command(tool, inner, depth + 1));
+                let inner = normalize_command(inner_tool, &inner);
+                worst = more_severe(worst, self.check_command(inner_tool, &inner, depth + 1));
             }
         }
         if depth < MAX_NESTING {
@@ -292,7 +320,8 @@ impl DangerRules for RuleSet {
     /// 依規則順序取第一個命中的（使用者規則在前）。
     fn check(&self, tool: &str, input: &Value) -> Option<Danger> {
         if is_command_tool(tool) {
-            return self.check_command(tool, input["command"].as_str()?, 0);
+            let command = normalize_command(tool, input["command"].as_str()?);
+            return self.check_command(tool, &command, 0);
         }
         self.rules
             .iter()

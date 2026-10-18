@@ -169,6 +169,34 @@ fn git_subcommand(seg: &[String]) -> Option<(String, Vec<String>)> {
     Some((sub, rest))
 }
 
+/// 指令型工具的指令在切段前先正規化：PowerShell 的跳脫字元是反引號（`` `x `` 就是 `x`，行尾的
+/// `` ` `` 是續行），路徑用反斜線；切段用的是 sh 的規則，所以先去掉反引號、反斜線換成 `/`。Bash 原樣。
+pub fn normalize_command<'a>(tool: &str, command: &'a str) -> std::borrow::Cow<'a, str> {
+    if tool != "PowerShell" {
+        return std::borrow::Cow::Borrowed(command);
+    }
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => match chars.next() {
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    out.push(' ');
+                }
+                Some('\n') => out.push(' '),
+                Some(n) => out.push(n),
+                None => {}
+            },
+            '\\' => out.push('/'),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// 把指令依 `&&`、`||`、`;`、`|`、換行切段，引號內的內容不切（所以 `echo 'git commit'` 不算 git）。
 pub fn shell_segments(command: &str) -> Vec<Vec<String>> {
     let mut segments = vec![Vec::new()];

@@ -302,6 +302,33 @@ fn kpi_models_split_cost_and_thinking_by_model() {
     );
 }
 
+/// W-H3：PowerShell 是指令型工具，KPI 的指令數與 Agents 的「現在在做」和 Bash 一樣。
+#[test]
+fn powershell_counts_as_a_command() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.called(
+                "s1",
+                "p1",
+                "PowerShell",
+                json!({"command": "Get-ChildItem src"}),
+                DAY,
+                Value::Null,
+            ),
+        ],
+    );
+    l.register_offset(0);
+    let snap = l.snapshot(&Channel::All, 0, DAY + H);
+    assert_eq!(snap["kpi"]["commands"], 1);
+    let agents = rows(&snap, "agents");
+    let main = agents.iter().find(|a| a["id"] == "s1/main").unwrap();
+    assert_eq!(main["current"], "$ Get-ChildItem src");
+}
+
 // ── agents 列
 
 #[test]

@@ -14,7 +14,7 @@ use crate::event::{
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
     FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
     SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped, Usage,
+    TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
@@ -1291,7 +1291,9 @@ impl Merger {
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
         match (ok, h.str_field("tool_name")) {
-            (Some(ok), Some("Bash")) => changes.extend(t.bash_result(agent, id, ok, ts_seen)),
+            (Some(ok), Some(tool)) if is_command_tool(tool) => {
+                changes.extend(t.bash_result(agent, id, ok, ts_seen))
+            }
             // subagent 失敗（#674）：Agent／Task 工具失敗；Esc 中斷（ok 為 None）不算
             (Some(false), Some("Agent" | "Task")) => t.signal(Signal::SubagentFail, ts_seen),
             _ => {}
@@ -1593,11 +1595,9 @@ impl Merger {
         ok: bool,
         meta: Meta,
     ) -> Option<Event> {
-        if h.str_field("tool_name") != Some("Bash") {
-            return None;
-        }
+        let tool = h.str_field("tool_name").filter(|t| is_command_tool(t))?;
         let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
-        let mut op = derive::git_op_from(command, response, ok)?;
+        let mut op = derive::git_op_from(&derive::normalize_command(tool, command), response, ok)?;
         op.tool_use_id = id.to_string();
         Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
     }

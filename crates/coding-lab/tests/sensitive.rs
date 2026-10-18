@@ -190,3 +190,56 @@ fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
     redact_keys(&mut v);
     assert_eq!(v, again);
 }
+
+// ── PowerShell（W-H3）：欄位名假設和 Bash 一樣是 `command`，尚未經實機確認（排在第 1 輪 Windows 驗收）
+
+fn ps(cmd: &str) -> bool {
+    is_sensitive("PowerShell", &json!({ "command": cmd }))
+}
+
+#[test]
+fn powershell_reading_secrets_or_listing_the_environment_hits() {
+    for c in [
+        "Get-Content .env",
+        "gc .env.local",
+        "type .env",
+        "cat .env",
+        "Get-Content -Path C:\\proj\\.env",
+        "Get-Content -Raw 'C:\\Users\\me\\.aws\\credentials'",
+        "Set-Location app; Get-Content config\\.env.production",
+        "Get-Content .e`nv",
+        "gc `\n  .env",
+        "Get-ChildItem env:",
+        "gci Env:",
+        "dir env:",
+        "ls env:*",
+        "Get-Item env:GITHUB_TOKEN",
+        "Get-Content env:AWS_SECRET_ACCESS_KEY",
+        "$env:GITHUB_TOKEN",
+        "[Environment]::GetEnvironmentVariables()",
+        "[System.Environment]::GetEnvironmentVariables() | Format-List",
+    ] {
+        assert!(ps(c), "{c}");
+    }
+    for c in [
+        "Get-Content README.md",
+        "Get-Content .env.example",
+        "Get-ChildItem src",
+        "$env:RUST_LOG = 'debug'; cargo test",
+        "Write-Output 'env:'",
+        "cargo test",
+        "git status",
+        "Get-Content src\\env.rs",
+    ] {
+        assert!(!ps(c), "{c}");
+    }
+}
+
+#[test]
+fn powershell_without_a_command_field_is_not_sensitive() {
+    assert!(!is_sensitive("PowerShell", &json!({})));
+    assert!(!is_sensitive(
+        "PowerShell",
+        &json!({ "script": "Get-Content .env" })
+    ));
+}
