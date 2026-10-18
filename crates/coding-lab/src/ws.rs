@@ -906,9 +906,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 msg["kind"].as_str().unwrap_or_default(),
                 msg["ref"].as_str().unwrap_or_default(),
             );
-            if let Some(store) = &state.store {
-                let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = store.ack(s, k, r, crate::now_ms()) {
+            if let Some(store) = state.store.clone() {
+                // SQLite 寫入會阻塞，不在 async worker 上拿 store 鎖（L-7）
+                let (s2, k2, r2) = (s.to_string(), k.to_string(), r.to_string());
+                let res = tokio::task::spawn_blocking(move || {
+                    store.lock().unwrap_or_else(|e| e.into_inner()).ack(
+                        &s2,
+                        &k2,
+                        &r2,
+                        crate::now_ms(),
+                    )
+                })
+                .await;
+                if let Ok(Err(e)) = res {
                     crate::logging::log(&format!("web：ack 寫入失敗：{e}"));
                 }
             }
@@ -920,13 +930,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             let session = msg["session"].as_str().unwrap_or_default().to_string();
             let before = msg["beforePos"].as_u64();
             let limit = msg["limit"].as_u64().unwrap_or(200).min(MORE_LIMIT) as usize;
-            let events = match &state.store {
+            let events = match state.store.clone() {
                 Some(store) => {
-                    let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                    more_events(&store, &session, before, limit).unwrap_or_else(|e| {
-                        crate::logging::log(&format!("web：載入更多失敗：{e}"));
-                        Vec::new()
-                    })
+                    // 讀 JSONL 會阻塞，不在 async worker 上做（L-7）
+                    let sid = session.clone();
+                    tokio::task::spawn_blocking(move || more_events(&store, &sid, before, limit))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(crate::store::StoreError::Io(std::io::Error::other(e)))
+                        })
+                        .unwrap_or_else(|e| {
+                            crate::logging::log(&format!("web：載入更多失敗：{e}"));
+                            Vec::new()
+                        })
                 }
                 None => Vec::new(),
             };
@@ -949,25 +965,38 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 /// 伴隨 Event 從窗口第一個 seq 往前、最後一個 seq 往後各 [`COMPANION_LOOKBACK`] 個找：平行工具的結果
 /// 常在下一張卡片進串流之後才到；伴隨 Event 依 toolUseId 過濾，不會混進窗口外的卡片。
 /// 狀態行仍以下一個帶 pos 的 Event 的時間為上限。
+///
+/// 鎖內只查 offset、放掉鎖再讀 JSONL（L-7、X1）：讀檔期間主迴圈的寫入與別的請求不用等。會阻塞，呼叫端放進 blocking 執行緒。
 pub(crate) fn more_events(
-    store: &Store,
+    store: &Mutex<Store>,
     session: &str,
     before: Option<u64>,
     limit: usize,
 ) -> Result<Vec<Event>, crate::store::StoreError> {
-    let window = store.stream_before(session, before, limit)?;
+    let lock = || store.lock().unwrap_or_else(|e| e.into_inner());
+    let (reads, reader) = {
+        let s = lock();
+        (s.stream_before_reads(session, before, limit)?, s.reader())
+    };
+    let window = reader.read(&reads)?;
     let (Some(first), Some(last)) = (window.first(), window.last()) else {
         return Ok(window);
     };
-    let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
     let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
-    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經由 stream_before 讀過（E-L9）
-    let pool = store.unplaced_by_seq(
-        session,
-        from,
-        last.seq + COMPANION_LOOKBACK,
-        crate::live::pool_kinds(),
-    )?;
+    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經讀過（E-L9）
+    let (next, pool_reads) = {
+        let s = lock();
+        (
+            s.next_pos_after(session, last.pos.unwrap_or(0))?,
+            s.unplaced_by_seq_reads(
+                session,
+                from,
+                last.seq + COMPANION_LOOKBACK,
+                crate::live::pool_kinds(),
+            )?,
+        )
+    };
+    let pool = reader.read(&pool_reads)?;
     Ok(crate::live::assemble_stream(
         window,
         pool,

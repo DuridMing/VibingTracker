@@ -108,14 +108,7 @@ pub async fn sessions(
     };
     let n = limit(&q, SESSIONS_DEFAULT, SESSIONS_MAX);
     // SQLite 與 JSONL 都會阻塞：放到 blocking 執行緒，不佔住 async worker（#683）。先讀完 store 再碰 live，不同時拿兩把鎖
-    let stored = tokio::task::spawn_blocking(move || {
-        stored_rows(
-            &store.lock().unwrap_or_else(|e| e.into_inner()),
-            cwd.as_deref(),
-            n,
-        )
-    })
-    .await;
+    let stored = tokio::task::spawn_blocking(move || stored_rows(&store, cwd.as_deref(), n)).await;
     let stored = match stored {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => return store_error(e),
@@ -145,13 +138,19 @@ pub async fn sessions(
 /// store 的 sessions 列，組成與 WS 相同欄位（不在 live 狀態裡的 session 直接用）。
 /// 最後一個 prompt 與 `lastPos` 用兩句批次查詢取，不是每列各查一次。
 fn stored_rows(
-    store: &Store,
+    store: &std::sync::Mutex<Store>,
     cwd: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(String, Value)>, crate::store::StoreError> {
-    let rows = store.sessions(cwd, limit)?;
-    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-    let extra = store.last_prompt_and_pos(&ids)?;
+    // 鎖內只查 SQLite 與 offset，最後一個 prompt 的文字在鎖外讀 JSONL（L-7、X1）
+    let (rows, mut extra, reads, reader) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = s.sessions(cwd, limit)?;
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let (extra, reads) = s.last_prompt_and_pos_reads(&ids)?;
+        (rows, extra, reads, s.reader())
+    };
+    crate::store::fill_last_prompts(&mut extra, reader.read(&reads)?);
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -188,29 +187,29 @@ pub async fn events(
 ) -> Response {
     let q = query(&uri);
     let before = q.get("beforePos").and_then(|v| v.parse::<u64>().ok());
-    let Some(store) = state.store() else {
+    let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有這個 session");
     };
-    let store = store.lock().unwrap_or_else(|e| e.into_inner());
-    match store.session(&id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
-        Err(e) => return store_error(e),
-    }
-    match more_events(
-        &store,
-        &id,
-        before,
-        limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize),
-    ) {
-        Ok(events) => {
-            let mut body = json!({ "session": id, "beforePos": before, "events": events });
-            // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-            state.redact_for(remote, &mut body);
-            ok(&body)
+    let n = limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize);
+    // SQLite 與讀 JSONL 都會阻塞：放到 blocking 執行緒，讀 JSONL 時不握 store 鎖（L-7）
+    tokio::task::spawn_blocking(move || {
+        match store.lock().unwrap_or_else(|e| e.into_inner()).session(&id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
+            Err(e) => return store_error(e),
         }
-        Err(e) => store_error(e),
-    }
+        match more_events(&store, &id, before, n) {
+            Ok(events) => {
+                let mut body = json!({ "session": id, "beforePos": before, "events": events });
+                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+                state.redact_for(remote, &mut body);
+                ok(&body)
+            }
+            Err(e) => store_error(e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 // ── /api/projects/replay（主頁時間軸回放，#729）
@@ -286,10 +285,13 @@ pub async fn project_replay(
     // SQLite 與讀 JSONL 都會阻塞；重放也是 CPU 工作，一起放到 blocking 執行緒
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        let read = store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .timeline(&cwd, since, at, until, n);
+        // 鎖內只查 session、offset 與確認時間，讀 JSONL 時放掉鎖：主迴圈的寫入不用等回放（C3、X1）
+        let read = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.timeline_reads(&cwd, since, at, until, n)
+                .map(|(reads, acks, cut)| (reads, acks, cut, s.reader()))
+        }
+        .and_then(|(reads, acks, cut, reader)| Ok((reader.read(&reads)?, acks, cut)));
         match read {
             Ok((events, acks, cut)) => {
                 let page = crate::timeline::Page {
@@ -398,9 +400,8 @@ fn files_blocking(
         return ok(&without_known_tree(body, have));
     }
     let session_paths = {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
         match &base {
-            Base::Session(id) => match session_changes(&store, id) {
+            Base::Session(id) => match session_changes(store, id) {
                 Ok(Some(c)) => Some(c),
                 Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
                 Err(e) => return store_error(e),
@@ -1271,12 +1272,23 @@ fn worktrees(root: &Path) -> Vec<(String, Option<String>)> {
 }
 
 /// `session` 基準：那個 session 的 file.edit／file.write；None 表示沒有這個 session。
-fn session_changes(store: &Store, id: &str) -> Result<Option<Changes>, crate::store::StoreError> {
-    if store.session(id)?.is_none() {
-        return Ok(None);
-    }
+fn session_changes(
+    store: &std::sync::Mutex<Store>,
+    id: &str,
+) -> Result<Option<Changes>, crate::store::StoreError> {
+    // 鎖內只查 offset，讀 JSONL 時放掉鎖（L-7、X1）
+    let (reads, reader) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        if s.session(id)?.is_none() {
+            return Ok(None);
+        }
+        (
+            s.events_of_types_reads(id, &["file.edit", "file.write", "tool.updated"])?,
+            s.reader(),
+        )
+    };
     let mut out: Changes = BTreeMap::new();
-    let events = store.events_of_types(id, &["file.edit", "file.write", "tool.updated"])?;
+    let events = reader.read(&reads)?;
     // 被拒或失敗的 Edit／Write 不算改動（contracts §4，#682）
     let failed: std::collections::HashSet<&str> = events
         .iter()
@@ -1452,13 +1464,20 @@ pub async fn thinking(
             "這個 collector 不對遠端提供 thinking（remote_thinking = hide）",
         );
     }
-    let Some(store) = state.store() else {
+    let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
     };
-    let found = {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        store.events_by_seq(&session, seq, seq)
-    };
+    // 不在 async worker 上拿 store 鎖、讀 JSONL 時不握鎖（L-7）
+    let sid = session.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let (reads, reader) = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            (s.events_by_seq_reads(&sid, seq, seq)?, s.reader())
+        };
+        reader.read(&reads)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::store::StoreError::Io(std::io::Error::other(e))));
     let events = match found {
         Ok(v) => v,
         Err(e) => return store_error(e),
