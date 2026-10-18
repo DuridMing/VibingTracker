@@ -316,16 +316,22 @@ impl Hub {
 
     /// 上游的一則 server → client 訊息
     pub fn on_message(&mut self, up: &str, msg: &Value) -> Vec<Out> {
+        self.on_message_owned(up, msg.clone())
+    }
+
+    /// 同 [`Hub::on_message`]，收下整則訊息（上游迴圈用）：frame 的 events、rows 直接拿走，不再各拷一份（E-H4）
+    pub fn on_message_owned(&mut self, up: &str, mut msg: Value) -> Vec<Out> {
         let ch = msg["ch"].as_str().unwrap_or("*").to_string();
-        match msg["t"].as_str().unwrap_or_default() {
+        let t = msg["t"].as_str().unwrap_or_default().to_string();
+        match t.as_str() {
             "welcome" => {
-                self.on_welcome(up, msg);
+                self.on_welcome(up, &msg);
                 Vec::new()
             }
             "snapshot" if ch == "*" => {
                 // （重）連上：快取裡有、新 snapshot 沒有的 session 先明確送 deleted，已開著的客戶端才不會留著
                 // 只有 offline 旗標的舊列（#723）；然後重送合併的 snapshot
-                let gone = self.on_all_snapshot(up, msg);
+                let gone = self.on_all_snapshot(up, &msg);
                 let mut outs = Vec::new();
                 if !gone.is_empty() {
                     let no = self.next_no();
@@ -341,27 +347,17 @@ impl Hub {
                 outs.push(Out::Resnapshot);
                 outs
             }
-            "snapshot" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
+            "snapshot" | "frame" if ch != "*" => {
+                self.rewrite(up, &mut msg);
                 match ch.strip_prefix("session:") {
-                    Some(id) => vec![Out::Session(id.to_string(), v)],
+                    Some(id) => vec![Out::Session(id.to_string(), msg)],
                     None => Vec::new(),
                 }
             }
-            "frame" if ch == "*" => vec![Out::All(self.on_all_frame(up, msg))],
-            "frame" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
-                match ch.strip_prefix("session:") {
-                    Some(id) => vec![Out::Session(id.to_string(), v)],
-                    None => Vec::new(),
-                }
-            }
+            "frame" => vec![Out::All(self.on_all_frame(up, msg))],
             "more" | "error" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
-                vec![Out::Any(v)]
+                self.rewrite(up, &mut msg);
+                vec![Out::Any(msg)]
             }
             _ => Vec::new(),
         }
@@ -448,12 +444,17 @@ impl Hub {
             .collect()
     }
 
-    fn on_all_frame(&mut self, up: &str, frame: &Value) -> Value {
-        let mut v = frame.clone();
+    fn on_all_frame(&mut self, up: &str, mut v: Value) -> Value {
         self.rewrite(up, &mut v);
         let no = self.next_no();
-        let events = v["events"].as_array().cloned().unwrap_or_default();
-        let rows = v["rows"].as_object().cloned().unwrap_or_default();
+        let events = match v["events"].take() {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        let rows = match v["rows"].take() {
+            Value::Object(o) => o,
+            _ => Map::new(),
+        };
         let had_kpi = rows.contains_key("kpi");
         {
             let cache = self.up(up);
@@ -770,7 +771,7 @@ struct UpHandle {
 struct HubState {
     hub: Mutex<Hub>,
     ups: Vec<UpHandle>,
-    out: broadcast::Sender<Arc<Out>>,
+    out: broadcast::Sender<Arc<Outgoing>>,
     web_root: Option<PathBuf>,
     instance: String,
     /// 上游 KPI「今天」用的時區：第一個明確帶 `utcOffsetMin` 的客戶端決定，之後不再變（#718：不然瀏覽器與
@@ -823,10 +824,36 @@ impl HubState {
         self.ups.iter().find(|u| u.up.name == name)
     }
 
+    /// 廣播給客戶端。Resnapshot 在這裡算一次合併的 snapshot（呼叫端已放掉 hub 鎖），
+    /// 不再每條連線各自在 hub 鎖裡算（E-H6）。
     fn emit(&self, outs: Vec<Out>) {
         for o in outs {
-            let _ = self.out.send(Arc::new(o));
+            let o = match o {
+                Out::Resnapshot => Out::All(self.hub().snapshot_all()),
+                o => o,
+            };
+            let _ = self.out.send(Arc::new(Outgoing {
+                out: o,
+                text: std::sync::OnceLock::new(),
+            }));
         }
+    }
+}
+
+/// 廣播的一則訊息：第一條連線序列化後，其他連線共用同一份 bytes（E-H6）。
+/// 客戶端都是本機（hub 不收遠端），不用依連線剝除，同一份文字可以給每一條。
+struct Outgoing {
+    out: Out,
+    text: std::sync::OnceLock<axum::extract::ws::Utf8Bytes>,
+}
+
+impl Outgoing {
+    fn text(&self) -> Option<axum::extract::ws::Utf8Bytes> {
+        let v = match &self.out {
+            Out::All(v) | Out::Session(_, v) | Out::Any(v) => v,
+            Out::Resnapshot => return None,
+        };
+        Some(self.text.get_or_init(|| v.to_string().into()).clone())
     }
 }
 
@@ -1027,7 +1054,7 @@ async fn run_upstream(
                 Some(Ok(M::Text(t))) => {
                     hb.on_activity(crate::now_ms());
                     let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
-                    let outs = state.hub().on_message(&up.name, &v);
+                    let outs = state.hub().on_message_owned(&up.name, v);
                     state.emit(outs);
                 }
                 Some(Ok(M::Ping(p))) => { hb.on_activity(crate::now_ms()); let _ = ws.send(M::Pong(p)).await; }
@@ -1094,13 +1121,16 @@ async fn client(mut socket: WebSocket, state: Arc<HubState>) {
             },
             out = rx.recv() => match out {
                 Ok(o) => {
-                    let ok = match &*o {
-                        Out::All(f) => !subs.all || send(&mut socket, f).await,
-                        Out::Session(id, v) => !subs.sessions.contains(id) || send(&mut socket, v).await,
-                        Out::Resnapshot => !subs.all || { let s = state.hub().snapshot_all(); send(&mut socket, &s).await },
-                        Out::Any(v) => send(&mut socket, v).await,
+                    let wanted = match &o.out {
+                        Out::All(_) | Out::Resnapshot => subs.all,
+                        Out::Session(id, _) => subs.sessions.contains(id),
+                        Out::Any(_) => true,
                     };
-                    if !ok { break; }
+                    if wanted && let Some(text) = o.text()
+                        && socket.send(Message::Text(text)).await.is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if subs.all { let s = state.hub().snapshot_all(); if !send(&mut socket, &s).await { break; } }
