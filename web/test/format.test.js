@@ -166,3 +166,12 @@ test("hide 模式與 0 字的思考佔位不寫「點開載入」、不可展開
   assert.match(od.html, /點開載入/);
   assert.equal(od.detail, "點一下載入思考內容");
 });
+
+test("Write／Edit 的計數一律當數字：hub 原樣轉送上游的 JSON，不能讓字串變成 HTML（F-8）", () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const w = formatRow(tool({ tool: "Write", input: { file_path: "n.ts" }, write: { path: "n.ts", isNew: false, lines: evil } })).html;
+  assert.doesNotMatch(w, /<img/);
+  assert.match(w, /（0 行）/);
+  const e = formatRow(tool({ tool: "Edit", input: { file_path: "a.ts" }, edit: { added: evil, removed: evil } })).html;
+  assert.doesNotMatch(e, /<img/);
+});

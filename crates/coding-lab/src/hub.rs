@@ -848,6 +848,7 @@ pub async fn serve_with_backoff(
         .route("/api/{*rest}", get(api_proxy))
         .fallback(get(static_file))
         .layer(middleware::from_fn(gate))
+        .layer(middleware::map_response(crate::ws::no_framing))
         .with_state(state);
     let task = tokio::spawn(async move {
         let _tasks = tasks;
@@ -858,9 +859,13 @@ pub async fn serve_with_backoff(
     Ok((local, task))
 }
 
-/// hub 只綁本機、免金鑰：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）
+/// hub 只綁本機、免金鑰：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）。
+/// hub 沒有金鑰驗證，反向代理轉來的（帶轉發標頭）一律拒絕：代理後面的人都會變成本機（S-1）。
 async fn gate(req: Request, next: Next) -> Response {
     let path = req.uri().path();
+    if crate::ws::proxied(req.headers()) {
+        return (StatusCode::FORBIDDEN, "hub 不接受反向代理轉來的連線").into_response();
+    }
     if !crate::ws::host_is_loopback(req.headers()) {
         return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
     }

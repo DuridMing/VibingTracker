@@ -272,6 +272,7 @@ pub async fn serve_web(
         .route("/auth/logout", post(auth_logout))
         .fallback(get(static_file))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
+        .layer(middleware::map_response(no_framing))
         .with_state(state);
     let task = tokio::spawn(async move {
         // 連線來源位址：遠端連線送出前剝除敏感輸出（#654）
@@ -286,7 +287,7 @@ pub async fn serve_web(
 /// 每個請求的門口：決定這條連線是「本機免金鑰」還是要驗金鑰，並把 [`Identity`] 放進 request extensions。
 ///
 /// - `/healthz` 與 `/auth/*` 不驗（登入頁本身要能開）。
-/// - 本機免金鑰（loopback 來源且 `auth = "local-open"`）：`Host` 必須是 loopback 名稱——DNS rebinding 時攻擊者的
+/// - 本機免金鑰（loopback 來源、沒有轉發標頭，且 `auth = "local-open"`）：`Host` 必須是 loopback 名稱——DNS rebinding 時攻擊者的
 ///   網域解析到 127.0.0.1，瀏覽器送出的 `Origin` 與 `Host` 都是攻擊者網域、彼此相同，只比 Origin 擋不住。
 ///   `/api` 與 `/ws` 另外要 `Origin == Host`。
 /// - 要金鑰的連線：Bearer 或 cookie（cookie 要配 `Origin`）。沒有或不對：API 與 WS 回 401／403，網頁導去登入頁。
@@ -300,7 +301,11 @@ async fn gate(
     let path = req.uri().path().to_string();
     let open = path == "/healthz" || path.starts_with("/auth/");
     let guarded = path.starts_with("/api/") || path == "/ws";
-    if !state.auth.needs_auth(peer) {
+    // 反向代理轉來的：來源與 Host 都可能是 loopback（nginx 預設改寫 Host），只有轉發標頭看得出來（S-1）
+    let proxied = proxied(req.headers());
+    req.extensions_mut()
+        .insert(Remote(proxied || state.remote_peer(peer)));
+    if !proxied && !state.auth.needs_auth(peer) {
         if !host_is_loopback(req.headers()) {
             return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
         }
@@ -476,6 +481,39 @@ async fn auth_logout(headers: HeaderMap) -> Response {
         .into_response()
 }
 
+/// gate 判定的「這條連線算不算遠端」：來源不是 loopback、測試強制，或經過反向代理（[`proxied`]）。
+/// handler 一律讀這個，不再各自看來源位址——代理轉來的連線來源是 127.0.0.1，只看位址會當成本機（S-1）。
+#[derive(Clone, Copy, Debug)]
+pub struct Remote(pub bool);
+
+/// 帶任何一個轉發標頭就是反向代理轉來的。代理一定會加其中之一（nginx 的 `proxy_set_header`、Caddy 預設、
+/// RFC 7239 `Forwarded`）；Claude Code 與瀏覽器直連都不會帶。標頭本身不可信，所以只拿來「升級成遠端」，不拿來放行。
+pub fn proxied(headers: &HeaderMap) -> bool {
+    [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
+}
+
+/// 每個回應（含 gate 拒絕的）都禁止被嵌進 iframe（F-7）：local-open 時任何網站都能把這頁放進 iframe、
+/// 誘導使用者點「全部確認」清掉危險警示。hub 的 web 入口也用。
+pub(crate) async fn no_framing(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    h.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
+}
+
 /// `Host` 是 loopback 名稱（hub 的 web 入口也用，#663）。
 pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
@@ -518,12 +556,11 @@ pub fn is_remote(peer: SocketAddr) -> bool {
 
 async fn ws_handler(
     State(state): State<Arc<WebState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     Extension(identity): Extension<Identity>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Origin 與金鑰都在 gate 驗過了
-    let remote = state.remote_peer(peer);
+    // Origin 與金鑰都在 gate 驗過了，遠端與否也是 gate 判定的
     ws.on_upgrade(move |socket| connection(socket, state, remote, identity))
 }
 
@@ -533,7 +570,7 @@ struct Conn {
     offset: i32,
     /// hello 帶的 frame 編號與收到 hello 的時間
     resume: Option<(u64, Instant)>,
-    /// 從別台連進來（[`is_remote`]）
+    /// 遠端連線（gate 判定的 [`Remote`]）
     remote: bool,
     /// 本機或哪一把金鑰（決定 `welcome.scope` 與能不能 ack）
     identity: Identity,
@@ -544,13 +581,7 @@ struct Conn {
 /// 送一則訊息；遠端連線先剝除敏感輸出（#654）與 thinking 全文（#668，依 `remote_thinking`）。
 async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
     let text = if conn.remote {
-        let mut v = v.clone();
-        crate::sensitive::redact_remote(&mut v);
-        crate::sensitive::redact_keys(&mut v);
-        if conn.thinking != RemoteThinking::Show {
-            defer_thinking(&mut v);
-        }
-        v.to_string()
+        redact_remote_copy(v, conn.thinking).to_string()
     } else {
         v.to_string()
     };
@@ -559,47 +590,109 @@ async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
 
 impl WebState {
     /// HTTP API 回應送給遠端前的剝除：敏感輸出（#654）＋依 `remote_thinking` 的 thinking（#668）。
-    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。
-    pub fn redact_for_peer(&self, peer: SocketAddr, body: &mut Value) {
-        if !self.remote_peer(peer) {
-            return;
-        }
-        crate::sensitive::redact_remote(body);
-        crate::sensitive::redact_keys(body);
-        if self.remote_thinking() != RemoteThinking::Show {
-            defer_thinking(body);
+    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。`remote` 是 gate 判定的 [`Remote`]。
+    pub fn redact_for(&self, remote: bool, body: &mut Value) {
+        if remote {
+            *body = redact_remote_copy(body, self.remote_thinking());
         }
     }
 }
 
-/// 把送出副本裡所有 `assistant.thinking` 的 `text` 換成空字串，加 `deferred: true` 與 `chars`（佔位要顯示長度）。
-/// frame、snapshot、載入更多的形狀不同，所以整個走一遍；只改送出的副本，JSONL 與 store 不變。
-pub fn defer_thinking(v: &mut Value) {
+/// 送給遠端連線的副本（不變式 6、7，contracts §4）：WS、每個 API、回放、hub 轉送都走這一個，一次走訪產出：
+/// - 命中敏感規則（`payload.sensitive`）的 Event 剝內容並加 `redacted: true`：`tool.result.output` 換 `""`；
+///   `tool.called.input` 只留路徑類欄位；`file.write.content` 換 `""`；`file.edit.hunk.lines` 換 `[]`（行號與計數保留，C8）。
+/// - `thinking` 不是 `Show` 時：`assistant.thinking` 的 `text` 換 `""`、加 `deferred` 與 `chars`（#668）；
+///   sessions 列裡來源是 thinking 的 `doing` 換 null（C2）。
+/// - 所有字串裡的 `clk_<id>_<secret>` 只留 `clk_<id>_…`（#720）。
+///
+/// frame、snapshot、載入更多、API 回應的形狀不同，所以整個走一遍；原值不動（JSONL、store、本機連線照舊）。
+pub fn redact_remote_copy(v: &Value, thinking: RemoteThinking) -> Value {
+    copy_for_remote(v, thinking != RemoteThinking::Show)
+}
+
+/// `tool.called.input` 剝除後留下的欄位：畫面要顯示是哪個檔或哪個指令。
+const KEEP_INPUT: [&str; 4] = ["file_path", "notebook_path", "path", "command"];
+
+fn copy_for_remote(v: &Value, defer: bool) -> Value {
     match v {
+        Value::String(s) if s.contains("clk_") => {
+            let mut masked = Value::String(s.clone());
+            crate::sensitive::redact_keys(&mut masked);
+            masked
+        }
         Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("assistant.thinking")
-                && let Some(Value::Object(p)) = map.get_mut("payload")
-            {
-                let chars = p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map_or(0, |t| t.chars().count());
-                p.insert("text".into(), Value::String(String::new()));
-                p.insert("deferred".into(), Value::Bool(true));
-                p.insert("chars".into(), json!(chars));
-                return;
+            let mut out: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, child)| (k.clone(), copy_for_remote(child, defer)))
+                .collect();
+            redact_event(map, &mut out, defer);
+            if defer && map.get("doingSource").and_then(Value::as_str) == Some("thinking") {
+                out.insert("doing".into(), Value::Null);
             }
-            for child in map.values_mut() {
-                defer_thinking(child);
-            }
+            Value::Object(out)
         }
-        Value::Array(items) => {
-            for child in items {
-                defer_thinking(child);
-            }
-        }
-        _ => {}
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|child| copy_for_remote(child, defer))
+                .collect(),
+        ),
+        other => other.clone(),
     }
+}
+
+/// `out` 是 `orig` 已複製（字串已遮金鑰）的副本；是 Event 時依種類剝內容。
+fn redact_event(
+    orig: &serde_json::Map<String, Value>,
+    out: &mut serde_json::Map<String, Value>,
+    defer: bool,
+) {
+    let Some(kind) = orig.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(Value::Object(p)) = out.get_mut("payload") else {
+        return;
+    };
+    if kind == "assistant.thinking" {
+        if defer {
+            let chars = orig["payload"]["text"]
+                .as_str()
+                .map_or(0, |t| t.chars().count());
+            p.insert("text".into(), Value::String(String::new()));
+            p.insert("deferred".into(), Value::Bool(true));
+            p.insert("chars".into(), json!(chars));
+        }
+        return;
+    }
+    if p.get("sensitive").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    match kind {
+        "tool.result" => {
+            p.insert("output".into(), Value::String(String::new()));
+        }
+        "tool.called" => {
+            let kept = match p.get("input") {
+                Some(Value::Object(input)) => input
+                    .iter()
+                    .filter(|(k, _)| KEEP_INPUT.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => serde_json::Map::new(),
+            };
+            p.insert("input".into(), Value::Object(kept));
+        }
+        "file.write" => {
+            p.insert("content".into(), Value::String(String::new()));
+        }
+        "file.edit" => {
+            if let Some(Value::Object(hunk)) = p.get_mut("hunk") {
+                hunk.insert("lines".into(), Value::Array(Vec::new()));
+            }
+        }
+        _ => return,
+    }
+    p.insert("redacted".into(), Value::Bool(true));
 }
 
 async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, identity: Identity) {

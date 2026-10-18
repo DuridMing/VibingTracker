@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::derive::relative_path;
-use crate::doing::Doing;
+use crate::doing::{Doing, Source};
 use crate::event::{DangerLevel, Event, Payload};
 use crate::status::task_failed;
 use crate::store::SessionRow;
@@ -1232,7 +1232,8 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model.as_deref().map(short_model), "modelId": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
+            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t),
+            "doingSource": s.doing.local().map(|(src, _)| doing_source(src)), "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
             "degraded": s.degraded,
@@ -1308,5 +1309,15 @@ fn describe(tool: &str, input: &Value, cwd: &str) -> String {
         "Edit" => format!("edit {}", path()),
         "Write" => format!("write {}", path()),
         other => other.to_string(),
+    }
+}
+
+/// sessions 列的 `doingSource`：遠端剝除靠它判斷 `doing` 是不是取自 thinking（C2，contracts §4）。
+fn doing_source(src: Source) -> &'static str {
+    match src {
+        Source::Text => "text",
+        Source::Thinking => "thinking",
+        Source::Tool => "tool",
+        Source::Prompt => "prompt",
     }
 }
