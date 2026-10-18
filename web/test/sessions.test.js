@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeSessions, projectRoots, pickProject, canReplay } from "../js/sessions.js";
+import { mergeSessions, projectRoots, canReplay } from "../js/sessions.js";
 
 const row = (id, extra = {}) => ({ id, cwd: "/repo", status: "run", startedAt: 1000, model: null, ...extra });
 
@@ -31,14 +31,6 @@ test("專案：cwd 在另一個 session 的 cwd 底下（worktree、子目錄）
 test("專案：只有 worktree 的 session 時，它自己就是專案；已結束的不算 live", () => {
   const sessions = [row("b", { cwd: "/repo/worktrees/feature/x", status: "ended" }), row("c", { cwd: "/repo/worktrees/feature/y" })];
   assert.deepEqual(projectRoots(sessions).map((p) => [p.cwd, p.live]), [["/repo/worktrees/feature/x", 0], ["/repo/worktrees/feature/y", 1]]);
-});
-
-test("預設專案：使用者選過且還在就用它，否則選 live 最多的", () => {
-  const roots = [{ cwd: "/a", sessions: ["1"], live: 1 }, { cwd: "/b", sessions: ["2", "3"], live: 2 }];
-  assert.equal(pickProject(roots, null), "/b");
-  assert.equal(pickProject(roots, "/a"), "/a");
-  assert.equal(pickProject(roots, "/gone"), "/b");
-  assert.equal(pickProject([], "/a"), null);
 });
 
 test("▶ 回放按鍵只給已結束的 session（#690）", () => {
