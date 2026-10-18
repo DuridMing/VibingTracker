@@ -269,3 +269,16 @@ test("頁面開著幾天：去重與卡片對照的集合有上限，計數照�
   t.apply([evs.at(-1)]);
   assert.equal(t.counts("a.txt").r, 300_000);
 });
+
+test("重抓檔案樹帶上次的 treeHash（have），相同時伺服器省略 tree（#766 F-6、contracts §7）", () => {
+  assert.equal(filesUrl("/repo", { kind: "main" }, "abcd1234abcd1234"), "/api/files?cwd=%2Frepo&base=main&have=abcd1234abcd1234");
+  assert.equal(filesUrl("/repo", { kind: "main" }, null), "/api/files?cwd=%2Frepo&base=main");
+  assert.equal(filesUrl("/repo", { kind: "commit", hash: "zz" }, "abcd"), null, "hash 格式不對照樣是 null");
+});
+
+test("使用者拒絕（PermissionDenied，denied）不算失敗：改動照樣收回，但不記「失敗」（#745 D6、contracts §4）", () => {
+  const t = tree(["src/a.rs"]);
+  t.apply([edit(A, "src/a.rs", "d1"), failed(A, "d1", { denied: true })]);
+  assert.equal(t.counts("src/a.rs").x, 0, "被拒不是工具出錯");
+  assert.equal(t.counts("src/a.rs").e, 0, "被拒的改動沒有發生，照樣收回");
+});

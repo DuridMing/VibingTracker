@@ -1093,6 +1093,7 @@ impl Merger {
                     error: None,
                     interrupted: None,
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
@@ -1123,6 +1124,7 @@ impl Merger {
                     error: Some(truncate(error, MESSAGE_LIMIT).0),
                     interrupted: h.field("is_interrupt").and_then(Value::as_bool),
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
@@ -1149,15 +1151,14 @@ impl Merger {
                     error: s("reason"),
                     interrupted: None,
                     danger: None,
+                    denied: true,
                 };
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 out.extend(self.tool_ended(h, &sid, &id, &agent, None, ts_seen));
             }
             "Stop" => {
                 let p = TurnStopped {
-                    last_message: h
-                        .str_field("last_assistant_message")
-                        .map(|m| truncate(m, MESSAGE_LIMIT).0),
+                    last_message: h.str_field("last_assistant_message").map(last_message),
                 };
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
                 if agent == "main" {
@@ -1205,9 +1206,7 @@ impl Merger {
                 };
                 let p = AgentFinished {
                     agent_id,
-                    last_message: h
-                        .str_field("last_assistant_message")
-                        .map(|m| truncate(m, MESSAGE_LIMIT).0),
+                    last_message: h.str_field("last_assistant_message").map(last_message),
                     transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
@@ -1528,6 +1527,7 @@ impl Merger {
                 error: None,
                 interrupted: None,
                 danger: danger.clone(),
+                denied: false,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1618,8 +1618,29 @@ impl Merger {
             .is_some_and(|c| c.sensitive);
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
+            // 改了哪個檔，但沒有單一的 hunk（儲存格、多處改動）：hunk 為 null（W-L9、#746）
+            "NotebookEdit" | "MultiEdit" => input["notebook_path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .map(|p| {
+                    Payload::FileEdit(FileEdit {
+                        tool_use_id,
+                        path: derive::relative_path(&cwd, p),
+                        hunk: None,
+                        hunk_source: HunkSource::None,
+                        truncated: false,
+                        sensitive,
+                        replace_all: false,
+                    })
+                }),
             "Edit" => path().map(|path| {
-                let (hunk, truncated) = match h.probe().and_then(|p| p.hunk.as_ref()) {
+                // 多處取代只畫第一處會少算 +N／−M，乾脆不畫（D7）
+                let replace_all = input["replace_all"].as_bool() == Some(true);
+                let probed = h
+                    .probe()
+                    .and_then(|p| p.hunk.as_ref())
+                    .filter(|_| !replace_all);
+                let (hunk, truncated) = match probed {
                     Some(hunk) => {
                         let (hunk, cut) = bounded_hunk(hunk, OUTPUT_LIMIT);
                         (Some(hunk), cut)
@@ -1638,6 +1659,7 @@ impl Merger {
                     hunk_source,
                     sensitive,
                     truncated,
+                    replace_all,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1980,6 +2002,7 @@ impl Merger {
                         error,
                         interrupted: rejected.then_some(true),
                         danger: None,
+                        denied: false,
                     };
                     let agent = self
                         .sessions
@@ -2041,6 +2064,11 @@ fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
         .iter()
         .position(|w| w.agent_id == agent_id)?;
     Some(s.waiting_starts.remove(i))
+}
+
+/// `lastMessage`：截 [`MESSAGE_LIMIT`] 個字元（契約寫的是「500 字」，不是 bytes，D8）。
+fn last_message(m: &str) -> String {
+    text::truncate_chars(m, MESSAGE_LIMIT).0.to_string()
 }
 
 /// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。

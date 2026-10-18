@@ -10,11 +10,12 @@ use std::sync::Arc;
 
 use axum::Extension;
 use axum::extract::{Path as UrlPath, State};
-use axum::http::{StatusCode, Uri, header};
-use axum::response::{IntoResponse, Response};
+use axum::http::{StatusCode, Uri};
+use axum::response::Response;
 use serde_json::{Value, json};
 
 use crate::event::Payload;
+use crate::http_util::query;
 use crate::live::{clip, short_model};
 use crate::store::{SessionRow, Store};
 use crate::ws::{MORE_LIMIT, Remote, WebState, more_events};
@@ -25,12 +26,7 @@ const EVENTS_DEFAULT: usize = 200;
 const TREE_MAX: usize = 20_000;
 
 fn reply(code: StatusCode, body: &Value) -> Response {
-    (
-        code,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
+    crate::http_util::json(code, body)
 }
 
 fn ok(body: &Value) -> Response {
@@ -44,42 +40,6 @@ fn error(code: StatusCode, msg: impl Into<String>) -> Response {
 fn store_error(e: impl std::fmt::Display) -> Response {
     crate::logging::log(&format!("web：API 讀取 store 失敗：{e}"));
     error(StatusCode::INTERNAL_SERVER_ERROR, "讀取資料失敗")
-}
-
-/// 查詢字串（`application/x-www-form-urlencoded`）；同名參數取最後一個。
-fn query(uri: &Uri) -> HashMap<String, String> {
-    uri.query()
-        .unwrap_or_default()
-        .split('&')
-        .filter(|kv| !kv.is_empty())
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (decode(k), decode(v))
-        })
-        .collect()
-}
-
-fn decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            b'%' if i + 2 < b.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
-                    Ok(v) => {
-                        out.push(v);
-                        i += 2;
-                    }
-                    Err(_) => out.push(b'%'),
-                }
-            }
-            c => out.push(c),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn limit(q: &HashMap<String, String>, default: usize, max: usize) -> usize {
@@ -107,15 +67,11 @@ pub async fn sessions(
         return ok(&json!({ "sessions": [] }));
     };
     let n = limit(&q, SESSIONS_DEFAULT, SESSIONS_MAX);
+    // live 裡的 session 整列用 live 的（只有 model 可能沿用 store 的），最後一個 prompt 不用從 JSONL 讀（E-H3）
+    let in_live = state.live().session_ids();
     // SQLite 與 JSONL 都會阻塞：放到 blocking 執行緒，不佔住 async worker（#683）。先讀完 store 再碰 live，不同時拿兩把鎖
-    let stored = tokio::task::spawn_blocking(move || {
-        stored_rows(
-            &store.lock().unwrap_or_else(|e| e.into_inner()),
-            cwd.as_deref(),
-            n,
-        )
-    })
-    .await;
+    let stored =
+        tokio::task::spawn_blocking(move || stored_rows(&store, cwd.as_deref(), n, &in_live)).await;
     let stored = match stored {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => return store_error(e),
@@ -144,14 +100,26 @@ pub async fn sessions(
 
 /// store 的 sessions 列，組成與 WS 相同欄位（不在 live 狀態裡的 session 直接用）。
 /// 最後一個 prompt 與 `lastPos` 用兩句批次查詢取，不是每列各查一次。
+/// `skip`：live 裡已有的 session，它們的列會整列換成 live 的，不用查最後一個 prompt（E-H3）。
 fn stored_rows(
-    store: &Store,
+    store: &std::sync::Mutex<Store>,
     cwd: Option<&str>,
     limit: usize,
+    skip: &std::collections::HashSet<String>,
 ) -> Result<Vec<(String, Value)>, crate::store::StoreError> {
-    let rows = store.sessions(cwd, limit)?;
-    let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
-    let extra = store.last_prompt_and_pos(&ids)?;
+    // 鎖內只查 SQLite 與 offset，最後一個 prompt 的文字在鎖外讀 JSONL（L-7、X1）
+    let (rows, mut extra, reads, reader) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        let rows = s.sessions(cwd, limit)?;
+        let ids: Vec<String> = rows
+            .iter()
+            .filter(|r| !skip.contains(&r.id))
+            .map(|r| r.id.clone())
+            .collect();
+        let (extra, reads) = s.last_prompt_and_pos_reads(&ids)?;
+        (rows, extra, reads, s.reader())
+    };
+    crate::store::fill_last_prompts(&mut extra, reader.read(&reads)?);
     Ok(rows
         .into_iter()
         .map(|r| {
@@ -188,29 +156,29 @@ pub async fn events(
 ) -> Response {
     let q = query(&uri);
     let before = q.get("beforePos").and_then(|v| v.parse::<u64>().ok());
-    let Some(store) = state.store() else {
+    let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有這個 session");
     };
-    let store = store.lock().unwrap_or_else(|e| e.into_inner());
-    match store.session(&id) {
-        Ok(Some(_)) => {}
-        Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
-        Err(e) => return store_error(e),
-    }
-    match more_events(
-        &store,
-        &id,
-        before,
-        limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize),
-    ) {
-        Ok(events) => {
-            let mut body = json!({ "session": id, "beforePos": before, "events": events });
-            // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-            state.redact_for(remote, &mut body);
-            ok(&body)
+    let n = limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize);
+    // SQLite 與讀 JSONL 都會阻塞：放到 blocking 執行緒，讀 JSONL 時不握 store 鎖（L-7）
+    tokio::task::spawn_blocking(move || {
+        match store.lock().unwrap_or_else(|e| e.into_inner()).session(&id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
+            Err(e) => return store_error(e),
         }
-        Err(e) => store_error(e),
-    }
+        match more_events(&store, &id, before, n) {
+            Ok(events) => {
+                let mut body = json!({ "session": id, "beforePos": before, "events": events });
+                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+                state.redact_for(remote, &mut body);
+                ok(&body)
+            }
+            Err(e) => store_error(e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 // ── /api/projects/replay（主頁時間軸回放，#729）
@@ -286,10 +254,13 @@ pub async fn project_replay(
     // SQLite 與讀 JSONL 都會阻塞；重放也是 CPU 工作，一起放到 blocking 執行緒
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
-        let read = store
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .timeline(&cwd, since, at, until, n);
+        // 鎖內只查 session、offset 與確認時間，讀 JSONL 時放掉鎖：主迴圈的寫入不用等回放（C3、X1）
+        let read = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            s.timeline_reads(&cwd, since, at, until, n)
+                .map(|(reads, acks, cut)| (reads, acks, cut, s.reader()))
+        }
+        .and_then(|(reads, acks, cut, reader)| Ok((reader.read(&reads)?, acks, cut)));
         match read {
             Ok((events, acks, cut)) => {
                 let page = crate::timeline::Page {
@@ -352,8 +323,13 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
+    let have = q.get("have").cloned();
+    let memo_key = (
+        cwd.clone(),
+        q.get("base").cloned().unwrap_or_else(|| "main".into()),
+    );
     // git 與 SQLite 都會阻塞，整段放到 blocking 執行緒
-    spawn_git(move || files_blocking(&store, &cwd, base))
+    spawn_git(move || files_blocking(&state, &store, &cwd, base, memo_key, have))
         .await
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -377,14 +353,24 @@ fn cwd_allowed(known: &[String], cwd: &str) -> bool {
         .any(|k| worktrees(Path::new(k)).first().map(|(p, _)| p.as_str()) == Some(cwd))
 }
 
-fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Response {
+fn files_blocking(
+    state: &WebState,
+    store: &std::sync::Mutex<Store>,
+    cwd: &str,
+    base: Base,
+    memo_key: (String, String),
+    have: Option<String>,
+) -> Response {
     if let Some(resp) = guard(store, cwd) {
         return resp;
     }
+    // 約 1 秒內的同一個 (cwd, base) 共用結果（E-H2）：多個分頁各自每 3 秒輪詢時不用每個都重跑一遍 git
+    if let Some(body) = state.recent_files(&memo_key) {
+        return ok(&without_known_tree(body, have));
+    }
     let session_paths = {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
         match &base {
-            Base::Session(id) => match session_changes(&store, id) {
+            Base::Session(id) => match session_changes(store, id) {
                 Ok(Some(c)) => Some(c),
                 Ok(None) => return error(StatusCode::NOT_FOUND, "沒有這個 session"),
                 Err(e) => return store_error(e),
@@ -398,19 +384,29 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
     let root_path = root.clone().unwrap_or_else(|| cwd.to_string());
     let (tree, truncated) = match &root {
         Some(r) => {
-            let mut t = nul_split(
-                &git(
-                    Path::new(r),
-                    &[
-                        "ls-files",
-                        "-z",
-                        "--cached",
-                        "--others",
-                        "--exclude-standard",
-                    ],
-                )
-                .unwrap_or_default(),
-            );
+            // -t 標出每個路徑的狀態（`? ` 是未追蹤）：樹與未追蹤檔一次拿到，算改動時不再掃一次（E-H2）
+            let listing = git(
+                Path::new(r),
+                &[
+                    "ls-files",
+                    "-z",
+                    "-t",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+            )
+            .unwrap_or_default();
+            let mut t = Vec::new();
+            let mut untracked = Vec::new();
+            for entry in listing.split('\0').filter(|e| e.len() > 2) {
+                let path = norm(&entry[2..]);
+                if entry.starts_with("? ") {
+                    untracked.push(path.clone());
+                }
+                t.push(path);
+            }
+            UNTRACKED.with(|u| u.borrow_mut().insert(norm(r), untracked));
             t.sort();
             t.dedup();
             let truncated = t.len() > TREE_MAX;
@@ -437,7 +433,7 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
                     by,
                     entries,
                     dir: None,
-                    head: None,
+                    last: None,
                 }],
             )
         }
@@ -464,7 +460,7 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
                     by,
                     entries,
                     dir: Some(r.clone()),
-                    head: None,
+                    last: None,
                 }],
             )
         }
@@ -477,11 +473,31 @@ fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Res
         },
     };
 
-    ok(&json!({
+    let tree_hash = tree_hash(&tree, truncated);
+    let body = json!({
         "root": root_path, "base": base_name, "baseRef": base_ref,
-        "tree": tree, "treeTruncated": truncated, "changes": merge_sources(&sources),
+        "tree": tree, "treeHash": tree_hash, "treeTruncated": truncated, "changes": merge_sources(&sources),
         "worktrees": wts.iter().map(|(path, branch)| json!({ "path": path, "branch": branch })).collect::<Vec<_>>(),
-    }))
+    });
+    state.remember_files(memo_key, body.clone());
+    ok(&without_known_tree(body, have))
+}
+
+/// `tree` 的雜湊（16 碼十六進位，E-H2）：前端帶回 `have`，相同就不用再送 2 萬筆路徑。
+fn tree_hash(tree: &[String], truncated: bool) -> String {
+    let mut text = tree.join("\n");
+    text.push_str(if truncated { "\n…" } else { "" });
+    crate::keys::sha256_hex(text.as_bytes())[..16].to_string()
+}
+
+/// 前端手上已經有這份樹（`have` 等於 `treeHash`）時拿掉 `tree`，其他欄位照給。
+fn without_known_tree(mut body: Value, have: Option<String>) -> Value {
+    if have.is_some_and(|h| body["treeHash"].as_str() == Some(h.as_str()))
+        && let Some(o) = body.as_object_mut()
+    {
+        o.remove("tree");
+    }
+    body
 }
 
 // ── /api/branches、/api/branch-diff（#696）
@@ -507,14 +523,11 @@ fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
     if let Some(resp) = guard(store, cwd) {
         return resp;
     }
+    // 只查還沒結束的 (id, cwd)，不讀出 1000 列完整資料再過濾（E-H9）
     let live: Vec<(String, String)> = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        match store.sessions(None, SESSIONS_MAX) {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| r.ended_at.is_none())
-                .map(|r| (r.id, norm(&r.cwd)))
-                .collect(),
+        match store.open_session_cwds() {
+            Ok(rows) => rows.into_iter().map(|(id, cwd)| (id, norm(&cwd))).collect(),
             Err(e) => return store_error(e),
         }
     };
@@ -578,19 +591,34 @@ fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
         .map(|((wt, branch), src)| {
             let dir = Path::new(wt);
             let counts = main
-                .and_then(|m| git(dir, &["rev-list", "--left-right", "--count", &format!("{m}...HEAD")]))
+                .and_then(|m| {
+                    git(
+                        dir,
+                        &[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            &format!("{m}...HEAD"),
+                        ],
+                    )
+                })
                 .and_then(|s| {
                     let mut n = s.split_whitespace().map(|v| v.parse::<u64>().ok());
                     Some((n.next()??, n.next()??))
                 });
-            let dirty = git(dir, &["status", "--porcelain"]).map(|s| s.lines().count());
-            let last = git(dir, &["log", "-1", "--format=%H%x00%s%x00%ct"]).and_then(|s| {
-                let mut f = s.trim_end().splitn(3, '\0');
-                let (hash, msg, ct) = (f.next()?, f.next()?, f.next()?);
-                Some(json!({ "hash": hash, "message": msg, "ts": ct.parse::<u64>().ok().map(|t| t * 1000) }))
-            });
+            // 未 commit 的改動：和 HEAD 比的已追蹤檔＋未追蹤檔（算改動時已經掃過，不再讓 status 重掃，E-H9）。
+            // 還沒有 commit 的 repo 沒有 HEAD 可比，退回 status
+            let dirty = match src.head() {
+                Some(_) => git(dir, &["diff", "HEAD", "--name-only", "-z"])
+                    .map(|s| nul_split(&s).len() + untracked_files(dir).len()),
+                None => git(dir, &["status", "--porcelain"]).map(|s| s.lines().count()),
+            };
+            let last = src
+                .last
+                .as_ref()
+                .map(|l| json!({ "hash": l.hash, "message": l.message, "ts": l.ts }));
             json!({
-                "branch": branch, "worktree": wt, "head": src.head,
+                "branch": branch, "worktree": wt, "head": src.head(),
                 "integration": main.is_some() && branch.as_deref() == main,
                 "ahead": counts.map(|c| c.1), "behind": counts.map(|c| c.0),
                 "dirty": dirty, "changed": src.entries.len(), "last": last,
@@ -1028,7 +1056,7 @@ fn integration_sources(
                     .map(|base| git_changes(dir, &[&base]))
                     .unwrap_or_default(),
                 by: json!({ "worktree": wt, "branch": branch }),
-                head: git(dir, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()),
+                last: last_commit(dir),
                 dir: Some(wt),
             }
         })
@@ -1045,8 +1073,32 @@ struct Source {
     entries: Changes,
     /// git 來源的 worktree 目錄（判斷衝突時讀內容）
     dir: Option<String>,
-    /// 該 worktree 的 HEAD（判斷衝突時找共同祖先）
-    head: Option<String>,
+    /// 該 worktree 的 HEAD 那個 commit（判斷衝突時找共同祖先；分支視窗的「最後一個 commit」）。
+    /// 一次 `log -1` 同時拿 hash、訊息與時間，不再另跑 `rev-parse HEAD`（E-H9）
+    last: Option<LastCommit>,
+}
+
+struct LastCommit {
+    hash: String,
+    message: String,
+    ts: Option<u64>,
+}
+
+impl Source {
+    fn head(&self) -> Option<&str> {
+        self.last.as_ref().map(|l| l.hash.as_str())
+    }
+}
+
+fn last_commit(dir: &Path) -> Option<LastCommit> {
+    let s = git(dir, &["log", "-1", "--format=%H%x00%s%x00%ct"])?;
+    let mut f = s.trim_end().splitn(3, '\0');
+    let (hash, message, ct) = (f.next()?, f.next()?, f.next()?);
+    Some(LastCommit {
+        hash: hash.to_string(),
+        message: message.to_string(),
+        ts: ct.parse::<u64>().ok().map(|t| t * 1000),
+    })
 }
 
 fn merge_sources(sources: &[Source]) -> Vec<Value> {
@@ -1118,13 +1170,13 @@ impl Touched {
         if a.entries.get(path).is_some_and(|(st, _)| st == "?") {
             return true;
         }
-        let (Some(dir), Some(ha), Some(hb)) = (&a.dir, &a.head, &b.head) else {
+        let (Some(dir), Some(ha), Some(hb)) = (&a.dir, a.head(), b.head()) else {
             return true;
         };
         let key = if ha <= hb {
-            (ha.clone(), hb.clone())
+            (ha.to_string(), hb.to_string())
         } else {
-            (hb.clone(), ha.clone())
+            (hb.to_string(), ha.to_string())
         };
         let fork = self
             .forks
@@ -1168,12 +1220,24 @@ fn git_changes(dir: &Path, range: &[&str]) -> Changes {
     let mut args = vec!["diff", "--name-status", "-z"];
     args.extend(range);
     let mut out = parse_name_status(&git(dir, &args).unwrap_or_default());
-    let others =
-        git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default();
-    for p in nul_split(&others) {
+    let others = untracked_files(dir);
+    for p in others {
         out.entry(p).or_insert_with(|| ("?".to_string(), None));
     }
     out
+}
+
+/// 這個目錄的未追蹤檔；同一個請求裡掃過就用快取，沒掃過就掃並記下（E-H2、E-H9：樹、改動、分支的 dirty 共用一次）。
+fn untracked_files(dir: &Path) -> Vec<String> {
+    let key = norm(&dir.to_string_lossy());
+    if let Some(cached) = UNTRACKED.with(|u| u.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let found = nul_split(
+        &git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default(),
+    );
+    UNTRACKED.with(|u| u.borrow_mut().insert(key, found.clone()));
+    found
 }
 
 /// `--name-status -z` 的輸出 → path → (status, 原路徑)。
@@ -1218,32 +1282,43 @@ fn worktrees(root: &Path) -> Vec<(String, Option<String>)> {
 }
 
 /// `session` 基準：那個 session 的 file.edit／file.write；None 表示沒有這個 session。
-fn session_changes(store: &Store, id: &str) -> Result<Option<Changes>, crate::store::StoreError> {
-    if store.session(id)?.is_none() {
-        return Ok(None);
+fn session_changes(
+    store: &std::sync::Mutex<Store>,
+    id: &str,
+) -> Result<Option<Changes>, crate::store::StoreError> {
+    // 改了哪些檔查 changes 表（被拒或失敗的已經刪掉，#682）；只有「是不是新檔」要看 file.write 的 Event，
+    // 所以只讀 file.write、不讀整個 session 的 Edit 與 tool.updated（E-H8）。鎖內只查，讀 JSONL 時放掉鎖（L-7）
+    let (rows, reads, reader) = {
+        let s = store.lock().unwrap_or_else(|e| e.into_inner());
+        if s.session(id)?.is_none() {
+            return Ok(None);
+        }
+        let rows = s.session_change_rows(id)?;
+        let reads = rows
+            .iter()
+            .any(|(_, kind, _)| kind == "write")
+            .then(|| s.events_of_types_reads(id, &["file.write"]))
+            .transpose()?;
+        (rows, reads, s.reader())
+    };
+    let kept: std::collections::HashSet<u64> = rows.iter().map(|(_, _, seq)| *seq).collect();
+    let mut new_files = std::collections::HashSet::new();
+    if let Some(reads) = reads {
+        for e in reader.read(&reads)? {
+            if kept.contains(&e.seq)
+                && let Ok(Some(Payload::FileWrite(p))) = e.payload_typed()
+                && p.is_new
+            {
+                new_files.insert(norm(&p.path));
+            }
+        }
     }
     let mut out: Changes = BTreeMap::new();
-    let events = store.events_of_types(id, &["file.edit", "file.write", "tool.updated"])?;
-    // 被拒或失敗的 Edit／Write 不算改動（contracts §4，#682）
-    let failed: std::collections::HashSet<&str> = events
-        .iter()
-        .filter(|e| e.kind == "tool.updated" && e.payload["status"] == "failed")
-        .filter_map(|e| e.payload["toolUseId"].as_str())
-        .collect();
-    for e in &events {
-        if e.payload["toolUseId"]
-            .as_str()
-            .is_some_and(|t| failed.contains(t))
-        {
-            continue;
-        }
-        let (path, new) = match e.payload_typed() {
-            Ok(Some(Payload::FileEdit(p))) => (p.path, false),
-            Ok(Some(Payload::FileWrite(p))) => (p.path, p.is_new),
-            _ => continue,
-        };
-        let entry = out.entry(norm(&path)).or_insert_with(|| ("M".into(), None));
-        if new {
+    for (path, _, _) in rows {
+        let path = norm(&path);
+        let status = if new_files.contains(&path) { "A" } else { "M" };
+        let entry = out.entry(path).or_insert_with(|| ("M".into(), None));
+        if status == "A" {
             entry.0 = "A".into();
         }
     }
@@ -1266,6 +1341,9 @@ thread_local! {
     /// 這個 blocking 執行緒上正在處理的請求的 filter driver 快取（目錄 → driver 名稱）；請求之外是 None。
     static FILTERS: std::cell::RefCell<Option<HashMap<std::path::PathBuf, Vec<String>>>> =
         const { std::cell::RefCell::new(None) };
+    /// 同一個請求裡已經掃過的未追蹤檔（目錄 → 路徑）：樹的 ls-files 一併分出來，算改動時不再掃一次（E-H2）
+    static UNTRACKED: std::cell::RefCell<HashMap<String, Vec<String>>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// 一個請求內的 git 快取（E-H1、W-L7）：每個 git 指令前原本都多跑一次 `git config` 查 filter driver，行程數加倍；
@@ -1282,6 +1360,7 @@ impl GitCtx {
 impl Drop for GitCtx {
     fn drop(&mut self) {
         FILTERS.with(|f| *f.borrow_mut() = None);
+        UNTRACKED.with(|u| u.borrow_mut().clear());
     }
 }
 
@@ -1395,13 +1474,20 @@ pub async fn thinking(
             "這個 collector 不對遠端提供 thinking（remote_thinking = hide）",
         );
     }
-    let Some(store) = state.store() else {
+    let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有這段 thinking");
     };
-    let found = {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        store.events_by_seq(&session, seq, seq)
-    };
+    // 不在 async worker 上拿 store 鎖、讀 JSONL 時不握鎖（L-7）
+    let sid = session.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let (reads, reader) = {
+            let s = store.lock().unwrap_or_else(|e| e.into_inner());
+            (s.events_by_seq_reads(&sid, seq, seq)?, s.reader())
+        };
+        reader.read(&reads)
+    })
+    .await
+    .unwrap_or_else(|e| Err(crate::store::StoreError::Io(std::io::Error::other(e))));
     let events = match found {
         Ok(v) => v,
         Err(e) => return store_error(e),

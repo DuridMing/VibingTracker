@@ -677,7 +677,7 @@ async fn resume_only_covers_the_resubscribe_burst() {
 }
 
 /// #654 驗收（本機那一半）：本機連線收到的敏感輸出是全文；welcome 說明這是本機連線。
-/// 遠端那一半（剝除）由 tests/sensitive.rs 的 redact_remote 與下面的 is_remote 涵蓋：P6 之前 web 只綁 loopback。
+/// 遠端那一半（剝除）由下面的 redact_remote_copy_* 與 remote_sessions_rows_are_redacted_over_http_and_ws 涵蓋。
 #[tokio::test]
 async fn local_connection_sees_sensitive_output_in_full() {
     let state = WebState::new(None, None, 64);

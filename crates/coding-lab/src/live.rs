@@ -657,7 +657,10 @@ impl Live {
             }
             Payload::ToolUpdated(u) => {
                 if u.status == crate::event::ToolStatus::Failed {
-                    counts.failures += 1;
+                    // Esc 與 PermissionDenied 不算失敗（D6），但被拒的改動一樣扣回
+                    if u.is_failure() {
+                        counts.failures += 1;
+                    }
                     self.revert_kpi(&sid, &u.tool_use_id);
                 }
                 let counts = self.slots.entry(ts / SLOT_MS).or_default();
@@ -756,7 +759,6 @@ impl Live {
                     s.branch = g.branch;
                 }
             }
-            Payload::ToolResult(r) if !r.ok => s.failures += 1,
             Payload::AttentionRaised(a) => {
                 let kind = enum_str(&a.kind);
                 if kind == "danger" {
@@ -816,6 +818,10 @@ impl Live {
                 }
             }
             Payload::ToolUpdated(u) => {
+                // 和 KPI 同一個判斷（D6）；tool_result 的 ok=false 含 Esc 與拒絕，不另外算
+                if u.is_failure() {
+                    s.failures += 1;
+                }
                 // 被拒或失敗的 Edit／Write 視為沒有發生，不留在改動紀錄（contracts §4，#682）
                 if u.status == crate::event::ToolStatus::Failed {
                     self.changes.retain(|c| {
@@ -902,6 +908,11 @@ impl Live {
             }
             _ => {}
         }
+    }
+
+    /// live 裡所有 session 的 id。
+    pub fn session_ids(&self) -> HashSet<String> {
+        self.sessions.keys().cloned().collect()
     }
 
     pub fn has_session(&self, id: &str) -> bool {

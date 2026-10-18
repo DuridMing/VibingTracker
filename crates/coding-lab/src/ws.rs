@@ -7,7 +7,7 @@
 //! （否則使用者瀏覽器裡任何網頁都能連 `ws://127.0.0.1:4801` 讀走 transcript；沒帶 `Origin` 的 wscat、curl 放行）。
 //! 遠端或 `auth = "always"` 的連線每個請求都要金鑰（[`crate::auth`]）：Bearer 或登入 cookie。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -56,6 +56,8 @@ pub struct WebState {
     remote_thinking: Mutex<RemoteThinking>,
     /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
     force_remote: std::sync::atomic::AtomicBool,
+    /// /api/files 最近的結果（E-H2）：(cwd, base) → (算好的時間, 回應)，約 1 秒內共用
+    files_memo: Mutex<HashMap<(String, String), (Instant, Value)>>,
     /// 進行中的回放請求數與上限（#742 B-N1）
     replays: std::sync::atomic::AtomicUsize,
     max_replays: std::sync::atomic::AtomicUsize,
@@ -64,6 +66,9 @@ pub struct WebState {
 /// 同一個 collector 同時最多幾個回放請求（#742 B-N1）：回放要讀整段 JSONL、重放、佔記憶體，
 /// 連續拖動滑桿或遠端送大範圍不能把 collector 拖垮。
 pub const MAX_REPLAYS: usize = 2;
+
+/// /api/files 的結果共用多久（E-H2）：前端每 3 秒輪詢一次，晚 1 秒內可以接受
+const FILES_MEMO: Duration = Duration::from_secs(1);
 
 /// 一個回放名額；drop 時還回去。
 pub(crate) struct ReplaySlot(Arc<WebState>);
@@ -120,6 +125,7 @@ impl WebState {
             auth,
             remote_thinking: Mutex::new(RemoteThinking::OnDemand),
             force_remote: std::sync::atomic::AtomicBool::new(false),
+            files_memo: Mutex::new(HashMap::new()),
             replays: std::sync::atomic::AtomicUsize::new(0),
             max_replays: std::sync::atomic::AtomicUsize::new(MAX_REPLAYS),
         })
@@ -142,6 +148,20 @@ impl WebState {
             .remote_thinking
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 約 [`FILES_MEMO`] 內算過的 /api/files 結果（E-H2）。
+    pub(crate) fn recent_files(&self, key: &(String, String)) -> Option<Value> {
+        let memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.get(key)
+            .filter(|(at, _)| at.elapsed() < FILES_MEMO)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub(crate) fn remember_files(&self, key: (String, String), body: Value) {
+        let mut memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.retain(|_, (at, _)| at.elapsed() < FILES_MEMO);
+        memo.insert(key, (Instant::now(), body));
     }
 
     /// 同時進行的回放請求上限（預設 [`MAX_REPLAYS`]）；測試用。
@@ -349,7 +369,7 @@ async fn gate(
         if !host_is_loopback(req.headers()) {
             return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
         }
-        if guarded && !same_origin(req.headers()) {
+        if guarded && !auth::same_origin(req.headers()) {
             return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
         }
         req.extensions_mut().insert(Identity::Local);
@@ -569,16 +589,11 @@ pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
 
 /// `/api/*`：同 `/ws`，使用者瀏覽器裡別的網頁不能讀走 session 資料。
 async fn require_same_origin(req: Request, next: Next) -> Response {
-    if same_origin(req.headers()) {
+    if auth::same_origin(req.headers()) {
         next.run(req).await
     } else {
         (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
     }
-}
-
-/// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
-fn same_origin(headers: &HeaderMap) -> bool {
-    auth::same_origin(headers)
 }
 
 pub fn thinking_str(mode: RemoteThinking) -> &'static str {
@@ -886,9 +901,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 msg["kind"].as_str().unwrap_or_default(),
                 msg["ref"].as_str().unwrap_or_default(),
             );
-            if let Some(store) = &state.store {
-                let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = store.ack(s, k, r, crate::now_ms()) {
+            if let Some(store) = state.store.clone() {
+                // SQLite 寫入會阻塞，不在 async worker 上拿 store 鎖（L-7）
+                let (s2, k2, r2) = (s.to_string(), k.to_string(), r.to_string());
+                let res = tokio::task::spawn_blocking(move || {
+                    store.lock().unwrap_or_else(|e| e.into_inner()).ack(
+                        &s2,
+                        &k2,
+                        &r2,
+                        crate::now_ms(),
+                    )
+                })
+                .await;
+                if let Ok(Err(e)) = res {
                     crate::logging::log(&format!("web：ack 寫入失敗：{e}"));
                 }
             }
@@ -900,13 +925,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             let session = msg["session"].as_str().unwrap_or_default().to_string();
             let before = msg["beforePos"].as_u64();
             let limit = msg["limit"].as_u64().unwrap_or(200).min(MORE_LIMIT) as usize;
-            let events = match &state.store {
+            let events = match state.store.clone() {
                 Some(store) => {
-                    let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                    more_events(&store, &session, before, limit).unwrap_or_else(|e| {
-                        crate::logging::log(&format!("web：載入更多失敗：{e}"));
-                        Vec::new()
-                    })
+                    // 讀 JSONL 會阻塞，不在 async worker 上做（L-7）
+                    let sid = session.clone();
+                    tokio::task::spawn_blocking(move || more_events(&store, &sid, before, limit))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(crate::store::StoreError::Io(std::io::Error::other(e)))
+                        })
+                        .unwrap_or_else(|e| {
+                            crate::logging::log(&format!("web：載入更多失敗：{e}"));
+                            Vec::new()
+                        })
                 }
                 None => Vec::new(),
             };
@@ -929,25 +960,38 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 /// 伴隨 Event 從窗口第一個 seq 往前、最後一個 seq 往後各 [`COMPANION_LOOKBACK`] 個找：平行工具的結果
 /// 常在下一張卡片進串流之後才到；伴隨 Event 依 toolUseId 過濾，不會混進窗口外的卡片。
 /// 狀態行仍以下一個帶 pos 的 Event 的時間為上限。
+///
+/// 鎖內只查 offset、放掉鎖再讀 JSONL（L-7、X1）：讀檔期間主迴圈的寫入與別的請求不用等。會阻塞，呼叫端放進 blocking 執行緒。
 pub(crate) fn more_events(
-    store: &Store,
+    store: &Mutex<Store>,
     session: &str,
     before: Option<u64>,
     limit: usize,
 ) -> Result<Vec<Event>, crate::store::StoreError> {
-    let window = store.stream_before(session, before, limit)?;
+    let lock = || store.lock().unwrap_or_else(|e| e.into_inner());
+    let (reads, reader) = {
+        let s = lock();
+        (s.stream_before_reads(session, before, limit)?, s.reader())
+    };
+    let window = reader.read(&reads)?;
     let (Some(first), Some(last)) = (window.first(), window.last()) else {
         return Ok(window);
     };
-    let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
     let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
-    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經由 stream_before 讀過（E-L9）
-    let pool = store.unplaced_by_seq(
-        session,
-        from,
-        last.seq + COMPANION_LOOKBACK,
-        crate::live::pool_kinds(),
-    )?;
+    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經讀過（E-L9）
+    let (next, pool_reads) = {
+        let s = lock();
+        (
+            s.next_pos_after(session, last.pos.unwrap_or(0))?,
+            s.unplaced_by_seq_reads(
+                session,
+                from,
+                last.seq + COMPANION_LOOKBACK,
+                crate::live::pool_kinds(),
+            )?,
+        )
+    };
+    let pool = reader.read(&pool_reads)?;
     Ok(crate::live::assemble_stream(
         window,
         pool,

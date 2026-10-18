@@ -499,3 +499,76 @@ fn store_reads_only_this_page_and_pages_cover_everything_once() {
     uniq.dedup();
     assert_eq!(uniq.len(), 1000);
 }
+
+/// C3（#742，X1）：回放讀 JSONL 時不握 store 鎖，主迴圈（sink、hook 後的 flush）不用等。
+/// 負載測試：16 個 session × 約 1500 行；release 跑：`cargo test --release --test timeline c3_ -- --ignored`。
+#[test]
+#[ignore]
+fn c3_replay_does_not_hold_the_store_lock_while_reading_jsonl() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("timeline-c3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let mut s = coding_lab::store::Store::open(&home).unwrap();
+    let filler = "回放負載測試的文字內容。".repeat(24);
+    for i in 0..16u64 {
+        let sid = format!("s{i:02}");
+        s.append(raw(&sid, 1, "session.started", None, 1000 + i,
+            json!({"cwd": "/p", "source": "startup", "model": null, "transcriptPath": null, "branch": null})));
+        for k in 0..1500u64 {
+            s.append(raw(
+                &sid,
+                k + 2,
+                "assistant.text",
+                Some(k + 1),
+                2000 + k * 1200 + i,
+                json!({"text": filler, "messageId": format!("m{k}"), "model": null}),
+            ));
+        }
+    }
+    s.flush().unwrap();
+    let store = Arc::new(Mutex::new(s));
+    let state = coding_lab::ws::WebState::new(Some(store.clone()), None, 8);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = rt.block_on(async {
+        coding_lab::ws::serve_web("127.0.0.1:0".parse().unwrap(), state)
+            .await
+            .unwrap()
+            .0
+    });
+    // 主迴圈的替身：不停地拿 store 鎖，記下最久等了多久
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (st2, stop2) = (store.clone(), stop.clone());
+    let waiter = std::thread::spawn(move || {
+        let mut worst = Duration::ZERO;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = Instant::now();
+            drop(st2.lock().unwrap());
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worst
+    });
+    let at = 2000 + 1500 * 1200;
+    let resp = rt.block_on(async {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut c,
+            format!("GET /api/projects/replay?cwd=%2Fp&at={at}&until={at} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut c, &mut out).await.unwrap();
+        out
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = waiter.join().unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "{}",
+        &resp[..200.min(resp.len())]
+    );
+    eprintln!("C3：回放期間主迴圈最久等 store 鎖 {worst:?}");
+    assert!(
+        worst < Duration::from_millis(100),
+        "回放讓主迴圈等 store 鎖 {worst:?}"
+    );
+}

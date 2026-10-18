@@ -1230,6 +1230,34 @@ impl Store {
     }
 
     /// 改動紀錄：最新在前。
+    /// 還沒結束的 session：(id, cwd)。分支視窗把它們歸到各自的 worktree（E-H9：不讀出完整的 sessions 列再過濾）。
+    pub fn open_session_cwds(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT id, cwd FROM sessions WHERE ended_at IS NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    /// 某 session 留下的改動：(path, kind, seq)，依 seq。被拒或失敗的已經從表裡刪掉（#682）。
+    /// `/api/files` 的 session 基準用它，不必把整個 session 的 Edit／Write／tool.updated 都從 JSONL 讀出來（E-H8）。
+    pub fn session_change_rows(
+        &self,
+        session: &str,
+    ) -> Result<Vec<(String, String, u64)>, StoreError> {
+        let mut stmt = self.db.prepare_cached(
+            "SELECT path, kind, seq FROM changes WHERE session = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map(params![session], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     pub fn recent_changes(&self, cwd: &str, limit: usize) -> Result<Vec<Change>, StoreError> {
         let mut stmt = self.db.prepare(
             "SELECT session, seq, tool_use_id, path, kind, agent, ts, added, removed FROM changes
@@ -1705,24 +1733,20 @@ fn index_event(
                     "DELETE FROM file_touch WHERE cwd = ?1 AND path = ?2 AND session = ?3 AND kind = ?4 AND count <= 0",
                     params![cwd, path, sid, kind],
                 )?;
-                // Esc 中斷不算失敗（和前端的失敗計數一致）
-                if p.interrupted != Some(true) {
+            }
+            // 「失敗」只算 tool.updated 的 failed、不是 Esc 也不是 PermissionDenied（D6、contracts §4）；
+            // 檔案工具的那個檔記一次 fail。tool.result 的 ok=false 不另外算
+            if p.is_failure() {
+                exec(
+                    tx,
+                    "UPDATE sessions SET failures = failures + 1 WHERE id = ?1",
+                    params![sid],
+                )?;
+                if let Some(path) = path_of_tool.get(&(sid.to_string(), p.tool_use_id.clone())) {
                     touch("fail", path)?;
                 }
             }
-            if !rows.is_empty() {
-                path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
-            }
-        }
-        Payload::ToolResult(p) if !p.ok => {
-            exec(
-                tx,
-                "UPDATE sessions SET failures = failures + 1 WHERE id = ?1",
-                params![sid],
-            )?;
-            if let Some(path) = path_of_tool.get(&(sid.to_string(), p.tool_use_id.clone())) {
-                touch("fail", path)?;
-            }
+            path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
         }
         Payload::FileRead(p) => {
             touch("read", &p.path)?;

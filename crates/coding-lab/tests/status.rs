@@ -1370,6 +1370,32 @@ fn seeded_cost_survives_the_next_tick() {
     );
 }
 
+/// PermissionDenied 衍生的 tool.updated 標 `denied`，下游才分得出它不是失敗（D6）；PostToolUseFailure 不標。
+#[test]
+fn permission_denied_is_marked_denied() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "git push", 1_000))
+        .feed(hook(
+            "PermissionDenied",
+            json!({ "tool_use_id": "t1", "tool_name": "Bash", "reason": "auto mode" }),
+            1_100,
+        ))
+        .feed(pre("t2", "false", 1_200))
+        .feed(fail("t2", 1_300));
+    let upd: Vec<(&str, &Value)> = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "tool.updated" && e.payload["status"] == "failed")
+        .map(|e| {
+            (
+                e.payload["toolUseId"].as_str().unwrap(),
+                &e.payload["denied"],
+            )
+        })
+        .collect();
+    assert_eq!(upd, [("t1", &json!(true)), ("t2", &Value::Null)]);
+}
+
 // ── resume、重啟與被丟棄的 session（#679）
 
 fn start(source: &str, ts: u64) -> Input {

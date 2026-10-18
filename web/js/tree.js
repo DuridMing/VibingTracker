@@ -87,8 +87,9 @@ export function gitMarks(changes) {
 }
 
 // 基準 → GET /api/files 的網址。「本次開啟以來」不在 collector（前端累積），仍要 tree，用 base=main 抓
-export function filesUrl(cwd, base) {
-  const q = (c, b) => `/api/files?cwd=${encodeURIComponent(c)}&base=${encodeURIComponent(b)}`;
+// have：上次回應的 treeHash，相同時伺服器省略 tree（樹只在新增或刪除檔案時才變，#766 F-6）
+export function filesUrl(cwd, base, have = null) {
+  const q = (c, b) => `/api/files?cwd=${encodeURIComponent(c)}&base=${encodeURIComponent(b)}${have ? `&have=${encodeURIComponent(have)}` : ""}`;
   switch (base?.kind) {
     case "session":
       return q(cwd, `session:${base.id}`);
@@ -292,7 +293,8 @@ export function createFileTree() {
       const id = pl.toolUseId;
       if (isFail) {
         if (!id) continue;
-        const interrupted = !!pl.interrupted;
+        // Esc 中斷與使用者拒絕（denied）都不算失敗，但改動一樣收回（contracts §4「失敗」的計數，#745 D6）
+        const interrupted = !!pl.interrupted || !!pl.denied;
         if (toolPath.has(id)) failCard(id, interrupted, hits);
         else {
           pendingFail.set(id, interrupted);

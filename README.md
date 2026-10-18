@@ -155,12 +155,12 @@ wait_guess_seconds = 30   # Claude 最後寫了一段話、之後這麼久沒有
 { "claude-opus-5-5": { "input": 4.0, "output": 20.0, "cacheRead": 0.2 } }
 ```
 
-`rules.json` 和內建規則同格式：同 `id` 的取代內建、新的 `id` 優先比對、`disable` 列出要停用的內建規則。`pattern` 是正則，Bash 預設比對依 `&&`、`;`、`|`、換行切開後的每一段（`"scope": "command"` 改成比對整條指令），其他工具預設比對 `file_path`（可用 `field` 指定）。改完重啟 collector 才生效；格式或正則有錯時整份不用、退回內建規則，並在日誌寫一行警告。危險只標示，不會攔截。
+`rules.json` 和內建規則同格式：同 `id` 的取代內建、新的 `id` 優先比對、`disable` 列出要停用的內建規則。`pattern` 是正則。指令型工具（Bash、PowerShell；`tools` 寫 `"@command"` 代表全部，`cmd /c …` 裡的指令也算）比對的是**分詞後**依 `&&`、`;`、`|`、換行切開的每一段：引號裡的符號不算分隔、反斜線續行接回同一段、heredoc 的本文當成字面文字不當指令、`$(…)` 與 `bash -c`、`cmd /c` 的內容另外檢查，`sudo`、`env`、`timeout` 等包裝先去掉（`"scope": "command"` 改成比對接回來的整條指令）。其他工具預設比對 `file_path`（可用 `field` 指定）。選填的 `unless` 也是正則，`pattern` 命中而 `unless` 也命中時不算，例如排除 `--dry-run`。改完重啟 collector 才生效；格式或正則有錯時整份不用、退回內建規則，並在日誌寫一行警告。危險只標示，不會攔截。
 
 ```json
 {
   "rules": [
-    { "id": "kubectl-delete", "tools": ["Bash"], "pattern": "^kubectl\\s+delete\\b", "level": "danger", "why": "刪除叢集資源" }
+    { "id": "kubectl-delete", "tools": ["@command"], "pattern": "^kubectl\\s+delete\\b", "unless": "\\s--dry-run(=|\\s|$)", "level": "danger", "why": "刪除叢集資源" }
   ],
   "disable": ["rm-rf-build"]
 }
@@ -192,6 +192,8 @@ coding-lab stop                                                   # 讓下一個
 遠端連線一律要金鑰，而且看不到命中敏感規則的工具輸出（例如讀 `.env`）；thinking 預設點開才載入（`remote_thinking`）。`view` 金鑰只能看，`operate` 才能按注意佇列的「已確認」。撤銷：`coding-lab key revoke <id>`，持有它的瀏覽器下一個請求起就要重新登入。金鑰與 cookie 走明文 http，所以只建議 tailnet（WireGuard 加密）、SSH 通道或自己前置 TLS（Caddy）；綁公開 IP 時 collector 會拒絕啟動，除非設 `allow_insecure = true`。
 
 多人共用的伺服器上，其他使用者也連得到 127.0.0.1，這時設 `auth = "always"`，連本機（含 SSH 通道）都要金鑰。
+
+**同一台機器只能有一個帳號使用 coding-lab**：hook 入口 4800 與網頁 4801 是整台機器共用的，Claude Code 的 hook 網址也不能依帳號變化。最先開 session 的帳號拿到 collector；其他帳號的 hook 會帶上自己的使用者名稱，collector 認得出不是自己的就丟掉（不記錄、不顯示，collector.log 記一行），所以那些帳號不會被追蹤。`coding-lab healthz` 會印出 collector 是哪個帳號的。多人共用的伺服器建議只在一個帳號裝 plugin，並且每個帳號都設 `auth = "always"`。
 
 **讓伺服器重開機後 collector 自己起來**：平常 collector 由第一個 session 的 `ensure` 拉起、閒置 10 分鐘退出；伺服器上想隨時都看得到（含沒有 session 在跑的時候），裝成常駐服務：
 

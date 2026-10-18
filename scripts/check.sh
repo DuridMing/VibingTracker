@@ -34,6 +34,13 @@ elif command -v node >/dev/null 2>&1; then
 else
   echo "（沒有 podman 映像 $NODE_IMAGE（離線拉不到）也沒有 Node：跳過前端測試，連上網路後再跑一次）"
 fi
+# 前端膠水的整合冒煙測試：mock collector → client → 串流模型（#749 T-2）。import 用容器裡的絕對路徑，沒有 podman 映像時跳過
+echo "== web mock 冒煙測試"
+if command -v podman >/dev/null 2>&1 && podman image exists "$NODE_IMAGE"; then
+  podman run --rm -v "$PWD/web:/web:Z,ro" -v "$PWD/tests/e2e/web:/e2e:Z,ro" "$NODE_IMAGE" node /e2e/mocksmoke.mjs
+else
+  echo "（沒有 podman 映像 $NODE_IMAGE：跳過，tests/scripts/web-mocksmoke.sh 可單獨跑）"
+fi
 # 端到端腳本裡不呼叫模型的純邏輯（tests/e2e/test_*.py）。
 # Windows 的 python3 可能是 Microsoft Store 的佔位程式（在 PATH 裡但跑不動，exit 49）：要真的跑一次才算找到（#711）
 echo "== e2e 腳本單元測試"

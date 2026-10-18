@@ -169,12 +169,13 @@ function tabTitle(s) {
 
 function sessionTab(s, extra = {}) {
   const host = hostTag(s.id);
-  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: tabTitle(s), onclick: () => selectTab(s.id), ...extra },
+  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: tabTitle(s), "aria-keyshortcuts": "M", onkeydown: (e) => { if (e.key === "m" || e.key === "M") { e.preventDefault(); openMonitor(s.id); } }, onclick: () => selectTab(s.id), ...extra },
     h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
     h("span", { class: "dot" }),
     host ? h("small", { class: "hst" }, host) : null,
     sessTag(s),
-    h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
+    // ⧉ 在 button 裡面，不能再是一個可聚焦的按鈕（巢狀互動元素鍵盤到不了）：滑鼠點 ⧉，鍵盤在 tab 上按 M（#747 F-12）
+    h("span", { class: "pop", "aria-hidden": "true", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看；鍵盤在 tab 上按 M）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
 }
 
 // 放不下的 session tab 收進「+N」（#704）：先全部畫出來量寬，再依 fitTabs 收起來；寬度變了重算
@@ -784,7 +785,7 @@ function feedFiles(events) {
   // 只存檔案樹用得到的欄位：write 的 content、edit 的 hunk 不留（開幾天會累積數十 MB，#766 F-5）
   for (const e of mine) {
     const p = e.payload ?? {};
-    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted } });
+    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted, denied: p.denied } });
   }
   if (left.fileEvents.length > FILE_EVENTS_MAX) left.fileEvents.splice(0, left.fileEvents.length - FILE_EVENTS_MAX);
   let changedFiles = gitOp;
@@ -845,7 +846,8 @@ async function loadFiles(cwd = null) {
   const ent = treeFor(cwd);
   const base = currentBase();
   // 樹還沒載入時，commit 基準先用專案的 cwd（另一個 worktree 的根不同，樹要以專案為準）
-  const url = base && filesUrl(cwd, ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const fbase = base && (ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const url = base && filesUrl(cwd, fbase);
   if (!url) {
     ent.error = base ? "commit hash 要 4–64 位十六進位" : "這個專案沒有 session";
     render(true);
@@ -862,10 +864,14 @@ async function loadFiles(cwd = null) {
   ent.loading = true;
   render(true);
   try {
-    const res = await apiFetch(url);
-    const body = await res.json().catch(() => ({}));
+    // 樹已經在手上就帶 treeHash：沒變時回應省略 tree（2 萬筆路徑不必每 3 秒重送，#766 F-6）
+    const have = cached?.url === url && ent.tree.root != null ? cached.body.treeHash : null;
+    const res = await apiFetch(have ? filesUrl(cwd, fbase, have) : url);
+    let body = await res.json().catch(() => ({}));
     if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    // 省略 tree 的回應：補上手上那份，快取（回放 reset 時重建用）與 applyFiles 都拿完整的
+    if (body.tree == null && cached?.body?.tree) body = { ...body, tree: cached.body.tree, treeTruncated: cached.body.treeTruncated };
     left.bodies.set(cwd, { url, body });
     applyFiles(ent, cwd, base, body);
   } catch (e) {
@@ -1352,7 +1358,7 @@ function projectHeader(x, pr, ent, i) {
     title: `${x.cwd}\n${ent?.error ?? ent?.info ?? ""}`.trim(),
   },
   h("span", { class: "lbl" }, h("span", { class: "pre" }, x.open ? "▾ " : "▸ "), h("i", { class: "psw", style: `background:${color}` }), h("span", { class: "nm", style: `color:${color}` }, proj.labels.get(x.cwd) ?? x.cwd), h("small", {}, ` ${pr?.live ?? 0}/${pr?.sessions.length ?? 0}${ent?.error ? " · 載入失敗" : ""}`)),
-  h("span", { class: "mk" }, h("span", { class: "pbr", role: "button", tabindex: "0", title: "這個專案的分支", onclick: (e) => { e.stopPropagation(); openBranches(x.cwd); } }, "⎇")));
+  h("span", { class: "mk" }, h("span", { class: "pbr", role: "button", tabindex: "0", title: "這個專案的分支", onclick: (e) => { e.stopPropagation(); openBranches(x.cwd); }, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); openBranches(x.cwd); } } }, "⎇")));
   const toggle = () => {
     if (proj.collapsed.has(x.cwd)) proj.collapsed.delete(x.cwd);
     else proj.collapsed.add(x.cwd);
@@ -1527,12 +1533,17 @@ function renderPane() {
 }
 
 // 危險指令提示框：這個 session 還沒確認的危險列；工具已結束（clearedAt）的變淡
+const dzAnnounced = new Set(); // 已朗讀過的危險列
 function renderPaneDanger(id) {
   const rows = sessionDangers([...store.attention.values()], id);
   const canAck = ui.welcome?.scope !== "view";
   if (!changed("spDz", `${Math.floor(Date.now() / 30_000)}|${canAck}|` + rows.map((r) => `${r.id}:${r.clearedAt ?? ""}:${ackPending.has(r.id)}`).join(","))) return;
   $("#spDz").hidden = !rows.length;
   $("#spDzN").textContent = rows.length ? `${rows.length} 筆待確認` : "";
+  // 框本身不是 role=alert（每 30 秒更新「幾分前」會被重唸）：只有出現新的危險列時朗讀一次（#747 F-12）
+  const fresh = rows.filter((r) => !dzAnnounced.has(r.id));
+  for (const r of fresh) dzAnnounced.add(r.id);
+  if (fresh.length) $("#spDzLive").textContent = `危險指令：${fresh.map((r) => r.reason ?? "").join("；")}`;
   const now = Date.now();
   $("#spDzList").replaceChildren(...rows.map((r) => {
     const pend = ackPending.has(r.id);
