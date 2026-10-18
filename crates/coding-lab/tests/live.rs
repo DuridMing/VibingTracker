@@ -1,5 +1,7 @@
 //! live：彙總列、KPI、暫存區、串流、frame 與 snapshot（contracts.md §6、#636）。
 
+mod common;
+
 use coding_lab::event::Event;
 use coding_lab::live::{Channel, Live};
 use serde_json::{Value, json};
@@ -1705,4 +1707,97 @@ fn seed_keeps_the_model_live_already_knows() {
         "claude-sonnet-5-5",
         "live 沒有就用 store 的"
     );
+}
+
+/// E-L6（#771）：狀態行插進窗口的位置用二分搜尋（partition_point）的前提——同一個 session 依 pos 排序時 seq 也單調——
+/// 在 samples 回放上成立，而且組出來的串流裡每個狀態行都夾在 seq 比它小、比它大的帶 pos Event 之間。
+#[test]
+fn assemble_stream_places_status_lines_between_seqs_on_samples() {
+    let dirs = common::sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("沒有 samples，略過");
+        return;
+    }
+    let mut checked = 0;
+    for dir in dirs {
+        let Some(m) = common::merged_events(&dir) else {
+            continue;
+        };
+        let mut window: Vec<Event> = m
+            .events
+            .iter()
+            .filter(|e| e.pos.is_some())
+            .cloned()
+            .collect();
+        window.sort_by_key(|e| (e.pos, e.seq));
+        assert!(
+            window.windows(2).all(|w| w[0].seq < w[1].seq),
+            "{}：依 pos 排序時 seq 不單調",
+            dir.display()
+        );
+        let pool: Vec<Event> = m
+            .events
+            .iter()
+            .filter(|e| e.pos.is_none())
+            .cloned()
+            .collect();
+        // 整段、以及從中間開始的窗口（狀態行有時間下限）
+        let tail = window.len().saturating_sub(40);
+        for w in [window.clone(), window[tail..].to_vec()] {
+            let out = coding_lab::live::assemble_stream(w, pool.clone(), None);
+            for (i, e) in out.iter().enumerate() {
+                // 和 live.rs 的 STATUS_LINES 同一組（session.started 只有 resume／compact 算）
+                let status = e.pos.is_none()
+                    && match e.kind.as_str() {
+                        "prompt.submitted" | "session.status" | "agent.finished" => true,
+                        "session.started" => {
+                            matches!(e.payload["source"].as_str(), Some("resume" | "compact"))
+                        }
+                        _ => false,
+                    };
+                if !status {
+                    continue;
+                }
+                if let Some(prev) = out[..i].iter().rev().find(|x| x.pos.is_some()) {
+                    assert!(
+                        prev.seq < e.seq,
+                        "{}：狀態行 seq {} 排在 seq {} 之後",
+                        dir.display(),
+                        e.seq,
+                        prev.seq
+                    );
+                }
+                if let Some(next) = out[i + 1..].iter().find(|x| x.pos.is_some()) {
+                    assert!(
+                        next.seq > e.seq,
+                        "{}：狀態行 seq {} 排在 seq {} 之前",
+                        dir.display(),
+                        e.seq,
+                        next.seq
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("檢查了 {checked} 個狀態行");
+}
+
+/// E-L2（#771）：大量 apply 之後 discard_pending，不組那個超大的 frame（也不留在 history），snapshot 照樣是最新狀態。
+#[test]
+fn discard_pending_drops_the_backlog_but_keeps_the_state() {
+    let mut l = Live::new();
+    let mut b = B::new();
+    let mut evs = vec![b.started("s1", DAY)];
+    evs.extend((1..=50).map(|i| b.text("s1", DAY + i)));
+    apply_all(&mut l, &evs);
+    l.discard_pending();
+    assert!(l.flush(DAY + 1_000).is_none(), "丟掉之後沒有東西可送");
+    assert_eq!(
+        l.frames_since(0).map(|f| f.len()),
+        Some(0),
+        "history 裡沒有那個大 frame"
+    );
+    let snap = l.snapshot(&Channel::Session("s1".into()), 0, DAY + 1_000);
+    assert_eq!(snap["stream"].as_array().map(Vec::len), Some(50), "{snap}");
 }

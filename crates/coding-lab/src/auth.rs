@@ -352,14 +352,6 @@ impl Auth {
         }
     }
 
-    pub fn mode(&self) -> AuthMode {
-        self.mode
-    }
-
-    pub fn home(&self) -> Option<&Path> {
-        self.home.as_deref()
-    }
-
     /// 這個來源的連線要不要金鑰：不是 loopback，或 `auth = "always"`。
     pub fn needs_auth(&self, peer: SocketAddr) -> bool {
         !peer.ip().is_loopback() || self.mode == AuthMode::Always
