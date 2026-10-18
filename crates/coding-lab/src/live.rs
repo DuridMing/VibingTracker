@@ -49,6 +49,11 @@ const STATUS_LINES: &[&str] = &[
     "session.started",
 ];
 
+/// 「載入更多」組串流時會用到的不帶 pos 的 Event 種類：卡片的伴隨 Event 與狀態行（E-L9：store 只讀這些）。
+pub fn pool_kinds() -> impl Iterator<Item = &'static str> {
+    COMPANIONS.iter().chain(STATUS_LINES).copied()
+}
+
 /// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact）才算。startup 與 clear
 /// 都是新 session 的第一行，不標（`/clear` 換 session id、舊 session 收到 SessionEnd reason clear，#688 實測）。
 fn is_status_line(e: &Event) -> bool {
@@ -227,9 +232,94 @@ pub struct Frame {
     agents: Vec<(String, Value)>,
     attention: Vec<(String, Value)>,
     kpi: BTreeMap<i32, Value>,
+    /// 序列化好的結果（E-L4）：(頻道, offset, 模式) → 送出的文字；None＝這種連線沒有內容
+    texts: std::sync::Mutex<HashMap<(String, i32, u8), Option<axum::extract::ws::Utf8Bytes>>>,
+    serialized: std::sync::atomic::AtomicUsize,
+}
+
+/// 本機版本直接序列化借用的 Event，不經過中間的 Value（E-L4）。
+#[derive(serde::Serialize)]
+struct FrameOut<'a> {
+    t: &'static str,
+    frame: u64,
+    ch: String,
+    events: Vec<&'a Event>,
+    rows: Value,
+}
+
+/// frame 送給哪一種連線：本機原樣，遠端依 `remote_thinking` 剝除（[`crate::ws::redact_remote_copy`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Local,
+    Remote(crate::config::RemoteThinking),
 }
 
 impl Frame {
+    /// 這個連線要送的文字（[`Frame::to_json`] 序列化後；遠端先剝除）。同一個 frame 每種（頻道、offset、模式）只序列化
+    /// 一次，之後的連線拿快取（E-L4）。遠端模式各自一份，本機的全文不會送給遠端（X9）；session 頻道不帶 kpi，不分 offset。
+    pub fn text_for(
+        &self,
+        ch: &Channel,
+        offset_min: i32,
+        wire: Wire,
+    ) -> Option<axum::extract::ws::Utf8Bytes> {
+        use crate::config::RemoteThinking;
+        let offset = if *ch == Channel::All { offset_min } else { 0 };
+        let mode = match wire {
+            Wire::Local => 0,
+            Wire::Remote(RemoteThinking::OnDemand) => 1,
+            Wire::Remote(RemoteThinking::Hide) => 2,
+            Wire::Remote(RemoteThinking::Show) => 3,
+        };
+        let key = (ch.name(), offset, mode);
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = texts.get(&key) {
+            return t.clone();
+        }
+        self.serialized
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = match wire {
+            Wire::Local => self.local_text(ch, offset),
+            Wire::Remote(thinking) => self
+                .to_json(ch, offset)
+                .map(|v| crate::ws::redact_remote_copy(&v, thinking).to_string()),
+        }
+        .map(axum::extract::ws::Utf8Bytes::from);
+        texts.insert(key, text.clone());
+        text
+    }
+
+    /// [`Frame::text_for`] 實際序列化了幾次（測試用）。
+    pub fn serializations(&self) -> usize {
+        self.serialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn local_text(&self, ch: &Channel, offset_min: i32) -> Option<String> {
+        let events: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|e| ch.wants(&e.session))
+            .collect();
+        let mut rows = self.rows_for(ch);
+        if *ch == Channel::All
+            && let Some(k) = self.kpi_for(offset_min)
+            && let Some(obj) = rows.as_object_mut()
+        {
+            obj.insert("kpi".into(), k);
+        }
+        if events.is_empty() && rows.as_object().is_none_or(|o| o.is_empty()) {
+            return None;
+        }
+        serde_json::to_string(&FrameOut {
+            t: "frame",
+            frame: self.no,
+            ch: ch.name(),
+            events,
+            rows,
+        })
+        .ok()
+    }
+
     pub fn events_for(&self, ch: &Channel) -> Vec<Event> {
         self.events
             .iter()
@@ -413,18 +503,31 @@ impl Live {
             .count()
     }
 
+    /// 「已扣回 KPI」記號的數量（測試確認它跟著卡片放掉，K-12）
+    pub fn reverted_count(&self) -> usize {
+        self.reverted.len()
+    }
+
     /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
     pub fn kpi_computations(&self) -> u64 {
         self.kpi_computes
     }
 
-    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）：之後由 /api/sessions 與回放查看。
-    /// 不送 deleted 列：已經開著的頁面可能還有它的串流行，保留那一列比較不會出錯。
+    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）並送 sessions 列 `deleted`：之後由
+    /// /api/sessions 與回放查看。還有佇列列的延後到佇列清空，佇列列不會變成孤兒列（契約 §6、K-7、D3）。
     fn evict_ended(&mut self, now: u64) {
+        let queued: HashSet<&str> = self
+            .attention
+            .values()
+            .map(|a| a.session.as_str())
+            .collect();
         let gone: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now))
+            .filter(|(id, s)| {
+                s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now)
+                    && !queued.contains(id.as_str())
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for sid in gone {
@@ -432,8 +535,9 @@ impl Live {
             self.streams.remove(&sid);
             self.status_lines.remove(&sid);
             self.bg_running.remove(&sid);
-            self.dirty_sessions.remove(&sid);
+            self.dirty_sessions.insert(sid.clone());
             self.card_events.retain(|(s, _), _| *s != sid);
+            self.reverted.retain(|(s, _)| *s != sid);
             self.staged.retain(|(s, _), _| *s != sid);
             self.agents.retain(|_, a| a.session != sid);
         }
@@ -523,7 +627,10 @@ impl Live {
                 if let Some(old) = stream.pop_front()
                     && let Some(id) = card_key(&old)
                 {
-                    self.card_events.remove(&(sid.clone(), id));
+                    // 「已扣回」只在伴隨 Event 還在時有用（revert_kpi 找不到就不扣），一起放掉（K-12）
+                    let key = (sid.clone(), id);
+                    self.card_events.remove(&key);
+                    self.reverted.remove(&key);
                 }
             }
             if let Some(s) = self.sessions.get_mut(&sid) {
@@ -589,10 +696,10 @@ impl Live {
                 s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
-                s.status = "run".into();
-                s.status_since = ts;
+                // 狀態不在這裡改，只認 session.status（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             }
             Payload::SessionEnded(_) => {
+                // merge 在 session.ended 之後一定發 ended；這裡照設，是給沒有 session.status 的舊 JSONL（不變式 9）
                 s.ended_at = Some(ts);
                 s.status = "ended".into();
                 s.status_since = ts;
@@ -913,8 +1020,9 @@ impl Live {
         for off in offsets {
             let current = self.kpi(off, now);
             let day = day_start(off, now);
-            let changed = match self.offsets.get(&off).cloned().flatten() {
-                Some((prev_day, prev)) if prev_day == day => {
+            // 和上次送出的比，借用不拷貝上一份（E-L3）
+            let changed = match self.offsets.get(&off).and_then(Option::as_ref) {
+                Some((prev_day, prev)) if *prev_day == day => {
                     let mut diff = Map::new();
                     if let (Some(c), Some(p)) = (current.as_object(), prev.as_object()) {
                         for (k, v) in c {
@@ -957,7 +1065,13 @@ impl Live {
 
         let sessions: Vec<(String, Value)> = std::mem::take(&mut self.dirty_sessions)
             .into_iter()
-            .filter_map(|id| self.session_row(&id).map(|row| (id, row)))
+            .map(|id| {
+                // 不在 live 裡的是剛移出的（evict_ended）
+                let row = self
+                    .session_row(&id)
+                    .unwrap_or_else(|| json!({ "id": id, "deleted": true }));
+                (id, row)
+            })
             .collect();
         let agents: Vec<(String, Value)> = std::mem::take(&mut self.dirty_agents)
             .into_iter()
@@ -998,6 +1112,8 @@ impl Live {
             agents,
             attention,
             kpi,
+            texts: Default::default(),
+            serialized: Default::default(),
         });
         self.history.push_back(frame.clone());
         let kept = self.limits.map_or(FRAMES_KEPT, |(_, h)| h);
@@ -1192,32 +1308,35 @@ impl Live {
     }
 
     fn kpi(&self, offset_min: i32, now: u64) -> Value {
+        // 加總時借用時間格裡的字串，不逐格 clone（E-L3：即時每次 flush、回放每個 frame 都算一次）
         let start = day_start(offset_min, now);
-        let mut total = Counts::default();
+        let mut sessions: HashSet<&str> = HashSet::new();
+        let mut agents: HashSet<&str> = HashSet::new();
+        let mut models: BTreeMap<&str, (f64, u64, BTreeSet<&str>)> = BTreeMap::new();
+        let mut sum = Counts::default();
         for c in self.slots.range(start / SLOT_MS..).map(|(_, c)| c) {
-            total.sessions.extend(c.sessions.iter().cloned());
-            total.agents.extend(c.agents.iter().cloned());
-            total.edits += c.edits;
-            total.writes += c.writes;
-            total.commands += c.commands;
-            total.failures += c.failures;
-            total.dangers += c.dangers;
-            total.commits += c.commits;
-            total.thinking += c.thinking;
-            total.cost += c.cost;
+            sessions.extend(c.sessions.iter().map(String::as_str));
+            agents.extend(c.agents.iter().map(String::as_str));
+            sum.edits += c.edits;
+            sum.writes += c.writes;
+            sum.commands += c.commands;
+            sum.failures += c.failures;
+            sum.dangers += c.dangers;
+            sum.commits += c.commits;
+            sum.thinking += c.thinking;
+            sum.cost += c.cost;
             for (name, (cost, thinking, ids)) in &c.models {
-                let m = total.models.entry(name.clone()).or_default();
+                let m = models.entry(name).or_default();
                 m.0 += cost;
                 m.1 += thinking;
-                m.2.extend(ids.iter().cloned());
+                m.2.extend(ids.iter().map(String::as_str));
             }
         }
-        let models: Map<String, Value> = total
-            .models
-            .iter()
+        let models: Map<String, Value> = models
+            .into_iter()
             .map(|(name, (cost, thinking, ids))| {
                 (
-                    name.clone(),
+                    name.to_string(),
                     json!({ "costUsd": cost, "thinkingTokens": thinking, "ids": ids }),
                 )
             })
@@ -1225,16 +1344,16 @@ impl Live {
         json!({
             "live": self.sessions.values().filter(|s| s.status == "run").count(),
             "attention": self.attention.len(),
-            "sessions": total.sessions.len(),
-            "agents": total.agents.len(),
-            "edits": total.edits,
-            "writes": total.writes,
-            "commands": total.commands,
-            "failures": total.failures,
-            "dangers": total.dangers,
-            "commits": total.commits,
-            "thinkingTokens": total.thinking,
-            "costUsd": total.cost,
+            "sessions": sessions.len(),
+            "agents": agents.len(),
+            "edits": sum.edits,
+            "writes": sum.writes,
+            "commands": sum.commands,
+            "failures": sum.failures,
+            "dangers": sum.dangers,
+            "commits": sum.commits,
+            "thinkingTokens": sum.thinking,
+            "costUsd": sum.cost,
             "models": models,
         })
     }

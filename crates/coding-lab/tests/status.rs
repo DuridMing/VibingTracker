@@ -1427,6 +1427,27 @@ fn resume_after_end_reports_status_again() {
     assert_eq!(r.statuses(), ["ended", "run", "danger"]);
 }
 
+/// /compact 接回同一個 session 時「完成待確認」還開著：merge 不發 `session.status`，
+/// live 也不能自己把狀態改成 run（不變式 8，K-5）。
+#[test]
+fn compact_does_not_desync_live_status() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("hi", 1_100))
+        .feed(stop(2_000))
+        .tick(8_000);
+    assert_eq!(r.statuses(), ["done"]);
+    r.feed(hook("PreCompact", json!({ "trigger": "manual" }), 20_000))
+        .feed(start("compact", 30_000));
+    assert_eq!(r.statuses(), ["done"], "compact 不改變 merge 的狀態");
+    let mut live = coding_lab::live::Live::new();
+    for e in &r.evs {
+        live.apply(e);
+    }
+    let row = live.session_row(&r.evs[0].session).unwrap();
+    assert_eq!(row["status"], "done", "live 要和 merge 一致");
+}
+
 #[test]
 fn resume_after_eviction_still_clears_old_done() {
     let mut r = Run::new();

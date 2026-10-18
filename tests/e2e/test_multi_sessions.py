@@ -41,9 +41,6 @@ class HunkChangedLine(unittest.TestCase):
         self.assertEqual(M.hunk_changed_line(h), 21)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class WindowsPortability(unittest.TestCase):
     """#717：中途砍 collector 與 CPU 取樣在 Windows 也要能跑（沒有 SIGKILL、沒有 /proc）。"""
@@ -66,3 +63,7 @@ class WindowsPortability(unittest.TestCase):
     def test_cpu_seconds_is_none_without_proc(self):
         with mock.patch.object(M, "PROC", M.Path("/nonexistent-proc")):
             self.assertIsNone(M.cpu_seconds(os.getpid()))
+
+
+if __name__ == "__main__":
+    unittest.main()

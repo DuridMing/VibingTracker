@@ -775,6 +775,28 @@ fn write_line_count_uses_full_length() {
     assert_eq!(s.recent_changes("/p", 10).unwrap()[0].added, Some(5000));
 }
 
+/// /compact 的 session.started 不能把 done 改成 run：狀態由 merge 的 `session.status` 決定（不變式 8，K-5）。
+#[test]
+fn only_session_status_changes_the_status() {
+    let mut s = Store::open(&home()).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(ev(
+        "s1",
+        2,
+        "session.status",
+        None,
+        1500,
+        json!({"status": "done", "since": 1500, "score": 1.0}),
+    ));
+    let mut compact = started("s1", 3, "/p");
+    compact.payload["source"] = json!("compact");
+    compact.ts_seen = 2000;
+    s.append(compact);
+    s.flush().unwrap();
+    let row = s.session("s1").unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.status_since), ("done", 1500));
+}
+
 /// 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）：sessions 列的結束時間與原因清掉，
 /// 否則下次重啟又被種回 ended。
 #[test]

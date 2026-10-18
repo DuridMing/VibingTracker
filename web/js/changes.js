@@ -93,13 +93,20 @@ export function createChanges({ cap = CAP } = {}) {
   };
 
   // snapshot.changes：舊到新
+  // snapshot（含重連、落後重送）：使用者停在某一筆而且它還在時保留選取，不跳回最新（#747 F-11）
   ch.load = (events) => {
+    const keep = ch.following ? null : ch.selectedKey;
     ch.list = [];
     keys.clear();
     failed.clear();
     for (const ev of events ?? []) if (isFailure(ev)) failed.add(ev.payload.toolUseId);
     for (const ev of events ?? []) if (!isFailure(ev)) add(ev);
     trim();
+    if (keep != null && keys.has(keep)) {
+      ch.following = false;
+      ch.selectedKey = keep;
+      return;
+    }
     ch.following = true;
     ch.selectedKey = ch.list[0]?.key ?? null;
   };

@@ -827,6 +827,40 @@ impl Store {
         self.read_at(session, offsets)
     }
 
+    /// 某 session 在 seq 範圍（含兩端）內、不帶 pos、種類是 `kinds` 之一的 Event，依 seq 排序。
+    /// 「載入更多」只需要伴隨 Event 與狀態行，不用把範圍內的每一行都讀出來解析（E-L9）。
+    pub fn unplaced_by_seq<'a>(
+        &self,
+        session: &str,
+        from: u64,
+        to: u64,
+        kinds: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Event>, StoreError> {
+        let kinds: Vec<&str> = kinds.into_iter().collect();
+        let list = (0..kinds.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT offset FROM events WHERE session = ?1 AND seq BETWEEN ?2 AND ?3
+               AND pos IS NULL AND type IN ({list}) ORDER BY seq"
+        ))?;
+        let mut args: Vec<rusqlite::types::Value> = vec![
+            session.to_string().into(),
+            (from.min(i64::MAX as u64) as i64).into(),
+            (to.min(i64::MAX as u64) as i64).into(),
+        ];
+        args.extend(
+            kinds
+                .iter()
+                .map(|k| rusqlite::types::Value::from(k.to_string())),
+        );
+        let offsets: Vec<i64> = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        self.read_at(session, offsets)
+    }
+
     /// `pos` 之後的第一個帶 pos 的 Event：(seq, ts_seen)。
     pub fn next_pos_after(
         &self,
@@ -1417,11 +1451,12 @@ fn index_event(
             if cwd.is_empty() {
                 *cwd = p.cwd.clone();
             }
+            // status 只由 session.status 寫（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             exec(tx,
                 "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
-                   ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
-                params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],
+                   ended_at = NULL, end_reason = NULL WHERE id = ?1",
+                params![sid, p.cwd, p.transcript_path, p.model, p.branch],
             )?;
             if let Some(path) = &p.transcript_path {
                 exec(

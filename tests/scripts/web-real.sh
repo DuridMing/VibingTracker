@@ -28,4 +28,4 @@ if [ "$js" = realcomplete.mjs ]; then
 fi
 exec podman run --rm --network host --security-opt label=disable \
   -v "$web:/web:ro" -v "$root/tests/e2e/web:/e2e:ro" -v "$main:$main:ro" $extra \
-  docker.io/library/node:22-alpine node "/e2e/$js" "$@"
+  docker.io/library/node:22.23.3-alpine node "/e2e/$js" "$@"

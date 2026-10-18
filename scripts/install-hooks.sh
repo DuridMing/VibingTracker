@@ -3,6 +3,14 @@
 # OpenProject 回填用的 post-commit hook 另外用 AItracking 的 integrations/git/install.sh 安裝。
 set -euo pipefail
 
+# --path-format 要 git 2.31 以上（#769 R-20）
+ver=$(git --version | sed 's/[^0-9]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/')
+set -- $ver
+if [ "${1:-0}" -lt 2 ] || { [ "${1:-0}" -eq 2 ] && [ "${2:-0}" -lt 31 ]; }; then
+  echo "install-hooks.sh 需要 git 2.31 以上（現在是 $(git --version)）" >&2
+  exit 1
+fi
+
 # hooks 目錄是所有 worktree 共用的：連結要指向主工作樹（git-common-dir 的上一層），
 # 不能用 --show-toplevel，否則在 worktree 裡執行、之後刪掉 worktree，pre-commit 就斷了（#687 R35）
 common="$(git rev-parse --path-format=absolute --git-common-dir)"

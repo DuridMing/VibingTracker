@@ -247,7 +247,7 @@ rm -rf ~/.coding-lab      # 二進位、網頁、設定、所有追蹤紀錄（J
 
 ## 開發
 
-需要 Rust stable（`cargo`）；前端測試用 podman 跑 `node:22-alpine`，主機不需要 Node。
+需要 Rust stable（`cargo`）；前端測試用 podman 跑 `node:22.23.3-alpine`，主機不需要 Node。
 
 ```bash
 scripts/check.sh                     # fmt、clippy、test、前端測試；commit 前必跑
