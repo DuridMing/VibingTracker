@@ -1,5 +1,5 @@
 {
-  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭）或 command（整條指令）。",
+  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。tools 寫 \"@command\" 代表所有指令型工具（Bash、PowerShell）。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭）或 command（整條指令）。",
   "rules": [
     {
       "id": "rm-rf-build",

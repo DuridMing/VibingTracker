@@ -20,6 +20,7 @@ pub mod serve;
 pub mod service;
 pub mod status;
 pub mod store;
+pub mod text;
 pub mod timeline;
 pub mod transcript;
 pub mod ws;
