@@ -263,26 +263,15 @@ fn read_secret(prompt: &str) -> Result<String, String> {
     let stdin = std::io::stdin();
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
-    let tty = stdin.is_terminal();
-    #[cfg(unix)]
-    let echo_off = tty
-        && std::process::Command::new("stty")
-            .arg("-echo")
-            .status()
-            .is_ok_and(|s| s.success());
-    #[cfg(not(unix))]
-    let echo_off = false;
-    if tty && !echo_off {
-        eprintln!("（輸入會顯示在畫面上）");
+    // 終端機：不回顯（三個平台都是，#743 W-L2）。rpassword 讀的是終端機本身，所以管線輸入（腳本、測試）照舊讀 stdin
+    if stdin.is_terminal() {
+        return rpassword::read_password().map_err(|e| format!("讀不到輸入：{e}"));
     }
     let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
-    #[cfg(unix)]
-    if echo_off {
-        let _ = std::process::Command::new("stty").arg("echo").status();
-        eprintln!();
-    }
-    read.map_err(|e| format!("讀不到輸入：{e}"))?;
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("讀不到輸入：{e}"))?;
     Ok(line)
 }
 
