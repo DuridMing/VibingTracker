@@ -1790,7 +1790,7 @@ function finishMore() {
 function onStreamSnapshot(m) {
   stream.load({ staged: m.staged, stream: m.stream });
   moreReq = null;
-  view.reset();
+  view.reset({ keep: true });
   updateHasMore();
 }
 

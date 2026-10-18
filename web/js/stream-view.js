@@ -234,11 +234,14 @@ export function createStreamView({ scroller, model, agentName, projectTag = null
       schedule();
     },
     // snapshot 之後整個重來
-    reset() {
+    // keep：重連或落後重送的 snapshot，使用者往上捲在看的那一行還在就停在那裡，不跳回底部（#747 F-11）
+    reset({ keep = false } = {}) {
+      const pick = keep && !follow && lastTopRows.length ? lastTopRows.find((a) => model.rows.some((r) => r.key === a.key && model.isVisible(r))) : null;
       for (const nd of nodes.values()) nd.el.remove();
       nodes.clear();
       pendingShift = 0;
-      setFollow(true);
+      if (pick) anchor = { ...pick };
+      else setFollow(true);
       dirty = true;
       schedule();
     },
