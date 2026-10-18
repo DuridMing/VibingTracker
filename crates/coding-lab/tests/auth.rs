@@ -678,3 +678,108 @@ async fn proxied_ws_needs_a_key_and_is_not_local() {
         "代理轉來的連線照遠端的 remote_thinking：{w}"
     );
 }
+
+// ── 金鑰檔的並發（#743 S-3、S-7、E-H10，X12） ─────────────────────────────────────
+
+/// collector 驗金鑰不再寫 keys.json（last_used 另存一個檔）：keys.json 只有 CLI 的 create／revoke 會寫。
+#[test]
+fn verifying_a_key_never_rewrites_keys_json_but_last_used_is_kept() {
+    let home = tmp("used");
+    let mut rng = keys::test_rng(5);
+    let mut ks = KeyStore::new(&mut rng);
+    let token = ks.create("laptop", Scope::View, None, 1, &mut rng);
+    let id = keys::parse_token(&token).unwrap().0.to_string();
+    ks.save(&home).unwrap();
+    let before = std::fs::read(KeyStore::path(&home)).unwrap();
+    let a = auth::Auth::new(home.clone(), AuthMode::Always);
+    a.verify_token(&token, NOW).unwrap();
+    assert_eq!(
+        std::fs::read(KeyStore::path(&home)).unwrap(),
+        before,
+        "keys.json 原封不動"
+    );
+    let loaded = KeyStore::load(&home).unwrap().unwrap();
+    assert_eq!(
+        loaded.get(&id).unwrap().last_used_ms,
+        Some(NOW),
+        "key list 仍看得到 last_used"
+    );
+}
+
+/// CLI 撤銷時 collector 正在寫 last_used：撤銷不能被蓋掉，CLI 也不能寫失敗（S-3）。
+#[test]
+fn revoke_is_never_lost_to_a_concurrent_last_used_write() {
+    use std::sync::{Arc, Barrier};
+    let (mut lost, mut failed) = (0, 0);
+    for i in 0..50u64 {
+        let home = tmp("revoke-race");
+        let mut rng = keys::test_rng(i + 3);
+        let mut ks = KeyStore::new(&mut rng);
+        let token = ks.create("laptop", Scope::View, None, 1, &mut rng);
+        let id = keys::parse_token(&token).unwrap().0.to_string();
+        ks.save(&home).unwrap();
+        let a = Arc::new(auth::Auth::new(home.clone(), AuthMode::Always));
+        let b = Arc::new(Barrier::new(2));
+        let (a2, b2, tok) = (a.clone(), b.clone(), token.clone());
+        let h = std::thread::spawn(move || {
+            b2.wait();
+            for k in 0..20u64 {
+                let _ = a2.verify_token(&tok, NOW + k * 61_000);
+            }
+        });
+        b.wait();
+        let mut cli = KeyStore::load(&home).unwrap().unwrap();
+        cli.revoke(&id, 5);
+        let saved = cli.save(&home).is_ok();
+        h.join().unwrap();
+        if !saved {
+            failed += 1;
+        } else if KeyStore::load(&home)
+            .unwrap()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .revoked_ms
+            .is_none()
+        {
+            lost += 1;
+        }
+        assert!(
+            a.verify_token(&token, NOW + 2_000_000).is_err() || !saved,
+            "撤銷之後不能再用"
+        );
+    }
+    assert_eq!(
+        (lost, failed),
+        (0, 0),
+        "撤銷被蓋掉 {lost} 次、CLI 寫入失敗 {failed} 次"
+    );
+}
+
+/// 同一個一次性連結被同時兌換：最多一次成功（S-7）。
+#[test]
+fn once_link_is_redeemed_at_most_once_under_concurrency() {
+    use std::sync::{Arc, Barrier};
+    for i in 0..200u64 {
+        let home = tmp("once-race");
+        let code =
+            auth::create_once_link(&home, "abcdefgh", NOW, &mut keys::test_rng(i + 1)).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let (home, code, b) = (home.clone(), code.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    auth::consume_once_link(&home, &code, NOW + 1)
+                })
+            })
+            .collect();
+        let ok = hs
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|r| matches!(r, Ok(Some(_))))
+            .count();
+        assert!(ok <= 1, "第 {i} 輪同一個 code 兌換成功 {ok} 次");
+        assert_eq!(ok, 1, "第 {i} 輪：要有一次成功");
+    }
+}

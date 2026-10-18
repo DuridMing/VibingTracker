@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const FILE_NAME: &str = "keys.json";
+/// 每把金鑰最後一次用到的時間（collector 寫）。和 `keys.json` 分開：`keys.json` 只有 CLI 的 create／revoke 會寫，
+/// collector 寫回 last_used 就不會蓋掉剛撤銷的金鑰（#743 S-3）。
+pub const USED_FILE: &str = "keys-usage.json";
 pub const TOKEN_PREFIX: &str = "clk_";
 pub const ID_LEN: usize = 8;
 /// 32 bytes 以 base62 表示固定補到 43 個字元（⌈256 / log2 62⌉）。
@@ -262,9 +265,17 @@ impl KeyStore {
         }
         let server_secret = hex_decode32(&f.server_secret)
             .ok_or_else(|| format!("{} 的 server_secret 不是 32 bytes 十六進位", path.display()))?;
+        let mut keys = f.keys;
+        // last_used 另存在 keys-usage.json；兩邊取較晚的（舊版 collector 寫在 keys.json 裡的也算）
+        let used = read_used(home);
+        for k in &mut keys {
+            if let Some(t) = used.get(&k.id) {
+                k.last_used_ms = Some(k.last_used_ms.map_or(*t, |o| o.max(*t)));
+            }
+        }
         Ok(Some(KeyStore {
             server_secret,
-            keys: f.keys,
+            keys,
         }))
     }
 
@@ -280,6 +291,24 @@ impl KeyStore {
         let text = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
         save_private_json(&path, &text)
     }
+}
+
+fn read_used(home: &Path) -> std::collections::HashMap<String, u64> {
+    std::fs::read_to_string(home.join(USED_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 記下這把金鑰在 `now_ms` 用過（寫 `keys-usage.json`，不碰 `keys.json`）。同一個程序內依序寫，不會互相蓋掉。
+pub fn record_used(home: &Path, id: &str, now_ms: u64) -> Result<(), String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut used = read_used(home);
+    let t = used.entry(id.to_string()).or_insert(0);
+    *t = (*t).max(now_ms);
+    let text = serde_json::to_string(&used).map_err(|e| e.to_string())?;
+    save_private_json(&home.join(USED_FILE), &text)
 }
 
 /// 寫一個只有自己能讀的 JSON 檔：先寫 `<path>.tmp`（unix 600）再 rename，不會留下半個檔。
@@ -330,18 +359,26 @@ pub fn parse_expires(s: &str, now_ms: u64) -> Result<Option<u64>, String> {
         return Ok(None);
     }
     let bad = || format!("--expires 要像 90d、12h、30m 或 never，收到 {s}");
-    let (num, unit) = s.split_at(s.len().checked_sub(1).ok_or_else(bad)?);
+    // 單位是最後一個字元；用字元切，不用位元組（「9天」切在「天」中間會 panic，W-L1）
+    let (num, unit) = s
+        .char_indices()
+        .last()
+        .map(|(i, _)| s.split_at(i))
+        .ok_or_else(bad)?;
     let n: u64 = num.parse().map_err(|_| bad())?;
     if n == 0 {
         return Err(bad());
     }
-    let ms = match unit {
-        "d" => n * 24 * 60 * 60 * 1000,
-        "h" => n * 60 * 60 * 1000,
-        "m" => n * 60 * 1000,
+    let unit_ms: u64 = match unit {
+        "d" => 24 * 60 * 60 * 1000,
+        "h" => 60 * 60 * 1000,
+        "m" => 60 * 1000,
         _ => return Err(bad()),
     };
-    Ok(Some(now_ms + ms))
+    n.checked_mul(unit_ms)
+        .and_then(|ms| now_ms.checked_add(ms))
+        .map(Some)
+        .ok_or_else(|| format!("--expires 太長：{s}"))
 }
 
 /// epoch ms → `YYYY-MM-DD HH:MM UTC`（list 用；不拉日期 crate）。
