@@ -1040,7 +1040,7 @@ impl Merger {
                     .permission_request(&tool, &input, ts_seen);
             }
             "PostToolBatch" => {
-                let changes = self.tracker(&sid).batch_done(ts_seen);
+                let changes = self.tracker(&sid).batch_done(&agent, ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             // Notification（idle_prompt、permission_prompt）只當補強，P3 先不用（PLAN「注意佇列」）
@@ -1335,7 +1335,7 @@ impl Merger {
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
-        session.status.tool_started(&id, &tool, &input);
+        session.status.tool_started(&id, &tool, &input, &agent);
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {

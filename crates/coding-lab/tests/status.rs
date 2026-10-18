@@ -267,6 +267,46 @@ fn wait_is_cleared_by_post_tool_batch_when_auto_denied() {
     assert_eq!(r.attention().last(), Some(&a("cleared", "wait", "t1")));
 }
 
+/// PostToolBatch 只代表送出它的那個 agent 這一批工具結束了：subagent 的不能清掉 main 還在等的權限詢問（K-11）。
+#[test]
+fn subagent_batch_does_not_clear_main_wait() {
+    let mut r = Run::new();
+    r.feed(subagent_start("b1", 900))
+        .feed(pre("t1", "git push", 1000))
+        .feed(ask("git push", 1100))
+        .tick(2200);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(hook(
+        "PostToolBatch",
+        json!({ "agent_id": "b1", "agent_type": "general-purpose", "tool_calls": [] }),
+        2500,
+    ));
+    assert_eq!(r.last_status(), "wait", "{:?}", r.attention());
+    // main 自己的 batch 照常清掉（自動駁回只有這個訊號）
+    r.feed(hook("PostToolBatch", json!({ "tool_calls": [] }), 2600));
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn subagent_batch_clears_its_own_wait() {
+    let mut r = Run::new();
+    r.feed(subagent_start("b1", 900))
+        .feed(pre_agent("t1", "git push", "b1", 1000))
+        .feed(hook(
+            "PermissionRequest",
+            json!({ "tool_name": "Bash", "tool_input": bash("git push"), "agent_id": "b1", "agent_type": "Explore" }),
+            1100,
+        ))
+        .tick(2200);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(hook(
+        "PostToolBatch",
+        json!({ "agent_id": "b1", "agent_type": "Explore", "tool_calls": [] }),
+        2500,
+    ));
+    assert_eq!(r.last_status(), "run");
+}
+
 #[test]
 fn wait_is_cleared_by_transcript_tool_result_when_esc() {
     let mut r = Run::new();

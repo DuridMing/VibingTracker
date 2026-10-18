@@ -114,6 +114,8 @@ struct Running {
     id: String,
     tool: String,
     input: Value,
+    /// 呼叫這個工具的 agent（main、subagent 的 agent_id）
+    agent: String,
 }
 
 /// 一個 session 的狀態。
@@ -172,11 +174,12 @@ impl Default for Tracker {
 }
 
 impl Tracker {
-    pub fn tool_started(&mut self, id: &str, tool: &str, input: &Value) {
+    pub fn tool_started(&mut self, id: &str, tool: &str, input: &Value, agent: &str) {
         self.running.push(Running {
             id: id.to_string(),
             tool: tool.to_string(),
             input: input.clone(),
+            agent: agent.to_string(),
         });
     }
 
@@ -245,9 +248,28 @@ impl Tracker {
         out
     }
 
-    /// 一批工具結束：被自動駁回的權限詢問只有這個訊號（實測 12 ms）。
-    pub fn batch_done(&mut self, now: u64) -> Vec<Change> {
-        let mut out = self.clear_waits();
+    /// `agent` 的一批工具結束：被自動駁回的權限詢問只有這個訊號（實測 12 ms）。只清這個 agent 的工具
+    /// 在等的；不知道是誰的（推測的「等你」、重啟前種回的）算 main 的（K-11）。
+    pub fn batch_done(&mut self, agent: &str, now: u64) -> Vec<Change> {
+        let owner = |running: &[Running], id: &str| {
+            running
+                .iter()
+                .find(|r| r.id == id)
+                .map_or("main", |r| r.agent.as_str())
+                == agent
+        };
+        self.pending_wait
+            .retain(|(id, _)| !owner(&self.running, id));
+        let refs: Vec<String> = self
+            .open
+            .iter()
+            .filter(|o| o.kind == AttentionKind::Wait && owner(&self.running, &o.reference))
+            .map(|o| o.reference.clone())
+            .collect();
+        let mut out: Vec<Change> = refs
+            .iter()
+            .filter_map(|r| self.clear(AttentionKind::Wait, r))
+            .collect();
         out.extend(self.recompute(now));
         out
     }
