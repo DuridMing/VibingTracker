@@ -322,6 +322,9 @@ pub struct ToolCalled {
     pub status: ToolStatus,
     pub placement: Placement,
     pub danger: Option<Danger>,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -380,6 +383,9 @@ pub struct FileEdit {
     pub path: String,
     pub hunk: Option<Hunk>,
     pub hunk_source: HunkSource,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -393,6 +399,9 @@ pub struct FileWrite {
     /// 全文行數（`content` 只留前 200 行）；舊的 Event 沒有（#682）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines: Option<u64>,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
