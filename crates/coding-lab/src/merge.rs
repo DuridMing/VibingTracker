@@ -1447,6 +1447,7 @@ impl Merger {
                 placement: Placement::Staged,
                 danger: danger.clone(),
                 input_truncated,
+                sensitive,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1497,6 +1498,12 @@ impl Merger {
                 .map(|p| derive::relative_path(&cwd, p))
         };
         let tool_use_id = id.to_string();
+        // 和 tool.called 同一個判斷（建卡時算過）
+        let sensitive = self
+            .sessions
+            .get(sid)
+            .and_then(|s| s.cards.get(id))
+            .is_some_and(|c| c.sensitive);
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
             "Edit" => path().map(|path| {
@@ -1511,6 +1518,7 @@ impl Merger {
                     path,
                     hunk,
                     hunk_source,
+                    sensitive,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1530,6 +1538,7 @@ impl Merger {
                     content,
                     truncated: total > WRITE_PREVIEW_LINES,
                     lines: Some(total as u64),
+                    sensitive,
                 })
             }),
             "Agent" | "Task" => {
@@ -1765,6 +1774,7 @@ impl Merger {
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
+                        let sensitive = card.sensitive;
                         let (input, input_truncated) =
                             text::truncated_clone(&block["input"], OUTPUT_LIMIT);
                         let p = ToolCalled {
@@ -1775,6 +1785,7 @@ impl Merger {
                             placement: Placement::Stream,
                             danger: None,
                             input_truncated,
+                            sensitive,
                         };
                         vec![self.emit(sid, Payload::ToolCalled(p), meta(true))]
                     }

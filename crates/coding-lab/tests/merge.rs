@@ -1568,6 +1568,55 @@ fn reading_secrets_marks_the_result_sensitive() {
     );
 }
 
+/// C8（#761）：敏感的 Write／Edit 在 tool.called、file.write、file.edit 也標 sensitive（hunk 的前後文是從實際檔案
+/// 讀的，會帶出 .env 原有的秘密）；判斷和 tool.result 一樣；沒命中時不輸出這個欄位。
+#[test]
+fn writing_secrets_marks_the_call_and_the_file_event_sensitive() {
+    let mut m = merger();
+    let w = m.handle(pre(
+        "t1",
+        "Write",
+        json!({"file_path": "/p/.env", "content": "TOKEN=abc\n"}),
+        1000,
+    ));
+    let e = m.handle(pre(
+        "t2",
+        "Edit",
+        json!({"file_path": "/p/.env", "old_string": "abc", "new_string": "xyz"}),
+        1100,
+    ));
+    let n = m.handle(pre(
+        "t3",
+        "Write",
+        json!({"file_path": "/p/src/a.rs", "content": "fn a() {}\n"}),
+        1200,
+    ));
+    let of = |evs: &[Event], t: &str| {
+        evs.iter()
+            .find(|e| e.type_name() == t)
+            .unwrap()
+            .payload
+            .clone()
+    };
+    assert_eq!(of(&w, "tool.called")["sensitive"], true);
+    assert_eq!(of(&w, "file.write")["sensitive"], true);
+    assert_eq!(of(&e, "tool.called")["sensitive"], true);
+    assert_eq!(of(&e, "file.edit")["sensitive"], true);
+    assert!(of(&n, "tool.called").get("sensitive").is_none());
+    assert!(of(&n, "file.write").get("sensitive").is_none());
+    // 本機照存
+    assert_eq!(of(&w, "file.write")["content"], "TOKEN=abc\n");
+}
+
+/// C8：讀敏感檔的指令型工具，tool.called 也標（輸入裡的指令本身通常不是秘密，但和 tool.result 一致）。
+#[test]
+fn reading_secrets_with_a_command_marks_the_call_sensitive() {
+    let mut m = merger();
+    let a = m.handle(pre("t1", "Bash", json!({"command": "cat .env"}), 1000));
+    let c = a.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert_eq!(c.payload["sensitive"], true);
+}
+
 /// #654（R22）：tool.called 的 input 裡過長的字串截到 8 KB，標 inputTruncated；短的不動。
 #[test]
 fn long_tool_input_strings_are_truncated() {
