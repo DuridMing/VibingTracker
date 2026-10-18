@@ -735,6 +735,24 @@ fn idle_from_before_a_restart_returns_to_run_on_the_next_prompt() {
         .unwrap();
         wait_for("Esc 後是 idle", || status() == "idle");
         wait_for("idle 寫進 store", || stored_status() == "idle");
+        // flush 先寫 JSONL、再在 SQLite 的交易裡記 tail 讀到的行號：只看 JSONL 就殺掉的話，可能殺在兩者之間，
+        // 重啟後從舊的行號重讀那行中斷，狀態在新的 prompt 之後又回到 idle（負載高時偶發，T-4）
+        let tail_line = || {
+            rusqlite::Connection::open_with_flags(
+                e.home.join("index.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|db| {
+                db.query_row(
+                    "SELECT line_no FROM tails WHERE session = 'si' AND file = 'main'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+            })
+            .ok()
+            .flatten()
+        };
+        wait_for("讀到的行號寫進索引", || tail_line() == Some(1));
     }
     let _second = start_serve(&e);
     assert_eq!(status(), "idle", "前提：重啟後重放出 idle");
