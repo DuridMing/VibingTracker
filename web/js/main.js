@@ -18,6 +18,7 @@ import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
 import { mergeSessions, projectRoots, canReplay, fitTabs } from "./sessions.js";
 import { projectColors, projectColor, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "./projects.js";
 import { degradedNotice } from "./degraded.js";
+import { norm as normPath } from "./paths.js";
 import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices, layoutGraph, withWip } from "./branches.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -683,6 +684,7 @@ const left = {
   hashCwd: null, // 從單 session 的 git 列點 commit 時，用那個 session 的 worktree
   trees: new Map(), // 專案 cwd → { tree, loading, error, info, req }
   fileEvents: [],
+  bodies: new Map(), // cwd → { url, body }：最後一次 /api/files 的回應（回放 reset 時重建用，#766 E-F5）
   dirty: true,
   rows: [],
   els: new Map(), // `${cwd}|${path}`（專案標題列是 `#${cwd}`）→ { el, sig }
@@ -699,7 +701,6 @@ const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?
 // 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
 const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
 const apiFetch = (url, { signal } = {}) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin", signal }).then(toLogin));
-const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 function allSessions() {
   return mergeSessions([...store.sessions.values()], left.fetched);
@@ -759,7 +760,11 @@ function feedFiles(events) {
   const mine = (events ?? []).filter((e) => e.type?.startsWith("file.") || (e.type === "tool.updated" && e.payload?.status === "failed"));
   const gitOp = (events ?? []).some((e) => e.type === "git.op");
   if (!mine.length && !gitOp) return;
-  left.fileEvents.push(...mine);
+  // 只存檔案樹用得到的欄位：write 的 content、edit 的 hunk 不留（開幾天會累積數十 MB，#766 F-5）
+  for (const e of mine) {
+    const p = e.payload ?? {};
+    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted } });
+  }
   if (left.fileEvents.length > FILE_EVENTS_MAX) left.fileEvents.splice(0, left.fileEvents.length - FILE_EVENTS_MAX);
   let changedFiles = gitOp;
   for (const [cwd, ent] of left.trees) {
@@ -779,7 +784,7 @@ function feedFiles(events) {
       const ent = left.trees.get(cwd);
       if (ent?.tree.root != null) setSince(ent);
     }
-  } else scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）
+  } else if (!tl.active) scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）；回放中的歷史改動不必（#766 E-F5）
 }
 
 function setSince(ent) {
@@ -825,6 +830,13 @@ async function loadFiles(cwd = null) {
     render(true);
     return;
   }
+  // 回放中（#730）：檔案清單是 git 現況、和回放的時刻無關，reset 後用上次抓到的重建，不再打 /api/files（#766 E-F5）
+  const cached = left.bodies.get(cwd);
+  if (tl.active && cached?.url === url) {
+    applyFiles(ent, cwd, base, cached.body);
+    render(true);
+    return;
+  }
   const req = ++ent.req;
   ent.loading = true;
   render(true);
@@ -833,26 +845,8 @@ async function loadFiles(cwd = null) {
     const body = await res.json().catch(() => ({}));
     if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-    // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
-    if (ent.tree.root == null || normRoot(body.root) === ent.tree.root) ent.tree.setFiles(body);
-    const n = body.changes?.length ?? 0;
-    const cf = (body.changes ?? []).filter((c) => c.conflict).length;
-    const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";
-    if (base.kind === "since") setSince(ent);
-    else if (base.kind === "session") {
-      ent.tree.setGit(body.changes, (p) => ent.tree.pathOf(cwdOf(base.id), p));
-      ent.info = `session ${shortId(base.id)} · ${n} 個檔有改動`;
-    } else {
-      ent.tree.setGit(body.changes);
-      const wts = new Set((body.changes ?? []).flatMap((c) => c.by.map((b) => b.worktree)));
-      ent.info = base.kind === "commit"
-        ? `相對 ${String(body.baseRef ?? base.hash).slice(0, 7)} · ${n} 個檔有改動`
-        : `相對 ${body.baseRef ?? "main"} · ${n} 個檔有改動${wts.size > 1 ? `（${wts.size} 個 worktree）` : ""}${cf ? ` · ⚠ ${cf} 個衝突候選` : ""}`;
-    }
-    ent.info += trunc;
-    ent.error = null;
-    left.dirty = true;
-    if (cwd === brTarget()) loadBranches();
+    left.bodies.set(cwd, { url, body });
+    applyFiles(ent, cwd, base, body);
   } catch (e) {
     if (req !== ent.req) return;
     ent.error = `檔案樹載入失敗：${e.message}`;
@@ -862,6 +856,30 @@ async function loadFiles(cwd = null) {
       render(true);
     }
   }
+}
+
+// /api/files 的回應套到一棵樹（新抓的或回放 reset 時快取的）
+function applyFiles(ent, cwd, base, body) {
+  // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
+  if (ent.tree.root == null || normPath(body.root) === ent.tree.root) ent.tree.setFiles(body);
+  const n = body.changes?.length ?? 0;
+  const cf = (body.changes ?? []).filter((c) => c.conflict).length;
+  const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";
+  if (base.kind === "since") setSince(ent);
+  else if (base.kind === "session") {
+    ent.tree.setGit(body.changes, (p) => ent.tree.pathOf(cwdOf(base.id), p));
+    ent.info = `session ${shortId(base.id)} · ${n} 個檔有改動`;
+  } else {
+    ent.tree.setGit(body.changes);
+    const wts = new Set((body.changes ?? []).flatMap((c) => c.by.map((b) => b.worktree)));
+    ent.info = base.kind === "commit"
+      ? `相對 ${String(body.baseRef ?? base.hash).slice(0, 7)} · ${n} 個檔有改動`
+      : `相對 ${body.baseRef ?? "main"} · ${n} 個檔有改動${wts.size > 1 ? `（${wts.size} 個 worktree）` : ""}${cf ? ` · ⚠ ${cf} 個衝突候選` : ""}`;
+  }
+  ent.info += trunc;
+  ent.error = null;
+  left.dirty = true;
+  if (cwd === brTarget()) loadBranches();
 }
 setInterval(() => { if (left.tab === "tree" && !document.hidden && left.base !== "since") loadFiles(); }, 60_000);
 
@@ -1886,7 +1904,7 @@ async function seekTimeline(at) {
 async function moreTimeline() {
   const req = tl.loadingMore();
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }), {
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false, from: tl.lower }), {
       signal: tlSignal(),
     });
     const body = await res.json();

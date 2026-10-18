@@ -995,3 +995,99 @@ async fn hub_refuses_reverse_proxied_requests() {
     assert_eq!(get("X-Forwarded-For: 203.0.113.9\r\n").await, 403);
     assert_eq!(get("Forwarded: for=203.0.113.9\r\n").await, 403);
 }
+
+/// C13（#742）：上游 store 裡有、但 live 已移出（結束超過 2 小時、或 hub 重連後快取清掉）的專案，
+/// hub 依 cwd 轉發時快取找不到就逐台問上游，不直接 404（回放、/api/sessions?cwd= 都一樣）。
+#[tokio::test]
+async fn hub_finds_the_owner_of_a_project_that_is_only_in_an_upstreams_store() {
+    let live = [started("live1", 1, 1000, "/a"), text("live1", 2, 1, 1001)];
+    let stored_only = [
+        started("old1", 1, 500, "/old"),
+        text("old1", 2, 1, 501),
+        text("old1", 3, 2, 502),
+    ];
+    let mut s = Store::open(&tmp("c13")).unwrap();
+    for e in live.iter().chain(&stored_only) {
+        s.append(e.clone());
+    }
+    s.flush().unwrap();
+    let web = WebState::new(Some(Arc::new(Mutex::new(s))), None, 64);
+    web.apply(&live);
+    web.flush(2000);
+    let up = upstream(&web).await;
+    let ups = vec![Upstream {
+        name: "alpha".into(),
+        url: format!("http://{up}"),
+        key: None,
+    }];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+        .await
+        .unwrap();
+    // 等 hub 連上上游、快取有 live1
+    for _ in 0..100 {
+        // 連上上游、快取有 live1 才算（快取找不到時 /api/sessions?cwd= 也回 200，只是列是空的）
+        if http_get(hub_addr, "/api/sessions?cwd=%2Fa").await.1["sessions"][0]["id"] == "live1" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (st, body) = http_get(
+        hub_addr,
+        "/api/projects/replay?cwd=%2Fold&at=400&until=1000",
+    )
+    .await;
+    assert_eq!(st, 200, "hub 要把 /old 的回放轉給 alpha：{body}");
+    assert!(!body["frames"].as_array().unwrap().is_empty(), "{body}");
+    assert_eq!(
+        body["snapshot"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "at=400 時還沒開始"
+    );
+    let (st, body) = http_get(hub_addr, "/api/sessions?cwd=%2Fold").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["sessions"][0]["id"], "old1", "{body}");
+    assert_eq!(body["sessions"][0]["host"], "alpha");
+    // 哪一台都沒有的目錄照舊 404
+    assert_eq!(
+        http_get(hub_addr, "/api/projects/replay?cwd=%2Fnowhere&at=400")
+            .await
+            .0,
+        404
+    );
+}
+
+/// R-5：`coding-lab config` 用 Debug 印設定，上游金鑰只留 id，不印 secret。
+#[test]
+fn upstream_debug_does_not_print_the_key_secret() {
+    let key = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    let up = Upstream {
+        name: "srv".into(),
+        url: "http://10.0.0.2:4801".into(),
+        key: Some(key.into()),
+    };
+    let shown = format!("{up:?} {up:#?}");
+    assert!(!shown.contains("0123456789abcdefghij"), "{shown}");
+    assert!(shown.contains("clk_ABCDEFGH_…"), "{shown}");
+}
+
+/// W-L4：hub add 只收 clk_ 金鑰的格式；含 \ 之類的字會讓 config.toml 解析失敗、所有子命令起不來。
+#[test]
+fn hub_add_rejects_malformed_keys() {
+    let dir = tmp("hub-add");
+    let cfg = dir.join("config.toml");
+    for bad in [
+        "abc\\def",
+        "clk_short",
+        "not-a-key",
+        "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcd\\e",
+    ] {
+        assert!(
+            hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(bad)).is_err(),
+            "{bad}"
+        );
+        assert!(!cfg.exists(), "{bad}：被拒時 config.toml 不變");
+    }
+    let good = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(good)).unwrap();
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains(good));
+}
