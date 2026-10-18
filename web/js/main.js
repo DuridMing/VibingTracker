@@ -162,9 +162,14 @@ function renderProjectSwitch() {
   sel.title = proj.cur ? `只看 ${proj.cur}\n其他專案的 session 只是隱藏，切回「全部專案」就回來` : "專案：全部（串流每行標專案、檔案樹與改動紀錄依專案分組）或只看一個";
 }
 
+function tabTitle(s) {
+  const host = hostTag(s.id);
+  return `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`;
+}
+
 function sessionTab(s, extra = {}) {
   const host = hostTag(s.id);
-  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`, onclick: () => selectTab(s.id), ...extra },
+  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: tabTitle(s), onclick: () => selectTab(s.id), ...extra },
     h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
     h("span", { class: "dot" }),
     host ? h("small", { class: "hst" }, host) : null,
@@ -177,7 +182,15 @@ let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions().filter((s) => inProject(s.id));
-  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
+  // 簽章只放結構欄位；lastPrompt、doing 只用在 tooltip，變了就地改 title，不重建整列、不重跑 fitTabRow 的強制排版（#757 E-F4）
+  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}`).join("|"))) {
+    for (const s of live) {
+      const b = box.querySelector(`[data-sid="${s.id}"]`);
+      const t = tabTitle(s);
+      if (b && b.title !== t) b.title = t;
+    }
+    return;
+  }
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
@@ -422,6 +435,10 @@ function render(urgent = false) {
   requestAnimationFrame(() => {
     rafPending = false;
     lastPanelRender = performance.now();
+    if (proj.dirty) {
+      proj.dirty = false;
+      syncProjects();
+    }
     renderOnce = stream.rows.length >= 3000;
     renderConn();
     renderDegraded();
@@ -697,7 +714,7 @@ const left = {
   refetch: 0,
 };
 // 專案切換（#669）：cur 是單一專案的根 cwd，null＝全部專案（預設）；roots 來自 sessions.js 的 projectRoots
-const proj = { cur: pref.get("project") || null, roots: [], rootCwds: [], colors: new Map(), labels: new Map(), many: false, collapsed: new Set(), sig: "" };
+const proj = { cur: pref.get("project") || null, roots: [], rootCwds: [], colors: new Map(), labels: new Map(), many: false, collapsed: new Set(), sig: "", dirty: false };
 const activeRoots = () => (proj.cur ? [proj.cur] : proj.rootCwds);
 const fetchedById = () => new Map(left.fetched.map((s) => [s.id, s]));
 let fetchedIndex = new Map();
@@ -1097,6 +1114,7 @@ function renderDetail() {
   pane.replaceChildren(head, h("div", { class: "bdb" }, files, br.file ? diffCols(br.file.diffs) : null));
 }
 
+let brSig = null; // 分支視窗上次畫的參照（E-F7）
 function renderBranches() {
   const n = changedBranches(br.body);
   const target = brTarget();
@@ -1106,8 +1124,10 @@ function renderBranches() {
     btn.textContent = `${proj.many ? `${proj.labels.get(target) ?? ""} ` : ""}${br.body ? `⎇ 分支（${n}）` : "⎇ 分支"}`;
   }
   if (!brWin.isOpen) return;
-  const sig = JSON.stringify([br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)]);
-  if (!changed("brList", sig)) return;
+  // 比參照不比內容：這幾個欄位每次更新都整個換掉（新的 fetch 結果），不必每次重繪都 JSON.stringify 整張圖與 diff（#757 E-F7）
+  const sig = [br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)];
+  if (brSig && sig.every((v, i) => v === brSig[i])) return;
+  brSig = sig;
   const body = br.body;
   $("#brWinSub").textContent = body?.integration ? `相對 ${body.integration}・點一列看檔案・拖標題列移動、右下角縮放` : "拖標題列移動、右下角縮放";
   $("#brWinTitle").textContent = `${proj.rootCwds.length > 1 && br.cwd ? `${proj.labels.get(br.cwd) ?? br.cwd} · ` : ""}${body ? `分支（${body.branches.length}）` : "分支"}`;
@@ -1274,6 +1294,7 @@ function renderTree() {
   const to = Math.min(rows.length, Math.ceil((top + height) / ROW_H) + 10);
   const running = new Set([...store.sessions.values()].filter((s) => s.status === "run").map((s) => s.id));
   const keep = new Set();
+  const fx = []; // 這次要閃或點亮的列：最後一起重新觸發動畫
   for (let i = from; i < to; i++) {
     const x = rows[i];
     const key = x.hdr ? `#${x.cwd}` : `${x.cwd}|${x.path}`;
@@ -1302,12 +1323,15 @@ function renderTree() {
       left.els.set(key, row);
     }
     const fl = left.flash.get(key);
-    if (fl || left.lit.has(key)) {
-      const el = row.el;
-      el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
-      void el.offsetWidth; // 重新觸發動畫
+    if (fl || left.lit.has(key)) fx.push({ el: row.el, fl, lit: left.lit.has(key) });
+  }
+  // 重新觸發動畫要「移除 class → 強制排版 → 加回」：分兩趟做，N 列只排版一次（#757 E-F8）
+  if (fx.length) {
+    for (const { el } of fx) el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
+    void inner.offsetWidth;
+    for (const { el, fl, lit } of fx) {
       if (fl) el.classList.add(fl);
-      if (left.lit.has(key)) el.classList.add("lit");
+      if (lit) el.classList.add("lit");
     }
   }
   for (const [p, row] of left.els) {
@@ -1725,7 +1749,7 @@ const brWin = makeFloating($("#brWin"), {
   },
   onToggle: (open) => {
     $("#brToggle").setAttribute("aria-expanded", String(open));
-    lastSig.delete("brList");
+    brSig = null;
     if (open) loadBranches();
     render(true);
   },
@@ -1864,7 +1888,7 @@ function applyMainFrame(m) {
   applyFrame(store, m);
   onStreamFrame(m);
   changes.apply(m.events);
-  if (m.rows?.sessions?.length) syncProjects();
+  if (m.rows?.sessions?.length) proj.dirty = true; // 在 render 裡做一次（#757 E-F2）
   feedFiles(m.events);
 }
 
@@ -2095,7 +2119,8 @@ const client = createClient({
         if (bench.on) benchFrame(m);
         else onStreamFrame(m);
         changes.apply(m.events);
-        if (m.rows?.sessions?.length) syncProjects();
+        // 專案清單在 render 裡同步一次：每則 frame 都全量合併、排序 sessions 太浪費，回放一個 tick 可能套上百個 frame（#757 E-F2）
+        if (m.rows?.sessions?.length) proj.dirty = true;
         feedFiles(m.events);
       }
       render();
