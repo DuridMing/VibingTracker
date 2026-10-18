@@ -146,7 +146,7 @@ pub fn write_failed(home: &Path, error: &str, addr: Option<SocketAddr>, file: Op
         v["file"] = json!(f.to_string_lossy().replace('\\', "/"));
     }
     log(&format!("起不來：{v}"));
-    let _ = std::fs::write(home.join(FAILED_FILE), v.to_string());
+    let _ = crate::store::write_private(&home.join(FAILED_FILE), v.to_string().as_bytes());
 }
 
 /// `since`（epoch ms）之後寫的 collector.failed 的錯誤訊息。
@@ -162,7 +162,7 @@ fn write_info(home: &Path, me: u32, hook: SocketAddr, webs: &[SocketAddr], closi
         "webs": webs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(), "closing": closing,
     });
-    if let Err(e) = std::fs::write(home.join(INFO_FILE), v.to_string()) {
+    if let Err(e) = crate::store::write_private(&home.join(INFO_FILE), v.to_string().as_bytes()) {
         log(&format!("寫不了 {INFO_FILE}：{e}"));
     }
 }
@@ -194,7 +194,7 @@ async fn bind_hooks(cfg: &Config, tx: &mpsc::Sender<Input>) -> io::Result<Option
 }
 
 pub async fn run(cfg: Config) -> io::Result<Outcome> {
-    std::fs::create_dir_all(&cfg.home)?;
+    crate::store::create_private_dir(&cfg.home)?;
     // 背景執行（ensure 拉起）時自己寫 collector.log 並輪替；前景跑時照舊印到終端機
     if !std::io::IsTerminal::is_terminal(&std::io::stderr())
         && let Err(e) = crate::logging::to_file(&cfg.home.join("collector.log"))
@@ -694,12 +694,18 @@ fn read_agent_meta(hook: &crate::hook::HookInput, tx: &mpsc::Sender<Input>) {
         return;
     };
     let path = crate::transcript::subagent_file(Path::new(transcript), agent, "meta.json");
+    let unc = crate::derive::is_unc(transcript);
     let (session, agent, tx) = (hook.session_id().to_string(), agent.to_string(), tx.clone());
     tokio::spawn(async move {
-        let meta = crate::transcript::read_agent_meta(path, AGENT_META_TRIES, || {
-            tokio::time::sleep(AGENT_META_EVERY)
-        })
-        .await;
+        // UNC 路徑不碰（#762 W-M5）：當成讀不到，merge 依呼叫順序配對
+        let meta = if unc {
+            crate::merge::AgentMetaRead::Unreadable
+        } else {
+            crate::transcript::read_agent_meta(path, AGENT_META_TRIES, || {
+                tokio::time::sleep(AGENT_META_EVERY)
+            })
+            .await
+        };
         // 讀不到也要說：merge 收到 Unreadable 就依呼叫順序配對，不必等滿上限
         let input = Input::AgentMeta {
             session,

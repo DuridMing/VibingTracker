@@ -706,12 +706,9 @@ enum Forwarded {
 }
 
 fn spawn_collector(cfg: &Config) -> Result<(), String> {
-    std::fs::create_dir_all(&cfg.home).map_err(|e| e.to_string())?;
+    coding_lab::store::create_private_dir(&cfg.home).map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.home.join("collector.log"))
+    let log = coding_lab::store::open_private_append(&cfg.home.join("collector.log"))
         .map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("serve")
@@ -903,8 +900,9 @@ fn stop() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {hook}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        coding_lab::hooks::STOP_PATH
+        "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH,
+        coding_lab::hooks::STOP_HEADER
     );
     if !http_once(hook, &req).is_ok_and(|r| r.starts_with(b"HTTP/1.1 200")) {
         eprintln!(

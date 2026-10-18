@@ -639,9 +639,11 @@ impl TailPlanner {
             return out;
         }
 
+        // UNC 路徑不碰：Windows 會去連那台主機（送出 NTLM 憑證），離線時還會卡住（#762 W-M5）。
+        // 不 tail 的 session 照收 hook，10 秒後依不變式 2 降級進串流
         let transcript = h
             .str_field("transcript_path")
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && !crate::derive::is_unc(p))
             .map(PathBuf::from);
         if let Some(path) = &transcript {
             match self.main.get(&sid) {

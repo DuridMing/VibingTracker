@@ -271,31 +271,85 @@ pub fn needs_probe(h: &HookInput) -> bool {
 }
 
 /// PreToolUse 的 Edit／Write：**回應 hook 之前**讀檔（#626：Claude Code 等 hook 回應才執行工具）。
-/// 同步 I/O，async 的呼叫端要放進 `spawn_blocking`。
+/// 同步 I/O，async 的呼叫端要放進 `spawn_blocking`；要設時限時改用 [`probe_job`]。
 pub fn attach_probe(h: &mut HookInput) {
+    if let Some(job) = probe_job(h) {
+        h.set_probe(job.run());
+    }
+}
+
+/// 讀檔探測要用到的欄位（從 hook 複製出來）：可以丟到 blocking 執行緒、逾時就放著不管，hook 照常處理（#762 W-M5）。
+pub struct ProbeJob {
+    edit: bool,
+    path: String,
+    /// 只有 cwd 底下的檔才讀內容；cwd 外的只看在不在（hook 可以被偽造，S-4）
+    read: bool,
+    old: String,
+    new: String,
+}
+
+/// UNC 路徑（`\\server\share`、`//server/share`、`\\?\UNC\…`）：碰了 Windows 就會去連那台主機、送出 NTLM 憑證，
+/// 離線的主機還會讓呼叫卡住幾十秒。
+pub fn is_unc(path: &str) -> bool {
+    let p = path.replace('\\', "/");
+    p.starts_with("//")
+}
+
+/// `path` 在 `cwd` 底下（`/` 與 `\\` 視為相同；Windows、macOS 不分大小寫）。
+fn is_under(cwd: &str, path: &str) -> bool {
+    let norm = |p: &str| {
+        let p = p.replace('\\', "/");
+        let p = p.trim_end_matches('/').to_string();
+        if cfg!(any(windows, target_os = "macos")) {
+            p.to_lowercase()
+        } else {
+            p
+        }
+    };
+    let (cwd, path) = (norm(cwd), norm(path));
+    !cwd.is_empty()
+        && path.len() > cwd.len()
+        && path.starts_with(&cwd)
+        && path[cwd.len()..].starts_with('/')
+}
+
+/// 這個 hook 要不要讀檔探測，要的話把需要的欄位複製出來。UNC 路徑一律不碰。
+pub fn probe_job(h: &HookInput) -> Option<ProbeJob> {
     if !needs_probe(h) {
-        return;
+        return None;
     }
-    let tool = h.str_field("tool_name").unwrap_or_default();
-    let Some(input) = h.field("tool_input") else {
-        return;
-    };
-    let Some(path) = input["file_path"].as_str() else {
-        return;
-    };
-    let meta = std::fs::metadata(path).ok();
-    let mut probe = FileProbe {
-        exists: meta.is_some(),
-        hunk: None,
-    };
-    // 只讀一般檔案：FIFO、裝置檔讀了可能不會回來
-    if tool == "Edit"
-        && meta.is_some_and(|m| m.is_file() && m.len() <= PROBE_MAX_BYTES)
-        && let Ok(text) = std::fs::read_to_string(path)
-    {
-        let old = input["old_string"].as_str().unwrap_or_default();
-        let new = input["new_string"].as_str().unwrap_or_default();
-        probe.hunk = edit_hunk(&text, old, new);
+    let input = h.field("tool_input")?;
+    let path = input["file_path"].as_str()?;
+    if is_unc(path) {
+        return None;
     }
-    h.set_probe(probe);
+    let edit = h.str_field("tool_name") == Some("Edit");
+    let s = |k: &str| input[k].as_str().unwrap_or_default().to_string();
+    Some(ProbeJob {
+        edit,
+        path: path.to_string(),
+        read: h.str_field("cwd").is_some_and(|cwd| is_under(cwd, path)),
+        old: if edit { s("old_string") } else { String::new() },
+        new: if edit { s("new_string") } else { String::new() },
+    })
+}
+
+impl ProbeJob {
+    /// 同步讀檔；網路磁碟上可能很慢，呼叫端自己設時限。
+    pub fn run(self) -> FileProbe {
+        let meta = std::fs::metadata(&self.path).ok();
+        let mut probe = FileProbe {
+            exists: meta.is_some(),
+            hunk: None,
+        };
+        // 只讀一般檔案：FIFO、裝置檔讀了可能不會回來
+        if self.edit
+            && self.read
+            && meta.is_some_and(|m| m.is_file() && m.len() <= PROBE_MAX_BYTES)
+            && let Ok(text) = std::fs::read_to_string(&self.path)
+        {
+            probe.hunk = edit_hunk(&text, &self.old, &self.new);
+        }
+        probe
+    }
 }

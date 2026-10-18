@@ -265,7 +265,7 @@ async fn edit_hunk_is_read_before_the_response() {
     let file = dir.join("calc.py");
     std::fs::write(&file, "def sub(a, b):\n    return a + b\n").unwrap();
     let (addr, mut rx) = server(8).await;
-    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
                       "tool_input": {"file_path": file, "old_string": "a + b", "new_string": "a - b"},
                       "tool_use_id": "e1"});
     post(addr, body.to_string().as_bytes()).await;
@@ -622,4 +622,188 @@ fn restart_reads_a_fresh_file_with_no_recorded_line_from_the_start() {
         ),
         "{a:?}"
     );
+}
+
+// ── hook 埠的來源檢查（#762 S-4、D10、contracts §7）：瀏覽器裡任何網頁都能對 127.0.0.1:4800 送 no-cors 的
+// POST（text/plain、不觸發 preflight），偽造 session、危險指令，或 POST /stop 關掉 collector
+
+async fn raw(addr: SocketAddr, req: String) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+fn hook_req(headers: &str, body: &str) -> String {
+    format!(
+        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn stop_req(headers: &str) -> String {
+    format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH
+    )
+}
+
+#[tokio::test]
+async fn hook_with_an_origin_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    let resp = raw(
+        addr,
+        hook_req(
+            "Origin: https://attacker.example\r\nContent-Type: application/json\r\n",
+            &body,
+        ),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    assert!(rx.try_recv().is_err(), "偽造的 hook 不能進 merge");
+}
+
+#[tokio::test]
+async fn hook_that_is_not_json_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    for headers in ["Content-Type: text/plain;charset=UTF-8\r\n", ""] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 415"), "{headers:?}：{resp}");
+    }
+    assert!(rx.try_recv().is_err());
+    // Claude Code 送的是 application/json（帶參數、大小寫不同也算）
+    for headers in [
+        "Content-Type: application/json\r\n",
+        "content-type: Application/JSON; charset=utf-8\r\n",
+    ] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{headers:?}：{resp}");
+        assert!(matches!(rx.try_recv(), Ok(Input::Hook { .. })));
+    }
+}
+
+#[tokio::test]
+async fn stop_needs_its_own_header_and_no_origin() {
+    let (tx, _rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    let stop = server.stop_requested();
+    for headers in [
+        "",
+        "Content-Type: text/plain\r\n",
+        "Origin: https://attacker.example\r\nX-Coding-Lab-Stop: 1\r\n",
+    ] {
+        let resp = raw(addr, stop_req(headers)).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "{headers:?}：{resp}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stop.notified())
+            .await
+            .is_err(),
+        "被拒的 stop 不能觸發結束"
+    );
+    let resp = raw(addr, stop_req("X-Coding-Lab-Stop: 1\r\n")).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    tokio::time::timeout(Duration::from_secs(2), stop.notified())
+        .await
+        .expect("coding-lab stop 帶的標頭要能結束");
+}
+
+// ── 讀檔探測（#762 W-M5）：UNC 路徑不碰（Windows 會去連那台主機、送出 NTLM 憑證），只讀 cwd 底下的檔，
+// 探測有時限（網路磁碟、OneDrive 隨選檔案、離線 NAS 會讓 hook 卡 21 秒）
+
+fn edit_hook(cwd: &str, path: &str) -> HookInput {
+    h(
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd,
+             "tool_use_id": "t1", "tool_input": {"file_path": path, "old_string": "a", "new_string": "b"}}),
+    )
+}
+
+#[test]
+fn unc_paths_are_never_touched() {
+    for path in [
+        "\\\\10.255.255.1\\share\\x.txt",
+        "//10.255.255.1/share/x.txt",
+        "\\\\?\\UNC\\10.255.255.1\\share\\x.txt",
+        "\\\\localhost\\C$\\Windows\\win.ini",
+    ] {
+        let mut hook = edit_hook("//10.255.255.1/share", path);
+        coding_lab::derive::attach_probe(&mut hook);
+        assert!(hook.probe().is_none(), "{path}");
+    }
+}
+
+#[test]
+fn files_outside_the_cwd_are_not_read() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    std::fs::write(dir.join("secret.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("proj/a.txt"), "a\n").unwrap();
+    let cwd = dir.join("proj");
+    let mut outside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("secret.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut outside);
+    let p = outside.probe().expect("存在與否還是看（不讀內容）");
+    assert!(p.exists);
+    assert!(p.hunk.is_none(), "cwd 外的檔不讀內容");
+    let mut inside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("proj/a.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut inside);
+    assert!(
+        inside.probe().is_some_and(|p| p.hunk.is_some()),
+        "cwd 底下照常算 hunk"
+    );
+}
+
+#[tokio::test]
+async fn probe_has_a_time_limit_and_the_hook_still_goes_through() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    // 時限設 0：探測一定逾時（不 sleep，等同探測卡住）
+    server.set_probe_limit(Duration::ZERO);
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                      "cwd": dir, "tool_use_id": "t1",
+                      "tool_input": {"file_path": dir.join("a.txt"), "old_string": "a", "new_string": "b"}});
+    let resp = post(server.addr, body.to_string().as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    match rx.try_recv() {
+        Ok(Input::Hook { hook, .. }) => assert!(hook.probe().is_none(), "逾時就不帶探測結果"),
+        _ => panic!("逾時也要照常交給 merge"),
+    }
+}
+
+/// W-M5：transcript_path 是 UNC 時不 tail（hook 照收，10 秒後依不變式 2 降級進串流）。
+#[test]
+fn unc_transcript_is_not_tailed() {
+    for t in ["\\\\nas\\share\\s1.jsonl", "//nas/share/s1.jsonl"] {
+        let mut p = TailPlanner::default();
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SessionStart",
+                                    "source": "startup", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SubagentStart",
+                                    "agent_id": "a1", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+    }
 }
