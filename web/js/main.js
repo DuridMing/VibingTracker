@@ -62,6 +62,14 @@ function renderConn() {
     text.append(" ", h("b", {}, `${ui.welcome.host} · v${ui.welcome.version}`));
   }
   document.body.classList.toggle("stale", ui.conn !== "open");
+  // 資料寫不進磁碟（磁碟滿、檔案被鎖，#781 W-M10）：畫面照常更新，但沒存下來，要讓人看得到
+  const se = store.storeError;
+  const seText = se ? `⚠ 資料沒有寫進磁碟（${fmtClock(se.since ?? Date.now())} 起，待寫 ${se.pending ?? 0} 筆${se.dropped ? `，已丟 ${se.dropped} 筆` : ""}）` : "";
+  if (changed("storeErr", seText)) {
+    $("#storeErr").hidden = !se;
+    $("#storeErr").textContent = seText;
+    $("#storeErr").title = se?.message ?? "";
+  }
 }
 
 function renderKpis() {
