@@ -17,7 +17,6 @@ pub fn edit_hunk(text: &str, old: &str, new: &str) -> Option<Hunk> {
     }
     let pos = text.find(old)?;
     let end = pos + old.len();
-    let new_text = format!("{}{}{}", &text[..pos], new, &text[end..]);
 
     // 以行為單位：受影響的舊行從 pos 所在行到 end-1 所在行
     let old_lines: Vec<&str> = text.split_inclusive('\n').collect();
@@ -32,14 +31,14 @@ pub fn edit_hunk(text: &str, old: &str, new: &str) -> Option<Hunk> {
     let mut last = line_of(end - 1);
     let block_start = offsets[first];
 
-    // 後面沒變的部分；若新內容不是以換行結尾，下一行會被併進同一行，一起算進受影響範圍
+    // 後面沒變的部分從 `suffix_at(last)` 開始；若新內容不是以換行結尾，下一行會被併進同一行，一起算進受影響範圍。
+    // 只組受影響的這一段，不組出整個新檔（E-M12）
     let suffix_at = |last: usize| offsets.get(last + 1).copied().unwrap_or(text.len());
-    let mut suffix = &text[suffix_at(last)..];
-    let mut new_block = &new_text[block_start..new_text.len() - suffix.len()];
-    while !new_block.is_empty() && !new_block.ends_with('\n') && !suffix.is_empty() {
+    let block = |to: usize| format!("{}{}{}", &text[block_start..pos], new, &text[end..to]);
+    let mut new_block = block(suffix_at(last));
+    while !new_block.is_empty() && !new_block.ends_with('\n') && suffix_at(last) < text.len() {
         last += 1;
-        suffix = &text[suffix_at(last)..];
-        new_block = &new_text[block_start..new_text.len() - suffix.len()];
+        new_block = block(suffix_at(last));
     }
 
     let strip = |l: &str| l.strip_suffix('\n').unwrap_or(l).to_string();
