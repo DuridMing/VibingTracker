@@ -272,6 +272,8 @@ struct Resumed {
     ended_at: Option<u64>,
     idle: bool,
     last_seen: Option<u64>,
+    /// 重啟前還在暫存區的卡片（K-8）
+    cards: Vec<(String, Card)>,
 }
 
 impl Merger {
@@ -300,6 +302,55 @@ impl Merger {
         let r = self.resumed.entry(sid.to_string()).or_default();
         (r.seq, r.pos) = (seq, pos);
         r.cwd = (!cwd.is_empty()).then(|| cwd.to_string());
+    }
+
+    /// collector 重啟時（K-8）：重啟前收到 PreToolUse、transcript 的 tool_use 行還沒到的暫存卡片種回，
+    /// 行到了照常依行號放進串流（不再發第二筆 tool.called）。`recent` 是 store 最近的 Event（依 seq）；
+    /// 暫存時間從 `now` 重新算，重啟後的 tail 補讀有完整的 [`FALLBACK_AFTER_MS`] 可以趕上，等不到才降級。
+    pub fn resume_staged(&mut self, recent: &[Event], now: u64) {
+        let mut staged: BTreeMap<(&str, &str), Card> = BTreeMap::new();
+        for e in recent {
+            let Some(id) = e.payload["toolUseId"].as_str() else {
+                continue;
+            };
+            let key = (e.session.as_str(), id);
+            match e.kind.as_str() {
+                "tool.called" if e.payload["placement"] == "staged" => {
+                    let card = Card {
+                        staged_at: Some(now),
+                        called: true,
+                        sensitive: e.payload["sensitive"].as_bool().unwrap_or(false),
+                        // 重啟前的 PreToolUse 已經處理過
+                        hooks_seen: tool_hook_bit("PreToolUse").unwrap_or(0),
+                        ..Card::new(&e.agent)
+                    };
+                    staged.insert(key, card);
+                }
+                "tool.placed" => {
+                    staged.remove(&key);
+                }
+                "tool.updated"
+                    if matches!(e.payload["status"].as_str(), Some("done" | "failed")) =>
+                {
+                    if let Some(c) = staged.get_mut(&key) {
+                        c.finished = true;
+                    }
+                }
+                "tool.result" => {
+                    if let Some(c) = staged.get_mut(&key) {
+                        c.result_sent = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ((sid, id), card) in staged {
+            self.resumed
+                .entry(sid.to_string())
+                .or_default()
+                .cards
+                .push((id.to_string(), card));
+        }
     }
 
     /// collector 重啟時，把 store 裡 session 的結束時間、是否中斷（status idle）與最後一筆 Event 的時間
@@ -350,6 +401,7 @@ impl Merger {
                 for item in r.open {
                     s.status.seed_open(item);
                 }
+                s.cards.extend(r.cards);
                 s.status.seed_state(r.ended_at.is_some(), r.idle);
             }
             s
@@ -541,6 +593,8 @@ impl Merger {
                     ended_at: s.ended_at,
                     idle: s.status.is_idle(),
                     last_seen: None,
+                    // 移出前暫存的卡片早就逾時降級了
+                    cards: Vec::new(),
                 };
                 self.resumed.insert(id, r);
             }
