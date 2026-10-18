@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::event::{AttentionKind, Event};
-use crate::hooks::serve_hooks;
+use crate::hooks::{HookServer, serve_hooks};
 use crate::merge::{Input, Merger};
 use crate::prices::Prices;
 use crate::rules::RuleSet;
@@ -42,6 +43,17 @@ const AGENT_META_TRIES: u32 = 40;
 /// 等上一個 collector 放掉 store 鎖最多多久（它只剩停 tail 與 flush）
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 pub const STORE_LOCK: &str = "collector.lock";
+/// 執行中 collector 的位址（contracts §5）
+pub const INFO_FILE: &str = "collector.json";
+/// collector 起不來的紀錄（L-1）
+pub const FAILED_FILE: &str = "collector.failed";
+/// collector.failed 多久以內算「最近起不來」：這段時間 ensure 不再拉起
+pub const FAILED_FRESH_MS: u64 = 60_000;
+/// hook 埠被佔用、卻沒有 collector 拿著鎖：等這麼久還是這樣，就當成被別的程式佔走
+/// （剛綁好埠、還沒拿到鎖的另一個 collector 也會短暫是這樣）
+const FOREIGN_PORT_AFTER: Duration = Duration::from_secs(1);
+/// web 埠綁不到時多久重試一次（L-4）
+const WEB_RETRY: Duration = Duration::from_secs(2);
 /// 多久清一次超過保留期限的 session（啟動時先清一次）
 const PRUNE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -79,6 +91,108 @@ pub fn log(msg: &str) {
     crate::logging::log(msg);
 }
 
+// ── collector 在不在跑（contracts §5、#738）：鎖＝在跑、collector.json＝位址、collector.failed＝起不來。
+// ensure、stop、healthz、service status 都用這一套判斷，不靠 TCP 探測猜（Windows 連沒在聽的埠要約 2 秒才回拒絕）
+
+/// collector.json 的內容。
+#[derive(Clone, Debug)]
+pub struct Info {
+    pub pid: u64,
+    pub hook: Option<SocketAddr>,
+    /// web 埠還沒綁上時是 None（L-4）
+    pub web: Option<SocketAddr>,
+    /// 正在結束（#685）：hook 埠放掉後新的 collector 可以接手
+    pub closing: bool,
+}
+
+pub fn read_info(home: &Path) -> Option<Info> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(INFO_FILE)).ok()?).ok()?;
+    let addr = |k: &str| v[k].as_str().and_then(|a| a.parse().ok());
+    Some(Info {
+        pid: v["pid"].as_u64().unwrap_or(0),
+        hook: addr("hook"),
+        web: addr("web"),
+        closing: v["closing"].as_bool().unwrap_or(false),
+    })
+}
+
+pub enum State {
+    /// 沒有人拿著 store 鎖
+    Down,
+    /// 有 collector 拿著鎖；collector.json 還沒寫（啟動中）或已刪（結束中）時是 None
+    Up(Option<Info>),
+}
+
+pub fn state(home: &Path) -> State {
+    match try_lock_store(home) {
+        Ok(Some(lock)) => {
+            drop(lock);
+            State::Down
+        }
+        Ok(None) => State::Up(read_info(home)),
+        // 鎖檔開不了（目錄不在、權限）：只能看 collector.json
+        Err(_) => read_info(home).map_or(State::Down, |i| State::Up(Some(i))),
+    }
+}
+
+/// 記下起不來的原因：之後的 ensure 在 [`FAILED_FRESH_MS`] 內不再拉起（L-1），訊息帶位址或檔名。
+pub fn write_failed(home: &Path, error: &str, addr: Option<SocketAddr>, file: Option<&Path>) {
+    let mut v = json!({ "ts": crate::now_ms(), "error": error });
+    if let Some(a) = addr {
+        v["addr"] = json!(a.to_string());
+    }
+    if let Some(f) = file {
+        v["file"] = json!(f.to_string_lossy().replace('\\', "/"));
+    }
+    log(&format!("起不來：{v}"));
+    let _ = std::fs::write(home.join(FAILED_FILE), v.to_string());
+}
+
+/// `since`（epoch ms）之後寫的 collector.failed 的錯誤訊息。
+pub fn failed_since(home: &Path, since: u64) -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join(FAILED_FILE)).ok()?).ok()?;
+    (v["ts"].as_u64()? >= since).then(|| v["error"].as_str().unwrap_or("").to_string())
+}
+
+fn write_info(home: &Path, me: u32, hook: SocketAddr, webs: &[SocketAddr], closing: bool) {
+    let v = json!({
+        "pid": me, "hook": hook.to_string(), "web": webs.first().map(|a| a.to_string()),
+        "webs": webs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(), "closing": closing,
+    });
+    if let Err(e) = std::fs::write(home.join(INFO_FILE), v.to_string()) {
+        log(&format!("寫不了 {INFO_FILE}：{e}"));
+    }
+}
+
+/// 綁 hook 埠（這也是單例鎖）。被佔用時分三種：上一個 collector 正在結束（collector.json 標 closing，#685）
+/// → 等它放掉再綁；另一個 collector 在跑 → `Ok(None)`；沒有 collector 卻被佔用（別的程式、別的資料目錄）→ 錯誤。
+async fn bind_hooks(cfg: &Config, tx: &mpsc::Sender<Input>) -> io::Result<Option<HookServer>> {
+    let deadline = Instant::now() + STORE_LOCK_WAIT;
+    let mut down_since: Option<Instant> = None;
+    loop {
+        match serve_hooks(cfg.hook_bind, tx.clone()).await {
+            Ok(h) => return Ok(Some(h)),
+            Err(e) if e.kind() == io::ErrorKind::AddrInUse => match state(&cfg.home) {
+                State::Up(Some(i)) if i.closing && Instant::now() < deadline => down_since = None,
+                State::Up(_) => return Ok(None),
+                State::Down => {
+                    if down_since.get_or_insert_with(Instant::now).elapsed() >= FOREIGN_PORT_AFTER {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!("{e}（沒有 collector 在跑，埠被別的程式佔用）"),
+                        ));
+                    }
+                }
+            },
+            Err(e) => return Err(e),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 pub async fn run(cfg: Config) -> io::Result<Outcome> {
     std::fs::create_dir_all(&cfg.home)?;
     // 背景執行（ensure 拉起）時自己寫 collector.log 並輪替；前景跑時照舊印到終端機
@@ -87,26 +201,45 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     {
         log(&format!("開不了 collector.log：{e}"));
     }
+    // 能預先知道會失敗的在綁 hook 埠之前檢查（L-1）：綁了就會回 200，之後才起不來的話那些 hook 就丟了
+    if let Err(e) = crate::store::preflight(&cfg.home) {
+        let msg = e.to_string();
+        write_failed(&cfg.home, &msg, None, Some(&cfg.home.join("index.sqlite")));
+        return Err(io::Error::other(msg));
+    }
     let (tx, mut rx) = mpsc::channel::<Input>(INPUT_QUEUE);
-    let hooks = match serve_hooks(cfg.hook_bind, tx.clone()).await {
-        Ok(h) => h,
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => return Ok(Outcome::AlreadyRunning),
-        Err(e) => return Err(e),
+    let hooks = match bind_hooks(&cfg, &tx).await {
+        Ok(Some(h)) => h,
+        Ok(None) => return Ok(Outcome::AlreadyRunning),
+        Err(e) => {
+            let msg = format!("hook 入口 {} 綁不到：{e}", cfg.hook_bind);
+            write_failed(&cfg.home, &msg, Some(cfg.hook_bind), None);
+            return Err(io::Error::new(e.kind(), msg));
+        }
     };
     let hook_addr = hooks.addr;
+    // 等鎖期間已經回 200 的 hook 還在佇列裡，起不來就丟了：至少留下紀錄
+    let lost = |tx: &mpsc::Sender<Input>| INPUT_QUEUE - tx.capacity();
     let store_lock = match lock_store(&cfg.home).await {
         Ok(lock) => lock,
         Err(e) => {
-            // 等鎖期間已經回 200 的 hook 還在佇列裡，結束就丟了：至少留下紀錄
-            log(&format!(
+            let msg = format!(
                 "{e}；放棄啟動，等鎖期間收到的 {} 個 hook 沒有寫入",
-                INPUT_QUEUE - tx.capacity()
-            ));
-            return Err(e);
+                lost(&tx)
+            );
+            write_failed(&cfg.home, &msg, None, Some(&cfg.home.join(STORE_LOCK)));
+            return Err(io::Error::other(msg));
         }
     };
 
-    let mut store = Store::open(&cfg.home).map_err(|e| io::Error::other(e.to_string()))?;
+    let mut store = match Store::open(&cfg.home) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("{e}；放棄啟動，收到的 {} 個 hook 沒有寫入", lost(&tx));
+            write_failed(&cfg.home, &msg, None, Some(&cfg.home.join("index.sqlite")));
+            return Err(io::Error::other(msg));
+        }
+    };
     // 啟動時先清超過保留期限的 session，再把計數交給 merge：反過來的話 merge 會把清掉的 session
     // 當成「被丟下」補發 session.ended，又把它寫回 store
     prune_store(&mut store);
@@ -159,28 +292,31 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             .collect(),
     );
     web.flush(crate::now_ms());
-    // 每個 [web].bind 各一個 listener，共用同一個 WebState（#722）；第一個是主要位址
-    let (web_addr, web_task) = serve_web(cfg.web_bind, web.clone()).await?;
-    let mut web_addrs = vec![web_addr];
-    let mut extra_tasks = Vec::new();
-    for b in cfg.web_binds.iter().skip(1) {
-        let (a, t) = serve_web(*b, web.clone()).await?;
-        web_addrs.push(a);
-        extra_tasks.push(t);
+    // 每個 [web].bind 各一個 listener，共用同一個 WebState（#722）；第一個是主要位址。
+    // 綁不到的不讓整個 collector 結束（已回 200 的 hook 會跟著丟），照收 hook、定期重試（L-4）
+    let mut web_addrs = Vec::new();
+    let mut web_tasks = Vec::new();
+    let mut web_pending = Vec::new();
+    for b in std::iter::once(cfg.web_bind).chain(cfg.web_binds.iter().skip(1).copied()) {
+        match serve_web(b, web.clone()).await {
+            Ok((a, t)) => {
+                web_addrs.push(a);
+                web_tasks.push(t);
+            }
+            Err(e) => {
+                log(&format!(
+                    "web 入口 {b} 綁不到：{e}；hook 照收，每 {} 秒重試",
+                    WEB_RETRY.as_secs()
+                ));
+                web_pending.push(b);
+            }
+        }
     }
     let flusher = web.spawn_flusher();
 
-    let info = cfg.home.join("collector.json");
     let me = std::process::id();
-    std::fs::write(
-        &info,
-        json!({
-            "pid": me, "hook": hook_addr.to_string(), "web": web_addr.to_string(),
-            "webs": web_addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-            "version": env!("CARGO_PKG_VERSION"), "startedAt": crate::now_ms(),
-        })
-        .to_string(),
-    )?;
+    write_info(&cfg.home, me, hook_addr, &web_addrs, false);
+    let _ = std::fs::remove_file(cfg.home.join(FAILED_FILE));
     log(&format!(
         "hook {hook_addr}、web {}、資料 {}",
         web_addrs
@@ -241,6 +377,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut rescore = tokio::time::interval(SCORE_EVERY);
     let mut prune = tokio::time::interval(PRUNE_EVERY);
     prune.tick().await; // 第一次立即觸發，啟動時已經清過
+    let mut web_retry = tokio::time::interval(WEB_RETRY);
+    web_retry.tick().await;
     let mut rebase = tokio::time::interval(COST_BASELINE_EVERY);
     rebase.tick().await; // 第一次立即觸發，啟動時已經算過
     let idle = Duration::from_secs(cfg.idle_exit_seconds);
@@ -323,14 +461,35 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     }
                     Some(_) => {
                         hooks.set_closing(false);
+                        write_info(&cfg.home, me, hook_addr, &web_addrs, false);
                         closing_since = None;
                     }
                     None if idle_now => {
                         hooks.set_closing(true);
+                        // 新的 collector 看到 closing 才會等這個埠放掉、接手（#685）
+                        write_info(&cfg.home, me, hook_addr, &web_addrs, true);
                         closing_since = Some(Instant::now());
                     }
                     None => {}
                 }
+            }
+            _ = web_retry.tick(), if !web_pending.is_empty() => {
+                let before = web_pending.len();
+                let mut still = Vec::new();
+                for b in web_pending.drain(..) {
+                    match serve_web(b, web.clone()).await {
+                        Ok((a, t)) => {
+                            log(&format!("web 入口 http://{a} 開始服務"));
+                            web_addrs.push(a);
+                            web_tasks.push(t);
+                        }
+                        Err(_) => still.push(b),
+                    }
+                }
+                if still.len() < before {
+                    write_info(&cfg.home, me, hook_addr, &web_addrs, closing_since.is_some());
+                }
+                web_pending = still;
             }
             _ = rebase.tick() => {
                 let now = crate::now_ms();
@@ -363,8 +522,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         }
     }
 
-    // 先放掉 hook 埠：之後 ensure 的 probe 會失敗而拉起新的 collector（它會等 store 鎖）
+    // 先放掉 hook 埠：ensure 會拉起新的 collector，它看到 closing 就等這個埠、綁上之後收 hook、等 store 鎖（#685）
     hooks.set_closing(true);
+    write_info(&cfg.home, me, hook_addr, &web_addrs, true);
     hooks.close().await;
     stop_all(tails.into_values(), &mut rx, |input| {
         sink(merger.handle(input))
@@ -373,11 +533,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
         log(&format!("寫入 store 失敗：{e}"));
     }
-    for task in [web_task, flusher].into_iter().chain(extra_tasks) {
+    for task in std::iter::once(flusher).chain(web_tasks) {
         task.abort();
         let _ = task.await;
     }
-    remove_info_if_mine(&info, me);
     // 先關 SQLite（最後一條連線關閉時做 checkpoint，I/O 忙時要好幾秒）才放 store 鎖：
     // 鎖一放掉 ensure 拉起的新 collector 就會開 store，不能撞上還在 checkpoint 的資料庫（#727）
     drop(web);
@@ -385,6 +544,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         Ok(store) => drop(store.into_inner().unwrap_or_else(|e| e.into_inner())),
         Err(_) => log("結束時 store 還有別的持有者，放鎖前沒能先關閉 SQLite"),
     }
+    // 順序：放 hook 埠 → flush、關 SQLite → 刪 collector.json → 放鎖（contracts §5、L-13）
+    remove_info_if_mine(&cfg.home.join(INFO_FILE), me);
     drop(store_lock);
     Ok(Outcome::Stopped)
 }

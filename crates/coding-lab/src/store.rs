@@ -298,6 +298,35 @@ pub struct Store {
     recover_bytes: u64,
 }
 
+/// 開 store 之前先檢查會讓它起不來的情況（L-1）：index.sqlite 打不開、schema 比支援的新。唯讀、不拿 store 鎖，
+/// 上一個 collector 還在寫的時候也可以查；serve 在綁 hook 埠之前呼叫，失敗的話一個 hook 都還沒收。
+pub fn preflight(home: &Path) -> Result<(), StoreError> {
+    let path = home.join("index.sqlite");
+    if !path.exists() {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_meta: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    let v: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match v.and_then(|s| s.parse::<u32>().ok()) {
+        Some(v) if v > SCHEMA_VERSION => Err(StoreError::FutureSchema(v)),
+        _ => Ok(()),
+    }
+}
+
 impl Store {
     /// 開啟（或建立）資料目錄：`<home>/events/`、`<home>/index.sqlite`。
     pub fn open(home: &Path) -> Result<Store, StoreError> {
