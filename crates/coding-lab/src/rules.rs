@@ -4,9 +4,12 @@
 //! 同 id 取代、新 id 放在最前面（使用者規則優先）、`disable` 停用。檔案壞掉或任何 pattern 編譯失敗，
 //! 整份不用、退回內建並回傳警告讓呼叫端寫 log。
 //!
-//! 指令型工具（[`COMMAND_TOOLS`]：Bash、PowerShell）依 `&&`／`;`／`|`／換行切段（引號內不切），每段各取「第一條命中」的規則，整條指令取最嚴重的等級；
-//! 所以 `rm -rf target && rm -rf /` 會被判 danger。`scope: command` 的規則（如 `curl … | sh`）比對整條指令。
-//! 段落另外去掉 `sudo`、`env`、`VAR=值` 等前綴再比一次，`sudo rm -rf x` 兩種都看得到。
+//! 指令型工具（[`COMMAND_TOOLS`]：Bash、PowerShell）先依 sh 的規則分詞（[`shell_parse`]：引號、跳脫與續行、
+//! heredoc 本文不當成指令），依 `&&`／`;`／`|`／換行切段，每段各取「第一條命中」的規則，整條指令取最嚴重的等級；
+//! 所以 `rm -rf target && rm -rf /` 會被判 danger。`scope: command` 的規則（如 `curl … | sh`）比對依原本分隔符號
+//! 接回來的整條指令，引號內的 `| ; &` 先中和（`echo 'curl x | sh'` 不算）。
+//! 段落另外去掉 `sudo`、`env`、`timeout` 這類包裝與 `VAR=值` 前綴、指令只留檔名（`/bin/rm` → `rm`）再比一次；
+//! `$( … )`、`( … )`、`bash -c`、`eval`、`find -exec` 裡的指令遞迴檢查。規則的 `unless` 也命中時不算（#745）。
 
 use std::path::Path;
 
@@ -14,7 +17,7 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::derive::{normalize_command, shell_segments};
+use crate::derive::{ShellParse, normalize_command, shell_parse};
 use crate::event::{COMMAND_TOOLS, COMMAND_TOOLS_ALIAS, Danger, DangerLevel, is_command_tool};
 use crate::merge::DangerRules;
 
@@ -41,6 +44,9 @@ struct RuleSpec {
     #[serde(default)]
     scope: Scope,
     pattern: String,
+    /// 這個也命中時不算（例如 `--dry-run`）：比對的文字和 `pattern` 相同（#745）
+    #[serde(default)]
+    unless: Option<String>,
     level: DangerLevel,
     why: String,
 }
@@ -56,6 +62,13 @@ enum Scope {
 struct Rule {
     spec: RuleSpec,
     re: Regex,
+    unless: Option<Regex>,
+}
+
+impl Rule {
+    fn hits(&self, text: &str) -> bool {
+        self.re.is_match(text) && !self.unless.as_ref().is_some_and(|u| u.is_match(text))
+    }
 }
 
 pub struct RuleSet {
@@ -139,7 +152,13 @@ fn compile(specs: Vec<RuleSpec>) -> Result<RuleSet, String> {
                 return Err(format!("規則 {} 套用在 {t}，field 只能是 command", spec.id));
             }
             let re = Regex::new(&spec.pattern).map_err(|e| format!("規則 {}：{e}", spec.id))?;
-            Ok(Rule { spec, re })
+            let unless = spec
+                .unless
+                .as_deref()
+                .map(Regex::new)
+                .transpose()
+                .map_err(|e| format!("規則 {} 的 unless：{e}", spec.id))?;
+            Ok(Rule { spec, re, unless })
         })
         .collect::<Result<_, String>>()?;
     Ok(RuleSet { rules })
@@ -153,35 +172,122 @@ fn more_severe(a: Option<Danger>, b: Option<Danger>) -> Option<Danger> {
     }
 }
 
-/// 去掉 `sudo [-選項]`、`env`、`VAR=值`、`nohup`、`time`、`exec` 這類前綴。
-fn strip_wrappers(tokens: &[String]) -> &[String] {
+/// 包裝指令的選項裡，後面帶一個值的（`sudo -u root`、`timeout -s KILL`）。
+fn takes_value(wrapper: &str, opt: &str) -> bool {
+    if let Some(long) = opt.strip_prefix("--") {
+        return !long.contains('=')
+            && match wrapper {
+                "sudo" | "doas" => matches!(
+                    long,
+                    "user" | "group" | "chdir" | "prompt" | "role" | "type" | "host" | "other-user"
+                ),
+                "env" => matches!(long, "unset" | "chdir" | "split-string"),
+                "timeout" => matches!(long, "signal" | "kill-after"),
+                _ => false,
+            };
+    }
+    match wrapper {
+        // 合併的短選項看最後一個字：`-iu root`
+        "sudo" | "doas" => opt.ends_with(['u', 'g', 'C', 'p', 'h', 'r', 't', 'U', 'D', 'T']),
+        "env" => matches!(opt, "-u" | "-C" | "-S"),
+        "nice" => opt == "-n",
+        "ionice" => matches!(opt, "-c" | "-n" | "-p" | "-P" | "-u"),
+        "stdbuf" => matches!(opt, "-i" | "-o" | "-e"),
+        "time" => matches!(opt, "-f" | "-o"),
+        "timeout" => matches!(opt, "-s" | "-k"),
+        "exec" => opt == "-a",
+        "xargs" => matches!(opt, "-n" | "-I" | "-L" | "-P" | "-d" | "-s" | "-E" | "-a"),
+        _ => false,
+    }
+}
+
+/// 去掉 `sudo`、`doas`、`env`、`timeout`、`nice`、`ionice`、`stdbuf`、`time`、`nohup`、`exec`、`command`、`xargs`
+/// 這類包裝（連同它們的選項；`timeout` 還有時間長度）與 `VAR=值` 前綴；指令只留檔名（`/bin/rm` → `rm`，C25、A-N4）。
+fn strip_wrappers(tokens: &[String]) -> Vec<String> {
     let mut i = 0;
     while let Some(t) = tokens.get(i) {
-        match t.as_str() {
-            "sudo" => {
+        let wrapper = t.as_str();
+        match wrapper {
+            "sudo" | "doas" | "env" | "timeout" | "nice" | "ionice" | "stdbuf" | "time"
+            | "nohup" | "exec" | "command" | "xargs" => {
                 i += 1;
-                while tokens.get(i).is_some_and(|t| t.starts_with('-')) {
-                    // -u／-g 後面帶一個值
-                    let takes_value = matches!(tokens[i].as_str(), "-u" | "-g" | "-C");
-                    i += if takes_value { 2 } else { 1 };
+                while let Some(o) = tokens.get(i) {
+                    if o == "--" {
+                        i += 1;
+                        break;
+                    }
+                    // `env -` 等於 `env -i`
+                    if !o.starts_with('-') || (o == "-" && wrapper != "env") {
+                        break;
+                    }
+                    i += if takes_value(wrapper, o) { 2 } else { 1 };
                 }
-            }
-            "env" | "nohup" | "time" | "exec" | "command" => i += 1,
-            "xargs" => {
-                i += 1;
-                while tokens.get(i).is_some_and(|t| t.starts_with('-')) {
-                    let takes_value = matches!(
-                        tokens[i].as_str(),
-                        "-n" | "-I" | "-L" | "-P" | "-d" | "-s" | "-E" | "-a"
-                    );
-                    i += if takes_value { 2 } else { 1 };
+                if wrapper == "timeout" {
+                    i += 1; // 時間長度
                 }
             }
             t if t.contains('=') && !t.starts_with('-') && !t.starts_with('=') => i += 1,
             _ => break,
         }
     }
-    &tokens[i.min(tokens.len())..]
+    let mut out = tokens[i.min(tokens.len())..].to_vec();
+    if let Some(first) = out.first_mut()
+        && let Some(name) = first.rsplit('/').next().filter(|n| !n.is_empty())
+    {
+        *first = name.to_string();
+    }
+    out
+}
+
+/// 一段指令裡要再檢查的指令：`bash -c '…'`、`cmd /c …`、`powershell -Command …`、`eval …`、`find -exec … ;`。
+fn inner_commands(tool: &str, words: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some((t, inner)) = shell_c_argument(words) {
+        out.push((t.to_string(), inner));
+    }
+    match words.first().map(String::as_str) {
+        Some("eval") => out.push((tool.to_string(), words[1..].join(" "))),
+        Some("find") => {
+            let mut rest = words.iter();
+            while rest
+                .by_ref()
+                .any(|w| matches!(w.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
+            {
+                let cmd: Vec<&str> = rest
+                    .by_ref()
+                    .take_while(|w| *w != ";" && *w != "+")
+                    .map(String::as_str)
+                    .collect();
+                out.push((tool.to_string(), cmd.join(" ")));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `scope: command` 比對的文字：依原本的分隔符號接回來的整條指令；引號與 heredoc 裡的 `| ; &` 換成空白，
+/// 字串裡的「管線」不會被當成真的管線。
+fn command_view(parsed: &ShellParse) -> String {
+    let mut out = String::new();
+    for seg in &parsed.segments {
+        for (k, w) in seg.words.iter().enumerate() {
+            if k > 0 {
+                out.push(' ');
+            }
+            if w.quoted {
+                out.extend(
+                    w.text
+                        .chars()
+                        .map(|c| if matches!(c, '|' | ';' | '&') { ' ' } else { c }),
+                );
+            } else {
+                out.push_str(&w.text);
+            }
+        }
+        out.push_str(if seg.piped { " | " } else { " ; " });
+    }
+    out
 }
 
 impl RuleSet {
@@ -196,7 +302,7 @@ impl RuleSet {
                     "file_path"
                 }) == field
             })
-            .find(|r| r.re.is_match(text))
+            .find(|r| r.hits(text))
             .map(|r| Danger {
                 rule: r.spec.id.clone(),
                 level: r.spec.level,
@@ -207,41 +313,6 @@ impl RuleSet {
 
 /// 子殼、命令替換、`bash -c` 最多往裡看幾層。
 const MAX_NESTING: usize = 4;
-
-/// `( … )`、`$( … )`、`` ` … ` `` 裡的指令（單引號內的不算）。
-fn nested_commands(command: &str) -> Vec<String> {
-    let chars: Vec<char> = command.chars().collect();
-    let (mut single, mut double) = (false, false);
-    let mut opens: Vec<usize> = Vec::new();
-    let mut tick: Option<usize> = None;
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if single {
-            single = c != '\'';
-        } else {
-            match c {
-                '\\' => i += 1,
-                '\'' if !double => single = true,
-                '"' => double = !double,
-                '`' => match tick.take() {
-                    Some(start) => out.push(chars[start..i].iter().collect()),
-                    None => tick = Some(i + 1),
-                },
-                '(' if !double || (i > 0 && chars[i - 1] == '$') => opens.push(i + 1),
-                ')' => {
-                    if let Some(start) = opens.pop() {
-                        out.push(chars[start..i].iter().collect());
-                    }
-                }
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    out
-}
 
 /// `bash -c '…'`、`sh -lc "…"` 的指令字串（`tokens` 已去掉引號與 sudo 等前綴）。
 fn shell_c_argument(tokens: &[String]) -> Option<(&'static str, String)> {
@@ -284,14 +355,16 @@ fn is_shell(tool: &str) -> bool {
 
 impl RuleSet {
     fn check_command(&self, tool: &str, command: &str, depth: usize) -> Option<Danger> {
-        let mut worst = self.first_match(tool, "command", command, Scope::Command);
-        for seg in shell_segments(command) {
-            let raw = seg.join(" ");
-            let stripped = strip_wrappers(&seg);
+        let parsed = shell_parse(command);
+        let mut worst = self.first_match(tool, "command", &command_view(&parsed), Scope::Command);
+        for seg in &parsed.segments {
+            let words: Vec<String> = seg.words.iter().map(|w| w.text.clone()).collect();
+            let raw = words.join(" ");
             worst = more_severe(
                 worst,
                 self.first_match(tool, "command", &raw, Scope::Segment),
             );
+            let stripped = strip_wrappers(&words);
             let joined = stripped.join(" ");
             if joined != raw {
                 worst = more_severe(
@@ -299,16 +372,17 @@ impl RuleSet {
                     self.first_match(tool, "command", &joined, Scope::Segment),
                 );
             }
-            if depth < MAX_NESTING
-                && let Some((inner_tool, inner)) = shell_c_argument(stripped)
-            {
-                let inner = normalize_command(inner_tool, &inner);
-                worst = more_severe(worst, self.check_command(inner_tool, &inner, depth + 1));
+            if depth < MAX_NESTING {
+                for (inner_tool, inner) in inner_commands(tool, &stripped) {
+                    let inner = normalize_command(&inner_tool, &inner);
+                    worst = more_severe(worst, self.check_command(&inner_tool, &inner, depth + 1));
+                }
             }
         }
+        // 只有最外層的 `$( … )`、`( … )`；更深的在遞迴裡分詞時才拿到（E-B5）
         if depth < MAX_NESTING {
-            for inner in nested_commands(command) {
-                worst = more_severe(worst, self.check_command(tool, &inner, depth + 1));
+            for inner in &parsed.nested {
+                worst = more_severe(worst, self.check_command(tool, inner, depth + 1));
             }
         }
         worst
@@ -331,9 +405,9 @@ impl DangerRules for RuleSet {
                 let field = r.spec.field.as_deref().unwrap_or("file_path");
                 input[field].as_str().is_some_and(|text| {
                     if field == "file_path" {
-                        r.re.is_match(&text.replace('\\', "/"))
+                        r.hits(&text.replace('\\', "/"))
                     } else {
-                        r.re.is_match(text)
+                        r.hits(text)
                     }
                 })
             })
