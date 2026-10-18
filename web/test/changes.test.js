@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createChanges, diffRows, writeRows, countHunk } from "../js/changes.js";
+import { createChanges, diffRows, writeRows, countHunk, editCounts } from "../js/changes.js";
 
 // file.edit／file.write Event 照 contracts.md §4
 const A = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -115,4 +115,23 @@ test("countHunk：只數 +／- 開頭的行，context 與空 hunk 不算（串�
   assert.deepEqual(countHunk([" a", "-b", "+c", "+d"]), { added: 2, removed: 1 });
   assert.deepEqual(countHunk([]), { added: 0, removed: 0 });
   assert.deepEqual(countHunk(undefined), { added: 0, removed: 0 });
+});
+
+test("遠端剝除、截斷、多處取代的 Edit：+／− 標成不知道，diff 寫明原因，不畫空白（#734 C8、#744 C7、#745 D7）", () => {
+  assert.deepEqual(editCounts({ hunk: { start: 1, oldLines: 1, newLines: 1, lines: ["-a", "+b"] } }), { added: 1, removed: 1, countsKnown: true, countLabel: null });
+  assert.equal(editCounts({ redacted: true, hunk: { start: 1, oldLines: 2, newLines: 3, lines: [] } }).countLabel, "敏感");
+  assert.equal(editCounts({ replaceAll: true, hunk: null }).countLabel, "多處取代");
+  assert.equal(editCounts({ truncated: true, hunk: { start: 1, oldLines: 1, newLines: 900, lines: ["+x"] } }).countLabel, "已截斷");
+  assert.equal(editCounts({ redacted: true }).countsKnown, false);
+
+  const ch = createChanges();
+  ch.apply([ev(A, "file.edit", { toolUseId: "r1", path: ".env", hunk: { start: 3, oldLines: 1, newLines: 1, lines: [] }, hunkSource: "pre", sensitive: true, redacted: true })]);
+  const e = ch.list[0];
+  assert.equal(e.redacted, true);
+  assert.equal(e.countLabel, "敏感");
+  assert.match(diffRows(e.hunk, e.hunkSource, e).at(-1).text, /敏感/);
+  assert.match(diffRows(null, "none", { replaceAll: true })[0].text, /多處取代/);
+  const cut = diffRows({ start: 1, oldLines: 1, newLines: 2, lines: ["+a"] }, "pre", { truncated: true });
+  assert.match(cut.at(-1).text, /8 KB/);
+  assert.match(writeRows("", false, true).at(-1).text, /敏感/);
 });

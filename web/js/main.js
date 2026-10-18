@@ -1,7 +1,6 @@
 import { createClient } from "./client.js";
 import { createStore, applySnapshot, applyFrame } from "./store.js";
 import { sessionColor, shortId } from "./color.js";
-import { installMock } from "./mock-feed.js";
 import { createStream } from "./stream.js";
 import { createStreamView } from "./stream-view.js";
 import { formatRow, esc } from "./format.js";
@@ -1503,7 +1502,7 @@ function renderPaneFiles(id) {
   h("span", { class: "ag" }, f.agents.map(who).join("、")))) : [h("div", { class: "none" }, "尚無改動")]));
   $("#spFb").hidden = !sel;
   if (sel) {
-    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT −${sel.removed} +${sel.added} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
+    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT ${sel.countLabel ?? `−${sel.removed} +${sel.added}`} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
     $("#spFbPath").textContent = sel.path;
     $("#spFbBody").innerHTML = diffHtml(sel);
   }
@@ -1522,7 +1521,9 @@ function renderChanges() {
     return;
   }
   const row = (c) => {
-    const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
+    const n = c.kind === "edit"
+      ? c.countLabel ? h("span", { class: "n" }, c.countLabel) : h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`))
+      : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
     return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
       h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
       h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
@@ -1549,7 +1550,7 @@ function renderDiff() {
   $("#gfbNone").hidden = !!c;
   if (!c) return;
   const who = `${shortId(c.session)} · ${agentWho(c.session, c.agent, agentName)}`;
-  $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
+  $("#fbKind").textContent = c.kind === "edit" ? `EDIT ${c.countLabel ?? `−${c.removed} +${c.added}`} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
   $("#fbPath").textContent = c.path;
   $("#fbPath").title = c.path;
   $("#fbBody").innerHTML = diffHtml(c);
@@ -1558,7 +1559,7 @@ function renderDiff() {
 
 // 修改情形的內容（全部串流的右欄與單 session 的檔案變更共用）
 function diffHtml(c) {
-  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource) : writeRows(c.content, c.truncated);
+  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource, c) : writeRows(c.content, c.truncated, c.redacted);
   const no = (v) => (v == null ? "" : String(v));
   return rows.map((r) => {
     if (r.type === "hunk") return `<div class="hunk">${esc(r.text)}</div>`;
@@ -1996,7 +1997,8 @@ bench.on = mockN > 0 && params.has("bench");
 bench.isolate = bench.on && params.has("isolate");
 // &prefill：mock 先產生一段歷史（每個 session 約 220 個 pos），用來試「載入更多」與 3000 行上限
 // &bigtree：檔案樹超過懶載入門檻（#642）
-const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
+// mock 只在 ?mock 時才載入（38 KB，正式環境用不到，#757 E-F11）
+const mock = mockN ? (await import("./mock-feed.js")).installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));

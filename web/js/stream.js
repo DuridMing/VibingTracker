@@ -4,7 +4,7 @@
 // - 超過上限從最舊的丟；往上「載入更多」時暫時保留（holding），回到底部再 trim。
 // - 篩選只影響可見性，不改順序。
 
-import { countHunk } from "./changes.js";
+import { editCounts } from "./changes.js";
 
 export const CAP = 3000;
 
@@ -124,7 +124,7 @@ export function createStream({ cap = CAP } = {}) {
         touch(id, ops);
         break;
       case "file.edit":
-        card(id, ev).edit = { path: p.path, ...countHunk(p.hunk?.lines) };
+        card(id, ev).edit = { path: p.path, ...editCounts(p) };
         touch(id, ops);
         break;
       case "file.write":

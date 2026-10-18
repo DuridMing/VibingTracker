@@ -136,7 +136,7 @@ test("衍生事件補進卡片：Edit 的增減行數、git commit、派出的 s
     called(A, "k1", "Task", { description: "找 .md" }), placed(A, "k1", 3),
     ev(A, "agent.spawned", { agentId: "a1", agentType: "Explore", name: "找 .md 檔", task: "列出 .md", parentToolUseId: "k1" }),
   ]);
-  assert.deepEqual(row(st, 0).card.edit, { path: "calc.py", added: 1, removed: 1 });
+  assert.deepEqual(row(st, 0).card.edit, { path: "calc.py", added: 1, removed: 1, countsKnown: true, countLabel: null });
   assert.equal(row(st, 1).card.git.hash, "4cf93bc");
   assert.equal(row(st, 2).card.agentName, "找 .md 檔");
 });
