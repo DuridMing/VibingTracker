@@ -14,7 +14,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::event::{Event, Payload};
 
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 /// 資料保留多久：最後活動早於這麼多天前的 session 由 [`Store::prune`] 清掉
 pub const RETENTION_DAYS: u64 = 30;
 
@@ -232,6 +232,16 @@ CREATE TABLE IF NOT EXISTS tails (
 /// v4：全專案回放（#702）依跨 session 順序鍵 (ts_seen, session, pos) 分頁，只索引進串流的 Event。
 const EVENTS_BY_TS_V4: &str = "
 CREATE INDEX IF NOT EXISTS events_by_ts ON events (ts_seen, session, pos) WHERE pos IS NOT NULL;
+";
+
+/// v6：拿掉 v4 的 events_by_ts（`/api/projects/events` 已移除，#742 D5：每筆帶 pos 的 Event 少一次 B-tree 插入）；
+/// 加每小時費用基準用的 usage 索引（#755 E-S5）、依種類找某個 session 的 Event（#756 E-H3）、
+/// prune 依 session 刪 file_touch（主鍵從 cwd 開始，沒有它要全表掃，#750 L-17）。資料不動。
+const INDEXES_V6: &str = "
+DROP INDEX IF EXISTS events_by_ts;
+CREATE INDEX IF NOT EXISTS events_usage_ts ON events (ts_seen) WHERE type = 'usage';
+CREATE INDEX IF NOT EXISTS events_by_type ON events (session, type, seq);
+CREATE INDEX IF NOT EXISTS file_touch_by_session ON file_touch (session);
 ";
 
 /// v5（#713）：`tails.line_no` 可為 NULL，把「不知道（從檔尾）」和「從頭讀、還沒有行產生 Event」（0）分開。
@@ -1488,6 +1498,9 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         }
         if v == 4 {
             tx.execute_batch(TAILS_V5)?;
+        }
+        if v == 5 {
+            tx.execute_batch(INDEXES_V6)?;
         }
         v += 1;
         tx.execute(
