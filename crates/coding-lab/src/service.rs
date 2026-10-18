@@ -477,10 +477,15 @@ fn oem_code_page() -> Option<u32> {
 /// 子程序輸出轉成文字：合法 UTF-8 照用；不是（Windows 的 schtasks 用 OEM code page，例如 cp950）就依這台的
 /// code page 解碼，解不了才 lossy。回報 `true` 表示最後是 lossy 的。
 pub fn decode_output(bytes: &[u8]) -> (String, bool) {
+    decode_output_with(bytes, oem_code_page())
+}
+
+/// `decode_output` 的本體，code page 由呼叫端給（測試不受執行機器的 OEM code page 影響）。
+pub fn decode_output_with(bytes: &[u8], code_page: Option<u32>) -> (String, bool) {
     if let Ok(t) = std::str::from_utf8(bytes) {
         return (t.trim().to_string(), false);
     }
-    if let Some(t) = oem_code_page().and_then(|cp| decode_with_code_page(bytes, cp)) {
+    if let Some(t) = code_page.and_then(|cp| decode_with_code_page(bytes, cp)) {
         return (t, false);
     }
     (String::from_utf8_lossy(bytes).trim().to_string(), true)

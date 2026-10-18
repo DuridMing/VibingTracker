@@ -26,7 +26,8 @@ fn tmp(name: &str) -> PathBuf {
 fn file_of<'a>(plan: &'a Plan, suffix: &str) -> &'a str {
     plan.files
         .iter()
-        .find(|(p, _)| p.to_string_lossy().ends_with(suffix))
+        // Windows 上 Path::join 產生 `\`，比對前統一成 `/`
+        .find(|(p, _)| p.to_string_lossy().replace('\\', "/").ends_with(suffix))
         .map(|(_, c)| c.as_str())
         .unwrap_or_else(|| panic!("plan 裡沒有 {suffix}：{:?}", plan.files))
 }
@@ -326,8 +327,10 @@ fn install_restores_the_collector_when_registration_fails() {
 fn non_utf8_command_output_is_flagged_instead_of_shown_as_garbage() {
     let (text, lossy) = service::decode_output(b"ERROR: Access is denied.\r\n");
     assert_eq!((text.as_str(), lossy), ("ERROR: Access is denied.", false));
-    // cp950 的「錯誤: 存取被拒。」不是合法 UTF-8
-    let (text, lossy) = service::decode_output(b"\xbf\xf9\xbb~: \xa6s\xa8\xfa\xb3Q\xa9\xda\xa1C");
+    // cp950 的「錯誤: 存取被拒。」不是合法 UTF-8；沒有可用的 code page 時只能 lossy。
+    // code page 用注入的：在 OEM code page 950 的 Windows 上 decode_output 會解碼成功（#724），斷言就不成立（#732）
+    let (text, lossy) =
+        service::decode_output_with(b"\xbf\xf9\xbb~: \xa6s\xa8\xfa\xb3Q\xa9\xda\xa1C", None);
     assert!(lossy);
     assert!(!text.is_empty());
 }
