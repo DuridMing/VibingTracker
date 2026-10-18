@@ -290,8 +290,10 @@ function renderLive() {
 const SESS_SHOWN = 200;
 function renderSessions() {
   const all = allSessions().filter((s) => inProject(s.id));
-  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
+  // 列表藏著（預設在檔案樹分頁）時不重建：doing 幾乎每次工具呼叫都會變（#757 E-F3）；切回來時 showLeftTab 清掉簽章
+  if (left.tab !== "sess") return;
+  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sess").replaceChildren(
     ...(all.length
       ? all.slice(0, SESS_SHOWN).map((s) =>
@@ -459,7 +461,7 @@ function renderAttention() {
   const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
   const now = viewNow();
   const canAck = ui.welcome?.scope !== "view" && !tl.active; // 回放中不能確認（#730）
-  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(","); // 分數不在簽章裡：#728 之後只剩 tooltip 用，collector 每 10 秒重算就重建佇列太浪費（#757 E-F9）
   if (!changed("att", sig)) return;
   const todo = canAck ? ackAllTargets(rows, ackPending) : [];
   $("#ackAll").hidden = !todo.length;
@@ -1218,7 +1220,11 @@ function showLeftTab(name) {
   $("#tbar").hidden = name !== "tree";
   $("#treeLeg").hidden = name !== "tree";
   $("#sess").hidden = name !== "sess";
-  if (name === "sess") loadSessions();
+  if (name === "sess") {
+    lastSig.delete("sess");
+    loadSessions();
+    renderSessions();
+  }
   else left.dirty = true;
   render(true);
 }
@@ -1389,7 +1395,7 @@ let paneMoreReq = null;
 // 逾時之後才到的回覆：對得上最後一次請求就照樣套用，不丟（#747 F-10）
 let paneMoreLate = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
-const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
+const LANE_TEXT = AGENT_STATUS_TEXT; // 同一份對照（#757 E-D9）
 
 // replay：session 已不在 live（#653），從最新的往前讀（beforePos 不帶）
 function paneMore(replay = false) {
@@ -2077,7 +2083,8 @@ const client = createClient({
       // 回放中（#730）即時的 `*` 不碰主頁，但通知照常：回放期間真的發生的危險、等你不能因為在看回放就漏掉，
       // 離開時的 snapshot 會把它們當成已知、永遠不再通知（#765 C5）
       if (m.ch === "*" && tl.blocksLive()) return void notifier.frame(m.rows?.attention);
-      applyFrame(store, m);
+      // session 分頁同時訂了 `*` 與 session:<id>，兩邊帶同樣的列：只套 `*` 的（監視器只有自己的頻道，#757 E-F10）
+      if (m.ch === "*" || isMonitor) applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
       // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
       if (isSessionTab(ui.tab) && m.ch === `session:${pane.session}`) paneView.update(pane.apply(m.events));

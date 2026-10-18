@@ -1,6 +1,6 @@
 // transcript 降級的標語（#652）：collector 的 sessions 列帶 degraded（降級中的檔），這裡只決定怎麼說。
 
-const short = (id) => String(id).slice(0, 8);
+import { shortId as short } from "./color.js";
 
 /** @returns {{sessions: string[], text: string} | null} */
 export function degradedNotice(sessions) {
