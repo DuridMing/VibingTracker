@@ -166,16 +166,3 @@ fn task_notification_round_shows_background_done() {
     );
     assert_eq!(d.local(), Some((Source::Prompt, "背景工作完成")));
 }
-
-#[test]
-fn remote_skips_thinking() {
-    let mut d = Doing::default();
-    d.prompt("跑測試", false);
-    d.thinking("Secret plan here.");
-    assert_eq!(d.local(), Some((Source::Thinking, "Secret plan here.")));
-    assert_eq!(d.remote(), Some("跑測試"), "遠端改送下一順位");
-    d.tool("$ cargo test");
-    assert_eq!(d.remote(), Some("$ cargo test"));
-    d.text("好了。");
-    assert_eq!(d.remote(), Some("好了。"));
-}

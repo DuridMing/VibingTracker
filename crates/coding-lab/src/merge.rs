@@ -562,7 +562,7 @@ impl Merger {
                 no,
                 value,
                 ts_seen,
-            } => self.on_line(&session, &file, no, &value, ts_seen),
+            } => self.on_line(&session, &file, no, value, ts_seen),
             Input::Degraded {
                 session,
                 file,
@@ -1049,15 +1049,15 @@ impl Merger {
                 out.extend(self.start_session(&sid, p, &agent, meta(), ts_seen));
             }
             "UserPromptSubmit" => {
-                let prompt = s("prompt").unwrap_or_default();
+                let prompt = h.str_field("prompt").unwrap_or_default();
                 let p = PromptSubmitted {
-                    text: truncate(&prompt, PROMPT_LIMIT).0,
+                    text: truncate(prompt, PROMPT_LIMIT).0,
                     prompt_id: s("prompt_id"),
-                    source: status::is_task_notification(&prompt).then(|| "task".into()),
+                    source: status::is_task_notification(prompt).then(|| "task".into()),
                 };
                 out.push(self.emit(&sid, Payload::PromptSubmitted(p), meta()));
                 // 被 TaskStop 停掉的背景 agent 沒有 SubagentStop，只有這個通知（#677）
-                let notice = status::parse_task_notification(&prompt).filter(|n| {
+                let notice = status::parse_task_notification(prompt).filter(|n| {
                     self.sessions
                         .get(&sid)
                         .is_some_and(|ss| ss.started_agents.contains(&n.task_id))
@@ -1114,20 +1114,21 @@ impl Merger {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
                     return out;
                 };
-                let error = s("error").unwrap_or_default();
+                // 先截再複製：不整串 clone（E-M12）
+                let error = h.str_field("error").unwrap_or_default();
                 let p = ToolUpdated {
                     tool_use_id: id.clone(),
                     status: ToolStatus::Failed,
                     duration_ms: h.field("duration_ms").and_then(Value::as_u64),
-                    error: Some(truncate(&error, MESSAGE_LIMIT).0),
+                    error: Some(truncate(error, MESSAGE_LIMIT).0),
                     interrupted: h.field("is_interrupt").and_then(Value::as_bool),
                     danger: None,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
-                let code = exit_code(&error);
+                let code = exit_code(error);
                 let output = || {
-                    let (kept, cut) = text::truncate_bytes(&error, OUTPUT_LIMIT);
+                    let (kept, cut) = text::truncate_bytes(error, OUTPUT_LIMIT);
                     (kept.to_string(), cut)
                 };
                 out.extend(self.result_once(&sid, &id, false, code, output, &agent, ts_seen));
@@ -1154,8 +1155,9 @@ impl Merger {
             }
             "Stop" => {
                 let p = TurnStopped {
-                    last_message: s("last_assistant_message")
-                        .map(|m| truncate(&m, MESSAGE_LIMIT).0),
+                    last_message: h
+                        .str_field("last_assistant_message")
+                        .map(|m| truncate(m, MESSAGE_LIMIT).0),
                 };
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
                 if agent == "main" {
@@ -1203,8 +1205,9 @@ impl Merger {
                 };
                 let p = AgentFinished {
                     agent_id,
-                    last_message: s("last_assistant_message")
-                        .map(|m| truncate(&m, MESSAGE_LIMIT).0),
+                    last_message: h
+                        .str_field("last_assistant_message")
+                        .map(|m| truncate(m, MESSAGE_LIMIT).0),
                     transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
@@ -1782,7 +1785,15 @@ impl Merger {
 
     // ── transcript
 
-    fn on_line(&mut self, sid: &str, file: &str, no: u64, v: &Value, ts_seen: u64) -> Vec<Event> {
+    /// 收 owned 的行：thinking／text 的文字（常有幾十 KB）直接移進 Event，不再複製一份（E-M7）。
+    fn on_line(
+        &mut self,
+        sid: &str,
+        file: &str,
+        no: u64,
+        mut v: Value,
+        ts_seen: u64,
+    ) -> Vec<Event> {
         let s = self.session(sid);
         if let Some(uuid) = v["uuid"].as_str()
             && !s.seen_uuids.insert(uuid)
@@ -1818,9 +1829,13 @@ impl Merger {
         if v["type"] == "assistant"
             && let Some(m) = &real_model
         {
-            match s.last_model.insert(agent.clone(), m.clone()) {
-                Some(prev) if prev != *m => changed = Some(prev),
-                _ => {}
+            // 模型沒變（幾乎每一行）時不配置字串（E-M12）
+            match s.last_model.get_mut(&agent) {
+                Some(prev) if prev == m => {}
+                Some(prev) => changed = Some(std::mem::replace(prev, m.clone())),
+                None => {
+                    s.last_model.insert(agent.clone(), m.clone());
+                }
             }
             first_line_of_message =
                 !message_id.is_empty() && s.last_message.get(file).is_none_or(|m| *m != message_id);
@@ -1870,11 +1885,24 @@ impl Merger {
         out.extend(self.apply(sid, changes, "main", ts_seen));
         let s = self.session(sid);
 
-        let main = match (v["type"].as_str(), block["type"].as_str()) {
-            (Some("assistant"), Some("thinking")) => {
+        // 先決定是哪種行，match 才不會一直借著 `v`（下面要把文字從 `v` 移出來）
+        let kind = match (v["type"].as_str(), block["type"].as_str()) {
+            (Some("assistant"), Some(k @ ("thinking" | "text" | "tool_use"))) => k,
+            (Some("user"), Some("tool_result")) => "tool_result",
+            (Some("user"), Some("text"))
+                if block["text"]
+                    .as_str()
+                    .is_some_and(status::is_interrupt_text) =>
+            {
+                "interrupt"
+            }
+            _ => "",
+        };
+        let main = match kind {
+            "thinking" => {
                 let signed = block["signature"].as_str().is_some_and(|x| !x.is_empty());
                 let p = AssistantThinking {
-                    text: block["thinking"].as_str().unwrap_or_default().to_string(),
+                    text: take_first_block_str(&mut v, "thinking"),
                     summarized: !signed,
                     message_id,
                     model,
@@ -1882,16 +1910,16 @@ impl Merger {
                 };
                 vec![self.emit(sid, Payload::AssistantThinking(p), meta(true))]
             }
-            (Some("assistant"), Some("text")) => {
+            "text" => {
                 let p = AssistantText {
-                    text: block["text"].as_str().unwrap_or_default().to_string(),
+                    text: take_first_block_str(&mut v, "text"),
                     message_id,
                     model,
                     delayed,
                 };
                 vec![self.emit(sid, Payload::AssistantText(p), meta(true))]
             }
-            (Some("assistant"), Some("tool_use")) => {
+            "tool_use" => {
                 let Some(id) = block["id"].as_str().map(str::to_string) else {
                     return out;
                 };
@@ -1928,7 +1956,7 @@ impl Merger {
                     }
                 }
             }
-            (Some("user"), Some("tool_result")) => {
+            "tool_result" => {
                 let Some(id) = block["tool_use_id"].as_str() else {
                     return out;
                 };
@@ -1976,11 +2004,7 @@ impl Merger {
                 evs.extend(self.apply(sid, changes, &agent, ts_seen));
                 evs
             }
-            (Some("user"), Some("text"))
-                if block["text"]
-                    .as_str()
-                    .is_some_and(status::is_interrupt_text) =>
-            {
+            "interrupt" => {
                 let changes = self.tracker(sid).interrupted(ts_seen);
                 self.apply(sid, changes, "main", ts_seen)
             }
@@ -1988,6 +2012,20 @@ impl Merger {
         };
         out.extend(main);
         out
+    }
+}
+
+/// 把訊息第一個 content block 的字串欄位移出來（沒有或不是字串時給空字串）。
+fn take_first_block_str(v: &mut Value, key: &str) -> String {
+    match v
+        .get_mut("message")
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.get_mut(0))
+        .and_then(|b| b.get_mut(key))
+        .map(Value::take)
+    {
+        Some(Value::String(s)) => s,
+        _ => String::new(),
     }
 }
 
