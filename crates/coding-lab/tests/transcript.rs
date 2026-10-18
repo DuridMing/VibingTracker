@@ -4,11 +4,12 @@ mod common;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use coding_lab::merge::{AgentMetaRead, Input};
-use coding_lab::transcript::{Start, TailOptions, TailReader, spawn_tail, stop_all};
+use coding_lab::transcript::{SharedWatcher, Start, TailOptions, TailReader, spawn_tail, stop_all};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -477,6 +478,7 @@ async fn degraded_carries_the_tail_number() {
             poll_every: Duration::from_millis(50),
             use_notify: false,
             tail: 5,
+            ..TailOptions::default()
         },
     );
     let got = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -495,4 +497,112 @@ fn after_zero_reads_from_the_beginning() {
     let mut r = TailReader::open(&p, Start::After(0)).unwrap();
     let got: Vec<u64> = r.poll().unwrap().lines.iter().map(|l| l.no).collect();
     assert_eq!(got, [1, 2, 3]);
+}
+
+/// E-S6：整個 collector 只開一個 notify watcher。資料夾依引用計數 watch／unwatch，事件依檔名分給各 tail。
+#[tokio::test]
+async fn shared_watcher_counts_directories_and_routes_by_file() {
+    let x = tmpfile("");
+    let y = x.with_file_name("y.jsonl");
+    std::fs::write(&y, "").unwrap();
+    let z = tmpfile("");
+    let w = Arc::new(SharedWatcher::default());
+    let (na, nb, nc) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let ga = w.register(&x, na.clone()).expect("watch 失敗");
+    let gb = w.register(&y, nb.clone()).expect("watch 失敗");
+    let gc = w.register(&z, nc.clone()).expect("watch 失敗");
+    assert_eq!(w.watched_dirs(), 2, "同一個資料夾只 watch 一次");
+
+    append(&x, &line("a"));
+    tokio::time::timeout(Duration::from_secs(5), na.notified())
+        .await
+        .expect("寫 x 要叫醒 x 的 tail");
+    assert!(
+        tokio::time::timeout(Duration::ZERO, nb.notified())
+            .await
+            .is_err(),
+        "同資料夾別的檔不該被叫醒"
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, nc.notified())
+            .await
+            .is_err()
+    );
+
+    drop(ga);
+    assert_eq!(w.watched_dirs(), 2, "y 還在用 x 的資料夾");
+    drop(gb);
+    assert_eq!(w.watched_dirs(), 1);
+    drop(gc);
+    assert_eq!(w.watched_dirs(), 0);
+
+    // 全部放掉之後再登記還是收得到
+    let _ga = w.register(&x, na.clone()).expect("watch 失敗");
+    append(&x, &line("b"));
+    tokio::time::timeout(Duration::from_secs(5), na.notified())
+        .await
+        .expect("重新登記後要收得到");
+}
+
+/// E-S6：tail 用共用 watcher（輪詢關到一小時，只靠 notify 叫醒），停掉 tail 時資料夾跟著 unwatch。
+#[tokio::test]
+async fn tails_share_one_watcher_and_release_it_on_stop() {
+    let first = tmpfile("");
+    let paths: Vec<PathBuf> = (0..3)
+        .map(|i| {
+            let p = first.with_file_name(format!("s{i}.jsonl"));
+            std::fs::write(&p, "").unwrap();
+            p
+        })
+        .collect();
+    let w = Arc::new(SharedWatcher::default());
+    let (tx, mut rx) = mpsc::channel(64);
+    let tails: Vec<_> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            spawn_tail(
+                p.clone(),
+                format!("s{i}"),
+                "main".into(),
+                Start::Beginning,
+                tx.clone(),
+                TailOptions {
+                    poll_every: Duration::from_secs(3600),
+                    watcher: Some(w.clone()),
+                    ..TailOptions::default()
+                },
+            )
+        })
+        .collect();
+    // tail 開檔在 blocking 執行緒，等三個都登記好
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while w.watched_files() < 3 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tail 沒有登記到共用 watcher"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(w.watched_dirs(), 1);
+    for p in &paths {
+        append(p, &line("x"));
+    }
+    let mut got = std::collections::BTreeSet::new();
+    while got.len() < 3 {
+        if let Input::Line { session, .. } = next(&mut rx).await {
+            got.insert(session);
+        }
+    }
+    let mut it = tails.into_iter();
+    it.next().unwrap().stop().await;
+    assert_eq!((w.watched_files(), w.watched_dirs()), (2, 1));
+    for t in it {
+        t.stop().await;
+    }
+    assert_eq!((w.watched_files(), w.watched_dirs()), (0, 0));
 }

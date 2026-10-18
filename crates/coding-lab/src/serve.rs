@@ -22,7 +22,9 @@ use crate::merge::{Input, Merger};
 use crate::prices::Prices;
 use crate::rules::RuleSet;
 use crate::store::Store;
-use crate::transcript::{TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail, stop_all};
+use crate::transcript::{
+    SharedWatcher, TailAction, TailHandle, TailOptions, TailPlanner, spawn_tail, stop_all,
+};
 use crate::ws::{WebState, serve_web};
 
 /// 重啟時從 store 重建多久以內的 live 狀態（涵蓋任何時區的「今天」）。
@@ -396,6 +398,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         Err(e) => log(&format!("讀取 tail 行號失敗，照舊從檔尾讀：{e}")),
     }
     let mut tails: HashMap<(String, String), TailHandle> = HashMap::new();
+    // 所有 tail 共用一個 notify watcher（E-S6）
+    let watcher = Arc::new(SharedWatcher::default());
     // 每個 tail 一個編號：TailReset 帶新的編號，merge 不理會被取代的舊 tail 送來的降級（#684 R20）
     let mut next_tail: u64 = 1;
     let mut tick = tokio::time::interval(TICK);
@@ -455,7 +459,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                         let id = next_tail;
                         next_tail += 1;
                         sink(merger.handle(action.reset(crate::now_ms(), id)));
-                        apply_tail(action, id, &mut tails, &tx);
+                        apply_tail(action, id, &mut tails, &tx, &watcher);
                     }
                     web.set_health(health(tails.len(), 0, &hooks));
                 }
@@ -501,7 +505,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     for action in planner.on_session_ended(&session) {
                         let id = next_tail;
                         next_tail += 1;
-                        apply_tail(action, id, &mut tails, &tx);
+                        apply_tail(action, id, &mut tails, &tx, &watcher);
                     }
                 }
                 web.set_health(health(tails.len(), lag.as_millis() as u64, &hooks));
@@ -701,6 +705,7 @@ fn apply_tail(
     id: u64,
     tails: &mut HashMap<(String, String), TailHandle>,
     tx: &mpsc::Sender<Input>,
+    watcher: &Arc<SharedWatcher>,
 ) {
     let stop = |h: TailHandle| {
         tokio::spawn(h.stop());
@@ -723,6 +728,7 @@ fn apply_tail(
                 tx.clone(),
                 TailOptions {
                     tail: id,
+                    watcher: Some(watcher.clone()),
                     ..TailOptions::default()
                 },
             );
