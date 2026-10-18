@@ -1,7 +1,7 @@
 //! 敏感輸出（#654）：每條規則都有命中與不命中的案例。
 
-use coding_lab::sensitive::{is_sensitive, redact_keys, redact_remote};
-use serde_json::{Value, json};
+use coding_lab::sensitive::{is_sensitive, redact_keys};
+use serde_json::json;
 
 fn read(path: &str) -> bool {
     is_sensitive("Read", &json!({ "file_path": path }))
@@ -112,31 +112,6 @@ fn bash_reading_secrets_or_dumping_the_environment_hits() {
     ] {
         assert!(!bash(c), "{c}");
     }
-}
-
-#[test]
-fn redact_remote_blanks_sensitive_results_anywhere_in_a_frame() {
-    let ev = |sensitive: bool| {
-        json!({"type": "tool.result", "payload": {"toolUseId": "t", "ok": true, "output": "A=secret",
-               "truncated": false, "sensitive": sensitive}})
-    };
-    let mut frame = json!({"t": "frame", "events": [ev(true), ev(false)],
-                           "stream": [ev(true)], "nested": {"events": [ev(true)]}});
-    redact_remote(&mut frame);
-    let out = |v: &Value| {
-        (
-            v["payload"]["output"].clone(),
-            v["payload"]["redacted"].clone(),
-        )
-    };
-    assert_eq!(out(&frame["events"][0]), (json!(""), json!(true)));
-    assert_eq!(
-        out(&frame["events"][1]),
-        (json!("A=secret"), Value::Null),
-        "沒命中的不動"
-    );
-    assert_eq!(out(&frame["stream"][0]), (json!(""), json!(true)));
-    assert_eq!(out(&frame["nested"]["events"][0]), (json!(""), json!(true)));
 }
 
 /// #720：遠端送出的副本裡，這個系統自己發的金鑰（`clk_<8 碼>_<43 碼>`）不論出現在哪個字串欄位都只留 id。

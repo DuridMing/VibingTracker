@@ -10,7 +10,7 @@ use common::{arrivals, read_jsonl, sample_sessions};
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{
-    AgentMetaRead, DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger,
+    AgentMetaRead, CARD_KEEP_MS, DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger,
     SESSION_EVICT_AFTER_MS, SESSION_IDLE_EVICT_MS,
 };
 use serde_json::{Value, json};
@@ -331,6 +331,46 @@ fn duplicate_transcript_lines_are_ignored() {
     let mut m = merger();
     assert_eq!(m.handle(line(1, thinking("u1", "m1"), 1000)).len(), 1);
     assert!(m.handle(line(1, thinking("u1", "m1"), 1001)).is_empty());
+}
+
+/// uuid 去重存成數字（E-M5）：標準格式的 uuid 只差一個字也不能當成同一行；不是標準格式的照樣去重。
+#[test]
+fn uuid_dedup_tells_close_uuids_apart_and_keeps_other_formats() {
+    let mut m = merger();
+    let a = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e6f";
+    let b = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e60";
+    assert_eq!(m.handle(line(1, thinking(a, "m1"), 1000)).len(), 1);
+    assert_eq!(m.handle(line(2, thinking(b, "m1"), 1001)).len(), 1);
+    assert!(m.handle(line(1, thinking(a, "m1"), 1002)).is_empty());
+    let upper = a.to_uppercase();
+    assert_eq!(
+        m.handle(line(3, thinking(&upper, "m1"), 1003)).len(),
+        1,
+        "大小寫不同就是不同的字串，和以前一樣"
+    );
+    assert!(m.handle(line(3, thinking(&upper, "m1"), 1004)).is_empty());
+}
+
+/// 完成的卡片（已進串流、已結束、結果已送）留 [`CARD_KEEP_MS`] 給重複的 hook（K-3），之後釋放；
+/// 沒完成的不動（K-12：長開的 session 不再一直累積卡片）。
+#[test]
+fn finished_cards_are_released_after_a_while() {
+    let mut m = merger();
+    m.handle(pre("t1", "Bash", json!({ "command": "ls" }), 1_000));
+    m.handle(post("t1", 1_100));
+    m.handle(line(1, tool_use("u1", "m1", "t1"), 1_200));
+    m.handle(line(2, tool_result("u2", "t1"), 1_300));
+    m.handle(line(3, tool_use("u3", "m2", "t2"), 1_400));
+    assert_eq!(m.card_count(S), 2);
+    m.tick(2_000);
+    assert!(
+        m.handle(post("t1", 2_100)).is_empty(),
+        "保留期間重複的 hook 照樣不處理"
+    );
+    m.tick(2_000 + CARD_KEEP_MS / 2);
+    assert_eq!(m.card_count(S), 2, "還在保留期間");
+    m.tick(2_000 + CARD_KEEP_MS);
+    assert_eq!(m.card_count(S), 1, "t1 釋放，還在跑的 t2 留著");
 }
 
 #[test]

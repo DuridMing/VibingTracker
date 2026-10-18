@@ -125,3 +125,17 @@ test("讀取失敗之後不開始播放（#765 C14）", () => {
   tl.play();
   assert.equal(tl.playing, true);
 });
+
+test("續頁帶第一段回應的 from（挑 session 的下界），跨午夜時下半段不少算前一天的 session（#765、#742 C6）", () => {
+  assert.equal(
+    timelineUrl({ cwd: "/p", at: 50, until: 90, offset: 0, snapshot: false, from: 7 }),
+    "/api/projects/replay?cwd=%2Fp&at=50&until=90&offset=0&limit=2000&snapshot=0&from=7",
+  );
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 100 });
+  const req = tl.seek(0);
+  tl.loaded(req, { snapshot: {}, frames: [], next: 50, from: -3600 });
+  assert.equal(tl.lower, -3600, "記下伺服器算的下界");
+  tl.seek(20);
+  assert.equal(tl.lower, null, "重新 seek 由伺服器重算");
+});

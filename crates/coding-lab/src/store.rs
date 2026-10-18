@@ -141,7 +141,7 @@ pub struct AttentionRow {
 }
 
 const SCHEMA_V1: &str = "
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   host TEXT NOT NULL DEFAULT 'local',
   cwd TEXT NOT NULL,
@@ -162,9 +162,9 @@ CREATE TABLE sessions (
   last_seq INTEGER NOT NULL DEFAULT 0,
   summary TEXT
 );
-CREATE INDEX sessions_by_cwd ON sessions (cwd, started_at);
+CREATE INDEX IF NOT EXISTS sessions_by_cwd ON sessions (cwd, started_at);
 
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
   session TEXT NOT NULL,
   seq INTEGER NOT NULL,
   type TEXT NOT NULL,
@@ -173,9 +173,9 @@ CREATE TABLE events (
   offset INTEGER NOT NULL,
   PRIMARY KEY (session, seq)
 ) WITHOUT ROWID;
-CREATE INDEX events_by_pos ON events (session, pos) WHERE pos IS NOT NULL;
+CREATE INDEX IF NOT EXISTS events_by_pos ON events (session, pos) WHERE pos IS NOT NULL;
 
-CREATE TABLE file_touch (
+CREATE TABLE IF NOT EXISTS file_touch (
   cwd TEXT NOT NULL,
   path TEXT NOT NULL,
   session TEXT NOT NULL,
@@ -185,7 +185,7 @@ CREATE TABLE file_touch (
   PRIMARY KEY (cwd, path, session, kind)
 ) WITHOUT ROWID;
 
-CREATE TABLE changes (
+CREATE TABLE IF NOT EXISTS changes (
   session TEXT NOT NULL,
   seq INTEGER NOT NULL,
   tool_use_id TEXT NOT NULL,
@@ -198,9 +198,9 @@ CREATE TABLE changes (
   removed INTEGER,
   PRIMARY KEY (session, seq)
 ) WITHOUT ROWID;
-CREATE INDEX changes_by_ts ON changes (cwd, ts DESC);
+CREATE INDEX IF NOT EXISTS changes_by_ts ON changes (cwd, ts DESC);
 
-CREATE TABLE attention (
+CREATE TABLE IF NOT EXISTS attention (
   session TEXT NOT NULL,
   kind TEXT NOT NULL,
   ref TEXT NOT NULL,
@@ -290,12 +290,124 @@ pub struct Store {
     recover_bytes: u64,
 }
 
+// ── 權限（S-6、contracts §5）：資料目錄與底下的檔只給目前使用者（Claude Code 自己的 transcript 也是 0600）
+
+/// 建（或收緊）資料目錄：unix 0700；Windows 第一次建立時停用 ACL 繼承、只授權目前使用者，底下的檔沿用它。
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let existed = dir.exists();
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    if !existed {
+        restrict_dir_acl(dir);
+    }
+    let _ = existed;
+    Ok(())
+}
+
+/// `icacls <dir> /inheritance:r /grant:r <使用者>:(OI)(CI)F`：只在第一次建立時做一次。失敗只寫 log
+/// （%USERPROFILE% 底下預設本來就只有自己能讀）。
+#[cfg(windows)]
+fn restrict_dir_acl(dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(user) = std::env::var("USERNAME") else {
+        return;
+    };
+    let ok = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:(OI)(CI)F"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        crate::logging::log(&format!("store：收緊 {} 的 ACL 失敗", dir.display()));
+    }
+}
+
+/// 以追加模式開檔；新建的檔是 0600（unix）。
+pub fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path)
+}
+
+/// 整個寫入一個檔（collector.json、collector.failed）：0600（unix），已存在的也收緊。
+pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut o = OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path)?;
+    restrict_file(path)?;
+    f.write_all(data)
+}
+
+/// 別人建的檔（SQLite 的 index.sqlite）收緊成 0600；Windows 沿用資料目錄的 ACL。
+pub fn restrict_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// 開 store 之前先檢查會讓它起不來的情況（L-1）：index.sqlite 打不開、schema 比支援的新。唯讀、不拿 store 鎖，
+/// 上一個 collector 還在寫的時候也可以查；serve 在綁 hook 埠之前呼叫，失敗的話一個 hook 都還沒收。
+pub fn preflight(home: &Path) -> Result<(), StoreError> {
+    let path = home.join("index.sqlite");
+    if !path.exists() {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_meta: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    let v: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match v.and_then(|s| s.parse::<u32>().ok()) {
+        Some(v) if v > SCHEMA_VERSION => Err(StoreError::FutureSchema(v)),
+        _ => Ok(()),
+    }
+}
+
 impl Store {
     /// 開啟（或建立）資料目錄：`<home>/events/`、`<home>/index.sqlite`。
     pub fn open(home: &Path) -> Result<Store, StoreError> {
         let events_dir = home.join("events");
-        fs::create_dir_all(&events_dir)?;
+        create_private_dir(home)?;
+        create_private_dir(&events_dir)?;
         let db = Connection::open(home.join("index.sqlite"))?;
+        // -wal、-shm 由 SQLite 照資料庫檔的權限建立
+        restrict_file(&home.join("index.sqlite"))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         let backfill_tails = migrate(&db)?;
@@ -336,8 +448,20 @@ impl Store {
             if path.extension().is_none_or(|x| x != "jsonl") {
                 continue;
             }
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let Ok(e) = Event::from_json_line(&line?) else {
+            // 讀不到的檔、不是 UTF-8 的行略過，不讓回填失敗（L-14）
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "store：回填 tails 時讀不到 {}：{e}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            for line in BufReader::new(file).split(b'\n') {
+                let Ok(line) = line else { break };
+                let Ok(e) = Event::from_json_line(String::from_utf8_lossy(&line).trim_end()) else {
                     continue;
                 };
                 if let Some(l) = &e.line {
@@ -361,6 +485,7 @@ impl Store {
         for ((sid, file), no) in &last {
             tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
         }
+        tx.execute("DELETE FROM meta WHERE key = 'backfill_tails'", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -459,7 +584,7 @@ impl Store {
     /// 追加一批到 session 檔；寫到一半失敗就截回原長度，不留半行。
     fn write_batch(&mut self, b: &Batch) -> io::Result<()> {
         let path = self.events_dir.join(&b.name);
-        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = open_private_append(&path)?;
         if let Err(e) = f.write_all(&b.buf) {
             self.file_len.remove(&b.name);
             if let Err(t) = OpenOptions::new()
@@ -484,10 +609,37 @@ impl Store {
             .collect();
         files.sort();
         for path in files {
-            let len = fs::metadata(&path)?.len();
-            let Some(session) = first_session(&path)? else {
-                continue;
-            };
+            // 一個檔讀不到（被防毒或備份軟體鎖住）時跳過它，不讓整個 store 開不了（W-L8）
+            match self.recover_file(&path) {
+                Err(StoreError::Io(e)) => {
+                    crate::logging::log(&format!("store：讀不到 {}，先跳過：{e}", path.display()));
+                }
+                other => other?,
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_file(&mut self, path: &Path) -> Result<(), StoreError> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let len = fs::metadata(path)?.len();
+        let Some(session) = first_session(path)? else {
+            // 一行完整的 Event 都還沒有：截掉沒寫完的半行，新的寫入才不會黏在後面（L-10）
+            let bytes = fs::read(path)?;
+            let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            if (complete as u64) < len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(complete as u64)?;
+            }
+            self.file_len.insert(name, complete as u64);
+            return Ok(());
+        };
+        {
             let indexed: Option<i64> = self.db.query_row(
                 "SELECT MAX(offset) FROM events WHERE session = ?1",
                 params![session],
@@ -495,7 +647,7 @@ impl Store {
             )?;
             // 索引超前 JSONL（檔案被截短）時從頭讀
             let from = indexed.map(|o| o as u64).filter(|o| *o < len).unwrap_or(0);
-            let mut file = File::open(&path)?;
+            let mut file = File::open(path)?;
             file.seek(SeekFrom::Start(from))?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
@@ -503,12 +655,8 @@ impl Store {
             let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
             let end = from + complete as u64;
             if end < len {
-                OpenOptions::new().write(true).open(&path)?.set_len(end)?;
+                OpenOptions::new().write(true).open(path)?.set_len(end)?;
             }
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
             self.file_len.insert(name, end);
 
             let mut start = 0usize;
@@ -1083,12 +1231,22 @@ impl Store {
 }
 
 /// JSONL 第一行的 session（檔名經過清理，不一定等於 session id）。
+/// 檔案裡第一個完整、讀得懂的 Event 的 session。第一行可能斷在多位元組字元中間或寫壞了（L-10），
+/// 往下找；最後沒有換行的半行不算。
 fn first_session(path: &Path) -> Result<Option<String>, StoreError> {
-    let mut line = String::new();
-    BufReader::new(File::open(path)?).read_line(&mut line)?;
-    Ok(Event::from_json_line(line.trim_end())
-        .ok()
-        .map(|e| e.session))
+    const TRIES: usize = 64;
+    let mut r = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    for _ in 0..TRIES {
+        line.clear();
+        if r.read_until(b'\n', &mut line)? == 0 || line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        if let Ok(e) = Event::from_json_line(String::from_utf8_lossy(&line).trim_end()) {
+            return Ok(Some(e.session));
+        }
+    }
+    Ok(None)
 }
 
 /// session id 只留安全字元當檔名，payload 不能決定寫入路徑。
@@ -1129,18 +1287,22 @@ fn read_version(db: &Connection) -> rusqlite::Result<Option<u32>> {
 }
 
 /// 依版本逐步升級；v0（空資料庫）先建 v1 的表，再一路升上來。
-/// 回傳要不要回填 tails：舊版資料庫升到 v3 時要；新建的不用（JSONL 由 recover 從頭索引，順便填好）。
+/// 回傳要不要回填 tails：舊版資料庫升到 v3 時記下、回填完才清掉（新建的不用）。
 fn migrate(db: &Connection) -> Result<bool, StoreError> {
     let from = read_version(db)?;
     let mut v = match from {
         Some(v) if v > SCHEMA_VERSION => return Err(StoreError::FutureSchema(v)),
         Some(v) => v,
+        // 建表與版本號在同一個交易（L-14）：做到一半當掉的話整個沒做，下次重來；
+        // 舊版留下的半套表靠 SCHEMA_V1 的 IF NOT EXISTS 補完
         None => {
-            db.execute_batch(SCHEMA_V1)?;
-            db.execute(
+            let tx = db.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V1)?;
+            tx.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
                 [],
             )?;
+            tx.commit()?;
             1
         }
     };
@@ -1153,6 +1315,11 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         }
         if v == 2 {
             tx.execute_batch(TAILS_V3)?;
+            // 舊的資料庫要從 JSONL 回填 tails：記在 meta，回填成功才刪，中途失敗下次開啟再做（L-14）。
+            // 新建的不用（JSONL 由 recover 從頭索引，順便填好）
+            if from.is_some() {
+                tx.execute(BACKFILL_PENDING, [])?;
+            }
         }
         if v == 3 {
             tx.execute_batch(EVENTS_BY_TS_V4)?;
@@ -1167,8 +1334,18 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         )?;
         tx.commit()?;
     }
-    Ok(from.is_some_and(|v| v < 3))
+    let pending: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'backfill_tails'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(pending.is_some())
 }
+
+const BACKFILL_PENDING: &str =
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('backfill_tails', '1')";
 
 const SESSION_COLUMNS: &str = "id, host, cwd, transcript_path, model, branch, first_prompt, started_at, ended_at,
     end_reason, status, status_since, commits, dangers, failures, cost_usd, thinking_tokens, last_seq";
@@ -1274,11 +1451,12 @@ fn index_event(
             if cwd.is_empty() {
                 *cwd = p.cwd.clone();
             }
+            // status 只由 session.status 寫（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             exec(tx,
                 "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
-                   ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
-                params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],
+                   ended_at = NULL, end_reason = NULL WHERE id = ?1",
+                params![sid, p.cwd, p.transcript_path, p.model, p.branch],
             )?;
             if let Some(path) = &p.transcript_path {
                 exec(

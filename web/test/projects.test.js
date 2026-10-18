@@ -62,3 +62,16 @@ test("檔案樹的專案列（全部專案時）：每個專案一個標題列�
   assert.equal(two[0].open, true);
   assert.equal(two[3].open, false);
 });
+
+test("專案篩選：同一個 session 只算一次歸屬，cwd 還不知道的不快取（#757 E-F1）", async () => {
+  const { sessionFilterFor } = await import("../js/projects.js");
+  let lookups = 0;
+  const cwds = new Map([["a", "/p/w"], ["b", "/q"]]);
+  const f = sessionFilterFor("/p", ["/p", "/q"], (id) => { lookups++; return cwds.get(id); });
+  for (let i = 0; i < 1000; i++) f("a");
+  assert.equal(lookups, 1, "同一個 session 的歸屬要記住");
+  assert.equal(f("b"), false);
+  assert.equal(f("c"), true, "cwd 不知道的不藏");
+  cwds.set("c", "/q");
+  assert.equal(f("c"), false, "cwd 知道了之後重新判斷");
+});

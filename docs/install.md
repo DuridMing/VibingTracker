@@ -114,6 +114,14 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
 4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
 
+伺服器是 Windows 時，防火牆預設擋下其他機器連進來的連線：綁 tailnet 或區網 IP 之後，在系統管理員的 PowerShell 開放 4801，只開給 tailnet 的網段：
+
+```powershell
+New-NetFirewallRule -DisplayName "coding-lab web" -Direction Inbound -Protocol TCP -LocalPort 4801 -RemoteAddress 100.64.0.0/10 -Action Allow
+```
+
+區網直連時把 `-RemoteAddress` 改成區網的網段，例如 `192.168.1.0/24`。不要開給 `Any`。4800（hook 入口）永遠只綁 127.0.0.1，不用開。
+
 遠端看不到命中敏感規則的工具輸出，thinking 預設點開才載入。撤銷金鑰：`coding-lab key revoke <id>`（`key list` 看 id）。綁公開 IP 會被拒絕啟動，除非自己前置 TLS 並設 `allow_insecure = true`——明文 http 上的金鑰會被同網段竊聽。
 
 ## 讓 collector 常駐（伺服器重開機後自己起來）

@@ -135,3 +135,19 @@ test("遠端剝除、截斷、多處取代的 Edit：+／− 標成不知道，d
   assert.match(cut.at(-1).text, /8 KB/);
   assert.match(writeRows("", false, true).at(-1).text, /敏感/);
 });
+
+test("重連或落後重送的 snapshot：停在舊的一筆時保留選取，不跳回最新（#747 F-11）", () => {
+  const ch = createChanges();
+  const a = edit(A, "a.rs");
+  const b = edit(A, "b.rs");
+  ch.apply([a, b]);
+  ch.select(ch.list[1].key); // 點舊的一筆 → 停住
+  assert.equal(ch.following, false);
+  const kept = ch.selectedKey;
+  ch.load([a, b, edit(A, "c.rs")]);
+  assert.equal(ch.selectedKey, kept, "選的那筆還在：保留");
+  assert.equal(ch.following, false);
+  ch.load([edit(B, "z.rs")]);
+  assert.equal(ch.following, true, "選的那筆不在了：回到最新");
+  assert.equal(ch.selectedKey, ch.list[0].key);
+});

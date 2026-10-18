@@ -10,6 +10,10 @@
 //! `POST /stop`（#700）：`coding-lab stop` 用它請 collector 走同一條正常結束路徑。背景 collector 沒有 console
 //! （Windows 更沒人能按 Ctrl-C），這是三平台都通的停法。和 hook 一樣只綁 loopback、不驗金鑰：能連到這個埠的
 //! 程序本來就能殺掉 collector。
+//!
+//! 來源檢查（#762 S-4、D10）：只綁 loopback 擋不住使用者瀏覽器裡的網頁——它們能對 127.0.0.1 送 no-cors 的 POST
+//! （`text/plain`，不觸發 preflight），偽造 session、危險指令或停掉 collector。所以帶 `Origin` 的一律 403
+//! （Claude Code 不帶，瀏覽器跨站送的一定帶）；`/hook` 不是 `application/json` 回 415；`/stop` 要帶 [`STOP_HEADER`]。
 
 use std::io;
 use std::net::SocketAddr;
@@ -33,8 +37,12 @@ pub const HOOK_PATH: &str = "/hook";
 pub const STOP_PATH: &str = "/stop";
 /// `ensure` 轉送時帶的標頭（值是 `ensure`）
 pub const VIA_HEADER: &str = "x-coding-lab-via";
+/// `POST /stop` 要帶的標頭（值是 `1`）：瀏覽器的 no-cors 請求帶不了自訂標頭
+pub const STOP_HEADER: &str = "x-coding-lab-stop";
 /// 放掉埠時最多等進行中的請求多久
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// Edit／Write 讀檔探測最多等多久（#762 W-M5）：逾時就不帶探測結果，hook 照常處理
+pub const PROBE_LIMIT: Duration = Duration::from_millis(300);
 
 struct HookState {
     tx: mpsc::Sender<Input>,
@@ -43,6 +51,8 @@ struct HookState {
     stop: Arc<Notify>,
     /// merge 的 channel 滿了而丟掉的 hook 數（之後給 /healthz）
     dropped: AtomicU64,
+    /// 讀檔探測的時限（毫秒）
+    probe_limit_ms: Arc<AtomicU64>,
 }
 
 /// 執行中的 hook 入口。
@@ -50,6 +60,7 @@ pub struct HookServer {
     pub addr: SocketAddr,
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
+    probe_limit_ms: Arc<AtomicU64>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -58,6 +69,12 @@ impl HookServer {
     /// 決定要結束（或取消結束）：結束中 ensure 轉送的 hook 回 503，其他 hook 照收。
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    /// 讀檔探測的時限（預設 [`PROBE_LIMIT`]，0 表示不讀檔；測試用）。
+    pub fn set_probe_limit(&self, limit: Duration) {
+        self.probe_limit_ms
+            .store(limit.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// 收到 `POST /stop` 時完成（#700）；主迴圈拿它放進 select，和閒置結束、Ctrl-C 走同一條路。
@@ -92,7 +109,13 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     let local = listener.local_addr()?;
     let closing = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(Notify::new());
-    let app = router_with(tx, closing.clone(), stop_flag.clone());
+    let probe_limit_ms = Arc::new(AtomicU64::new(PROBE_LIMIT.as_millis() as u64));
+    let app = router_with(
+        tx,
+        closing.clone(),
+        stop_flag.clone(),
+        probe_limit_ms.clone(),
+    );
     let (shutdown, stop) = oneshot::channel::<()>();
     let stop = async move {
         if stop.await.is_err() {
@@ -111,25 +134,24 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
         addr: local,
         closing,
         stop: stop_flag,
+        probe_limit_ms,
         shutdown: Some(shutdown),
         task,
     })
 }
 
-pub fn router(tx: mpsc::Sender<Input>) -> Router {
-    router_with(
-        tx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Notify::new()),
-    )
-}
-
-fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>, stop: Arc<Notify>) -> Router {
+fn router_with(
+    tx: mpsc::Sender<Input>,
+    closing: Arc<AtomicBool>,
+    stop: Arc<Notify>,
+    probe_limit_ms: Arc<AtomicU64>,
+) -> Router {
     let state = Arc::new(HookState {
         tx,
         closing,
         stop,
         dropped: AtomicU64::new(0),
+        probe_limit_ms,
     });
     Router::new()
         .route(HOOK_PATH, post(handle))
@@ -137,8 +159,30 @@ fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>, stop: Arc<Noti
         .with_state(state)
 }
 
+/// 瀏覽器送的請求：帶 `Origin`（Claude Code 的 http hook 與 ensure、stop 都不帶）。
+fn from_browser(headers: &HeaderMap) -> bool {
+    headers.contains_key(axum::http::header::ORIGIN)
+}
+
+/// `Content-Type: application/json`（可以帶參數、不分大小寫）。
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
+}
+
 /// `POST /stop`：記下要結束，立刻回 200；實際結束由主迴圈做（它要先放埠、停 tail、flush）。
-async fn handle_stop(State(state): State<Arc<HookState>>) -> StatusCode {
+async fn handle_stop(State(state): State<Arc<HookState>>, headers: HeaderMap) -> StatusCode {
+    if from_browser(&headers)
+        || headers
+            .get(STOP_HEADER)
+            .is_none_or(|v| v.as_bytes() != b"1")
+    {
+        crate::logging::log("拒收 stop：帶 Origin 或沒有 X-Coding-Lab-Stop");
+        return StatusCode::FORBIDDEN;
+    }
     crate::logging::log("收到 stop");
     state.stop.notify_one();
     StatusCode::OK
@@ -150,6 +194,14 @@ async fn handle(
     body: Bytes,
 ) -> StatusCode {
     let ts_seen = crate::now_ms();
+    if from_browser(&headers) {
+        crate::logging::log("拒收 hook：帶 Origin（瀏覽器送的）");
+        return StatusCode::FORBIDDEN;
+    }
+    if !is_json(&headers) {
+        crate::logging::log("拒收 hook：Content-Type 不是 application/json");
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+    }
     if state.closing.load(Ordering::SeqCst)
         && headers
             .get(VIA_HEADER)
@@ -161,19 +213,19 @@ async fn handle(
         Ok(mut hook) => {
             // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）。
             // 讀檔是同步 I/O，放到 blocking 執行緒，不佔住處理其他 hook 的 worker
-            if crate::derive::needs_probe(&hook) {
-                hook = match tokio::task::spawn_blocking(move || {
-                    crate::derive::attach_probe(&mut hook);
-                    hook
-                })
-                .await
+            let limit = Duration::from_millis(state.probe_limit_ms.load(Ordering::SeqCst));
+            // 時限 0 表示不讀檔（和逾時一樣：不帶探測結果、照常處理）
+            if let Some(job) = crate::derive::probe_job(&hook).filter(|_| !limit.is_zero()) {
+                match tokio::time::timeout(limit, tokio::task::spawn_blocking(move || job.run()))
+                    .await
                 {
-                    Ok(h) => h,
-                    Err(e) => {
-                        crate::logging::log(&format!("hooks：讀檔探針失敗：{e}"));
-                        return StatusCode::OK;
-                    }
-                };
+                    Ok(Ok(probe)) => hook.set_probe(probe),
+                    Ok(Err(e)) => crate::logging::log(&format!("hooks：讀檔探針失敗：{e}")),
+                    Err(_) => crate::logging::log(&format!(
+                        "hooks：讀檔探測超過 {} ms，不帶探測結果",
+                        limit.as_millis()
+                    )),
+                }
             }
             if state.tx.try_send(Input::Hook { hook, ts_seen }).is_err() {
                 let n = state.dropped.fetch_add(1, Ordering::Relaxed) + 1;

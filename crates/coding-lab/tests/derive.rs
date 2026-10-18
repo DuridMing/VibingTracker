@@ -483,6 +483,60 @@ fn usage_once_per_message_and_model_change_line() {
     assert!(mc.pos < text_ev.pos, "狀態行在該行之前");
 }
 
+/// 同一則訊息拆成多行、collector 在行與行之間重啟（K-13）：重啟後接著讀的行不再算一次 usage，
+/// 新的訊息照算。上一輪最後的 usage 由 store 的最近 Event 交回（`resume_staged`）。
+#[test]
+fn usage_is_not_counted_again_after_a_restart_mid_message() {
+    let think = json!({"type": "thinking", "thinking": "…", "signature": "s"});
+    let text = json!({"type": "text", "text": "好"});
+    let mut a = Merger::new(Box::new(NoDanger));
+    let before = line(&mut a, 1, assistant("u1", "m1", "claude-opus-5-5", think));
+    assert_eq!(of(&before, "usage").len(), 1);
+
+    let mut b = Merger::new(Box::new(NoDanger));
+    let last = before.last().unwrap();
+    b.resume("s1", last.seq, 0, "");
+    b.resume_staged(&before, 100);
+    let after = line(
+        &mut b,
+        2,
+        assistant("u2", "m1", "claude-opus-5-5", text.clone()),
+    );
+    assert!(of(&after, "usage").is_empty(), "m1 重啟前已經算過");
+    let next = line(&mut b, 3, assistant("u3", "m2", "claude-opus-5-5", text));
+    assert_eq!(of(&next, "usage").len(), 1, "新的訊息照算");
+}
+
+/// 「同一則訊息的行一定連在一起」是以檔為單位：subagent 的行夾在 main 的同一則訊息中間，
+/// main 那則訊息不算第二次（K-13 改成每個檔記最後一則）。
+#[test]
+fn usage_once_per_message_with_subagent_lines_in_between() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let text = json!({"type": "text", "text": "好"});
+    let mut all = line(
+        &mut m,
+        1,
+        assistant("u1", "m1", "claude-opus-5-5", text.clone()),
+    );
+    all.extend(m.handle(Input::Line {
+        session: "s1".into(),
+        file: "agent-a1".into(),
+        no: 1,
+        value: assistant("u9", "m9", "claude-opus-5-5", text.clone()),
+        ts_seen: 2,
+    }));
+    all.extend(line(
+        &mut m,
+        2,
+        assistant("u2", "m1", "claude-opus-5-5", text),
+    ));
+    let ids: Vec<&str> = of(&all, "usage")
+        .iter()
+        .map(|e| e.payload["messageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["m1", "m9"]);
+}
+
 #[test]
 fn synthetic_model_is_ignored() {
     let mut m = Merger::new(Box::new(NoDanger));
@@ -644,7 +698,7 @@ fn edit_hunk_is_bounded_in_bytes() {
     let path = f.to_str().unwrap();
     let mut m = Merger::new(Box::new(NoDanger));
     let edit = |new: String, id: &str| {
-        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
                "tool_input": {"file_path": path, "old_string": "OLD", "new_string": new}, "tool_use_id": id})
     };
     // 一行 1.5 MB

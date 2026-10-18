@@ -8,9 +8,11 @@ const LIMIT = 2000;
 // 佇列剩不到這麼多個 frame 就先要下一段，播放不會停在段與段之間
 const LOW_WATER = 200;
 
-export function timelineUrl({ cwd, at, until, offset = 0, snapshot = true, limit = LIMIT }) {
+// from：續頁沿用第一段回應的下界（伺服器挑 session 用，跨午夜時才不會少算，#742 C6）
+export function timelineUrl({ cwd, at, until, offset = 0, snapshot = true, limit = LIMIT, from = null }) {
   let url = `/api/projects/replay?cwd=${encodeURIComponent(cwd)}&at=${at}&until=${until}&offset=${offset}&limit=${limit}`;
   if (!snapshot) url += "&snapshot=0";
+  if (from != null) url += `&from=${from}`;
   return url;
 }
 
@@ -19,6 +21,7 @@ export function createTimeline() {
     active: false, cwd: null, from: 0, to: 0, t: 0,
     playing: false, speed: 60, ended: false,
     queue: [], next: null, loading: false, req: 0, error: null,
+    lower: null, // 伺服器回的挑 session 下界（回應的 from），續頁帶回去
   };
   const clamp = (t) => Math.min(tl.to, Math.max(tl.from, t));
 
@@ -36,7 +39,7 @@ export function createTimeline() {
   // 跳到某個時刻（拖動、重新載入）：舊段作廢；回傳這次請求的編號，回應帶回來時比對
   tl.seek = (t) => {
     tl.req++;
-    Object.assign(tl, { t: clamp(t), queue: [], next: null, loading: true, ended: false, error: null });
+    Object.assign(tl, { t: clamp(t), queue: [], next: null, loading: true, ended: false, error: null, lower: null });
     return tl.req;
   };
   // seek 的回應：過期回 null；否則換上這段的 frame，回傳要套用的 snapshot
@@ -44,6 +47,7 @@ export function createTimeline() {
     if (req !== tl.req) return null;
     tl.queue = [...(body.frames ?? [])];
     tl.next = body.next ?? null;
+    tl.lower = body.from ?? null;
     tl.loading = false;
     return body.snapshot ?? null;
   };

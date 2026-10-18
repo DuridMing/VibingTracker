@@ -54,3 +54,10 @@ test("tab 列：選中的被收起來時換到列上，擠掉最後一個看得�
   assert.deepEqual(fitTabs([100, 100, 100, 250], 330, 40, 3), { shown: [3], hidden: [0, 1, 2] });
   assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, 1), { shown: [0, 1], hidden: [2, 3] }, "選中的本來就看得到：不動");
 });
+
+test("同一個專案的 cwd 磁碟機代號大小寫不同（e:\\ 與 E:\\）也歸成同一個專案（#748 L-11）", () => {
+  const sessions = [row("a", { cwd: "E:\\repo" }), row("b", { cwd: "e:\\repo\\worktrees\\x" })];
+  const roots = projectRoots(sessions);
+  assert.equal(roots.length, 1);
+  assert.deepEqual(roots[0].sessions.sort(), ["a", "b"]);
+});

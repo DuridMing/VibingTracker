@@ -3,7 +3,7 @@
 //! stderr 被 `ensure` 導到檔案後，程序自己換不了 stderr 指向的檔案，所以 log 改由這裡寫；
 //! stderr 是終端機時（開發時前景跑）照舊印到畫面。
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -22,7 +22,7 @@ pub struct RotatingLog {
 
 impl RotatingLog {
     pub fn open(path: &Path, max: u64, keep: usize) -> io::Result<RotatingLog> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let file = crate::store::open_private_append(path)?;
         let len = file.metadata()?.len();
         Ok(RotatingLog {
             path: path.to_path_buf(),
@@ -61,10 +61,7 @@ impl RotatingLog {
             }
         }
         std::fs::rename(&self.path, numbered(1))?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        self.file = crate::store::open_private_append(&self.path)?;
         self.len = 0;
         Ok(())
     }
