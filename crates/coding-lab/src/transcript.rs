@@ -581,6 +581,8 @@ pub struct TailPlanner {
     stopped: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// (session, file) → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)
     read: std::collections::HashMap<(String, String), (Option<String>, u64)>,
+    /// 已結束的 session（SessionEnd，或 merge 判定 abandoned）：下一個 SessionStart 之前不再開 tail（C12、L-8）
+    ended: std::collections::HashSet<String>,
 }
 
 fn slash(p: &Path) -> String {
@@ -624,18 +626,44 @@ impl TailPlanner {
         }
     }
 
+    /// merge 判定這個 session 結束了（沒有 SessionEnd、被丟下的 abandoned，L-8）：停掉它的 tail。
+    /// 不停的話 tail 與它的 watcher 會一直留著，常駐服務（不閒置結束）下只增不減。
+    pub fn on_session_ended(&mut self, session: &str) -> Vec<TailAction> {
+        self.ended.insert(session.to_string());
+        let had_main = self.main.remove(session).is_some();
+        let had_agents = self.agents.remove(session).is_some_and(|a| !a.is_empty());
+        self.stopped.remove(session);
+        if had_main || had_agents {
+            vec![TailAction::StopSession {
+                session: session.to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 這個 session 結束了、還沒有新的 SessionStart。
+    pub fn is_ended(&self, session: &str) -> bool {
+        self.ended.contains(session)
+    }
+
     pub fn on_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
         let sid = h.session_id().to_string();
         let event = h.event_name();
         let mut out = Vec::new();
 
         if event == "SessionEnd" {
-            let had_main = self.main.remove(&sid).is_some();
-            let had_agents = self.agents.remove(&sid).is_some_and(|a| !a.is_empty());
-            self.stopped.remove(&sid);
-            if had_main || had_agents {
-                out.push(TailAction::StopSession { session: sid });
-            }
+            return self.on_session_ended(&sid);
+        }
+        // 結束之後、下一個 SessionStart 之前的 hook（/clear 後舊 id 晚到的背景 agent 結果）不開 tail（C12）：
+        // 沒有東西會再停掉它，tail 與 watcher 會一直留著。
+        // main 的 UserPromptSubmit／PreToolUse 例外：merge 依同一條規則把 session 重新打開（#679，閒置被補
+        // abandoned 後終端機又用起來，不會有 SessionStart），tail 要跟著回來
+        let main_activity = matches!(event, "UserPromptSubmit" | "PreToolUse")
+            && h.str_field("agent_id").is_none_or(str::is_empty);
+        if event == "SessionStart" || main_activity {
+            self.ended.remove(&sid);
+        } else if self.ended.contains(&sid) {
             return out;
         }
 
