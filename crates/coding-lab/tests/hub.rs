@@ -1091,3 +1091,19 @@ fn hub_add_rejects_malformed_keys() {
     hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(good)).unwrap();
     assert!(std::fs::read_to_string(&cfg).unwrap().contains(good));
 }
+
+/// W-L5（#768）：殘缺或惡意的 chunked 回應回 Err，不能 panic（release 是 panic=abort，整個 hub 會結束）。
+#[test]
+fn chunked_parser_rejects_truncated_and_huge_chunks_without_panicking() {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for body in [
+        "5\r\nhello",                // 最後一個 chunk 後面沒有 \r\n、也沒有 0 chunk
+        "5\r\nhel",                  // chunk 不完整
+        "ffffffffffffffff\r\nx\r\n", // 長度大到加起來溢位
+        "fffffffffffffff0\r\nx\r\n",
+    ] {
+        let raw = format!("{head}{body}");
+        let r = std::panic::catch_unwind(|| hub::parse_http_response(raw.as_bytes()));
+        assert!(matches!(r, Ok(Err(_))), "{body:?}：要回 Err、不能 panic");
+    }
+}

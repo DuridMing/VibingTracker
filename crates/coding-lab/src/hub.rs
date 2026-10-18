@@ -278,9 +278,8 @@ impl Hub {
     fn up(&mut self, name: &str) -> &mut UpCache {
         if !self.ups.contains_key(name) {
             self.names.push(name.to_string());
-            self.ups.insert(name.to_string(), UpCache::default());
         }
-        self.ups.get_mut(name).expect("剛放進去")
+        self.ups.entry(name.to_string()).or_default()
     }
 
     fn next_no(&mut self) -> u64 {
@@ -624,7 +623,14 @@ pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
     let body = if chunked {
         let mut out = Vec::new();
         let mut p = 0;
-        while let Some(nl) = rest[p..].windows(2).position(|w| w == b"\r\n") {
+        // 每一步都檢查邊界、加法都 checked：上游走區網的 http，殘缺或惡意的回應只能回 Err，
+        // 不能 panic（release 是 panic=abort，整個 hub 會結束，W-L5）
+        while let Some(nl) = rest
+            .get(p..)
+            .ok_or("chunk 不完整")?
+            .windows(2)
+            .position(|w| w == b"\r\n")
+        {
             let size = usize::from_str_radix(
                 String::from_utf8_lossy(&rest[p..p + nl])
                     .split(';')
@@ -638,8 +644,9 @@ pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
             if size == 0 {
                 break;
             }
-            out.extend_from_slice(rest.get(p..p + size).ok_or("chunk 不完整")?);
-            p += size + 2;
+            let end = p.checked_add(size).ok_or("chunk 長度太大")?;
+            out.extend_from_slice(rest.get(p..end).ok_or("chunk 不完整")?);
+            p = end.checked_add(2).ok_or("chunk 長度太大")?;
         }
         out
     } else {

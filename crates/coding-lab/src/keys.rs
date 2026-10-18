@@ -115,6 +115,8 @@ pub struct SystemRng;
 impl Rng for SystemRng {
     fn fill(&mut self, buf: &mut [u8]) {
         // getrandom 只在系統亂數來源壞掉時失敗；那時寧可 panic 也不要發出可預測的金鑰
+        // 只有 CLI（`key create`、`key login-link`）用，不在 collector 的執行期路徑上；
+        // 亂數來源不可用時寧可停下，也不發出可預測的金鑰（C21）
         getrandom::fill(buf).expect("系統亂數來源不可用");
     }
 }
