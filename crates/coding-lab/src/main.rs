@@ -335,7 +335,10 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 return Ok(());
             }
             // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束；登記失敗再把它拉回（#719）
-            let was_running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            let was_running = matches!(
+                coding_lab::serve::state(&cfg.home),
+                coding_lab::serve::State::Up(_)
+            );
             if was_running
                 && std::process::Command::new(&ctx.exe)
                     .arg("stop")
@@ -437,12 +440,11 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 service::status_command(platform, &ctx).join(" "),
                 files[0].display()
             );
-            let running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
-            println!(
-                "collector：{}（hook 入口 {}）",
-                if running { "執行中" } else { "沒有在跑" },
-                cfg.hook_bind
-            );
+            let running = running_info(&cfg, Duration::ZERO);
+            match running.as_ref().and_then(|i| i.hook) {
+                Some(hook) => println!("collector：執行中（hook 入口 {hook}）"),
+                None => println!("collector：沒有在跑"),
+            }
             Ok(())
         }
     }
@@ -624,13 +626,19 @@ fn run_serve(overrides: &Overrides) -> ExitCode {
     }
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// 連本機的 collector：它在跑（拿著鎖）時連線不到 1 ms；沒在聽的埠在 Windows 要約 2 秒才回拒絕，不能等那麼久（EW2）
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// ensure 整體最多花多久（plugin 的 SessionStart hook timeout 是 5 秒）
 const ENSURE_BUDGET: Duration = Duration::from_secs(4);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SessionStart command hook：確保 collector 在跑，再把 stdin 的 payload 轉送給它。
+///
+/// 在不在跑看 store 鎖、位址看 collector.json、起不來看 collector.failed（contracts §5），不靠 TCP 探測猜。
+/// 轉送拿到 503 或連線斷掉，表示舊的 collector 正在結束（#685）：拉起新的，新的看到 closing 會等舊的放掉 hook 埠、
+/// 綁上之後先收 hook，所以照樣送到同一個位址就好。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout。
 fn ensure() -> Result<(), String> {
+    use coding_lab::serve::{self, State};
     let cfg = Config::load(&Overrides::default())?;
     let mut body = Vec::new();
     let stdin = std::io::stdin();
@@ -640,32 +648,64 @@ fn ensure() -> Result<(), String> {
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    // 轉送拿到 503，或 probe 之後埠就被放掉（連線被拒、還沒回應就被 RST），表示舊的 collector 正在閒置結束
-    // （#685）：等它放掉埠，拉起新的再送一次。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout
+    let home = &cfg.home;
+    // L-1：最近起不來過就不再拉起，不讓每個 SessionStart 都等滿預算
+    let fresh = coding_lab::now_ms().saturating_sub(serve::FAILED_FRESH_MS);
+    if let Some(e) = serve::failed_since(home, fresh) {
+        return Err(format!(
+            "collector 最近起不來，{} 秒內不再拉起：{e}",
+            serve::FAILED_FRESH_MS / 1000
+        ));
+    }
     let deadline = Instant::now() + ENSURE_BUDGET;
-    let mut spawned = false;
+    // 拉起 collector 的時間（epoch ms）：之後寫的 collector.failed 就是它的
+    let mut spawned: Option<u64> = None;
+    let spawn = |spawned: &mut Option<u64>| -> Result<(), String> {
+        if spawned.is_none() {
+            *spawned = Some(coding_lab::now_ms());
+            spawn_collector(&cfg)?;
+        }
+        Ok(())
+    };
+    // 我們拉起的 collector 用這份設定，位址就是 cfg.hook_bind
+    let mut target = cfg.hook_bind;
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(format!(
                 "collector {} 秒內沒有起來",
                 ENSURE_BUDGET.as_secs()
             ));
         }
-        if probe(cfg.hook_bind, left) {
-            if body.is_empty() {
+        if let Some(e) = spawned.and_then(|t| serve::failed_since(home, t)) {
+            return Err(format!("collector 起不來：{e}"));
+        }
+        match serve::state(home) {
+            State::Up(Some(info)) => {
+                if let Some(a) = info.hook {
+                    target = a;
+                }
+                if info.closing {
+                    spawn(&mut spawned)?;
+                } else if body.is_empty() {
+                    return Ok(());
+                }
+            }
+            // 啟動中（綁好 hook 埠、還沒寫 collector.json）或結束中（刪了 collector.json、還沒放鎖）：
+            // 多拉起一個沒關係，在跑的那個會讓它以「已經有 collector」結束
+            State::Up(None) | State::Down => spawn(&mut spawned)?,
+        }
+        if body.is_empty() {
+            if spawned.is_some() && matches!(serve::state(home), State::Up(_)) {
                 return Ok(());
             }
+        } else {
             let left = deadline.saturating_duration_since(Instant::now());
-            match forward(cfg.hook_bind, &body, left)? {
+            match forward(target, &body, left)? {
                 Forwarded::Accepted => return Ok(()),
                 Forwarded::Exiting => {}
             }
-        } else if !spawned {
-            spawn_collector(&cfg)?;
-            spawned = true;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -674,10 +714,6 @@ enum Forwarded {
     Accepted,
     /// collector 正在結束、或連線在送達前就斷了：確定沒有收下，可以再送
     Exiting,
-}
-
-fn probe(addr: SocketAddr, left: Duration) -> bool {
-    !left.is_zero() && TcpStream::connect_timeout(&addr, PROBE_TIMEOUT.min(left)).is_ok()
 }
 
 fn spawn_collector(cfg: &Config) -> Result<(), String> {
@@ -750,7 +786,7 @@ fn no_inherit_std_handles() {
 fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, String> {
     use std::io::ErrorKind;
     let step = |d: Duration| d.min(left).max(Duration::from_millis(1));
-    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(PROBE_TIMEOUT)) else {
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(CONNECT_TIMEOUT)) else {
         return Ok(Forwarded::Exiting);
     };
     s.set_write_timeout(Some(step(FORWARD_TIMEOUT)))
@@ -832,9 +868,37 @@ fn prune() -> ExitCode {
     }
 }
 
-/// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 放掉埠、刪掉 collector.json 才回。
-/// 背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），這是三平台都通、不丟資料的停法；
-/// 沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
+/// 一次 HTTP 請求（`Connection: close`），回傳整個回應。只連 collector.json 寫的位址（R-11）。
+fn http_once(addr: SocketAddr, request: &str) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect_timeout(&addr, FORWARD_TIMEOUT)?;
+    s.set_read_timeout(Some(FORWARD_TIMEOUT))?;
+    s.set_write_timeout(Some(FORWARD_TIMEOUT))?;
+    s.write_all(request.as_bytes())?;
+    let mut out = Vec::new();
+    s.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// 執行中 collector 的位址（contracts §5）：拿著鎖、collector.json 有寫才算；啟動或結束到一半時等 `wait`。
+/// 沒有 collector.json 時不退回設定裡的預設埠：那可能是別的資料目錄的 collector（R-11）。
+fn running_info(cfg: &Config, wait: Duration) -> Option<coding_lab::serve::Info> {
+    use coding_lab::serve::State;
+    let deadline = Instant::now() + wait;
+    loop {
+        match coding_lab::serve::state(&cfg.home) {
+            State::Down => return None,
+            State::Up(Some(info)) => return Some(info),
+            State::Up(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            State::Up(None) => return None,
+        }
+    }
+}
+
+/// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 關好 SQLite、刪掉 collector.json、放掉 store 鎖才回
+/// （L-13：回報結束時新的 collector 馬上就能開 store）。背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），
+/// 這是三平台都通、不丟資料的停法；沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
 fn stop() -> ExitCode {
     const STOP_WAIT: Duration = Duration::from_secs(15);
     let cfg = match Config::load(&Overrides::default()) {
@@ -844,46 +908,38 @@ fn stop() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let info = cfg.home.join("collector.json");
-    let hook = std::fs::read_to_string(&info)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| {
-            v["hook"]
-                .as_str()
-                .and_then(|w| w.parse::<SocketAddr>().ok())
-        })
-        .unwrap_or(cfg.hook_bind);
-    let Ok(mut s) = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT) else {
-        eprintln!("coding-lab：collector 沒有在跑（{hook}）");
+    let Some((pid, hook)) = running_info(&cfg, STOP_WAIT).and_then(|i| i.hook.map(|h| (i.pid, h)))
+    else {
+        eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
         return ExitCode::SUCCESS;
     };
-    let _ = s.set_read_timeout(Some(FORWARD_TIMEOUT));
-    let _ = s.set_write_timeout(Some(FORWARD_TIMEOUT));
     let req = format!(
         "POST {} HTTP/1.1\r\nHost: {hook}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::STOP_PATH
     );
-    let mut resp = [0u8; 64];
-    let accepted = s.write_all(req.as_bytes()).is_ok()
-        && matches!(s.read(&mut resp), Ok(n) if resp[..n].starts_with(b"HTTP/1.1 200"));
-    drop(s);
-    if !accepted {
+    if !http_once(hook, &req).is_ok_and(|r| r.starts_with(b"HTTP/1.1 200")) {
         eprintln!(
             "coding-lab：collector 沒有接受 stop（{hook}）；請直接結束 coding-lab serve 這個程序"
         );
         return ExitCode::FAILURE;
     }
-    // 埠放掉之後它還在停 tail、flush：等 collector.json 被刪掉（它是最後一步）
+    // 它刪 collector.json 時 SQLite 已經關好，緊接著放鎖。鎖一放掉可能馬上被新的 collector 拿走，
+    // 所以 collector.json 不見之後鎖還被拿著一陣子、或換成別的 pid 寫的，也算它結束了
+    const HANDED_OVER: Duration = Duration::from_secs(1);
     let deadline = Instant::now() + STOP_WAIT;
+    let mut gone_at: Option<Instant> = None;
     while Instant::now() < deadline {
-        let port_free = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT).is_err();
-        let info_gone = !info.exists();
-        if port_free && info_gone {
+        use coding_lab::serve::State;
+        let done = match coding_lab::serve::state(&cfg.home) {
+            State::Down => true,
+            State::Up(Some(i)) => i.pid != pid,
+            State::Up(None) => gone_at.get_or_insert_with(Instant::now).elapsed() >= HANDED_OVER,
+        };
+        if done {
             eprintln!("coding-lab：collector 已結束");
             return ExitCode::SUCCESS;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     eprintln!(
         "coding-lab：collector 收到 stop 但 {} 秒內還沒結束；看 {}",
@@ -901,25 +957,20 @@ fn healthz() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let web = std::fs::read_to_string(cfg.home.join("collector.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["web"].as_str().and_then(|w| w.parse::<SocketAddr>().ok()))
-        .unwrap_or(cfg.web_bind);
-    let mut s = match TcpStream::connect_timeout(&web, PROBE_TIMEOUT) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("coding-lab：collector 沒有在跑（{web}）");
-            return ExitCode::FAILURE;
-        }
+    let Some(web) = running_info(&cfg, Duration::from_secs(2)).and_then(|i| i.web) else {
+        eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
+        return ExitCode::FAILURE;
     };
-    let _ = s.set_read_timeout(Some(FORWARD_TIMEOUT));
-    let _ = write!(
-        s,
-        "GET /healthz HTTP/1.1\r\nHost: {web}\r\nConnection: close\r\n\r\n"
-    );
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    println!("{}", out.split("\r\n\r\n").nth(1).unwrap_or(&out));
-    ExitCode::SUCCESS
+    let req = format!("GET /healthz HTTP/1.1\r\nHost: {web}\r\nConnection: close\r\n\r\n");
+    match http_once(web, &req) {
+        Ok(out) => {
+            let out = String::from_utf8_lossy(&out);
+            println!("{}", out.split("\r\n\r\n").nth(1).unwrap_or(&out));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("coding-lab：連不上 collector（{web}）：{e}");
+            ExitCode::FAILURE
+        }
+    }
 }
