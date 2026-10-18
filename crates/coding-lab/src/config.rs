@@ -179,19 +179,15 @@ impl Config {
         })
     }
 
-    /// 讀真正的環境變數與 `<home>/config.toml`。
+    /// 讀真正的環境變數與 `<home>/config.toml`。`web_root` 只填設定給的值，沒給時二進位旁邊的 `web/`
+    /// 由要 serve 前端的 serve、hub 用 [`Config::web_root_or_bundled`] 去找（E-B7）。
     pub fn load(cli: &Overrides) -> Result<Config, String> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        // 路徑可以不是 UTF-8：`env` 會把這種 CODING_LAB_HOME 當成沒設，所以先用 var_os 讀（L-16）。
-        // 命令列優先於環境變數，放進 cli.home 不改變優先序
-        let mut cli = cli.clone();
-        if cli.home.is_none() {
-            cli.home = std::env::var_os("CODING_LAB_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from);
-        }
-        let cli = &cli;
-        let home = home_dir(cli, &env, default_home());
+        let home = resolve_home(cli);
+        let cli = &Overrides {
+            home: Some(home.clone()),
+            ..cli.clone()
+        };
         let file = match std::fs::read_to_string(home.join("config.toml")) {
             Ok(t) => Some(t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -202,11 +198,14 @@ impl Config {
                 ));
             }
         };
-        let mut c = Config::resolve(cli, &env, file.as_deref(), default_home())?;
-        if c.web_root.is_none() {
-            c.web_root = std::env::current_exe().ok().and_then(|e| bundled_web(&e));
-        }
-        Ok(c)
+        Config::resolve(cli, &env, file.as_deref(), home)
+    }
+
+    /// 前端靜態檔：設定給的，否則二進位旁邊的 `web/`（wrapper 從 Release 下載時解在一起，#656）。
+    pub fn web_root_or_bundled(&self) -> Option<PathBuf> {
+        self.web_root
+            .clone()
+            .or_else(|| std::env::current_exe().ok().and_then(|e| bundled_web(&e)))
     }
 
     pub fn resolve(
@@ -263,35 +262,35 @@ impl Config {
             .clone()
             .or_else(|| env("CODING_LAB_WEB_ROOT").map(PathBuf::from))
             .or(f.web.root);
-        let idle_exit_seconds = match (cli.idle_exit_seconds, env("CODING_LAB_IDLE_EXIT_SECONDS")) {
-            (Some(v), _) => v,
-            (None, Some(v)) => v
-                .parse()
-                .map_err(|_| format!("CODING_LAB_IDLE_EXIT_SECONDS 不是非負整數：{v}"))?,
-            (None, None) => f
-                .collector
-                .idle_exit_seconds
-                .unwrap_or(DEFAULT_IDLE_EXIT_SECONDS),
+        // 環境變數 > 檔案 > 預設的整數設定；`what` 是格式不對時的說明
+        let num = |key: &str, what: &str, file: Option<u64>, default: u64| match env(key) {
+            Some(v) => v.parse().map_err(|_| format!("{key} 不是{what}：{v}")),
+            None => Ok(file.unwrap_or(default)),
         };
-
-        let store_flush_ms = match env("CODING_LAB_STORE_FLUSH_MS") {
-            Some(v) => v
-                .parse()
-                .map_err(|_| format!("CODING_LAB_STORE_FLUSH_MS 不是正整數：{v}"))?,
-            None => f.collector.store_flush_ms.unwrap_or(DEFAULT_STORE_FLUSH_MS),
+        let idle_exit_seconds = match cli.idle_exit_seconds {
+            Some(v) => v,
+            None => num(
+                "CODING_LAB_IDLE_EXIT_SECONDS",
+                "非負整數",
+                f.collector.idle_exit_seconds,
+                DEFAULT_IDLE_EXIT_SECONDS,
+            )?,
         };
+        let store_flush_ms = num(
+            "CODING_LAB_STORE_FLUSH_MS",
+            "正整數",
+            f.collector.store_flush_ms,
+            DEFAULT_STORE_FLUSH_MS,
+        )?;
         if store_flush_ms == 0 {
             return Err("[collector].store_flush_ms 要大於 0".into());
         }
-        let wait_guess_seconds = match env("CODING_LAB_WAIT_GUESS_SECONDS") {
-            Some(v) => v
-                .parse()
-                .map_err(|_| format!("CODING_LAB_WAIT_GUESS_SECONDS 不是非負整數：{v}"))?,
-            None => f
-                .collector
-                .wait_guess_seconds
-                .unwrap_or(DEFAULT_WAIT_GUESS_SECONDS),
-        };
+        let wait_guess_seconds = num(
+            "CODING_LAB_WAIT_GUESS_SECONDS",
+            "非負整數",
+            f.collector.wait_guess_seconds,
+            DEFAULT_WAIT_GUESS_SECONDS,
+        )?;
         let auth: AuthMode =
             pick(&None, "CODING_LAB_WEB_AUTH", &f.web.auth, "local-open").parse()?;
         let remote_thinking: RemoteThinking = pick(
@@ -425,6 +424,22 @@ fn unknown_keys(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// 資料目錄：命令列 > `CODING_LAB_HOME` > 預設，不讀 config.toml（設定壞掉時也找得到 log 該寫哪）。
+/// 路徑可以不是 UTF-8，所以 CODING_LAB_HOME 用 var_os 讀（L-16）。
+pub fn resolve_home(cli: &Overrides) -> PathBuf {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let cli = match &cli.home {
+        Some(_) => cli.clone(),
+        None => Overrides {
+            home: std::env::var_os("CODING_LAB_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            ..cli.clone()
+        },
+    };
+    home_dir(&cli, &env, default_home())
 }
 
 fn home_dir(

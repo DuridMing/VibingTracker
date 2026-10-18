@@ -151,7 +151,7 @@ impl ServeArgs {
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Serve(args) => run_serve(&args.overrides()),
+        Command::Serve(args) => run(|| run_serve(&args.overrides())),
         // 不變式 4：ensure 失敗也不能讓 Claude Code 看到錯誤，stdout 也不能有任何輸出
         Command::Ensure => {
             if let Err(e) = ensure() {
@@ -159,41 +159,71 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Command::Config(args) => match Config::load(&args.overrides()) {
-            Ok(c) => {
-                for w in &c.warnings {
-                    eprintln!("coding-lab：{w}");
-                }
-                println!("{c:#?}");
-                ExitCode::SUCCESS
+        Command::Config(args) => run(|| {
+            let c = config(&args.overrides())?;
+            for w in &c.warnings {
+                eprintln!("coding-lab：{w}");
             }
-            Err(e) => {
-                eprintln!("coding-lab：{e}");
-                ExitCode::from(2)
-            }
-        },
-        Command::Healthz => healthz(),
-        Command::Stop => stop(),
-        Command::Prune => prune(),
+            println!("{c:#?}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Healthz => run(healthz),
+        Command::Stop => run(stop),
+        Command::Prune => run(prune),
         Command::Service(args) => service(args.command),
         Command::Key(args) => key(args.command),
         Command::Hub(args) => hub(args),
     }
 }
 
-/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
-fn hub(args: HubArgs) -> ExitCode {
-    match hub_inner(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+/// 子命令失敗的原因（E-D7）：設定錯誤一律 exit 2，其他失敗 exit 1。
+enum Failure {
+    Config(String),
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Failure {
+        Failure::Other(e)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(e: &str) -> Failure {
+        Failure::Other(e.to_string())
+    }
+}
+
+/// 讀設定；讀不了算設定錯誤。
+fn config(overrides: &Overrides) -> Result<Config, Failure> {
+    Config::load(overrides).map_err(Failure::Config)
+}
+
+/// 跑一個子命令：錯誤印到 stderr，退出碼見 [`Failure`]。
+fn run(f: impl FnOnce() -> Result<ExitCode, Failure>) -> ExitCode {
+    match f() {
+        Ok(code) => code,
+        Err(Failure::Config(e)) => {
+            eprintln!("coding-lab：{e}");
+            ExitCode::from(2)
+        }
+        Err(Failure::Other(e)) => {
             eprintln!("coding-lab：{e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn hub_inner(args: HubArgs) -> Result<(), String> {
-    let cfg = Config::load(&Overrides::default())?;
+/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
+fn hub(args: HubArgs) -> ExitCode {
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        hub_inner(cfg, args)?;
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn hub_inner(cfg: Config, args: HubArgs) -> Result<(), String> {
     match args.command {
         Some(HubCommand::Add { name, url, no_key }) => {
             let key = if no_key {
@@ -240,10 +270,13 @@ fn hub_inner(args: HubArgs) -> Result<(), String> {
                 .build()
                 .map_err(|e| format!("無法建立 runtime：{e}"))?;
             rt.block_on(async {
-                let (addr, task) =
-                    coding_lab::hub::serve(bind, cfg.hub_upstreams.clone(), cfg.web_root.clone())
-                        .await
-                        .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
+                let (addr, task) = coding_lab::hub::serve(
+                    bind,
+                    cfg.hub_upstreams.clone(),
+                    cfg.web_root_or_bundled(),
+                )
+                .await
+                .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
                 eprintln!(
                     "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
                     cfg.hub_upstreams
@@ -281,18 +314,15 @@ fn read_secret(prompt: &str) -> Result<String, String> {
 
 /// `coding-lab service …`（#662）：Plan 由 service.rs 算，這裡只負責環境、印出與執行。
 fn service(cmd: ServiceCommand) -> ExitCode {
-    match service_inner(cmd) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
-        }
-    }
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        service_inner(cfg, cmd)?;
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
-fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
+fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
     use coding_lab::service::{self, Platform};
-    let cfg = Config::load(&Overrides::default())?;
     let platform = Platform::current().ok_or_else(|| {
         format!(
             "{} 沒有常駐服務的做法；請自己用系統的方式跑 coding-lab serve --idle-exit-seconds 0",
@@ -445,17 +475,14 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
 
 /// `coding-lab key …`（#666）。collector 每次驗證都重讀 keys.json，所以這裡直接改檔就生效，不必重啟。
 fn key(cmd: KeyCommand) -> ExitCode {
-    match key_inner(cmd) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
-        }
-    }
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        key_inner(cfg, cmd)?;
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
-fn key_inner(cmd: KeyCommand) -> Result<(), String> {
-    let cfg = Config::load(&Overrides::default())?;
+fn key_inner(cfg: Config, cmd: KeyCommand) -> Result<(), String> {
     let now = coding_lab::now_ms();
     let mut rng = SystemRng;
     let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
@@ -588,14 +615,8 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
     }
 }
 
-fn run_serve(overrides: &Overrides) -> ExitCode {
-    let cfg = match Config::load(overrides) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+fn run_serve(overrides: &Overrides) -> Result<ExitCode, Failure> {
+    let cfg = config(overrides)?;
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads())
         .enable_all()
@@ -604,18 +625,18 @@ fn run_serve(overrides: &Overrides) -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("coding-lab：無法建立 runtime：{e}");
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
     };
     match rt.block_on(serve::run(cfg)) {
-        Ok(Outcome::Stopped) => ExitCode::SUCCESS,
+        Ok(Outcome::Stopped) => Ok(ExitCode::SUCCESS),
         Ok(Outcome::AlreadyRunning) => {
             eprintln!("coding-lab：已經有 collector 在跑");
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -818,22 +839,15 @@ fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, S
 }
 
 fn append_log(msg: &str) {
-    let home = Config::load(&Overrides::default())
-        .map(|c| c.home)
-        .unwrap_or_else(|_| coding_lab::config::default_home());
-    let _ = std::fs::create_dir_all(&home);
+    // 不讀 config.toml：設定壞掉正是常見的原因，那時也要寫進 CODING_LAB_HOME 而不是預設的 home
+    let home = coding_lab::config::resolve_home(&Overrides::default());
+    let _ = coding_lab::store::create_private_dir(&home);
     coding_lab::logging::append(&home.join("collector.log"), msg);
 }
 
 /// 清掉超過保留期限的 session。collector 在跑時不動（它啟動時與每天會自己清），避免兩個程序同時寫 store。
-fn prune() -> ExitCode {
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+fn prune() -> Result<ExitCode, Failure> {
+    let cfg = config(&Overrides::default())?;
     let days = coding_lab::store::RETENTION_DAYS;
     let _lock = match serve::try_lock_store(&cfg.home) {
         Ok(Some(lock)) => lock,
@@ -841,11 +855,11 @@ fn prune() -> ExitCode {
             eprintln!(
                 "coding-lab：collector 正在執行，它啟動時與每天會自動清掉 {days} 天前的資料；要立刻清請先結束 collector"
             );
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
     };
     let before = coding_lab::now_ms().saturating_sub(days * 24 * 60 * 60 * 1000);
@@ -857,11 +871,11 @@ fn prune() -> ExitCode {
                 r.sessions.len(),
                 r.bytes / 1024
             );
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }
@@ -903,21 +917,15 @@ fn running_info(cfg: &Config, wait: Duration) -> Option<coding_lab::serve::Info>
 /// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 關好 SQLite、刪掉 collector.json、放掉 store 鎖才回
 /// （L-13：回報結束時新的 collector 馬上就能開 store）。背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），
 /// 這是三平台都通、不丟資料的停法；沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
-fn stop() -> ExitCode {
+fn stop() -> Result<ExitCode, Failure> {
     const STOP_WAIT: Duration = Duration::from_secs(15);
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+    let cfg = config(&Overrides::default())?;
     let Some((pid, hook, token)) = running_info(&cfg, STOP_WAIT).and_then(|i| {
         i.hook
             .map(|h| (i.pid, h, i.stop_token.unwrap_or_else(|| "1".into())))
     }) else {
         eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
-        return ExitCode::SUCCESS;
+        return Ok(ExitCode::SUCCESS);
     };
     let req = format!(
         "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -928,7 +936,7 @@ fn stop() -> ExitCode {
         eprintln!(
             "coding-lab：collector 沒有接受 stop（{hook}）；請直接結束 coding-lab serve 這個程序"
         );
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     }
     // 它刪 collector.json 時 SQLite 已經關好，緊接著放鎖。鎖一放掉可能馬上被新的 collector 拿走，
     // 所以 collector.json 不見之後鎖還被拿著一陣子、或換成別的 pid 寫的，也算它結束了
@@ -945,7 +953,7 @@ fn stop() -> ExitCode {
         if done {
             eprintln!("coding-lab：collector 已結束");
             service_start_hint(&cfg.home);
-            return ExitCode::SUCCESS;
+            return Ok(ExitCode::SUCCESS);
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -954,7 +962,7 @@ fn stop() -> ExitCode {
         STOP_WAIT.as_secs(),
         cfg.home.join("collector.log").display()
     );
-    ExitCode::FAILURE
+    Ok(ExitCode::FAILURE)
 }
 
 /// 裝了常駐服務時，stop 停掉的就是它，而且不會自己回來（R-6）：提示怎麼叫回來。服務管理員自己呼叫
@@ -975,28 +983,22 @@ fn service_start_hint(home: &std::path::Path) {
     }
 }
 
-fn healthz() -> ExitCode {
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+fn healthz() -> Result<ExitCode, Failure> {
+    let cfg = config(&Overrides::default())?;
     let Some(web) = running_info(&cfg, Duration::from_secs(2)).and_then(|i| i.web) else {
         eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     };
     let req = format!("GET /healthz HTTP/1.1\r\nHost: {web}\r\nConnection: close\r\n\r\n");
     match http_once(web, &req) {
         Ok(out) => {
             let out = String::from_utf8_lossy(&out);
             println!("{}", out.split("\r\n\r\n").nth(1).unwrap_or(&out));
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
             eprintln!("coding-lab：連不上 collector（{web}）：{e}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }

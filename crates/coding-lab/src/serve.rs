@@ -283,7 +283,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
 
     let web = WebState::new_with_auth(
         Some(store.clone()),
-        cfg.web_root.clone(),
+        cfg.web_root_or_bundled(),
         FRAME_QUEUE,
         cfg.home.clone(),
         cfg.auth,
