@@ -230,6 +230,17 @@ impl Tracker {
         out
     }
 
+    /// subagent（含背景 agent）結束：之後不會再有它的 Bash 成功來解除它的連續失敗，跟著結束一起清掉（K-1）。
+    pub fn agent_finished(&mut self, agent: &str, now: u64) -> Vec<Change> {
+        self.fail_streak.remove(agent);
+        let mut out = Vec::new();
+        if let Some(r) = self.fail_open.remove(agent) {
+            out.extend(self.clear(AttentionKind::Fail, &r));
+        }
+        out.extend(self.recompute(now));
+        out
+    }
+
     /// 一批工具結束：被自動駁回的權限詢問只有這個訊號（實測 12 ms）。
     pub fn batch_done(&mut self, now: u64) -> Vec<Change> {
         let mut out = self.clear_waits();

@@ -579,6 +579,55 @@ fn failures_of_parallel_agents_are_counted_separately() {
     );
 }
 
+/// subagent 連續失敗兩次進 fail；它結束後不會再有它的 Bash 成功，fail 要跟著它結束一起解除（K-1）。
+fn subagent_fails_twice(r: &mut Run) {
+    r.feed(subagent_start("a1", 900))
+        .feed(pre_agent("t1", "x", "a1", 1000))
+        .feed(fail_agent("t1", "a1", 1100))
+        .feed(pre_agent("t2", "y", "a1", 1200))
+        .feed(fail_agent("t2", "a1", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")], "前提");
+    assert_eq!(r.last_status(), "fail");
+}
+
+#[test]
+fn subagent_fail_is_cleared_when_the_subagent_stops() {
+    let mut r = Run::new();
+    subagent_fails_twice(&mut r);
+    r.feed(subagent_stop("a1", 2000));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "fail", "t2")));
+    assert_eq!(r.last_status(), "run");
+    // 之後 main 的一輪照常完成
+    r.feed(stop(3000)).tick(9000);
+    assert_eq!(r.last_status(), "done");
+}
+
+#[test]
+fn subagent_fail_is_cleared_when_its_task_notification_finishes_it() {
+    let mut r = Run::new();
+    subagent_fails_twice(&mut r);
+    r.feed(prompt(&notification("a1", Some("failed")), 2000));
+    assert!(
+        r.attention().contains(&a("cleared", "fail", "t2")),
+        "{:?}",
+        r.attention()
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn main_fail_is_not_cleared_by_a_subagent_stop() {
+    let mut r = Run::new();
+    r.feed(subagent_start("a1", 900))
+        .feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "y", 1200))
+        .feed(fail("t2", 1300))
+        .feed(subagent_stop("a1", 2000));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
+    assert_eq!(r.last_status(), "fail");
+}
+
 #[test]
 fn interrupted_tool_is_not_a_failure() {
     let mut r = Run::new();

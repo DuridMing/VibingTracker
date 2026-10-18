@@ -851,22 +851,14 @@ impl Merger {
                 {
                     self.tracker(&sid).signal(Signal::SubagentFail, ts_seen);
                 }
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                if let Some(n) = &notice {
-                    out.extend(self.agent_by_order(&sid, &n.task_id, ts_seen));
-                }
-                if let Some(n) = notice
-                    && let Some(ss) = self.sessions.get_mut(&sid)
-                    && ss.finished_agents.insert(n.task_id.clone())
-                {
-                    ss.held_bg.retain(|_, h| h.agent_id != n.task_id);
+                if let Some(n) = notice {
                     let p = AgentFinished {
                         agent_id: n.task_id,
                         last_message: None,
                         transcript_path: None,
                         status: n.status,
                     };
-                    out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                    out.extend(self.finish_agent(&sid, p, meta()));
                 }
                 let changes = self.tracker(&sid).prompt(s("prompt_id"), ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
@@ -987,13 +979,6 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                out.extend(self.agent_by_order(&sid, &agent_id, ts_seen));
-                let ss = self.session(&sid);
-                ss.held_bg.retain(|_, h| h.agent_id != agent_id);
-                if !ss.finished_agents.insert(agent_id.clone()) {
-                    return out;
-                }
                 let p = AgentFinished {
                     agent_id,
                     last_message: s("last_assistant_message")
@@ -1001,7 +986,7 @@ impl Merger {
                     transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
-                out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                out.extend(self.finish_agent(&sid, p, meta()));
             }
             "PermissionRequest" => {
                 let tool = h.str_field("tool_name").unwrap_or_default().to_string();
@@ -1016,6 +1001,24 @@ impl Merger {
             // Notification（idle_prompt、permission_prompt）只當補強，P3 先不用（PLAN「注意佇列」）
             _ => {}
         }
+        out
+    }
+
+    /// 一個 subagent 結束（SubagentStop，或被 TaskStop 停掉的背景 agent 的 task-notification；E-M9）：
+    /// 先配好還在等配對的、發出 spawn（agent.finished 不能比 agent.spawned 早），每個 agent 只結束一次，
+    /// 它留下的連續失敗跟著解除（K-1）。
+    fn finish_agent(&mut self, sid: &str, p: AgentFinished, meta: Meta) -> Vec<Event> {
+        let ts_seen = meta.ts_seen;
+        let agent_id = p.agent_id.clone();
+        let mut out = self.agent_by_order(sid, &agent_id, ts_seen);
+        let ss = self.session(sid);
+        ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+        if !ss.finished_agents.insert(agent_id.clone()) {
+            return out;
+        }
+        out.push(self.emit(sid, Payload::AgentFinished(p), meta));
+        let changes = self.tracker(sid).agent_finished(&agent_id, ts_seen);
+        out.extend(self.apply(sid, changes, &agent_id, ts_seen));
         out
     }
 
