@@ -217,8 +217,10 @@ export function createStreamView({ scroller, model, agentName, projectTag = null
         const nd = nodes.get(k);
         if (nd) nd.v = -1;
       }
-      if (ops.appended && !follow) {
-        unseen += ops.appended;
+      // 只算篩選後看得到的新行（#747 F-14）；新行一定在尾端（上限丟的是最前面）
+      const fresh = ops.appended && !follow ? model.rows.slice(-ops.appended).filter((r) => model.isVisible(r)).length : 0;
+      if (fresh) {
+        unseen += fresh;
         pill.textContent = `↓ ${unseen} 個新事件`;
         pill.classList.add("show");
       }

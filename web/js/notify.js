@@ -107,18 +107,19 @@ export function createNotifier({ now, setTimeout, clearTimeout, emit, windowMs =
   };
 }
 
-// 多個主視窗用 BroadcastChannel 選一個負責出聲：活著的視窗中 id 最小的（id 用開啟時間開頭，所以是最早開的那個）
-export function createLeader({ id, channel, now, setInterval, clearInterval, beatMs = 1500, ttlMs = 5000 }) {
-  if (channel == null) return { isLeader: () => true, stop() {} };
-  const peers = new Map(); // id → 最後一次聽到的時間
-  const beat = () => channel.postMessage({ t: "beat", id });
+// 多個主視窗用 BroadcastChannel 選一個負責出聲：活著的視窗中，看得到的優先，再取 id 最小的（id 用開啟時間開頭，所以是最早開的那個）。
+// 背景分頁的計時器會被瀏覽器節流（心跳可能一分鐘才一次），只比 id 時前景、背景的分頁會都以為自己是 leader（#747 F-3）
+export function createLeader({ id, channel, now, setInterval, clearInterval, beatMs = 1500, ttlMs = 5000, visible = () => true }) {
+  if (channel == null) return { isLeader: () => true, beat() {}, stop() {} };
+  const peers = new Map(); // id → { seen: 最後一次聽到的時間, vis: 那時看不看得到 }
+  const beat = () => channel.postMessage({ t: "beat", id, vis: visible() });
   channel.onmessage = (e) => {
     const m = e.data;
     if (m == null || m.id === id) return;
     if (m.t === "bye") return void peers.delete(m.id);
     if (m.t !== "beat") return;
     const isNew = !peers.has(m.id);
-    peers.set(m.id, now());
+    peers.set(m.id, { seen: now(), vis: m.vis !== false });
     if (isNew) beat(); // 新開的視窗馬上知道有誰在
   };
   const timer = setInterval(beat, beatMs);
@@ -126,12 +127,18 @@ export function createLeader({ id, channel, now, setInterval, clearInterval, bea
   return {
     isLeader() {
       const t = now();
-      for (const [p, seen] of peers) {
-        if (t - seen > ttlMs) peers.delete(p);
-        else if (p < id) return false;
+      const me = visible();
+      let lead = true;
+      for (const [p, x] of peers) {
+        // 背景分頁的心跳稀疏：看得到的同伴照 ttl 判斷，看不到的同伴放寬到一分鐘多
+        if (t - x.seen > (x.vis ? ttlMs : Math.max(ttlMs, 65_000))) peers.delete(p);
+        else if (x.vis && !me) lead = false;
+        else if (x.vis === me && p < id) lead = false;
       }
-      return true;
+      return lead;
     },
+    // 看得見與否變了（visibilitychange）時馬上告訴其他視窗
+    beat,
     stop() {
       clearInterval(timer);
       channel.postMessage({ t: "bye", id });

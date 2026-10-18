@@ -605,8 +605,10 @@ const leader = createLeader({
   now: () => Date.now(),
   setInterval: (fn, ms) => window.setInterval(fn, ms),
   clearInterval: (t) => window.clearInterval(t),
+  visible: () => !document.hidden,
 });
 addEventListener("pagehide", () => leader.stop());
+document.addEventListener("visibilitychange", () => leader.beat());
 
 const notifier = createNotifier({
   now: () => Date.now(),
@@ -1870,7 +1872,7 @@ function startTimeline() {
   const cwd = $("#rpProj").value;
   if (!cwd) return;
   const choice = $("#rpRange").value;
-  let { from, to } = rangeFor(choice, Date.now(), utcOffset());
+  let { from, to } = rangeFor(choice, Date.now(), (ms) => -new Date(ms).getTimezoneOffset());
   if (choice === "custom") {
     // datetime-local 沒有時區，Date.parse 當成本地時間
     from = Date.parse($("#rpFrom").value);
