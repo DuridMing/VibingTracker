@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use coding_lab::derive::{edit_hunk, git_op_from, relative_path};
+use coding_lab::derive::{edit_hunk, git_op_from, relative_path, shell_segments};
 use coding_lab::event::{Event, HunkSource};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{DangerRules, Input, Merger, SESSION_IDLE_EVICT_MS};
@@ -214,6 +214,75 @@ fn git_subcommands_and_non_git() {
         git_op_from("echo 'git commit'", None, true).is_none(),
         "字串裡的 git 不算"
     );
+}
+
+fn segs(cmd: &str) -> Vec<Vec<String>> {
+    shell_segments(cmd)
+}
+
+fn v(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
+/// 分詞（#745 K-9）：反斜線跳脫與續行、雙引號內的跳脫、heredoc 本文、註解、重導向、命令替換。
+#[test]
+fn shell_segments_follow_shell_quoting() {
+    assert_eq!(
+        segs("git push \\\n  --force origin"),
+        [v(&["git", "push", "--force", "origin"])],
+        "續行接回同一段"
+    );
+    assert_eq!(segs("\\rm -rf x"), [v(&["rm", "-rf", "x"])]);
+    assert_eq!(
+        segs("echo \"a \\\"b\\\" ; c\" ; ls"),
+        [v(&["echo", "a \"b\" ; c"]), v(&["ls"])],
+        "雙引號內的 \\\" 不結束引號"
+    );
+    assert_eq!(segs("echo 'a\\b'"), [v(&["echo", "a\\b"])], "單引號內原樣");
+    assert_eq!(segs("ls # rm -rf /\npwd"), [v(&["ls"]), v(&["pwd"])]);
+    assert_eq!(
+        segs("echo a#b"),
+        [v(&["echo", "a#b"])],
+        "詞中間的 # 不是註解"
+    );
+    assert_eq!(
+        segs("grep KEY <.env 2>&1"),
+        [v(&["grep", "KEY", "<", ".env", "2", ">&", "1"])],
+        "重導向是自己的詞，2>&1 的 & 不切段"
+    );
+    assert_eq!(
+        segs("docker rm $(docker ps -aq -f status=exited)"),
+        [v(&["docker", "rm", "$(docker…)"])],
+        "命令替換在段裡只留第一個詞"
+    );
+}
+
+#[test]
+fn heredoc_body_is_one_word_of_its_command() {
+    assert_eq!(
+        segs("cat > x.sh <<'EOF'\nrm -rf /\necho hi\nEOF\nls"),
+        [
+            v(&["cat", ">", "x.sh", "<<", "rm -rf / echo hi"]),
+            v(&["ls"])
+        ]
+    );
+    assert_eq!(
+        segs("cat <<-END\n\tgit push -f\n\tEND"),
+        [v(&["cat", "<<", "git push -f"])],
+        "<<- 去掉行首的 tab"
+    );
+    assert_eq!(
+        segs("cat <<< 'rm -rf /'"),
+        [v(&["cat", "<<<", "rm -rf /"])],
+        "here-string 不是 heredoc"
+    );
+}
+
+#[test]
+fn commit_message_heredoc_is_not_a_git_op_of_its_own() {
+    let cmd =
+        "git add -A && git commit -m \"$(cat <<'EOF'\nfix: x\n\ngit push --force is gone\nEOF\n)\"";
+    assert_eq!(git_op_from(cmd, None, true).unwrap().op, "commit");
 }
 
 #[test]
@@ -730,4 +799,62 @@ fn edit_hunk_is_bounded_in_bytes() {
         4,
         "a、-OLD、+NEW、b"
     );
+}
+
+/// D7（#745 C19）：replace_all 的 Edit 不畫第一處：`hunk` 為 null、`hunkSource: none`、`replaceAll: true`，
+/// 畫面標「多處取代」；一般的 Edit 不輸出 `replaceAll`。
+#[test]
+fn replace_all_edit_has_no_hunk() {
+    let dir = tmpdir();
+    let f = dir.join("a.rs");
+    std::fs::write(&f, "let foo = 1;\n// x\nprint(foo);\n").unwrap();
+    let path = f.to_str().unwrap();
+    let mut m = Merger::new(Box::new(NoDanger));
+    let edit = |all: bool, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
+               "tool_input": {"file_path": path, "old_string": "foo", "new_string": "bar", "replace_all": all},
+               "tool_use_id": id})
+    };
+    let evs = handle(&mut m, edit(true, "e1"), 1);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["hunk"], &fe["hunkSource"], &fe["replaceAll"]),
+        (&Value::Null, &json!("none"), &json!(true))
+    );
+    let evs = handle(&mut m, edit(false, "e2"), 2);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert!(fe["hunk"].is_object());
+    assert!(fe.get("replaceAll").is_none());
+}
+
+/// D8（#745 K-10）：lastMessage 截 500 個字元（不是 500 bytes）：440 個中文字整段留著，600 個截成 500。
+#[test]
+fn last_message_is_cut_at_500_chars() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let stop = |msg: String, ts: u64| json!({"session_id": "s1", "hook_event_name": "Stop", "last_assistant_message": msg, "_ts": ts});
+    let short = "這是一段很長的中文訊息".repeat(40);
+    let evs = handle(&mut m, stop(short.clone(), 1), 1);
+    assert_eq!(
+        of(&evs, "turn.stopped")[0].payload["lastMessage"],
+        json!(short)
+    );
+    let evs = handle(&mut m, stop("字".repeat(600), 2), 2);
+    let kept = of(&evs, "turn.stopped")[0].payload["lastMessage"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert_eq!(kept, 500);
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "SubagentStop", "agent_id": "a1",
+               "agent_type": "Explore", "last_assistant_message": "字".repeat(600)}),
+        3,
+    );
+    let kept = of(&evs, "agent.finished")[0].payload["lastMessage"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert_eq!(kept, 500, "subagent 的也一樣");
 }

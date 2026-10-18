@@ -200,52 +200,406 @@ pub fn normalize_command<'a>(tool: &str, command: &'a str) -> std::borrow::Cow<'
     std::borrow::Cow::Owned(out)
 }
 
-/// 把指令依 `&&`、`||`、`;`、`|`、換行切段，引號內的內容不切（所以 `echo 'git commit'` 不算 git）。
-pub fn shell_segments(command: &str) -> Vec<Vec<String>> {
-    let mut segments = vec![Vec::new()];
-    let mut token = String::new();
-    let mut quote: Option<char> = None;
-    let mut depth = 0usize; // $( … ) 的層數
-    let chars: Vec<char> = command.chars().collect();
-    let mut i = 0;
-    let flush = |token: &mut String, segments: &mut Vec<Vec<String>>| {
-        if !token.is_empty()
-            && let Some(seg) = segments.last_mut()
-        {
-            seg.push(std::mem::take(token));
-        }
+/// 分詞後的一個詞。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellWord {
+    /// 去掉引號與跳脫後的文字。命令替換只留 `$(第一個詞…)`（內容另外放在 [`ShellParse::nested`]）；
+    /// heredoc 本文的換行接成空白
+    pub text: String,
+    /// 有任何部分來自引號或 heredoc 本文：是字面的文字，不是 shell 語法
+    pub quoted: bool,
+}
+
+/// 一段指令（`&&`、`||`、`;`、`|`、換行之間）。
+#[derive(Clone, Debug, Default)]
+pub struct ShellSegment {
+    pub words: Vec<ShellWord>,
+    /// 這段後面接的是管線 `|`
+    pub piped: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct ShellParse {
+    pub segments: Vec<ShellSegment>,
+    /// 最外層的 `$( … )`、`` ` … ` ``、`( … )` 裡的指令；更深的由呼叫端對它們再分詞（E-B5）
+    pub nested: Vec<String>,
+}
+
+/// 依 sh 的規則分詞（#745 K-9）：引號、反斜線跳脫與續行、雙引號內的跳脫、`#` 註解、重導向（自己一個詞，
+/// `2>&1` 的 `&` 不切段）、heredoc（本文接在 `<<` 之後當成一個詞，不當成指令）、命令替換。
+pub fn shell_parse(command: &str) -> ShellParse {
+    let mut l = Lexer {
+        c: command.chars().collect(),
+        i: 0,
+        out: ShellParse {
+            segments: vec![ShellSegment::default()],
+            nested: Vec::new(),
+        },
+        word: String::new(),
+        in_word: false,
+        quoted: false,
+        heredocs: Vec::new(),
+        parens: Vec::new(),
     };
-    while i < chars.len() {
-        let c = chars[i];
-        match quote {
-            Some(q) => {
-                if c == q && depth == 0 {
-                    quote = None;
-                } else {
-                    if c == '(' && i > 0 && chars[i - 1] == '$' {
-                        depth += 1;
-                    } else if c == ')' && depth > 0 {
-                        depth -= 1;
+    l.run();
+    l.out.segments.retain(|s| !s.words.is_empty());
+    l.out
+}
+
+/// 把指令切段、每段分詞（規則見 [`shell_parse`]），引號內的內容不切（所以 `echo 'git commit'` 不算 git）。
+pub fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    shell_parse(command)
+        .segments
+        .into_iter()
+        .map(|s| s.words.into_iter().map(|w| w.text).collect())
+        .collect()
+}
+
+/// 還在等本文的 heredoc：本文放進第 `segment` 段的第 `word` 個詞。
+struct Heredoc {
+    delim: String,
+    strip_tabs: bool,
+    segment: usize,
+    word: usize,
+}
+
+struct Lexer {
+    c: Vec<char>,
+    i: usize,
+    out: ShellParse,
+    word: String,
+    in_word: bool,
+    quoted: bool,
+    heredocs: Vec<Heredoc>,
+    /// 還沒關上的 `(` 的下一個位置
+    parens: Vec<usize>,
+}
+
+impl Lexer {
+    fn at(&self, i: usize) -> Option<char> {
+        self.c.get(i).copied()
+    }
+
+    fn push(&mut self, ch: char) {
+        self.word.push(ch);
+        self.in_word = true;
+    }
+
+    fn flush(&mut self) {
+        if self.in_word
+            && let Some(seg) = self.out.segments.last_mut()
+        {
+            seg.words.push(ShellWord {
+                text: std::mem::take(&mut self.word),
+                quoted: self.quoted,
+            });
+        }
+        self.in_word = false;
+        self.quoted = false;
+    }
+
+    fn push_word(&mut self, text: &str, quoted: bool) {
+        self.flush();
+        self.word.push_str(text);
+        self.in_word = true;
+        self.quoted = quoted;
+        self.flush();
+    }
+
+    fn end_segment(&mut self, piped: bool) {
+        self.flush();
+        if let Some(last) = self.out.segments.last_mut()
+            && !last.words.is_empty()
+        {
+            last.piped = piped;
+            self.out.segments.push(ShellSegment::default());
+        }
+    }
+
+    fn run(&mut self) {
+        while let Some(ch) = self.at(self.i) {
+            match ch {
+                ' ' | '\t' | '\r' => {
+                    self.flush();
+                    self.i += 1;
+                }
+                '\n' => {
+                    self.end_segment(false);
+                    self.i += 1;
+                    self.read_heredocs();
+                }
+                '\\' => match self.at(self.i + 1) {
+                    // 續行
+                    Some('\n') => self.i += 2,
+                    Some(n) => {
+                        self.push(n);
+                        self.i += 2;
                     }
-                    token.push(c);
+                    None => {
+                        self.push('\\');
+                        self.i += 1;
+                    }
+                },
+                '\'' => {
+                    self.i += 1;
+                    self.in_word = true;
+                    self.quoted = true;
+                    while let Some(n) = self.at(self.i) {
+                        self.i += 1;
+                        if n == '\'' {
+                            break;
+                        }
+                        self.word.push(n);
+                    }
+                }
+                '"' => {
+                    self.i += 1;
+                    self.in_word = true;
+                    self.quoted = true;
+                    self.double_quoted();
+                }
+                '`' => {
+                    self.i += 1;
+                    let inner = self.backtick();
+                    self.substitution(inner, '`');
+                }
+                '$' if self.at(self.i + 1) == Some('(') => {
+                    self.i += 2;
+                    let inner = self.dollar_paren();
+                    self.substitution(inner, '$');
+                }
+                '#' if !self.in_word => {
+                    while self.at(self.i).is_some_and(|c| c != '\n') {
+                        self.i += 1;
+                    }
+                }
+                ';' => {
+                    self.end_segment(false);
+                    self.i += 1;
+                }
+                '|' => {
+                    if self.at(self.i + 1) == Some('|') {
+                        self.end_segment(false);
+                        self.i += 2;
+                    } else {
+                        self.end_segment(true);
+                        self.i += 1;
+                        // `|&`
+                        if self.at(self.i) == Some('&') {
+                            self.i += 1;
+                        }
+                    }
+                }
+                '&' if self.at(self.i + 1) == Some('>') => self.redirect(),
+                '&' => {
+                    self.end_segment(false);
+                    self.i += 1;
+                }
+                '<' | '>' => self.redirect(),
+                '(' => {
+                    self.parens.push(self.i + 1);
+                    self.push('(');
+                    self.i += 1;
+                }
+                ')' => {
+                    if let Some(start) = self.parens.pop()
+                        && self.parens.is_empty()
+                    {
+                        self.out.nested.push(self.c[start..self.i].iter().collect());
+                    }
+                    self.push(')');
+                    self.i += 1;
+                }
+                ch => {
+                    self.push(ch);
+                    self.i += 1;
                 }
             }
-            None => match c {
-                '\'' | '"' => quote = Some(c),
-                ' ' | '\t' => flush(&mut token, &mut segments),
-                '\n' | ';' | '|' | '&' => {
-                    flush(&mut token, &mut segments);
-                    if segments.last().is_some_and(|s| !s.is_empty()) {
-                        segments.push(Vec::new());
+        }
+        self.end_segment(false);
+    }
+
+    /// 雙引號內：`\"`、`\\`、`\$`、`` \` `` 是跳脫，`\` 加換行是續行，其他的反斜線照留；命令替換照樣展開。
+    fn double_quoted(&mut self) {
+        while let Some(n) = self.at(self.i) {
+            match n {
+                '"' => {
+                    self.i += 1;
+                    return;
+                }
+                '\\' => match self.at(self.i + 1) {
+                    Some('\n') => self.i += 2,
+                    Some(e @ ('"' | '\\' | '$' | '`')) => {
+                        self.word.push(e);
+                        self.i += 2;
+                    }
+                    _ => {
+                        self.word.push('\\');
+                        self.i += 1;
+                    }
+                },
+                '$' if self.at(self.i + 1) == Some('(') => {
+                    self.i += 2;
+                    let inner = self.dollar_paren();
+                    self.substitution(inner, '$');
+                }
+                '`' => {
+                    self.i += 1;
+                    let inner = self.backtick();
+                    self.substitution(inner, '`');
+                }
+                _ => {
+                    self.word.push(n);
+                    self.i += 1;
+                }
+            }
+        }
+    }
+
+    /// `$(` 之後到對應的 `)`（只數括號）。
+    fn dollar_paren(&mut self) -> String {
+        let start = self.i;
+        let mut depth = 1usize;
+        while let Some(n) = self.at(self.i) {
+            match n {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let inner = self.c[start..self.i].iter().collect();
+                        self.i += 1;
+                        return inner;
                     }
                 }
-                _ => token.push(c),
-            },
+                _ => {}
+            }
+            self.i += 1;
         }
-        i += 1;
+        self.c[start..].iter().collect()
     }
-    flush(&mut token, &mut segments);
-    segments.into_iter().filter(|s| !s.is_empty()).collect()
+
+    /// `` ` `` 之後到下一個沒跳脫的 `` ` ``。
+    fn backtick(&mut self) -> String {
+        let start = self.i;
+        while let Some(n) = self.at(self.i) {
+            match n {
+                '\\' => self.i += 2,
+                '`' => {
+                    let inner = self.c[start..self.i].iter().collect();
+                    self.i += 1;
+                    return inner;
+                }
+                _ => self.i += 1,
+            }
+        }
+        self.c[start.min(self.c.len())..].iter().collect()
+    }
+
+    /// 命令替換：詞裡只留 `$(第一個詞…)`，免得裡面的選項被當成外面指令的（`docker rm $(docker ps -f …)`）；
+    /// 內容交給呼叫端遞迴。在 `( … )` 裡的不另外記，外層的內容已經含它。
+    fn substitution(&mut self, inner: String, kind: char) {
+        let first = inner.split_whitespace().next().unwrap_or_default();
+        let shown = if kind == '$' {
+            format!("$({first}…)")
+        } else {
+            format!("`{first}…`")
+        };
+        self.word.push_str(&shown);
+        self.in_word = true;
+        if self.parens.is_empty() {
+            self.out.nested.push(inner);
+        }
+    }
+
+    /// 重導向自己一個詞：`<`、`>`、`>>`、`2>` 的 `>`、`>&`、`&>`、`<<<`；`<<`、`<<-` 是 heredoc。
+    fn redirect(&mut self) {
+        self.flush();
+        let mut op = String::new();
+        if self.at(self.i) == Some('&') {
+            op.push('&');
+            self.i += 1;
+        }
+        while let Some(ch @ ('<' | '>')) = self.at(self.i) {
+            op.push(ch);
+            self.i += 1;
+        }
+        match self.at(self.i) {
+            Some('&') if !op.starts_with('&') => {
+                op.push('&');
+                self.i += 1;
+            }
+            Some('-') if op == "<<" => {
+                op.push('-');
+                self.i += 1;
+            }
+            Some('|') if op == ">" => self.i += 1,
+            _ => {}
+        }
+        if op == "<<" || op == "<<-" {
+            self.push_word("<<", false);
+            self.heredoc_delimiter(op == "<<-");
+        } else {
+            self.push_word(&op, false);
+        }
+    }
+
+    /// heredoc 的結束字（去掉引號與反斜線），先放一個空的詞，換行之後讀到本文再填進去。
+    fn heredoc_delimiter(&mut self, strip_tabs: bool) {
+        while matches!(self.at(self.i), Some(' ' | '\t')) {
+            self.i += 1;
+        }
+        let mut delim = String::new();
+        while let Some(n) = self.at(self.i) {
+            if n.is_whitespace() || matches!(n, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+                break;
+            }
+            if !matches!(n, '\'' | '"' | '\\') {
+                delim.push(n);
+            }
+            self.i += 1;
+        }
+        let segment = self.out.segments.len().saturating_sub(1);
+        let word = self.out.segments.last().map_or(0, |s| s.words.len());
+        self.push_word("", true);
+        self.heredocs.push(Heredoc {
+            delim,
+            strip_tabs,
+            segment,
+            word,
+        });
+    }
+
+    /// 換行之後：依序讀完每個 heredoc 的本文（到只有結束字的那一行；沒有就到結尾）。
+    fn read_heredocs(&mut self) {
+        for h in std::mem::take(&mut self.heredocs) {
+            let mut body: Vec<String> = Vec::new();
+            while self.i < self.c.len() {
+                let end = (self.i..self.c.len())
+                    .find(|&k| self.c[k] == '\n')
+                    .unwrap_or(self.c.len());
+                let line: String = self.c[self.i..end].iter().collect();
+                self.i = (end + 1).min(self.c.len());
+                let line = line.strip_suffix('\r').unwrap_or(&line);
+                let line = if h.strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line
+                };
+                if line == h.delim {
+                    break;
+                }
+                body.push(line.to_string());
+            }
+            if let Some(w) = self
+                .out
+                .segments
+                .get_mut(h.segment)
+                .and_then(|s| s.words.get_mut(h.word))
+            {
+                w.text = body.join(" ");
+            }
+        }
+    }
 }
 
 /// 路徑相對 `cwd`、一律 `/` 分隔；不在 `cwd` 底下就回傳正規化後的完整路徑。
@@ -322,7 +676,9 @@ pub fn probe_job(h: &HookInput) -> Option<ProbeJob> {
     if is_unc(path) {
         return None;
     }
-    let edit = h.str_field("tool_name") == Some("Edit");
+    // replace_all 的 Edit 不畫 hunk（D7），不用讀檔
+    let edit =
+        h.str_field("tool_name") == Some("Edit") && input["replace_all"].as_bool() != Some(true);
     let s = |k: &str| input[k].as_str().unwrap_or_default().to_string();
     Some(ProbeJob {
         edit,

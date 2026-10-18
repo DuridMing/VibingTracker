@@ -390,6 +390,9 @@ pub struct FileEdit {
     /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
+    /// `replace_all` 的 Edit：`hunk` 為 null，畫面標「多處取代」，不畫第一處（D7、#745）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_all: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
