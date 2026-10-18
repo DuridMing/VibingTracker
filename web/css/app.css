@@ -488,3 +488,6 @@ body.monitor .top{grid-template-columns:auto 1fr}
 
 /* 只給螢幕閱讀器讀（#747 F-12） */
 .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* 資料寫不進磁碟的提示（#781 W-M10） */
+.storeerr{margin-left:8px;padding:2px 8px;border-radius:999px;background:var(--rose-soft);color:var(--rose);font-size:12px;font-weight:600}
