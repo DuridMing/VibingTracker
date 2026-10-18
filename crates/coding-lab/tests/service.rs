@@ -335,7 +335,9 @@ fn non_utf8_command_output_is_flagged_instead_of_shown_as_garbage() {
     assert!(!text.is_empty());
 }
 
-/// #724：Windows 的 schtasks 用 OEM code page 輸出，要解成可讀文字（實機拿到的 cp950 位元組）
+/// #724：Windows 的 schtasks 用 OEM code page 輸出，要解成可讀文字（實機拿到的 cp950 位元組）。
+/// encoding_rs 只在 Windows 編（#758），這個測試由 Windows 的 check.sh／CI 跑
+#[cfg(windows)]
 #[test]
 fn oem_code_page_bytes_decode_to_readable_text() {
     // 「錯誤: 存取被拒。\r\n」的 cp950 位元組（#715 Windows 側實機紀錄）
@@ -361,6 +363,19 @@ fn oem_code_page_bytes_decode_to_readable_text() {
     assert_eq!(service::code_page_label(12345), None);
     assert!(service::decode_with_code_page(&denied, 12345).is_none());
     // UTF-8 照舊直接用
+    assert_eq!(
+        service::decode_output("ok\n".as_bytes()),
+        ("ok".to_string(), false)
+    );
+}
+
+/// 非 Windows 不帶 encoding_rs：code page 對照表照常，解碼一律交給 UTF-8／lossy（#758 E-B9）
+#[cfg(not(windows))]
+#[test]
+fn code_page_decoding_is_windows_only() {
+    assert_eq!(service::code_page_label(950), Some("big5"));
+    assert_eq!(service::code_page_label(12345), None);
+    assert!(service::decode_with_code_page(&[0xbf, 0xf9], 950).is_none());
     assert_eq!(
         service::decode_output("ok\n".as_bytes()),
         ("ok".to_string(), false)

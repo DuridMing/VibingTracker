@@ -445,10 +445,17 @@ pub fn code_page_label(cp: u32) -> Option<&'static str> {
 }
 
 /// 用指定的 code page 解碼（Windows 子程序的 stderr／stdout，#724）；不認得的 code page 回 None。
+#[cfg(windows)]
 pub fn decode_with_code_page(bytes: &[u8], cp: u32) -> Option<String> {
     let enc = encoding_rs::Encoding::for_label(code_page_label(cp)?.as_bytes())?;
     let (text, _, had_errors) = enc.decode(bytes);
     (!had_errors).then(|| text.trim().to_string())
+}
+
+/// 非 Windows 的子程序輸出本來就是 UTF-8，不需要 code page 解碼：encoding_rs 只在 Windows 編（#758 E-B9）。
+#[cfg(not(windows))]
+pub fn decode_with_code_page(_bytes: &[u8], _cp: u32) -> Option<String> {
+    None
 }
 
 /// 這台 Windows 主控台的 OEM code page：`reg query` 的 `OEMCP` 值（不用 unsafe 的 Win32 呼叫）。非 Windows 回 None。

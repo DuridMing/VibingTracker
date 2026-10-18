@@ -24,12 +24,15 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 # 0.10 與 axum 的 sha1 共用 digest 0.10，不重複編兩版（#772）
 sha2 = "0.10"
-# Windows 子程序（schtasks）的輸出是 OEM code page（cp950 等），要解成可讀文字（#724）
-encoding_rs = "0.8.42"
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
 # 跟 axum 0.8 的 ws 用同一版，不重複編兩版（#772）
 tokio-tungstenite = "0.29.0"
 toml = "1.1.8"
+
+# Windows 子程序（schtasks）的輸出是 OEM code page（cp950 等），要解成可讀文字（#724）；
+# 其他平台用不到，只在 Windows 編（#758 E-B9：Windows 二進位大小不變，Linux／macOS 少編一個 crate）
+[target.'cfg(windows)'.dependencies]
+encoding_rs = "0.8.42"
 
 [dev-dependencies]
 
