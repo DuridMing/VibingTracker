@@ -1055,3 +1055,39 @@ async fn hub_finds_the_owner_of_a_project_that_is_only_in_an_upstreams_store() {
         404
     );
 }
+
+/// R-5：`coding-lab config` 用 Debug 印設定，上游金鑰只留 id，不印 secret。
+#[test]
+fn upstream_debug_does_not_print_the_key_secret() {
+    let key = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    let up = Upstream {
+        name: "srv".into(),
+        url: "http://10.0.0.2:4801".into(),
+        key: Some(key.into()),
+    };
+    let shown = format!("{up:?} {up:#?}");
+    assert!(!shown.contains("0123456789abcdefghij"), "{shown}");
+    assert!(shown.contains("clk_ABCDEFGH_…"), "{shown}");
+}
+
+/// W-L4：hub add 只收 clk_ 金鑰的格式；含 \ 之類的字會讓 config.toml 解析失敗、所有子命令起不來。
+#[test]
+fn hub_add_rejects_malformed_keys() {
+    let dir = tmp("hub-add");
+    let cfg = dir.join("config.toml");
+    for bad in [
+        "abc\\def",
+        "clk_short",
+        "not-a-key",
+        "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcd\\e",
+    ] {
+        assert!(
+            hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(bad)).is_err(),
+            "{bad}"
+        );
+        assert!(!cfg.exists(), "{bad}：被拒時 config.toml 不變");
+    }
+    let good = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(good)).unwrap();
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains(good));
+}

@@ -5,7 +5,7 @@
 //! `<key id>.<到期 ms>.<簽章>`：collector 重啟不必重登，但每次仍比對 `keys.json`，撤銷立即生效。
 //! hook 入口（4800）完全不經過這裡（不變式 6）。
 //!
-//! 時間一律注入（epoch ms）；`keys.json` 依 mtime 重讀，CLI 改檔不必重啟。
+//! 時間一律注入（epoch ms）；`keys.json` 換過（mtime、大小或 inode 變了）就重讀，CLI 改檔不必重啟。
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -198,6 +198,10 @@ fn write_links(home: &Path, links: &[OnceLink]) -> Result<(), String> {
     keys::save_private_json(&home.join(LINKS_FILE), &text)
 }
 
+/// 一次性連結檔的讀改寫都在這把鎖裡：同時兩個兌換不會都讀到同一個 code（S-7）。
+/// CLI 建連結是另一個程序，不受這把鎖保護，但它只新增、不兌換。
+static LINKS_LOCK: Mutex<()> = Mutex::new(());
+
 /// 建一個 5 分鐘內、只能用一次的登入連結 code（`coding-lab key login-link`）。檔裡只存 code 的 SHA-256。
 pub fn create_once_link(
     home: &Path,
@@ -206,6 +210,7 @@ pub fn create_once_link(
     rng: &mut dyn Rng,
 ) -> Result<String, String> {
     let code = keys::random_base62(rng);
+    let _guard = LINKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut links = read_links(home)?;
     links.retain(|l| l.expires_ms > now_ms);
     links.push(OnceLink {
@@ -219,6 +224,7 @@ pub fn create_once_link(
 
 /// 用掉一個 code：找得到而且沒過期回它的 key id；不論結果都把它從檔裡拿掉。
 pub fn consume_once_link(home: &Path, code: &str, now_ms: u64) -> Result<Option<String>, String> {
+    let _guard = LINKS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut links = read_links(home)?;
     if links.is_empty() {
         return Ok(None);
@@ -314,8 +320,30 @@ pub enum Denied {
     OriginMismatch,
 }
 
-struct KeysCache {
+/// `keys.json` 有沒有換過：mtime 加上大小與 inode。只看 mtime 時，CLI 在同一個 mtime 刻度內撤銷會讀不到（S-3）；
+/// CLI 寫檔是寫暫存檔再 rename，每次都換 inode。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileStamp {
     mtime: Option<SystemTime>,
+    len: u64,
+    ino: u64,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Some(FileStamp {
+        mtime: m.modified().ok(),
+        len: m.len(),
+        ino,
+    })
+}
+
+struct KeysCache {
+    mtime: Option<FileStamp>,
     store: Option<KeyStore>,
     /// 每把金鑰上次寫回 last_used 的時間
     flushed: HashMap<String, u64>,
@@ -363,12 +391,12 @@ impl Auth {
             .unwrap_or(false)
     }
 
-    /// 拿目前的 `keys.json`（mtime 變了就重讀）；沒有資料目錄回 None。讀不到或權限不對時當成沒有金鑰並寫 log。
+    /// 拿目前的 `keys.json`（換過就重讀，見 [`FileStamp`]）；沒有資料目錄回 None。讀不到或權限不對時當成沒有金鑰並寫 log。
     fn with_keys<R>(&self, f: impl FnOnce(&mut KeysCache, &Path) -> R) -> Option<R> {
         let home = self.home.as_ref()?;
         let mut cache = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let path = KeyStore::path(home);
-        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mtime = file_stamp(&path);
         if mtime != cache.mtime || (mtime.is_some() && cache.store.is_none()) {
             cache.store = match KeyStore::load(home) {
                 Ok(s) => s,
@@ -382,33 +410,38 @@ impl Auth {
         Some(f(&mut cache, home))
     }
 
-    /// 驗一個完整的金鑰；成功回 (id, scope) 並把 last_used 寫回（每把最多每分鐘一次）。
+    /// 驗一個完整的金鑰；成功回 (id, scope) 並記下 last_used（每把最多每分鐘一次）。
+    /// last_used 寫在 `keys-used.json`、在金鑰快取的鎖外寫：collector 從不寫 `keys.json`，CLI 的撤銷不會被蓋掉
+    /// （S-3），驗證也不用等寫檔與 sync（E-H10）。
     pub fn verify_token(&self, token: &str, now_ms: u64) -> Result<(String, Scope), String> {
-        self.with_keys(|cache, home| {
-            let store = cache
-                .store
-                .as_mut()
-                .ok_or_else(|| "還沒有任何金鑰".to_string())?;
-            let (id, scope) = store
-                .verify(token, now_ms)
-                .map(|k| (k.id.clone(), k.scope))
-                .map_err(|e| e.to_string())?;
-            let due = cache
-                .flushed
-                .get(&id)
-                .is_none_or(|t| now_ms.saturating_sub(*t) >= LAST_USED_FLUSH_MS);
-            if due {
-                if let Err(e) = store.save(home) {
-                    crate::logging::log(&format!("web：寫回 last_used 失敗：{e}"));
+        let verified = self
+            .with_keys(|cache, _| {
+                let store = cache
+                    .store
+                    .as_mut()
+                    .ok_or_else(|| "還沒有任何金鑰".to_string())?;
+                let (id, scope) = store
+                    .verify(token, now_ms)
+                    .map(|k| (k.id.clone(), k.scope))
+                    .map_err(|e| e.to_string())?;
+                let due = cache
+                    .flushed
+                    .get(&id)
+                    .is_none_or(|t| now_ms.saturating_sub(*t) >= LAST_USED_FLUSH_MS);
+                if due {
+                    cache.flushed.insert(id.clone(), now_ms);
                 }
-                cache.mtime = std::fs::metadata(KeyStore::path(home))
-                    .and_then(|m| m.modified())
-                    .ok();
-                cache.flushed.insert(id.clone(), now_ms);
-            }
-            Ok((id, scope))
-        })
-        .unwrap_or_else(|| Err("這個 collector 沒有金鑰檔".to_string()))
+                Ok((id, scope, due))
+            })
+            .unwrap_or_else(|| Err("這個 collector 沒有金鑰檔".to_string()));
+        let (id, scope, due) = verified?;
+        if due
+            && let Some(home) = &self.home
+            && let Err(e) = keys::record_used(home, &id, now_ms)
+        {
+            crate::logging::log(&format!("web：記下 last_used 失敗：{e}"));
+        }
+        Ok((id, scope))
     }
 
     /// 這把 id 現在能不能用（cookie 用）。

@@ -320,3 +320,21 @@ mod cli {
         assert!(err.contains("nope0000"), "{err}");
     }
 }
+
+/// W-L1：單位不是 ASCII 時回錯誤（原本位元組切片切在「天」的中間而 panic）；乘出來溢位也回錯誤。
+#[test]
+fn parse_expires_rejects_non_ascii_units_and_overflow() {
+    for bad in [
+        "9天",
+        "天",
+        "9d天",
+        "18446744073709551615d",
+        "99999999999999999m",
+    ] {
+        assert!(keys::parse_expires(bad, NOW).is_err(), "{bad}");
+    }
+    assert!(
+        keys::parse_expires("1d", u64::MAX - 1).is_err(),
+        "加上 now 溢位"
+    );
+}

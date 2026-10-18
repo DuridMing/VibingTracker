@@ -85,12 +85,30 @@ impl Heartbeat {
 }
 
 /// `[[hub.upstream]]`：一台 collector。`key` 省略時只適合本機或 SSH 通道（那台 `auth = "local-open"`）。
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Upstream {
     pub name: String,
     pub url: String,
     #[serde(default)]
     pub key: Option<String>,
+}
+
+/// `coding-lab config` 用 Debug 印整份設定：金鑰只留 `clk_<id>_…`，疑難排解時整段貼出去也不會外洩（R-5）。
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = self
+            .key
+            .as_deref()
+            .map(|k| match crate::keys::parse_token(k) {
+                Some((id, _)) => format!("clk_{id}_…"),
+                None => "…".to_string(),
+            });
+        f.debug_struct("Upstream")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("key", &key)
+            .finish()
+    }
 }
 
 /// `http://host:port[/]` → `host:port`。TLS 不內建（只接受 http://）：遠端請走 tailnet 或 SSH 通道。
@@ -682,10 +700,11 @@ pub fn append_upstream(
         return Err(format!("名稱只能用英數字與 . _ -：{name}"));
     }
     ws_url(url)?;
+    // 只收這個系統發的 clk_ 金鑰（W-L4）：其他字元（例如 \）寫進 TOML 會讓 config.toml 解析失敗、所有子命令起不來
     if let Some(k) = key
-        && (k.is_empty() || k.chars().any(|c| c.is_control() || c == '"'))
+        && crate::keys::parse_token(k).is_none()
     {
-        return Err("金鑰格式不對".into());
+        return Err("金鑰格式不對：要是 `coding-lab key create` 印出的 clk_ 開頭那一串".into());
     }
     let existing = match std::fs::read_to_string(config_path) {
         Ok(t) => t,
