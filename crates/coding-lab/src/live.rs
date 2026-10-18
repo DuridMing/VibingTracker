@@ -577,10 +577,10 @@ impl Live {
                 s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
-                s.status = "run".into();
-                s.status_since = ts;
+                // 狀態不在這裡改，只認 session.status（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             }
             Payload::SessionEnded(_) => {
+                // merge 在 session.ended 之後一定發 ended；這裡照設，是給沒有 session.status 的舊 JSONL（不變式 9）
                 s.ended_at = Some(ts);
                 s.status = "ended".into();
                 s.status_since = ts;
