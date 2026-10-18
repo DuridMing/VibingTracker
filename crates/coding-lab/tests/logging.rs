@@ -55,3 +55,38 @@ fn reopening_continues_from_the_existing_size() {
     );
     assert_eq!(read(&path), "0123456789\n");
 }
+
+/// L-15（#750）：輪替失敗（Windows 上 collector.log 被不共用刪除權限的程式開著時 rename 會失敗）不能讓之後的
+/// log 全部丟掉：照樣寫進目前的檔，過一陣子再試輪替。這裡讓 `.1` 是有東西的資料夾，rename 一定失敗。
+#[test]
+fn a_failed_rotation_keeps_appending_to_the_current_file() {
+    let d = dir("rotate-fails");
+    let path = d.join("collector.log");
+    std::fs::create_dir_all(d.join("collector.log.1/x")).unwrap();
+    let mut log = RotatingLog::open(&path, 50, 1).unwrap();
+    for i in 0..10 {
+        let _ = log.write_line(&format!("line {i:03} xxxxxxxxx"));
+    }
+    let current = read(&path);
+    for i in 0..10 {
+        assert!(current.contains(&format!("line {i:03}")), "{current}");
+    }
+}
+
+/// L-15：panic 訊息原本只到 stderr，而背景 collector 的 stderr 是 ensure 開的那個 collector.log；
+/// 輪替之後那個 handle 指到 `.1`（最後被刪掉）。panic hook 改寫進目前的 log。
+#[test]
+fn panics_are_written_to_the_current_log() {
+    let d = dir("panic");
+    let path = d.join("collector.log");
+    coding_lab::logging::to_file(&path).unwrap();
+    coding_lab::logging::log_panics();
+    let r = std::panic::catch_unwind(|| panic!("boom 1234"));
+    assert!(r.is_err());
+    let text = read(&path);
+    assert!(
+        text.contains("panic") && text.contains("boom 1234"),
+        "{text}"
+    );
+    assert!(text.contains("logging.rs"), "要有位置：{text}");
+}

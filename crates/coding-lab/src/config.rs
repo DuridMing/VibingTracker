@@ -105,6 +105,8 @@ pub struct Config {
     pub hub_bind: SocketAddr,
     /// `[[hub.upstream]]`：hub 要看的每台 collector
     pub hub_upstreams: Vec<crate::hub::Upstream>,
+    /// 照樣能用、但使用者該知道的設定問題（config.toml 打錯的鍵，L-16）；serve 寫進 log、`config` 印到 stderr
+    pub warnings: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -180,6 +182,15 @@ impl Config {
     /// 讀真正的環境變數與 `<home>/config.toml`。
     pub fn load(cli: &Overrides) -> Result<Config, String> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        // 路徑可以不是 UTF-8：`env` 會把這種 CODING_LAB_HOME 當成沒設，所以先用 var_os 讀（L-16）。
+        // 命令列優先於環境變數，放進 cli.home 不改變優先序
+        let mut cli = cli.clone();
+        if cli.home.is_none() {
+            cli.home = std::env::var_os("CODING_LAB_HOME")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+        }
+        let cli = &cli;
         let home = home_dir(cli, &env, default_home());
         let file = match std::fs::read_to_string(home.join("config.toml")) {
             Ok(t) => Some(t),
@@ -209,6 +220,7 @@ impl Config {
             Some(text) => toml::from_str(text).map_err(|e| format!("config.toml 格式錯誤：{e}"))?,
             None => FileConfig::default(),
         };
+        let warnings = file.map(unknown_keys).unwrap_or_default();
         let pick = |cli: &Option<String>, key: &str, file: &Option<String>, default: &str| {
             cli.clone()
                 .or_else(|| env(key))
@@ -353,8 +365,66 @@ impl Config {
             allow_insecure,
             hub_bind,
             hub_upstreams: f.hub.upstream,
+            warnings,
         })
     }
+}
+
+/// config.toml 裡認得的段落與鍵；改 FileConfig 時一起改（L-16）。
+const KNOWN_KEYS: &[(&str, &[&str])] = &[
+    ("hook", &["bind"]),
+    (
+        "web",
+        &["bind", "root", "auth", "remote_thinking", "allow_insecure"],
+    ),
+    (
+        "collector",
+        &["idle_exit_seconds", "store_flush_ms", "wait_guess_seconds"],
+    ),
+    ("hub", &["bind", "upstream"]),
+];
+const UPSTREAM_KEYS: &[&str] = &["name", "url", "key"];
+
+/// config.toml 裡不認得的鍵（打錯字），每個一則警告。serde 會默默略過它們，結果是改了沒生效又看不出原因。
+fn unknown_keys(text: &str) -> Vec<String> {
+    let Ok(root) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut warn = |key: String| {
+        out.push(format!(
+            "config.toml 有不認得的設定 {key}，已略過（打錯字？）"
+        ))
+    };
+    for (section, value) in &root {
+        let Some((_, keys)) = KNOWN_KEYS.iter().find(|(s, _)| s == section) else {
+            match value {
+                toml::Value::Table(_) => warn(format!("[{section}]")),
+                _ => warn(section.clone()),
+            }
+            continue;
+        };
+        let Some(table) = value.as_table() else {
+            continue;
+        };
+        for (key, v) in table {
+            if !keys.contains(&key.as_str()) {
+                warn(format!("[{section}].{key}"));
+            } else if section == "hub" && key == "upstream" {
+                for u in v
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u.as_table())
+                {
+                    for k in u.keys().filter(|k| !UPSTREAM_KEYS.contains(&k.as_str())) {
+                        warn(format!("[[hub.upstream]].{k}"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn home_dir(

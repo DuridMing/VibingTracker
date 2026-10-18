@@ -217,6 +217,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     {
         log(&format!("開不了 collector.log：{e}"));
     }
+    crate::logging::log_panics();
     // 能預先知道會失敗的在綁 hook 埠之前檢查（L-1）：綁了就會回 200，之後才起不來的話那些 hook 就丟了
     if let Err(e) = crate::store::preflight(&cfg.home) {
         let msg = e.to_string();
@@ -271,6 +272,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
 
     if let Some(w) = cfg.plugin_warning() {
         log(&w);
+    }
+    for w in &cfg.warnings {
+        log(w);
     }
     let (rules, warning) = RuleSet::load(&cfg.home.join("rules.json"));
     if let Some(w) = warning {

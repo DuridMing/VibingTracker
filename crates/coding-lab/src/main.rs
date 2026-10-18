@@ -161,6 +161,9 @@ fn main() -> ExitCode {
         }
         Command::Config(args) => match Config::load(&args.overrides()) {
             Ok(c) => {
+                for w in &c.warnings {
+                    eprintln!("coding-lab：{w}");
+                }
                 println!("{c:#?}");
                 ExitCode::SUCCESS
             }
