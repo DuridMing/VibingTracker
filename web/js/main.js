@@ -441,7 +441,7 @@ function render(urgent = false) {
 }
 
 // ---------- 注意佇列（#646） ----------
-// 排序：種類 > session 分數 > raisedAt（attention.js）。「已確認」送 ack，等 collector 送 deleted 才真的移除；送出後到刪除前先變淡。
+// 排序：種類 > raisedAt 由新到舊（attention.js，#728）。「已確認」送 ack，等 collector 送 deleted 才真的移除；送出後到刪除前先變淡。
 const ackPending = new Set();
 const scoreOf = (id) => store.sessions.get(id)?.score;
 
@@ -453,14 +453,14 @@ function ago(ms) {
 
 function renderAttention() {
   for (const id of ackPending) if (!store.attention.has(id)) ackPending.delete(id);
-  const allRows = sortAttention([...store.attention.values()], scoreOf);
+  const allRows = sortAttention([...store.attention.values()]);
   const rows = allRows.filter((r) => inProject(r.session));
   const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
   const now = Date.now();
   const canAck = ui.welcome?.scope !== "view";
   const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
-  const todo = canAck ? ackAllTargets(rows, ackPending, scoreOf) : [];
+  const todo = canAck ? ackAllTargets(rows, ackPending) : [];
   $("#ackAll").hidden = !todo.length;
   $("#ackAll").textContent = `全部確認（${todo.length}）`;
   const box = $("#att");
@@ -509,7 +509,7 @@ function onServerError(m) {
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
   ui.ackError = null;
-  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending, scoreOf)) {
+  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) {
     ackPending.add(r.id);
     client.ack({ session: r.session, kind: r.kind, ref: r.ref });
   }
