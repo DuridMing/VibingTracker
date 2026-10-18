@@ -764,8 +764,14 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, i
                             continue;
                         }
                         conn.subs.insert(ch.clone(), f.no);
-                        if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(&mut socket, &conn, &j).await
+                        // 同一個 frame 每種（頻道、offset、模式）只序列化一次，其他連線拿快取（E-L4）
+                        let wire = if conn.remote {
+                            crate::live::Wire::Remote(conn.thinking)
+                        } else {
+                            crate::live::Wire::Local
+                        };
+                        if let Some(text) = f.text_for(&ch, conn.offset, wire)
+                            && socket.send(Message::Text(text)).await.is_err()
                         {
                             return;
                         }

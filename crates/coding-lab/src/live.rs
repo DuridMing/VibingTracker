@@ -227,9 +227,94 @@ pub struct Frame {
     agents: Vec<(String, Value)>,
     attention: Vec<(String, Value)>,
     kpi: BTreeMap<i32, Value>,
+    /// 序列化好的結果（E-L4）：(頻道, offset, 模式) → 送出的文字；None＝這種連線沒有內容
+    texts: std::sync::Mutex<HashMap<(String, i32, u8), Option<axum::extract::ws::Utf8Bytes>>>,
+    serialized: std::sync::atomic::AtomicUsize,
+}
+
+/// 本機版本直接序列化借用的 Event，不經過中間的 Value（E-L4）。
+#[derive(serde::Serialize)]
+struct FrameOut<'a> {
+    t: &'static str,
+    frame: u64,
+    ch: String,
+    events: Vec<&'a Event>,
+    rows: Value,
+}
+
+/// frame 送給哪一種連線：本機原樣，遠端依 `remote_thinking` 剝除（[`crate::ws::redact_remote_copy`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Local,
+    Remote(crate::config::RemoteThinking),
 }
 
 impl Frame {
+    /// 這個連線要送的文字（[`Frame::to_json`] 序列化後；遠端先剝除）。同一個 frame 每種（頻道、offset、模式）只序列化
+    /// 一次，之後的連線拿快取（E-L4）。遠端模式各自一份，本機的全文不會送給遠端（X9）；session 頻道不帶 kpi，不分 offset。
+    pub fn text_for(
+        &self,
+        ch: &Channel,
+        offset_min: i32,
+        wire: Wire,
+    ) -> Option<axum::extract::ws::Utf8Bytes> {
+        use crate::config::RemoteThinking;
+        let offset = if *ch == Channel::All { offset_min } else { 0 };
+        let mode = match wire {
+            Wire::Local => 0,
+            Wire::Remote(RemoteThinking::OnDemand) => 1,
+            Wire::Remote(RemoteThinking::Hide) => 2,
+            Wire::Remote(RemoteThinking::Show) => 3,
+        };
+        let key = (ch.name(), offset, mode);
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = texts.get(&key) {
+            return t.clone();
+        }
+        self.serialized
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = match wire {
+            Wire::Local => self.local_text(ch, offset),
+            Wire::Remote(thinking) => self
+                .to_json(ch, offset)
+                .map(|v| crate::ws::redact_remote_copy(&v, thinking).to_string()),
+        }
+        .map(axum::extract::ws::Utf8Bytes::from);
+        texts.insert(key, text.clone());
+        text
+    }
+
+    /// [`Frame::text_for`] 實際序列化了幾次（測試用）。
+    pub fn serializations(&self) -> usize {
+        self.serialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn local_text(&self, ch: &Channel, offset_min: i32) -> Option<String> {
+        let events: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|e| ch.wants(&e.session))
+            .collect();
+        let mut rows = self.rows_for(ch);
+        if *ch == Channel::All
+            && let Some(k) = self.kpi_for(offset_min)
+            && let Some(obj) = rows.as_object_mut()
+        {
+            obj.insert("kpi".into(), k);
+        }
+        if events.is_empty() && rows.as_object().is_none_or(|o| o.is_empty()) {
+            return None;
+        }
+        serde_json::to_string(&FrameOut {
+            t: "frame",
+            frame: self.no,
+            ch: ch.name(),
+            events,
+            rows,
+        })
+        .ok()
+    }
+
     pub fn events_for(&self, ch: &Channel) -> Vec<Event> {
         self.events
             .iter()
@@ -998,6 +1083,8 @@ impl Live {
             agents,
             attention,
             kpi,
+            texts: Default::default(),
+            serialized: Default::default(),
         });
         self.history.push_back(frame.clone());
         let kept = self.limits.map_or(FRAMES_KEPT, |(_, h)| h);
