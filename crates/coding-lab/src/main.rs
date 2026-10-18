@@ -75,11 +75,17 @@ enum ServiceCommand {
         /// 只印出會寫的檔與會跑的指令，不執行
         #[arg(long)]
         dry_run: bool,
+        /// 已經有服務、但用的是別的資料目錄時，照樣換成目前的
+        #[arg(long)]
+        force: bool,
     },
     /// 停掉並移除常駐服務（只刪 install 寫的檔）
     Uninstall {
         #[arg(long)]
         dry_run: bool,
+        /// 服務用的是別的資料目錄時，照樣移除
+        #[arg(long)]
+        force: bool,
     },
     /// 有沒有裝、collector 現在有沒有在跑
     Status,
@@ -345,9 +351,18 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
         }
     };
     match cmd {
-        ServiceCommand::Install { dry_run } => {
+        ServiceCommand::Install { dry_run, force } => {
             if let Some(w) = cfg.plugin_warning() {
                 eprintln!("coding-lab：{w}");
+            }
+            // 已經有服務、但 home 不同：不換掉（W-L11）
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            if let Err(e) = service::check_existing(existing.as_deref(), &cfg.home, force) {
+                if !dry_run {
+                    return Err(e);
+                }
+                eprintln!("coding-lab：（實際執行時會被拒）{e}");
             }
             let plan = service::plan_install(platform, &ctx);
             describe(&plan);
@@ -373,6 +388,13 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
                 eprintln!(
                     "coding-lab：舊的 collector 沒有停下來，服務可能綁不到埠；稍後用 service status 確認"
                 );
+            }
+            // 舊版放在工作排程器根目錄的 CodingLab：是自己這個 home 的才刪（W-L11）
+            if platform == Platform::Windows
+                && let Some(cmd) =
+                    service::legacy_windows_task(&ctx, &mut service::run_command_capture_quiet)
+            {
+                let _ = service::run_command_capture_quiet(&cmd);
             }
             if platform == Platform::Macos && service::installed(platform, &ctx) {
                 // 重裝：先卸掉舊的（沒裝過時 bootout 會失敗，所以只在檔案在時做）
@@ -411,7 +433,15 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
             }
             Ok(())
         }
-        ServiceCommand::Uninstall { dry_run } => {
+        ServiceCommand::Uninstall { dry_run, force } => {
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            if let Err(e) = service::check_existing(existing.as_deref(), &cfg.home, force) {
+                if !dry_run {
+                    return Err(e);
+                }
+                eprintln!("coding-lab：（實際執行時會被拒）{e}");
+            }
             let plan = service::plan_uninstall(platform, &ctx);
             describe(&plan);
             if dry_run {
@@ -463,6 +493,21 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
                 service::status_command(platform, &ctx).join(" "),
                 files[0].display()
             );
+            // 服務用的 home 和目前的不一定一樣（W-L11）
+            if let Some(h) =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet)
+            {
+                let same = service::check_existing(Some(&h), &cfg.home, false).is_ok();
+                println!(
+                    "服務的資料目錄：{}（{}）",
+                    h.display(),
+                    if same {
+                        "和目前的相同".to_string()
+                    } else {
+                        format!("和目前的 {} 不同", cfg.home.display())
+                    }
+                );
+            }
             let running = running_info(&cfg, Duration::ZERO);
             match running.as_ref().and_then(|i| i.hook) {
                 Some(hook) => println!("collector：執行中（hook 入口 {hook}）"),

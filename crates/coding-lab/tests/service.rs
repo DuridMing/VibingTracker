@@ -167,7 +167,10 @@ fn start_command_brings_the_resident_collector_back() {
         j(Platform::Macos),
         "launchctl kickstart gui/1000/io.coding-lab.collector"
     );
-    assert_eq!(j(Platform::Windows), "schtasks /Run /TN CodingLab");
+    assert_eq!(
+        j(Platform::Windows),
+        r"schtasks /Run /TN \CodingLab\default"
+    );
 }
 
 #[test]
@@ -210,12 +213,13 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     );
     let cmds: Vec<String> = plan.commands.iter().map(|c| c.join(" ")).collect();
     assert!(
-        cmds.iter()
-            .any(|c| c.starts_with("schtasks /Create /TN CodingLab /XML ") && c.ends_with(" /F")),
+        cmds.iter().any(
+            |c| c.starts_with(r"schtasks /Create /TN \CodingLab\u /XML ") && c.ends_with(" /F")
+        ),
         "{cmds:?}"
     );
     assert!(
-        cmds.iter().any(|c| c == "schtasks /Run /TN CodingLab"),
+        cmds.iter().any(|c| c == r"schtasks /Run /TN \CodingLab\u"),
         "{cmds:?}"
     );
 }
@@ -267,7 +271,7 @@ fn uninstall_removes_exactly_what_install_wrote_on_every_platform() {
             &ctx(Path::new(r"C:\Users\u\.coding-lab"))
         )
         .iter()
-        .any(|c| c == "schtasks /Delete /TN CodingLab /F")
+        .any(|c| c == r"schtasks /Delete /TN \CodingLab\default /F")
     );
 }
 
@@ -343,7 +347,10 @@ fn status_asks_the_service_manager_not_just_the_file() {
         cmds(Platform::Macos),
         "launchctl print gui/1000/io.coding-lab.collector"
     );
-    assert_eq!(cmds(Platform::Windows), "schtasks /Query /TN CodingLab");
+    assert_eq!(
+        cmds(Platform::Windows),
+        r"schtasks /Query /TN \CodingLab\default"
+    );
     for p in [Platform::Linux, Platform::Macos, Platform::Windows] {
         assert!(
             service::query_installed(p, &c, &mut |_| Ok("enabled\n".into())),
@@ -486,4 +493,117 @@ fn quiet_capture_returns_the_error_text_without_decorating_it() {
         &c,
         &mut |_| Err("not found".into())
     ));
+}
+
+/// W-L11（#781）：同一個帳號用兩個 home 各 install 一次，第二次被拒並說出原本服務的 home；`--force` 才換。
+#[test]
+fn a_second_install_with_another_home_is_refused() {
+    let dir = tmp("two-homes");
+    let mk = |home: &str| Ctx {
+        exe: PathBuf::from("/opt/coding-lab/bin/coding-lab"),
+        home: dir.join(home),
+        config_home: dir.join("config"),
+        user_home: dir.join("user"),
+        uid: Some(1000),
+        user: None,
+    };
+    let (a, b) = (mk("home a"), mk("home-b"));
+    let mut ok = |_: &[String]| -> Result<String, String> { Ok(String::new()) };
+    assert_eq!(service::existing_home(Platform::Linux, &a, &mut ok), None);
+    service::apply(&service::plan_install(Platform::Linux, &a), &mut |_| Ok(())).unwrap();
+    let existing = service::existing_home(Platform::Linux, &b, &mut ok);
+    assert_eq!(existing.as_deref(), Some(a.home.as_path()));
+    let err = service::check_existing(existing.as_deref(), &b.home, false).unwrap_err();
+    assert!(
+        err.contains(&a.home.display().to_string()) && err.contains("--force"),
+        "{err}"
+    );
+    assert!(service::check_existing(existing.as_deref(), &b.home, true).is_ok());
+    assert!(
+        service::check_existing(existing.as_deref(), &a.home, false).is_ok(),
+        "同一個 home 重裝照常"
+    );
+}
+
+/// W-L11：三個平台寫出去的設定都讀得回原本的 home（含空白、引號、%、$、結尾的反斜線）。
+#[test]
+fn the_home_is_read_back_from_what_install_wrote() {
+    for home in [
+        "/home/u/.coding-lab",
+        "/home/u/a b/100%/$x",
+        r#"/home/u/q"uote"#,
+    ] {
+        let c = ctx(Path::new(home));
+        let unit = file_of(
+            &service::plan_install(Platform::Linux, &c),
+            "coding-lab.service",
+        )
+        .to_string();
+        assert_eq!(
+            service::home_from_unit(&unit).as_deref(),
+            Some(Path::new(home)),
+            "{unit}"
+        );
+        let plist = file_of(&service::plan_install(Platform::Macos, &c), ".plist").to_string();
+        assert_eq!(
+            service::home_from_plist(&plist).as_deref(),
+            Some(Path::new(home)),
+            "{plist}"
+        );
+    }
+    for home in [
+        r"C:\Users\u\.coding-lab",
+        r"D:\data\",
+        r#"C:\a "b"\c"#,
+        r"C:\x y\z",
+    ] {
+        let c = Ctx {
+            exe: PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe"),
+            home: PathBuf::from(home),
+            config_home: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
+            user_home: PathBuf::from(r"C:\Users\u"),
+            uid: None,
+            user: Some(r"DESKTOP-1\u".into()),
+        };
+        let xml = file_of(
+            &service::plan_install(Platform::Windows, &c),
+            "coding-lab-task.xml",
+        )
+        .to_string();
+        assert_eq!(
+            service::home_from_task_xml(&xml).as_deref(),
+            Some(Path::new(home)),
+            "{xml}"
+        );
+    }
+}
+
+/// W-L11：Windows 的工作放在 `\CodingLab\<使用者>`：根目錄的名稱整台機器共用，別的帳號會裝不起來或被蓋掉。
+#[test]
+fn windows_task_is_named_after_the_user() {
+    let mut c = ctx(Path::new(r"C:\Users\u\.coding-lab"));
+    c.user = Some(r"DESKTOP-1\Alice".into());
+    assert_eq!(service::windows_task(&c), r"\CodingLab\Alice");
+    let cmds: Vec<String> = service::plan_install(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    assert!(
+        cmds.iter()
+            .any(|c| c.starts_with(r"schtasks /Create /TN \CodingLab\Alice /XML ")),
+        "{cmds:?}"
+    );
+    let un: Vec<String> = service::plan_uninstall(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    assert!(
+        un.iter()
+            .any(|c| c == r"schtasks /Delete /TN \CodingLab\Alice /F"),
+        "{un:?}"
+    );
+    c.user = Some("we/ird:name".into());
+    assert_eq!(service::windows_task(&c), r"\CodingLab\we_ird_name");
 }

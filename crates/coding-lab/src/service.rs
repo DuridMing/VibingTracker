@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 pub const LINUX_UNIT: &str = "coding-lab.service";
 pub const MACOS_LABEL: &str = "io.coding-lab.collector";
+/// 工作排程器的資料夾（W-L11）；0.1.0 之前這是放在根目錄的工作名稱
 pub const WINDOWS_TASK: &str = "CodingLab";
 pub const WINDOWS_XML: &str = "coding-lab-task.xml";
 
@@ -329,15 +330,16 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                     .unwrap_or_default(),
             );
             let path = task_xml_path(ctx);
+            let task = windows_task(ctx);
             Plan {
                 commands: vec![
-                    s(&["schtasks", "/Create", "/TN", WINDOWS_TASK, "/XML", &path.to_string_lossy(), "/F"]),
-                    s(&["schtasks", "/Run", "/TN", WINDOWS_TASK]),
+                    s(&["schtasks", "/Create", "/TN", &task, "/XML", &path.to_string_lossy(), "/F"]),
+                    s(&["schtasks", "/Run", "/TN", &task]),
                 ],
                 files: vec![(path, xml)],
                 removes: vec![],
                 notes: vec![
-                    format!("查看：schtasks /Query /TN {WINDOWS_TASK} /V /FO LIST；紀錄：{home}\\collector.log"),
+                    format!("查看：schtasks /Query /TN {task} /V /FO LIST；紀錄：{home}\\collector.log"),
                     "工作排程器在使用者登入時啟動；要在沒人登入時就跑，請在「工作排程器」裡把這個工作改成「不論使用者登入與否均執行」。".into(),
                 ],
             }
@@ -361,8 +363,8 @@ pub fn plan_uninstall(platform: Platform, ctx: &Ctx) -> Plan {
             ])]
         }
         Platform::Windows => vec![
-            s(&["schtasks", "/End", "/TN", WINDOWS_TASK]),
-            s(&["schtasks", "/Delete", "/TN", WINDOWS_TASK, "/F"]),
+            s(&["schtasks", "/End", "/TN", &windows_task(ctx)]),
+            s(&["schtasks", "/Delete", "/TN", &windows_task(ctx), "/F"]),
         ],
     };
     Plan {
@@ -407,7 +409,6 @@ pub fn apply(
     Ok(())
 }
 
-/// 問系統「這個服務有沒有登記」的指令（#719）：install 失敗後檔案可能還在，所以 status 以這個為準
 /// 把裝好的常駐服務叫起來的指令（R-6）：`coding-lab stop` 讓它正常結束，三個平台都不算失敗、不會自己重啟。
 pub fn start_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
     match platform {
@@ -417,10 +418,11 @@ pub fn start_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
             "kickstart",
             &format!("gui/{}/{MACOS_LABEL}", ctx.uid.unwrap_or(501)),
         ]),
-        Platform::Windows => s(&["schtasks", "/Run", "/TN", WINDOWS_TASK]),
+        Platform::Windows => s(&["schtasks", "/Run", "/TN", &windows_task(ctx)]),
     }
 }
 
+/// 問系統「這個服務有沒有登記」的指令（#719）：install 失敗後檔案可能還在，所以 status 以這個為準
 pub fn status_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
     match platform {
         Platform::Linux => s(&["systemctl", "--user", "is-enabled", LINUX_UNIT]),
@@ -429,7 +431,7 @@ pub fn status_command(platform: Platform, ctx: &Ctx) -> Vec<String> {
             "print",
             &format!("gui/{}/{MACOS_LABEL}", ctx.uid.unwrap_or(501)),
         ]),
-        Platform::Windows => s(&["schtasks", "/Query", "/TN", WINDOWS_TASK]),
+        Platform::Windows => s(&["schtasks", "/Query", "/TN", &windows_task(ctx)]),
     }
 }
 
@@ -589,4 +591,172 @@ fn capture(cmd: &[String], quiet: bool) -> Result<String, String> {
         return Ok(decode_output(&out.stdout).0);
     }
     Err(output_error(prog, &out, quiet))
+}
+
+/// Windows 的工作名稱（W-L11）：放在 `\CodingLab\` 資料夾、以使用者命名。工作排程器根目錄的名稱整台機器共用，
+/// 固定叫 `CodingLab` 時別的帳號裝不起來（存取被拒），系統管理員的 `/F` 還會蓋掉別人的。
+pub fn windows_task(ctx: &Ctx) -> String {
+    let user = ctx
+        .user
+        .as_deref()
+        .and_then(|u| u.rsplit('\\').next())
+        .unwrap_or("");
+    let name: String = user
+        .chars()
+        .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+        .collect();
+    let name = if name.trim().is_empty() {
+        "default"
+    } else {
+        name.trim()
+    };
+    format!("\\{WINDOWS_TASK}\\{name}")
+}
+
+/// 已經裝好的常駐服務用的是哪個 home（W-L11）：Linux、macOS 讀 install 寫的檔（位置和 home 無關），
+/// Windows 問工作排程器要這個使用者那個工作的 XML。沒裝、讀不到都是 None。
+pub fn existing_home(
+    platform: Platform,
+    ctx: &Ctx,
+    run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+) -> Option<PathBuf> {
+    match platform {
+        Platform::Linux => home_from_unit(&std::fs::read_to_string(unit_path(ctx)).ok()?),
+        Platform::Macos => home_from_plist(&std::fs::read_to_string(plist_path(ctx)).ok()?),
+        Platform::Windows => home_from_task_xml(
+            &run(&s(&[
+                "schtasks",
+                "/Query",
+                "/TN",
+                &windows_task(ctx),
+                "/XML",
+            ]))
+            .ok()?,
+        ),
+    }
+}
+
+/// 舊版（0.1.0 之前）放在工作排程器根目錄的 `CodingLab`：home 和這次的相同才刪（是自己的），
+/// 不同的可能是別的帳號的，不動。回傳要跑的刪除指令。
+pub fn legacy_windows_task(
+    ctx: &Ctx,
+    run: &mut dyn FnMut(&[String]) -> Result<String, String>,
+) -> Option<Vec<String>> {
+    let xml = run(&s(&["schtasks", "/Query", "/TN", WINDOWS_TASK, "/XML"])).ok()?;
+    let home = home_from_task_xml(&xml)?;
+    same_home(&home, &ctx.home).then(|| s(&["schtasks", "/Delete", "/TN", WINDOWS_TASK, "/F"]))
+}
+
+fn same_home(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    } else {
+        a == b
+    }
+}
+
+/// install／uninstall 前的檢查（W-L11）：已經有服務、但用的是別的 home 時拒絕，說出原本的 home；`force` 才照做。
+/// 同一個帳號拿測試用的 CODING_LAB_HOME 試服務時，不會把正式的服務換掉或移除。
+pub fn check_existing(existing: Option<&Path>, home: &Path, force: bool) -> Result<(), String> {
+    match existing {
+        Some(old) if !force && !same_home(old, home) => Err(format!(
+            "這個帳號已經裝了常駐服務，用的資料目錄是 {}，不是目前的 {}；確定要換成目前的請加 --force（或用原本的 home 執行 service uninstall）",
+            old.display(),
+            home.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// unit 檔的 `Environment=CODING_LAB_HOME=…`，還原 [`systemd_value`] 的引號、跳脫與 `%%`。
+pub fn home_from_unit(text: &str) -> Option<PathBuf> {
+    let v = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Environment=CODING_LAB_HOME="))?;
+    let v = match v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        Some(inner) => {
+            let mut out = String::new();
+            let mut chars = inner.chars();
+            while let Some(c) = chars.next() {
+                out.push(if c == '\\' {
+                    chars.next().unwrap_or('\\')
+                } else {
+                    c
+                });
+            }
+            out
+        }
+        None => v.to_string(),
+    };
+    Some(PathBuf::from(v.replace("%%", "%")))
+}
+
+/// plist 的 ProgramArguments 裡 `--home` 的下一個 `<string>`。
+pub fn home_from_plist(text: &str) -> Option<PathBuf> {
+    let after = text.split_once("<string>--home</string>")?.1;
+    let v = after.split_once("<string>")?.1.split_once("</string>")?.0;
+    Some(PathBuf::from(xml_unescape(v)))
+}
+
+/// 工作 XML 的 `<Arguments>` 照 Windows 命令列規則拆開，取 `--home` 的下一個。
+pub fn home_from_task_xml(text: &str) -> Option<PathBuf> {
+    let args = text
+        .split_once("<Arguments>")?
+        .1
+        .split_once("</Arguments>")?
+        .0;
+    let args = split_windows_args(&xml_unescape(args));
+    let i = args.iter().position(|a| a == "--home")?;
+    args.get(i + 1).map(PathBuf::from)
+}
+
+fn xml_unescape(t: &str) -> String {
+    t.replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// [`windows_arg`] 的反向：`CommandLineToArgvW` 的規則（`2n` 個反斜線＋引號 → `n` 個反斜線、切換引號；
+/// `2n+1` 個 → `n` 個反斜線＋字面的引號；其他地方的反斜線照原樣）。
+fn split_windows_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let (mut quoted, mut started, mut slashes) = (false, false, 0usize);
+    for c in line.chars() {
+        match c {
+            '\\' => {
+                slashes += 1;
+                started = true;
+            }
+            '"' => {
+                cur.extend(std::iter::repeat_n('\\', slashes / 2));
+                if slashes % 2 == 1 {
+                    cur.push('"');
+                } else {
+                    quoted = !quoted;
+                }
+                slashes = 0;
+                started = true;
+            }
+            _ => {
+                cur.extend(std::iter::repeat_n('\\', slashes));
+                slashes = 0;
+                if c.is_whitespace() && !quoted {
+                    if started {
+                        args.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                } else {
+                    cur.push(c);
+                    started = true;
+                }
+            }
+        }
+    }
+    cur.extend(std::iter::repeat_n('\\', slashes));
+    if started {
+        args.push(cur);
+    }
+    args
 }
