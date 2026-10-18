@@ -160,12 +160,16 @@ test(`> ${LAZY_THRESHOLD} 檔懶載入：沒展開的目錄不建子節點`, () 
 test("大樹開頁：20000 檔建樹加第一次 visible 在 50 ms 內", () => {
   const big = [];
   for (let d = 0; d < 200; d++) for (let f = 0; f < 100; f++) big.push(`pkg${d}/src/m${f}.ts`);
-  const t0 = performance.now();
-  const t = tree(big);
-  t.apply([edit(A, "pkg3/src/m1.ts")]);
-  const rows = t.visible();
-  const ms = performance.now() - t0;
-  assert.equal(rows.length, 200 + 1 + 100);
+  // 取 3 次裡最快的：機器忙（check.sh 與其他編譯同時跑）時單次會被排程拖慢，演算法變慢則 3 次都慢（#749 T-4）
+  let ms = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    const t = tree(big);
+    t.apply([edit(A, "pkg3/src/m1.ts")]);
+    const rows = t.visible();
+    ms = Math.min(ms, performance.now() - t0);
+    assert.equal(rows.length, 200 + 1 + 100);
+  }
   assert.ok(ms < 50, `${ms.toFixed(1)} ms`);
 });
 
