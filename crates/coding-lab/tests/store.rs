@@ -1405,3 +1405,77 @@ fn data_dir_and_files_are_private() {
     let _s = Store::open(&h).unwrap();
     assert_eq!(mode(&h), 0o700, "重新開啟時收緊舊版的權限");
 }
+
+// ── X1（#740）：web 的讀取鎖內只查 offset、鎖外讀 JSONL（EventsReader）。JSONL 只會 append，
+// 索引裡的 offset 一定指向已經寫完的行，所以不拿 store 的鎖也能讀；主迴圈的寫入不必等 web 讀完
+
+fn prompt_ev(session: &str, seq: u64, pos: Option<u64>, text: &str) -> Event {
+    ev(
+        session,
+        seq,
+        "prompt.submitted",
+        pos,
+        1000 + seq,
+        json!({"text": text, "promptId": format!("p{seq}")}),
+    )
+}
+
+#[test]
+fn events_reader_reads_outside_the_store_lock() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    for seq in 2..=40 {
+        s.append(prompt_ev("s1", seq, Some(seq), &format!("第 {seq}")));
+    }
+    s.flush().unwrap();
+    // 鎖內：只查 offset
+    let reads = s.stream_before_reads("s1", Some(30), 5).unwrap();
+    let reader = s.reader();
+    // 主迴圈照常寫（新的行接在後面），已查好的 offset 照樣讀得到
+    s.append(prompt_ev("s1", 41, Some(41), "之後寫的"));
+    s.flush().unwrap();
+    let got: Vec<u64> = reader.read(&reads).unwrap().iter().map(|e| e.seq).collect();
+    assert_eq!(got, [25, 26, 27, 28, 29]);
+    assert_eq!(
+        got,
+        s.stream_before("s1", Some(30), 5)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        "和原本的 stream_before 一樣"
+    );
+}
+
+/// E-S3：offset 接續時不 seek、跳著的也讀得對；不同 session 的依查詢的順序接起來。
+#[test]
+fn events_reader_reads_contiguous_and_scattered_offsets() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    for sid in ["a", "b"] {
+        s.append(started(sid, 1, "/p"));
+        for seq in 2..=20 {
+            s.append(prompt_ev(sid, seq, None, &"字".repeat(seq as usize * 50)));
+        }
+    }
+    s.flush().unwrap();
+    let all = s.events_by_seq("a", 1, 20).unwrap();
+    assert_eq!(all.len(), 20);
+    assert!(all.windows(2).all(|w| w[0].seq + 1 == w[1].seq));
+    let some = s.events_by_seq("b", 5, 7).unwrap();
+    assert_eq!(some.iter().map(|e| e.seq).collect::<Vec<_>>(), [5, 6, 7]);
+    let types = s
+        .events_of_types("a", &["session.started", "prompt.submitted"])
+        .unwrap();
+    assert_eq!(types.len(), 20);
+    let mut last = s.last_prompt_and_pos(&["a".into(), "b".into()]).unwrap();
+    let text_b = last.remove("b").unwrap().0.unwrap();
+    assert_eq!(text_b, "字".repeat(20 * 50));
+    // recent_events（E-S4：依主鍵順序讀、每個檔只開一次）回傳仍依 (ts_seen, session, seq)
+    let recent = s.recent_events(0).unwrap();
+    assert_eq!(recent.len(), 40);
+    assert!(recent.windows(2).all(
+        |w| (w[0].ts_seen, &w[0].session, w[0].seq) <= (w[1].ts_seen, &w[1].session, w[1].seq)
+    ));
+}
