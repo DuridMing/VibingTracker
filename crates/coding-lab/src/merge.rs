@@ -12,9 +12,9 @@ use crate::derive;
 use crate::event::{
     AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
-    FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
-    SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped, Usage, is_command_tool,
+    FileRead, FileWrite, Hunk, HunkSource, LineRef, ModelChanged, Payload, Placement,
+    PromptSubmitted, SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus,
+    ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
@@ -1512,7 +1512,13 @@ impl Merger {
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
             "Edit" => path().map(|path| {
-                let hunk = h.probe().and_then(|p| p.hunk.clone());
+                let (hunk, truncated) = match h.probe().and_then(|p| p.hunk.as_ref()) {
+                    Some(hunk) => {
+                        let (hunk, cut) = bounded_hunk(hunk, OUTPUT_LIMIT);
+                        (Some(hunk), cut)
+                    }
+                    None => (None, false),
+                };
                 let hunk_source = if hunk.is_some() {
                     HunkSource::Pre
                 } else {
@@ -1524,6 +1530,7 @@ impl Merger {
                     hunk,
                     hunk_source,
                     sensitive,
+                    truncated,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1898,6 +1905,33 @@ fn truncate(s: &str, max: usize) -> (String, bool) {
 }
 
 /// PostToolUse 的 `tool_response`：Bash 取 stdout（＋stderr），其他工具用精簡 JSON。
+/// hunk 的行合計不超過 `max` bytes：放不下的行丟掉、最後一行截在字元邊界；行號與 +／− 的行數不動，
+/// 改動紀錄的 +N／−M 照算（C7）。回傳是否有截。
+fn bounded_hunk(hunk: &Hunk, max: usize) -> (Hunk, bool) {
+    let mut room = max;
+    let mut lines = Vec::new();
+    let mut cut = false;
+    for l in &hunk.lines {
+        let (kept, c) = text::truncate_bytes(l, room);
+        if c {
+            if !kept.is_empty() {
+                lines.push(kept.to_string());
+            }
+            cut = true;
+            break;
+        }
+        room -= l.len();
+        lines.push(l.clone());
+    }
+    let out = Hunk {
+        lines,
+        start: hunk.start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    };
+    (out, cut)
+}
+
 /// 截到 `max` bytes 以內，回傳是否有截。
 fn response_text(v: Option<&Value>, max: usize) -> (String, bool) {
     match v {
