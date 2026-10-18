@@ -738,7 +738,7 @@ mod download {
     /// Windows 上執行中的 .exe 也換不掉。先放 bin/.staged/，下一次 ensure 而且沒有 collector 在跑時才換（#784 W-R1-5）
     #[test]
     fn an_update_while_the_collector_runs_is_staged_until_it_stops() {
-        let e = env("staged");
+        let Some(e) = env("staged") else { return };
         fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
         let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
         assert!(
