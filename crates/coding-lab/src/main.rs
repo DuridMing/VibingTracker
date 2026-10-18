@@ -229,19 +229,25 @@ fn hub_inner(args: HubArgs) -> Result<(), String> {
                 None => cfg.hub_bind,
             };
             if !bind.ip().is_loopback() {
-                return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
+                return Err(format!("hub 的 web 只能綁本機位址，收到 {bind}"));
             }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| format!("無法建立 runtime：{e}"))?;
+            // 127.0.0.1 是整台機器共用的：每次啟動產生新的 token，只印在這個終端機（W-M8）
+            let token = coding_lab::hub::new_token(&mut coding_lab::keys::SystemRng);
             rt.block_on(async {
-                let (addr, task) =
-                    coding_lab::hub::serve(bind, cfg.hub_upstreams.clone(), cfg.web_root.clone())
-                        .await
-                        .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
+                let (addr, task) = coding_lab::hub::serve(
+                    bind,
+                    cfg.hub_upstreams.clone(),
+                    cfg.web_root.clone(),
+                    token.clone(),
+                )
+                .await
+                .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
                 eprintln!(
-                    "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
+                    "coding-lab hub：http://{addr}/?token={token}（上游：{}）\n用這個網址開；hub 重新啟動後要用新印出的網址。Ctrl-C 結束",
                     cfg.hub_upstreams
                         .iter()
                         .map(|u| format!("{} {}", u.name, u.url))

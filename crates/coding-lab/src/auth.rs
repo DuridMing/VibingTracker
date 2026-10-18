@@ -109,16 +109,18 @@ pub fn set_cookie_header(value: &str, max_age_s: u64, secure: bool) -> String {
 
 /// 請求裡的登入 cookie（有多個 `Cookie` 標頭也找得到）。
 pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
+    cookie_named(headers, COOKIE_NAME)
+}
+
+/// 請求裡名為 `name` 的 cookie（有多個 `Cookie` 標頭也找得到）。
+pub fn cookie_named(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .map(str::trim)
-        .find_map(|kv| {
-            kv.strip_prefix(COOKIE_NAME)
-                .and_then(|r| r.strip_prefix('='))
-        })
+        .find_map(|kv| kv.strip_prefix(name).and_then(|r| r.strip_prefix('=')))
         .map(str::to_string)
 }
 

@@ -210,8 +210,10 @@ coding-lab service uninstall
 ```bash
 coding-lab hub add build-01 http://100.64.0.5:4801      # 會問金鑰（在那台 key create 的 clk_…），不進 shell 歷史
 coding-lab hub add tunnel http://127.0.0.1:14801 --no-key   # SSH 通道（ssh -N -L 14801:127.0.0.1:4801 <伺服器>）的不用金鑰
-coding-lab hub                                           # 本機開 http://127.0.0.1:4802
+coding-lab hub                                           # 印出 http://127.0.0.1:4802/?token=…，用這個網址開
 ```
+
+127.0.0.1 是整台機器共用的，hub 又拿著上游的金鑰，所以 hub 每次啟動都產生新的 token、只印在執行它的終端機：用印出的網址開，第一次會換成 cookie（HttpOnly、SameSite=Strict），之後網址列不再帶 token；沒有 token 也沒有 cookie 的 `/api`、`/ws` 一律 401。hub 重新啟動後舊的 cookie 失效，要用新印出的網址。腳本可以用 `Authorization: Bearer <token>`。
 
 串流每行前面多一個 `[主機]`，Sessions、Agents 也標主機；某台斷線時它的 session 標「離線」、hub 自動重連，其他台照常。hub 只轉發不存資料；要「載入更多」、看 thinking 全文、按「已確認」都轉給對應的那台（那台的金鑰是 `view` 就不能確認）。上游列在 `~/.coding-lab/config.toml` 的 `[[hub.upstream]]`（`name`、`url`、`key`；檔案權限 600），hub 的埠用 `[hub] bind` 或 `--bind` 改（只能是本機位址）。上游網址只接受 `http://`：遠端一律走 tailnet 或 SSH 通道。
 

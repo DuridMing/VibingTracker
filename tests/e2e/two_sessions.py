@@ -35,12 +35,13 @@ WORK = ROOT / "target" / "tmp" / "e2e-two-sessions"
 class WS:
     """最小的 WebSocket 用戶端（RFC 6455，只用文字訊息）。不帶 Origin，就和 wscat 一樣。"""
 
-    def __init__(self, port):
+    def __init__(self, port, headers=None):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
         key = base64.b64encode(os.urandom(16)).decode()
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
         self.s.sendall(
             f"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode()
         )
         head = b""
         while b"\r\n\r\n" not in head:
