@@ -12,9 +12,9 @@ use crate::derive;
 use crate::event::{
     AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
-    FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
-    SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped, Usage, is_command_tool,
+    FileRead, FileWrite, Hunk, HunkSource, LineRef, ModelChanged, Payload, Placement,
+    PromptSubmitted, SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus,
+    ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
@@ -994,7 +994,7 @@ impl Merger {
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 let output = || response_text(h.field("tool_response"), OUTPUT_LIMIT);
                 out.extend(self.result_once(&sid, &id, true, None, output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta));
                 // Agent／Task 的結果帶 agentId（背景 agent 啟動時、前景 agent 結束時）：subagent 對應哪個呼叫（#680）
                 if matches!(h.str_field("tool_name"), Some("Agent" | "Task"))
                     && let Some(a) = h
@@ -1027,7 +1027,7 @@ impl Merger {
                     (kept.to_string(), cut)
                 };
                 out.extend(self.result_once(&sid, &id, false, code, output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, None, false, meta()));
+                out.extend(self.git_op(h, &sid, &id, None, false, meta));
                 let interrupt = h.field("is_interrupt").and_then(Value::as_bool) == Some(true);
                 let ok = (!interrupt).then_some(false);
                 out.extend(self.tool_ended(h, &sid, &id, &agent, ok, ts_seen));
@@ -1512,7 +1512,13 @@ impl Merger {
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
             "Edit" => path().map(|path| {
-                let hunk = h.probe().and_then(|p| p.hunk.clone());
+                let (hunk, truncated) = match h.probe().and_then(|p| p.hunk.as_ref()) {
+                    Some(hunk) => {
+                        let (hunk, cut) = bounded_hunk(hunk, OUTPUT_LIMIT);
+                        (Some(hunk), cut)
+                    }
+                    None => (None, false),
+                };
                 let hunk_source = if hunk.is_some() {
                     HunkSource::Pre
                 } else {
@@ -1524,6 +1530,7 @@ impl Merger {
                     hunk,
                     hunk_source,
                     sensitive,
+                    truncated,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1598,20 +1605,31 @@ impl Merger {
         id: &str,
         response: Option<&Value>,
         ok: bool,
-        meta: Meta,
+        meta: impl FnOnce() -> Meta,
     ) -> Option<Event> {
         let tool = h.str_field("tool_name").filter(|t| is_command_tool(t))?;
         let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
         let mut op = derive::git_op_from(&derive::normalize_command(tool, command), response, ok)?;
         op.tool_use_id = id.to_string();
-        Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
+        // Meta（含 raw 的 clone）確定有 git 操作才建（E-M8）
+        Some(self.emit(
+            sid,
+            Payload::GitOp(op),
+            Meta {
+                raw: None,
+                ..meta()
+            },
+        ))
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1627,7 +1645,10 @@ impl Merger {
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         if card.result_sent {
             return None;
         }
@@ -1733,7 +1754,7 @@ impl Merger {
         let changes = if agent == "main" && v["type"] == "assistant" && block["type"] == "text" {
             let r = Some(message_id.as_str())
                 .filter(|m| !m.is_empty())
-                .or(v["uuid"].as_str())
+                .or_else(|| v["uuid"].as_str())
                 .map_or_else(|| format!("line-{no}"), str::to_string);
             self.tracker(sid).assistant_text(&r, ts_seen)
         } else {
@@ -1776,7 +1797,10 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
+                        let card = s
+                            .cards
+                            .entry(id.clone())
+                            .or_insert_with(|| Card::new(&agent));
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
@@ -1826,7 +1850,7 @@ impl Merger {
                         .sessions
                         .get(sid)
                         .and_then(|s| s.cards.get(id))
-                        .map_or(agent.clone(), |c| c.agent.clone());
+                        .map_or_else(|| agent.clone(), |c| c.agent.clone());
                     let m = Meta {
                         agent,
                         ts_seen,
@@ -1881,6 +1905,33 @@ fn truncate(s: &str, max: usize) -> (String, bool) {
 }
 
 /// PostToolUse 的 `tool_response`：Bash 取 stdout（＋stderr），其他工具用精簡 JSON。
+/// hunk 的行合計不超過 `max` bytes：放不下的行丟掉、最後一行截在字元邊界；行號與 +／− 的行數不動，
+/// 改動紀錄的 +N／−M 照算（C7）。回傳是否有截。
+fn bounded_hunk(hunk: &Hunk, max: usize) -> (Hunk, bool) {
+    let mut room = max;
+    let mut lines = Vec::new();
+    let mut cut = false;
+    for l in &hunk.lines {
+        let (kept, c) = text::truncate_bytes(l, room);
+        if c {
+            if !kept.is_empty() {
+                lines.push(kept.to_string());
+            }
+            cut = true;
+            break;
+        }
+        room -= l.len();
+        lines.push(l.clone());
+    }
+    let out = Hunk {
+        lines,
+        start: hunk.start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    };
+    (out, cut)
+}
+
 /// 截到 `max` bytes 以內，回傳是否有截。
 fn response_text(v: Option<&Value>, max: usize) -> (String, bool) {
     match v {

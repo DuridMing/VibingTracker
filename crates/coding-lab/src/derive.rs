@@ -92,6 +92,10 @@ const GIT_OPS: &[&str] = &[
 /// 從 Bash 指令（與 PostToolUse 的 `tool_response`）判斷 git 操作。一串指令裡取最後一個有意義的 git 子命令。
 /// 優先用 Claude Code 給的結構化 `gitOperation`，沒有才解析 stdout 的 `[branch hash] message`。
 pub fn git_op_from(command: &str, response: Option<&Value>, ok: bool) -> Option<GitOp> {
+    // 絕大多數指令跟 git 無關：不必斷詞（E-M8）
+    if !command.contains("git") {
+        return None;
+    }
     let (sub, args) = shell_segments(command)
         .into_iter()
         .filter_map(|seg| git_subcommand(&seg))
@@ -105,7 +109,7 @@ pub fn git_op_from(command: &str, response: Option<&Value>, ok: bool) -> Option<
         branch = detail["branch"].as_str().map(str::to_string);
         hash = detail["sha"]
             .as_str()
-            .or(detail["hash"].as_str())
+            .or_else(|| detail["hash"].as_str())
             .map(str::to_string);
     }
     let stdout = response

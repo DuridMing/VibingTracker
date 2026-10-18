@@ -145,6 +145,8 @@ pub struct Tracker {
     signals: Vec<(Signal, u64)>,
     /// 最近 24 小時的 (時間, 費用)，CostSpike 用（#675）
     recent_cost: std::collections::VecDeque<(u64, f64)>,
+    /// `recent_cost` 的合計，進出時加減（E-M10）
+    recent_total: f64,
     last_spike: Option<u64>,
 }
 
@@ -168,6 +170,7 @@ impl Default for Tracker {
             report_next: false,
             signals: Vec::new(),
             recent_cost: Default::default(),
+            recent_total: 0.0,
             last_spike: None,
         }
     }
@@ -444,7 +447,7 @@ impl Tracker {
     pub fn cost(&mut self, at: u64, usd: f64, baseline: Option<f64>) {
         self.seed_cost(at, usd);
         let Some(base) = baseline else { return };
-        let total: f64 = self.recent_cost.iter().map(|(_, c)| c).sum();
+        let total = self.recent_total;
         if total > base * COST_SPIKE_FACTOR && self.last_spike.is_none_or(|t| t + DAY_MS <= at) {
             self.last_spike = Some(at);
             self.signal(Signal::CostSpike, at);
@@ -454,9 +457,15 @@ impl Tracker {
     /// 重啟時從 store 補回最近 24 小時的花費：只進滾動區間，不觸發。
     pub fn seed_cost(&mut self, at: u64, usd: f64) {
         self.recent_cost.push_back((at, usd));
+        self.recent_total += usd;
         let from = at.saturating_sub(DAY_MS);
         while self.recent_cost.front().is_some_and(|(t, _)| *t < from) {
-            self.recent_cost.pop_front();
+            if let Some((_, c)) = self.recent_cost.pop_front() {
+                self.recent_total -= c;
+            }
+        }
+        if self.recent_cost.is_empty() {
+            self.recent_total = 0.0; // 不讓浮點誤差一直累積
         }
     }
 
@@ -537,10 +546,6 @@ impl Tracker {
         let open: Vec<(AttentionKind, u64)> =
             self.open.iter().map(|o| (o.kind, o.raised_at)).collect();
         score(&self.cfg, &open, &self.signals, now)
-    }
-
-    pub fn state(&self) -> SessionState {
-        self.state
     }
 
     fn is_open(&self, kind: AttentionKind, r: &str) -> bool {
