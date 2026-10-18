@@ -849,3 +849,31 @@ async fn hook_over_the_limit_is_still_answered_200() {
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert!(rx.try_recv().is_err());
 }
+
+/// L-7（#740）：hook 入口跑在自己的執行緒與 runtime 上。web 的 async handler 鎖 std Mutex<Store> 被卡住、
+/// 主 runtime 的 worker 全被佔住時，hook 照樣立刻回 200（不變式 4）。
+#[test]
+fn hooks_are_answered_while_every_main_worker_is_stuck() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr, _rx) = rt.block_on(server(8));
+    // 佔住唯一的 worker（像 handler 在 async 裡等 store 的鎖）
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        started_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    started_rx.recv().unwrap();
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    let t = Instant::now();
+    assert!(
+        post_blocking(addr, &body, Duration::from_secs(5)),
+        "hook 要回 200"
+    );
+    // 不變式 4 的預算是 100 ms；測的是「不用等那 3 秒」，負載高的機器上留一點餘裕
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    drop(rt);
+}
