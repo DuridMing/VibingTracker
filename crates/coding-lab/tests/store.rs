@@ -1158,41 +1158,63 @@ fn tool_paths_are_forgotten_when_the_session_ends() {
     assert_eq!(s.cached_tool_paths(), 0);
 }
 
-/// v3 升 v4：加上 events 依 ts_seen 的索引，全專案回放不用掃全表（不變式 9）。
-#[test]
-fn v3_database_gets_the_ts_index() {
-    let h = home();
-    {
-        let mut s = Store::open(&h).unwrap();
-        s.append(started("s1", 1, "/p"));
-        s.append(text("s1", 2, 1));
-        s.flush().unwrap();
-    }
+fn index_names(h: &std::path::Path) -> Vec<String> {
     let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
-    db.execute_batch(
-        "DROP INDEX IF EXISTS events_by_ts;
-         UPDATE meta SET value = '3' WHERE key = 'schema_version';",
-    )
-    .unwrap();
-    drop(db);
-
-    let s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(
-        s.timeline("/p", 0, 0, u64::MAX, 10).unwrap().0.len(),
-        2,
-        "升級前的資料查得到"
-    );
-    drop(s);
-    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
-    let n: i64 = db
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_by_ts'",
-            [],
-            |r| r.get(0),
-        )
+    let mut stmt = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .unwrap();
-    assert_eq!(n, 1, "v4 有 events_by_ts 索引");
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// v5 升 v6（#755、#756、#742 D5、#750 L-17）：拿掉 events_by_ts，加 usage 的費用基準、依種類找 Event、
+/// file_touch 依 session 刪的索引；資料不動（不變式 9）。從 v3 一路升上來也一樣。
+#[test]
+fn v5_database_is_upgraded_to_v6() {
+    for from in ["3", "5"] {
+        let h = home();
+        {
+            let mut s = Store::open(&h).unwrap();
+            s.append(started("s1", 1, "/p"));
+            s.append(text("s1", 2, 1));
+            s.flush().unwrap();
+        }
+        let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+        db.execute_batch(&format!(
+            "DROP INDEX IF EXISTS events_usage_ts; DROP INDEX IF EXISTS events_by_type;
+             DROP INDEX IF EXISTS file_touch_by_session;
+             CREATE INDEX IF NOT EXISTS events_by_ts ON events (ts_seen, session, pos) WHERE pos IS NOT NULL;
+             UPDATE meta SET value = '{from}' WHERE key = 'schema_version';"
+        ))
+        .unwrap();
+        drop(db);
+
+        let s = Store::open(&h).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 6);
+        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(
+            s.timeline("/p", 0, 0, u64::MAX, 10).unwrap().0.len(),
+            2,
+            "升級前的資料查得到（從 v{from}）"
+        );
+        drop(s);
+        let names = index_names(&h);
+        for want in ["events_usage_ts", "events_by_type", "file_touch_by_session"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "從 v{from} 升級後缺 {want}：{names:?}"
+            );
+        }
+        assert!(!names.iter().any(|n| n == "events_by_ts"), "{names:?}");
+    }
+    // 新建的也一樣
+    let h = home();
+    drop(Store::open(&h).unwrap());
+    let names = index_names(&h);
+    assert!(names.iter().any(|n| n == "events_by_type"));
+    assert!(!names.iter().any(|n| n == "events_by_ts"));
 }
 
 // ── #713：tails 的「不知道」（NULL，從檔尾）和「從頭、還沒讀」（0，重啟從第 1 行）分開
