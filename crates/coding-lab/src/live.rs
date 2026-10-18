@@ -418,13 +418,21 @@ impl Live {
         self.kpi_computes
     }
 
-    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）：之後由 /api/sessions 與回放查看。
-    /// 不送 deleted 列：已經開著的頁面可能還有它的串流行，保留那一列比較不會出錯。
+    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）並送 sessions 列 `deleted`：之後由
+    /// /api/sessions 與回放查看。還有佇列列的延後到佇列清空，佇列列不會變成孤兒列（契約 §6、K-7、D3）。
     fn evict_ended(&mut self, now: u64) {
+        let queued: HashSet<&str> = self
+            .attention
+            .values()
+            .map(|a| a.session.as_str())
+            .collect();
         let gone: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now))
+            .filter(|(id, s)| {
+                s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now)
+                    && !queued.contains(id.as_str())
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for sid in gone {
@@ -432,7 +440,7 @@ impl Live {
             self.streams.remove(&sid);
             self.status_lines.remove(&sid);
             self.bg_running.remove(&sid);
-            self.dirty_sessions.remove(&sid);
+            self.dirty_sessions.insert(sid.clone());
             self.card_events.retain(|(s, _), _| *s != sid);
             self.staged.retain(|(s, _), _| *s != sid);
             self.agents.retain(|_, a| a.session != sid);
@@ -589,10 +597,10 @@ impl Live {
                 s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
-                s.status = "run".into();
-                s.status_since = ts;
+                // 狀態不在這裡改，只認 session.status（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             }
             Payload::SessionEnded(_) => {
+                // merge 在 session.ended 之後一定發 ended；這裡照設，是給沒有 session.status 的舊 JSONL（不變式 9）
                 s.ended_at = Some(ts);
                 s.status = "ended".into();
                 s.status_since = ts;
@@ -957,7 +965,13 @@ impl Live {
 
         let sessions: Vec<(String, Value)> = std::mem::take(&mut self.dirty_sessions)
             .into_iter()
-            .filter_map(|id| self.session_row(&id).map(|row| (id, row)))
+            .map(|id| {
+                // 不在 live 裡的是剛移出的（evict_ended）
+                let row = self
+                    .session_row(&id)
+                    .unwrap_or_else(|| json!({ "id": id, "deleted": true }));
+                (id, row)
+            })
             .collect();
         let agents: Vec<(String, Value)> = std::mem::take(&mut self.dirty_agents)
             .into_iter()

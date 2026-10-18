@@ -1240,11 +1240,12 @@ fn index_event(
             if cwd.is_empty() {
                 *cwd = p.cwd.clone();
             }
+            // status 只由 session.status 寫（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             exec(tx,
                 "UPDATE sessions SET cwd = CASE WHEN cwd = '' THEN ?2 ELSE cwd END, transcript_path = COALESCE(?3, transcript_path),
                    model = COALESCE(?4, model), branch = COALESCE(?5, branch),
-                   ended_at = NULL, end_reason = NULL, status = 'run', status_since = ?6 WHERE id = ?1",
-                params![sid, p.cwd, p.transcript_path, p.model, p.branch, ts],
+                   ended_at = NULL, end_reason = NULL WHERE id = ?1",
+                params![sid, p.cwd, p.transcript_path, p.model, p.branch],
             )?;
             if let Some(path) = &p.transcript_path {
                 exec(

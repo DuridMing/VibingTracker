@@ -1680,6 +1680,86 @@ fn ended_sessions_leave_live_after_two_hours() {
     assert!(text.contains("\"s2\""));
 }
 
+/// 移出時送 sessions 列 `deleted`（契約 §6）：已開著的頁面才知道它不在 live 了。
+#[test]
+fn evicted_session_sends_a_deleted_row() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.ev(
+                "s1",
+                "session.ended",
+                "main",
+                DAY + H,
+                false,
+                json!({"reason": "exit"}),
+            ),
+        ],
+    );
+    l.flush(DAY + H + 1);
+    let f = l.flush(DAY + 3 * H + 1).expect("移出要送 frame");
+    assert_eq!(
+        f.rows_for(&Channel::All)["sessions"],
+        json!([{"id": "s1", "deleted": true}])
+    );
+}
+
+/// 還有佇列列（未確認的 done、已解除但未確認的 danger）的 session 延後移出，佇列列不會變成孤兒列；
+/// 全部確認後下一次檢查才移（契約 §6、#737 K-7、D3）。
+#[test]
+fn session_with_open_attention_stays_until_the_queue_is_empty() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let raised = |b: &mut B, kind: &str, r: &str, ts: u64| {
+        b.ev(
+            "s1",
+            "attention.raised",
+            "main",
+            ts,
+            false,
+            json!({"kind": kind, "ref": r, "reason": "x"}),
+        )
+    };
+    let e1 = raised(&mut b, "done", "p1", DAY + 10);
+    let e2 = raised(&mut b, "danger", "t1", DAY + 20);
+    let e3 = b.ev(
+        "s1",
+        "attention.cleared",
+        "main",
+        DAY + 30,
+        false,
+        json!({"kind": "danger", "ref": "t1"}),
+    );
+    let end = b.ev(
+        "s1",
+        "session.ended",
+        "main",
+        DAY + H,
+        false,
+        json!({"reason": "exit"}),
+    );
+    apply_all(&mut l, &[b.started("s1", DAY), e1, e2, e3, end]);
+    l.flush(DAY + 3 * H + 1);
+    assert_eq!(l.session_count(), 1, "還有兩列沒確認：不移出");
+    let snap = l.snapshot(&Channel::All, 0, DAY + 3 * H + 2);
+    assert_eq!(rows(&snap, "sessions").len(), 1);
+    assert_eq!(rows(&snap, "attention").len(), 2);
+
+    assert!(l.ack("s1", "done", "p1"));
+    l.flush(DAY + 4 * H);
+    assert_eq!(l.session_count(), 1, "還有一列");
+    assert!(l.ack("s1", "danger", "t1"));
+    let f = l.flush(DAY + 5 * H).unwrap();
+    assert_eq!(l.session_count(), 0, "佇列清空後移出");
+    assert_eq!(
+        f.rows_for(&Channel::All)["sessions"],
+        json!([{"id": "s1", "deleted": true}])
+    );
+}
+
 /// #686（R23）：沒有新 Event 時 flush 不重算 KPI（只在有新 Event、跨時間格或跨午夜時算）。
 #[test]
 fn flush_without_new_events_does_not_recompute_kpi() {
