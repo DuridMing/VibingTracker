@@ -193,6 +193,8 @@ coding-lab stop                                                   # 讓下一個
 
 多人共用的伺服器上，其他使用者也連得到 127.0.0.1，這時設 `auth = "always"`，連本機（含 SSH 通道）都要金鑰。
 
+**同一台機器只能有一個帳號使用 coding-lab**：hook 入口 4800 與網頁 4801 是整台機器共用的，Claude Code 的 hook 網址也不能依帳號變化。最先開 session 的帳號拿到 collector；其他帳號的 hook 會帶上自己的使用者名稱，collector 認得出不是自己的就丟掉（不記錄、不顯示，collector.log 記一行），所以那些帳號不會被追蹤。`coding-lab healthz` 會印出 collector 是哪個帳號的。多人共用的伺服器建議只在一個帳號裝 plugin，並且每個帳號都設 `auth = "always"`。
+
 **讓伺服器重開機後 collector 自己起來**：平常 collector 由第一個 session 的 `ensure` 拉起、閒置 10 分鐘退出；伺服器上想隨時都看得到（含沒有 session 在跑的時候），裝成常駐服務：
 
 ```bash

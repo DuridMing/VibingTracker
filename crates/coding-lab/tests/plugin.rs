@@ -91,7 +91,18 @@ fn http_hooks_post_to_the_loopback_hook_port_with_a_short_timeout() {
             t <= 1,
             "{event}：collector 沒跑時不能拖慢 Claude Code（timeout {t}）"
         );
-        assert!(h.get("headers").is_none(), "{event}：hook 入口不驗金鑰");
+        // 多帳號（#778 W-M7）：帶使用者名稱，collector 丟掉別的帳號送來的；不帶任何金鑰（hook 入口不驗金鑰）。
+        // 兩個變數分兩個標頭：「列在 allowedEnvVars 但沒設定」的變數會變成什麼，官方文件沒寫
+        assert_eq!(
+            h["headers"],
+            serde_json::json!({ "X-Coding-Lab-User": "${USER}", "X-Coding-Lab-Username": "${USERNAME}" }),
+            "{event}"
+        );
+        assert_eq!(
+            h["allowedEnvVars"],
+            serde_json::json!(["USER", "USERNAME"]),
+            "{event}"
+        );
     }
 }
 
