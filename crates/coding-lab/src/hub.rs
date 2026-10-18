@@ -1484,10 +1484,15 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
     let Some(u) = state.handle(&owner) else {
         return not_found("上游不存在");
     };
+    // 只有帶 Event 或 sessions 列的回應要改寫、標 host（E-H5）；其他（檔案樹、diff、分支、thinking 全文…）
+    // 原封轉送 bytes，不解析也不重新序列化。原封送沒有剝除的顧慮：hub 對上游是遠端，需要剝的上游已經剝過；
+    // hub 自己沒有遠端客戶端（只綁 loopback、帶轉發標頭的一律 403，見 gate）。這個前提一改，這裡要回到
+    // ws::redact_remote_copy。
+    let rewrite = path.ends_with("/events") && path.starts_with("/api/sessions/")
+        || path == "/api/projects/replay";
     match http_get(&u.up.url, &pq, u.up.key.as_deref()).await {
         Ok(mut r) => {
-            // 回應裡的 Event 與 sessions 列也標 host
-            if let Ok(mut v) = serde_json::from_slice::<Value>(&r.body) {
+            if rewrite && let Ok(mut v) = serde_json::from_slice::<Value>(&r.body) {
                 state.hub().rewrite(&owner, &mut v);
                 r.body = v.to_string().into_bytes();
             }

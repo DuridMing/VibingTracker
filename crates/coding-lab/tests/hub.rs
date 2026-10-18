@@ -1192,3 +1192,91 @@ async fn hub_sessions_asks_upstreams_in_parallel_and_respects_limit() {
         "依開始時間由新到舊，同時間依 host：{ids:?}"
     );
 }
+
+/// E-H5（#756）：只有 sessions/<id>/events 與 projects/replay 要改寫加 host；其他 /api/* 原封轉送上游的 bytes
+/// （不解析、不重新序列化約 1 MB 的檔案樹與 diff）。前提：hub 沒有遠端客戶端——只綁 loopback、
+/// 帶轉發標頭的一律 403（hub_refuses_reverse_proxied_requests 鎖住），所以上游給本機版本可以原封送。
+#[tokio::test]
+async fn hub_relays_non_rewritten_api_bytes_unchanged() {
+    let repo = tmp("eh5-repo");
+    let git = |args: &[&str]| {
+        let mut c = std::process::Command::new("git");
+        for (k, _) in std::env::vars() {
+            if k.starts_with("GIT_") {
+                c.env_remove(k);
+            }
+        }
+        assert!(
+            c.current_dir(&repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false"
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+    let cwd = repo
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let evs = [started("s1", 1, 1000, &cwd), text("s1", 2, 1, 1001)];
+    let web = collector("eh5", &evs);
+    let up = upstream(&web).await;
+    let ups = vec![Upstream {
+        name: "alpha".into(),
+        url: format!("http://{up}"),
+        key: None,
+    }];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+        .await
+        .unwrap();
+    let enc: String = cwd
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    for _ in 0..100 {
+        if http_get(hub_addr, &format!("/api/sessions?cwd={enc}"))
+            .await
+            .1["sessions"][0]["id"]
+            == "s1"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let path = format!("/api/files?cwd={enc}&base=main");
+    let direct = hub::http_get(&format!("http://{up}"), &path, None)
+        .await
+        .unwrap();
+    let via = hub::http_get(&format!("http://{hub_addr}"), &path, None)
+        .await
+        .unwrap();
+    assert_eq!(direct.status, 200);
+    assert!(
+        String::from_utf8_lossy(&direct.body).contains("a.txt"),
+        "前提：有改動"
+    );
+    assert_eq!(via.body, direct.body, "原封轉送");
+    // 要改寫的照舊帶 host
+    let (_, ev) = http_get(hub_addr, "/api/sessions/s1/events?limit=5").await;
+    assert_eq!(ev["events"][0]["host"], "alpha", "{ev}");
+}
