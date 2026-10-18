@@ -1648,3 +1648,103 @@ async fn cwd_whitelist_does_not_accept_arbitrary_ancestors() {
         assert_eq!(code, want, "{why}（{cwd}）：{body}");
     }
 }
+
+// ── S-2：git 呼叫不執行 repo 設定或 .git/hooks 裡的外部程式（#743） ─────────────────────
+
+/// 植入三種「git 會替你執行的程式」：`.git/hooks/post-index-change`（git status 刷新 index 時跑）、
+/// submodule 自己 config 裡的 clean filter、`log.showSignature`＋假的 `gpg.program`。每支都只在 `marks/` 留下標記檔。
+#[cfg(unix)]
+fn booby_trapped_repo() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = canon(&tmp("trap"));
+    let marks = base.join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let script = |name: &str| {
+        let p = base.join(name);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marks.join(name).display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    // submodule 的來源
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q", "-b", "main"]);
+    write(&sub, "a.txt", "sub\n");
+    write(&sub, ".gitattributes", "*.txt filter=evil\n");
+    git(&sub, &["add", "."]);
+    git(&sub, &["commit", "-qm", "sub"]);
+    // 主 repo
+    let root = base.join("super");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, "x.txt", "x\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "init"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &s(&sub),
+            "sub",
+        ],
+    );
+    git(&root, &["commit", "-qm", "sub"]);
+    let filter = script("filter");
+    git(
+        &root.join("sub"),
+        &["config", "filter.evil.clean", &s(&filter)],
+    );
+    let gpg = script("gpg");
+    git(&root, &["config", "log.showSignature", "true"]);
+    git(&root, &["config", "gpg.program", &s(&gpg)]);
+    let hook = script("hook");
+    std::fs::copy(&hook, root.join(".git/hooks/post-index-change")).unwrap();
+    // 讓 index 的 stat 資訊過期（內容不變、mtime 改掉）：git status 會想刷新 index，就會觸發 post-index-change
+    let later = std::time::SystemTime::now() + Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(root.join("x.txt"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    write(&root.join("sub"), "a.txt", "sub changed\n");
+    (root, marks)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_calls_never_run_repo_hooks_filters_or_gpg() {
+    let (root, marks) = booby_trapped_repo();
+    let home = tmp("trap-home");
+    let store = store_with(&home, &[started("s1", 1, 1_000, &s(&root))]);
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    let cwd = enc(&s(&root));
+    let head = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    for path in [
+        format!("/api/files?cwd={cwd}"),
+        format!("/api/files?cwd={cwd}&base=session:s1"),
+        format!("/api/files?cwd={cwd}&base=commit:{head}"),
+        format!("/api/branches?cwd={cwd}"),
+        format!("/api/graph?cwd={cwd}"),
+        format!("/api/commit?cwd={cwd}&hash={head}"),
+        format!("/api/commit-diff?cwd={cwd}&worktree={cwd}&path=x.txt"),
+        format!("/api/commit-diff?cwd={cwd}&worktree={cwd}&path=sub"),
+        format!("/api/branch-diff?cwd={cwd}&worktree={cwd}&path=x.txt"),
+    ] {
+        let (code, body) = get(addr, &path).await;
+        assert!(code < 500, "{path}：{code} {body}");
+    }
+    let ran: Vec<String> = std::fs::read_dir(&marks)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(ran.is_empty(), "collector 執行了 repo 設定的程式：{ran:?}");
+}

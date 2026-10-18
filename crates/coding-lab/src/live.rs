@@ -107,14 +107,12 @@ pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u
         list.sort_by_key(|e| e.seq);
         keep_latest_update(list);
     }
-    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）
+    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）。同 session 內 pos 與 seq 都由 merge 依序發、一起單調，
+    // 所以依 pos 排好的窗口 seq 也遞增，可以二分搜尋（E-L6）
     lines.sort_by_key(|e| e.seq);
     let mut after: Vec<Vec<Event>> = vec![Vec::new(); window.len() + 1];
     for l in lines {
-        let at = window
-            .iter()
-            .rposition(|e| e.seq < l.seq)
-            .map_or(0, |i| i + 1);
+        let at = window.partition_point(|e| e.seq < l.seq);
         after[at].push(l);
     }
     let mut after = after.into_iter();
@@ -873,6 +871,15 @@ impl Live {
     }
 
     /// 打包這段時間的變化；沒有任何變化回 None。
+    /// 丟掉還沒送出的變更、不組 frame（E-L2）：啟動時重建、回放追到起點這類大量 apply，
+    /// 沒有人在等那些 frame（重連的 instance 不同、回放只要 snapshot），組出來只會留在 history 佔記憶體。
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.dirty_sessions.clear();
+        self.dirty_agents.clear();
+        self.dirty_attention.clear();
+    }
+
     pub fn flush(&mut self, now: u64) -> Option<Arc<Frame>> {
         self.evict_ended(now);
         let mut kpi = BTreeMap::new();

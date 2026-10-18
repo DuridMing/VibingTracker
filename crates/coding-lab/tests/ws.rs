@@ -880,3 +880,57 @@ async fn every_response_forbids_framing() {
         );
     }
 }
+
+/// C8 端到端：merge 對敏感路徑的 Write／Edit 標 sensitive（#761），遠端副本剝掉新寫入的秘密，
+/// 也剝掉 Edit 的 hunk 前後文從實際檔案帶出的舊秘密（#734）。本機副本照舊。
+#[test]
+fn sensitive_writes_and_edits_from_merge_never_reach_remote_copies() {
+    use coding_lab::config::RemoteThinking;
+    use coding_lab::hook::HookInput;
+    use coding_lab::merge::{Input, Merger};
+    let dir = tmp("c8");
+    std::fs::write(
+        dir.join(".env"),
+        "DB_PASSWORD=OLDSECRET-zzz\nFOO=1\nBAR=2\n",
+    )
+    .unwrap();
+    let cwd = dir.to_string_lossy().replace('\\', "/");
+    let hook = |v: Value| {
+        let mut h = HookInput::from_json(v.to_string().as_bytes()).unwrap();
+        coding_lab::derive::attach_probe(&mut h);
+        h
+    };
+    let mut m = Merger::new(Box::new(coding_lab::rules::RuleSet::builtin()));
+    let mut evs = Vec::new();
+    for (i, v) in [
+        json!({"session_id": "s1", "hook_event_name": "SessionStart", "cwd": cwd, "source": "startup",
+               "transcript_path": format!("{cwd}/t.jsonl")}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": cwd,
+               "tool_input": {"file_path": format!("{cwd}/new/.env"), "content": "API_KEY=NEWSECRET-abc\n"},
+               "tool_use_id": "w1"}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd,
+               "tool_input": {"file_path": format!("{cwd}/.env"), "old_string": "FOO=1", "new_string": "FOO=2"},
+               "tool_use_id": "e1"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        evs.extend(m.handle(Input::Hook { hook: hook(v), ts_seen: i as u64 + 1 }));
+    }
+    let kinds: Vec<&str> = evs.iter().map(|e| e.type_name()).collect();
+    assert!(
+        kinds.contains(&"file.write") && kinds.contains(&"file.edit"),
+        "{kinds:?}"
+    );
+    let local = json!({ "events": evs }).to_string();
+    assert!(
+        local.contains("NEWSECRET") && local.contains("OLDSECRET"),
+        "前提：本機副本有全文"
+    );
+    let remote =
+        coding_lab::ws::redact_remote_copy(&json!({ "events": evs }), RemoteThinking::Show)
+            .to_string();
+    for secret in ["NEWSECRET", "OLDSECRET"] {
+        assert!(!remote.contains(secret), "遠端副本含 {secret}：{remote}");
+    }
+}
