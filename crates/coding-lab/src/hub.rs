@@ -786,6 +786,9 @@ struct HubState {
     known_cwds: Mutex<HashMap<String, String>>,
 }
 
+/// 記下的 session 對照最多幾筆（E-H11）
+const KNOWN_SESSIONS_MAX: usize = 4096;
+
 /// 記下的目錄對照最多幾筆，超過就整個重來（逐台問一次的成本很低，不用 LRU）
 const KNOWN_CWDS_MAX: usize = 1024;
 
@@ -804,10 +807,12 @@ impl HubState {
     }
 
     fn remember(&self, sid: &str, up: &str) {
-        self.known
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), up.to_string());
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        // 有上限（E-H11）：滿了就整個重來，之後用到再逐台問（成本很低，不用 LRU）
+        if known.len() >= KNOWN_SESSIONS_MAX && !known.contains_key(sid) {
+            known.clear();
+        }
+        known.insert(sid.to_string(), up.to_string());
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {

@@ -241,6 +241,9 @@ pub fn consume_once_link(home: &Path, code: &str, now_ms: u64) -> Result<Option<
 
 // ── 速率限制 ──────────────────────────────────────────────────────────────
 
+/// 限流表最多記幾個 IP（E-H11）
+const RATE_TABLE_MAX: usize = 1024;
+
 /// 每個來源 IP 在 `window_ms` 內最多 `max` 次失敗；超過就暫時不收登入。
 pub struct RateLimiter {
     max: usize,
@@ -257,6 +260,11 @@ impl RateLimiter {
         }
     }
 
+    /// 表裡記著幾個 IP（測試用）。
+    pub fn tracked(&self) -> usize {
+        self.hits.len()
+    }
+
     pub fn allowed(&mut self, ip: IpAddr, now_ms: u64) -> bool {
         self.prune(ip, now_ms);
         self.hits.get(&ip).is_none_or(|q| q.len() < self.max)
@@ -265,6 +273,24 @@ impl RateLimiter {
     pub fn record_failure(&mut self, ip: IpAddr, now_ms: u64) {
         self.prune(ip, now_ms);
         self.hits.entry(ip).or_default().push_back(now_ms);
+        // 表滿了（E-H11）：先清掉整個窗口都沒再失敗的 IP，還太多就丟最久沒失敗的。
+        // 只清這次請求的 IP 時，不會再來的 IP 永遠留著，換 IPv6 位址就能讓表一直長大
+        if self.hits.len() > RATE_TABLE_MAX {
+            let window = self.window_ms;
+            self.hits
+                .retain(|_, q| q.back().is_some_and(|t| t + window > now_ms));
+            while self.hits.len() > RATE_TABLE_MAX {
+                let Some(oldest) = self
+                    .hits
+                    .iter()
+                    .min_by_key(|(_, q)| q.back().copied().unwrap_or(0))
+                    .map(|(ip, _)| *ip)
+                else {
+                    break;
+                };
+                self.hits.remove(&oldest);
+            }
+        }
     }
 
     fn prune(&mut self, ip: IpAddr, now_ms: u64) {
