@@ -11,7 +11,13 @@ const CONTEXT: usize = 3;
 
 /// 依 Edit 的 `old_string` → `new_string` 算出 unified diff 的 hunk（上下文 3 行，與 `git diff -U3` 相同）。
 /// 多處相同時取第一處；找不到或 `old_string` 為空回 None。
+/// 含 `\r\n` 時比對與 hunk 一律以 `\n` 計（W-M1：Windows 的 autocrlf 讓檔案是 CRLF、`old_string` 是 LF）；
+/// 行數不變，行號照舊。
 pub fn edit_hunk(text: &str, old: &str, new: &str) -> Option<Hunk> {
+    if [text, old, new].iter().any(|s| s.contains("\r\n")) {
+        let lf = |s: &str| s.replace("\r\n", "\n");
+        return edit_hunk(&lf(text), &lf(old), &lf(new));
+    }
     if old.is_empty() {
         return None;
     }

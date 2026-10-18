@@ -1614,6 +1614,21 @@ impl Merger {
             .is_some_and(|c| c.sensitive);
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
+            // 改了哪個檔，但沒有單一的 hunk（儲存格、多處改動）：hunk 為 null（W-L9、#746）
+            "NotebookEdit" | "MultiEdit" => input["notebook_path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .map(|p| {
+                    Payload::FileEdit(FileEdit {
+                        tool_use_id,
+                        path: derive::relative_path(&cwd, p),
+                        hunk: None,
+                        hunk_source: HunkSource::None,
+                        truncated: false,
+                        sensitive,
+                        replace_all: false,
+                    })
+                }),
             "Edit" => path().map(|path| {
                 // 多處取代只畫第一處會少算 +N／−M，乾脆不畫（D7）
                 let replace_all = input["replace_all"].as_bool() == Some(true);
