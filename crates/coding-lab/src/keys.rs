@@ -16,6 +16,8 @@ pub const FILE_NAME: &str = "keys.json";
 /// 每把金鑰最後一次用到的時間（collector 寫）。和 `keys.json` 分開：`keys.json` 只有 CLI 的 create／revoke 會寫，
 /// collector 寫回 last_used 就不會蓋掉剛撤銷的金鑰（#743 S-3）。
 pub const USED_FILE: &str = "keys-usage.json";
+/// `keys.json` 與 `login-links.json` 讀改寫的跨程序鎖（W-L13）
+pub const LOCK_FILE: &str = "keys.lock";
 pub const TOKEN_PREFIX: &str = "clk_";
 pub const ID_LEN: usize = 8;
 /// 32 bytes 以 base62 表示固定補到 43 個字元（⌈256 / log2 62⌉）。
@@ -256,8 +258,7 @@ impl KeyStore {
             Err(e) => return Err(format!("讀不到 {}：{e}", path.display())),
         };
         check_mode(&path)?;
-        let f: FileFormat =
-            serde_json::from_str(&text).map_err(|e| format!("{} 格式錯誤：{e}", path.display()))?;
+        let f: FileFormat = serde_json::from_str(&text).map_err(|e| corrupt(&path, e))?;
         if f.version > FILE_VERSION {
             return Err(format!(
                 "{} 是版本 {}，這個 coding-lab 只認得到版本 {FILE_VERSION}；請升級",
@@ -281,7 +282,27 @@ impl KeyStore {
         }))
     }
 
-    /// 寫回 `<home>/keys.json`：先寫 `.tmp`（600）再 rename，不會留下半個檔。
+    /// 在 `<home>/keys.lock` 的獨佔鎖裡讀、改、寫 `keys.json`（W-L13）：同時跑的 `key create`／`revoke`
+    /// 不會用舊內容蓋掉彼此。`f` 回 (結果, 有沒有改)；沒有檔案時用 `rng` 建一份新的。
+    pub fn update<T>(
+        home: &Path,
+        rng: &mut dyn Rng,
+        f: impl FnOnce(&mut KeyStore, &mut dyn Rng) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let _lock = lock_home(home)?;
+        let mut store = match KeyStore::load(home)? {
+            Some(s) => s,
+            None => KeyStore::new(rng),
+        };
+        let (out, changed) = f(&mut store, rng)?;
+        if changed {
+            store.save(home)?;
+        }
+        Ok(out)
+    }
+
+    /// 寫回 `<home>/keys.json`：先寫暫存檔（600）再 rename，不會留下半個檔；原本的內容留在 `keys.json.bak`。
+    /// 和別的程序並行時要在 [`KeyStore::update`] 裡呼叫。
     pub fn save(&self, home: &Path) -> Result<(), String> {
         std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
         let path = KeyStore::path(home);
@@ -291,8 +312,75 @@ impl KeyStore {
             keys: self.keys.clone(),
         };
         let text = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
-        save_secret_json(&path, &text)
+        save_secret_json_with_backup(&path, &text)
     }
+}
+
+/// 讀到格式錯誤的檔：有 `.bak` 時說可以從它還原。
+pub(crate) fn corrupt(path: &Path, e: serde_json::Error) -> String {
+    let bak = backup_path(path);
+    let hint = if bak.exists() {
+        format!(
+            "；上一版在 {}，確認內容後把它改名回 {} 就能還原",
+            bak.display(),
+            path.display()
+        )
+    } else {
+        String::new()
+    };
+    format!("{} 格式錯誤：{e}{hint}", path.display())
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// 拿 `<home>/keys.lock` 的獨佔鎖（跨程序；檔案關掉就放掉）：`keys.json` 與 `login-links.json`
+/// 的讀、改、寫整段拿著（W-L13）。CLI 只拿一下；別的程序拿著時等它放掉。
+pub(crate) fn lock_home(home: &Path) -> Result<std::fs::File, String> {
+    std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+    let path = home.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("開不了 {}：{e}", path.display()))?;
+    file.lock()
+        .map_err(|e| format!("鎖不了 {}：{e}", path.display()))?;
+    Ok(file)
+}
+
+/// 暫存檔名：`<檔名>.<pid>.<亂數>.tmp`。同一個 home 的程序各寫各的，不會 rename 走別人寫到一半的檔（W-L13）。
+fn tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut buf = [0u8; 8];
+    // 亂數只是避免撞名；系統亂數來源壞掉時退回時間與序號
+    let r = if getrandom::fill(&mut buf).is_ok() {
+        u64::from_le_bytes(buf)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        nanos ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{r:016x}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// 同 [`save_secret_json`]，寫之前把原本的內容（還能解析的才算）留在 `<path>.bak`：寫壞或誤刪時還原得回來。
+/// 原本的檔已經壞了就不碰 `.bak`，免得蓋掉最後一份好的。
+pub(crate) fn save_secret_json_with_backup(path: &Path, text: &str) -> Result<(), String> {
+    if let Ok(old) = std::fs::read_to_string(path)
+        && serde_json::from_str::<serde_json::Value>(&old).is_ok()
+    {
+        save_secret_json(&backup_path(path), &old)?;
+    }
+    save_secret_json(path, text)
 }
 
 fn read_used(home: &Path) -> std::collections::HashMap<String, u64> {
@@ -313,9 +401,9 @@ pub fn record_used(home: &Path, id: &str, now_ms: u64) -> Result<(), String> {
     save_private_json(&home.join(USED_FILE), &text)
 }
 
-/// 寫一個只有自己能讀的 JSON 檔：先寫 `<path>.tmp`（unix 600）再 rename，不會留下半個檔。
+/// 寫一個只有自己能讀的 JSON 檔：先寫暫存檔（unix 600）再 rename，不會留下半個檔。
 pub(crate) fn save_private_json(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = tmp_path(path);
     write_private(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
@@ -327,7 +415,7 @@ pub(crate) fn save_private_json(path: &Path, text: &str) -> Result<(), String> {
 /// Windows 上另外把暫存檔的 ACL 收成只有目前使用者（停用繼承），再寫內容、rename（同一磁碟區 rename 保留 ACL）。
 /// 不靠資料目錄的 ACL：目錄只在 collector 第一次建立時收緊，使用者先建好的 home 沒有（#735 S-6／W-L3）。
 pub(crate) fn save_secret_json(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = tmp_path(path);
     write_secret(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

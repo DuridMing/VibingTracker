@@ -460,7 +460,8 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
     let cfg = Config::load(&Overrides::default())?;
     let now = coding_lab::now_ms();
     let mut rng = SystemRng;
-    let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
+    // 只讀的子命令用這份；create／revoke 在鎖裡重讀（KeyStore::update，W-L13）
+    let store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
     match cmd {
         KeyCommand::Create {
             name,
@@ -468,9 +469,15 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             expires,
         } => {
             let expires_ms = coding_lab::keys::parse_expires(&expires, now)?;
-            let token = store.create(&name, scope, expires_ms, now, &mut rng);
-            store.save(&cfg.home)?;
-            let id = store.list().last().map(|k| k.id.as_str()).unwrap_or("");
+            let (token, id) = KeyStore::update(&cfg.home, &mut rng, |store, rng| {
+                let token = store.create(&name, scope, expires_ms, now, rng);
+                let id = store
+                    .list()
+                    .last()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_default();
+                Ok(((token, id), true))
+            })?;
             println!("金鑰（只顯示這一次，請現在複製）：\n\n    {token}\n");
             println!(
                 "id {id}　name {name}　scope {}　到期 {}",
@@ -574,13 +581,16 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             Ok(())
         }
         KeyCommand::Revoke { id } => {
-            if store.get(&id).is_none() {
-                return Err(format!(
-                    "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
-                ));
-            }
-            if store.revoke(&id, now) {
-                store.save(&cfg.home)?;
+            let revoked = KeyStore::update(&cfg.home, &mut rng, |store, _| {
+                if store.get(&id).is_none() {
+                    return Err(format!(
+                        "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
+                    ));
+                }
+                let revoked = store.revoke(&id, now);
+                Ok((revoked, revoked))
+            })?;
+            if revoked {
                 println!("已撤銷 {id}，持有這把金鑰的連線下一次請求起失效");
             } else {
                 println!("{id} 先前已撤銷");
