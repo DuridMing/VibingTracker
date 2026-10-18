@@ -858,3 +858,50 @@ fn last_message_is_cut_at_500_chars() {
         .count();
     assert_eq!(kept, 500, "subagent 的也一樣");
 }
+
+/// W-M1（#746）：Windows 上 git 預設 autocrlf，檔案是 CRLF、Claude 給的 old_string 是 LF。
+/// 比對與 hunk 一律以 `\n` 計：多行的 Edit 也找得到，hunk 的行尾不帶 `\r`，行號不變。
+#[test]
+fn crlf_files_get_hunks_without_carriage_returns() {
+    let text = "a\r\nb\r\nc\r\nd\r\n";
+    let h = edit_hunk(text, "b\nc", "B\nC").expect("多行的 old_string 要找得到");
+    assert!(h.lines.iter().all(|l| !l.ends_with('\r')), "{:?}", h.lines);
+    assert_eq!(h.lines, [" a", "-b", "-c", "+B", "+C", " d"]);
+    assert_eq!((h.start, h.old_lines, h.new_lines), (1, 4, 4));
+    let one = edit_hunk(text, "c", "C").unwrap();
+    assert_eq!(one.lines, [" a", " b", "-c", "+C", " d"]);
+    let crlf_old = edit_hunk(text, "b\r\nc", "B\r\nC").unwrap();
+    assert_eq!(crlf_old.lines, h.lines, "old_string 也是 CRLF 時結果相同");
+}
+
+/// W-L9（#746）：NotebookEdit 與 MultiEdit 也產生 file.edit（hunk 為 null），改動紀錄與檔案樹看得到。
+#[test]
+fn notebook_and_multi_edit_derive_file_edit() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", "/repo", "startup"), 1);
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "NotebookEdit", "cwd": "/repo",
+               "tool_input": {"notebook_path": "/repo/nb/a.ipynb", "new_source": "x = 1", "cell_id": "c1"},
+               "tool_use_id": "n1"}),
+        2,
+    );
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["path"], &fe["hunk"], &fe["hunkSource"]),
+        (&json!("nb/a.ipynb"), &Value::Null, &json!("none"))
+    );
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "MultiEdit", "cwd": "/repo",
+               "tool_input": {"file_path": "/repo/src/b.rs",
+                              "edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]},
+               "tool_use_id": "m1"}),
+        3,
+    );
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["path"], &fe["hunk"]),
+        (&json!("src/b.rs"), &Value::Null)
+    );
+}
