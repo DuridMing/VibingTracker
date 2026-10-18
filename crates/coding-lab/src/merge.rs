@@ -27,6 +27,8 @@ pub const FALLBACK_AFTER_MS: u64 = 10_000;
 pub const FALLBACK_WAIT_MS: u64 = 60_000;
 /// session 結束後在記憶體留多久（晚到的 transcript 行、tail 關掉前最後一次讀檔）。
 pub const SESSION_EVICT_AFTER_MS: u64 = 10 * 60 * 1000;
+/// 完成的卡片（已進串流、已結束、結果已送）在記憶體留多久：給重複送達的 hook（K-3）與晚到的行，之後釋放（K-12）。
+pub const CARD_KEEP_MS: u64 = 10 * 60 * 1000;
 /// 沒有 SessionEnd（終端機被直接關掉）的 session，多久沒有任何事件就移除。
 pub const SESSION_IDLE_EVICT_MS: u64 = 24 * 60 * 60 * 1000;
 /// SubagentStart 有好幾個候選呼叫時，等 meta.json／PostToolUse 的 agentId 的上限；過了依呼叫順序配對（#680）。
@@ -116,6 +118,8 @@ struct Card {
     sensitive: bool,
     /// 已處理過的工具 hook（[`tool_hook_bit`]）：同一個 hook 收到兩次只處理第一次（K-3）
     hooks_seen: u8,
+    /// 第一次被檢查到「完成」的時間；過了 [`CARD_KEEP_MS`] 就釋放（K-12）
+    done_at: Option<u64>,
 }
 
 impl Card {
@@ -129,9 +133,18 @@ impl Card {
             called: false,
             sensitive: false,
             hooks_seen: 0,
+            done_at: None,
         }
     }
+
+    /// 已進串流、已結束、結果也送了：之後只剩重複送達的 hook 會用到它
+    fn is_done(&self) -> bool {
+        self.called && self.staged_at.is_none() && self.finished && self.result_sent
+    }
 }
+
+/// 檢查完成卡片的間隔：tick 不必每次走過所有卡片（E-M4）
+const CARD_SWEEP_EVERY_MS: u64 = 60_000;
 
 /// 帶 tool_use_id、每張卡片最多一次的 hook。URL 重複或裝了兩份 plugin 時同一個 hook 會收到兩次（K-3）。
 fn tool_hook_bit(event: &str) -> Option<u8> {
@@ -163,7 +176,9 @@ struct Session {
     /// file.* 的路徑基準：第一次 SessionStart 的 cwd（#672）；之後的 hook 與 SessionStart 都不改
     cwd: Option<String>,
     last_model: HashMap<String, String>,
-    seen_messages: HashSet<String>,
+    /// 每個 transcript 檔最後一則 assistant 訊息的 message.id：同一則拆成多行時 usage 只算第一行。
+    /// 同一則的行在檔內一定連續（本機 17,586 則實測），不用留所有見過的 id（K-12、K-13）
+    last_message: HashMap<String, String>,
     pending_agents: Vec<PendingAgent>,
     /// 已知的 agent_id → 呼叫的 tool_use_id：PostToolUse 的 `tool_response.agentId`、meta.json 的 `toolUseId`（#680）
     known_agents: HashMap<String, String>,
@@ -203,6 +218,19 @@ struct HeldTool {
     hook: HookInput,
     agent_id: String,
     ts_seen: u64,
+}
+
+/// 完成的卡片第一次檢查到時記下時間，滿 [`CARD_KEEP_MS`] 後釋放（K-12）：長開的 session 不再一直累積卡片。
+/// 還在等 transcript tool_use 行的（已降級進串流）不算完成，行到了才不會再建一次。
+fn release_done_cards(s: &mut Session, now: u64) {
+    let waiting = &s.fallback_waiting;
+    s.cards.retain(|id, c| {
+        if !c.is_done() || waiting.contains_key(id) {
+            return true;
+        }
+        let since = *c.done_at.get_or_insert(now);
+        since + CARD_KEEP_MS > now
+    });
 }
 
 /// 已呼叫 Agent／Task 工具、還沒對到 SubagentStart 的 subagent。
@@ -262,6 +290,8 @@ pub struct Merger {
     cost_baseline: Option<f64>,
     /// 「等你」保底判斷的門檻（#706）；新建的 session 套用它
     wait_guess_ms: u64,
+    /// 上一次檢查完成卡片的時間（K-12）
+    card_sweep_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -277,6 +307,8 @@ struct Resumed {
     last_seen: Option<u64>,
     /// 重啟前還在暫存區的卡片（K-8）
     cards: Vec<(String, Card)>,
+    /// 重啟前每個檔最後算過 usage 的 message.id（K-13）
+    last_message: HashMap<String, String>,
 }
 
 impl Merger {
@@ -289,6 +321,7 @@ impl Merger {
             resumed: HashMap::new(),
             cost_baseline: None,
             wait_guess_ms: status::WAIT_GUESS_AFTER_MS,
+            card_sweep_at: None,
         }
     }
 
@@ -310,9 +343,20 @@ impl Merger {
     /// collector 重啟時（K-8）：重啟前收到 PreToolUse、transcript 的 tool_use 行還沒到的暫存卡片種回，
     /// 行到了照常依行號放進串流（不再發第二筆 tool.called）。`recent` 是 store 最近的 Event（依 seq）；
     /// 暫存時間從 `now` 重新算，重啟後的 tail 補讀有完整的 [`FALLBACK_AFTER_MS`] 可以趕上，等不到才降級。
+    /// 同時種回每個檔最後算過 usage 的訊息：重啟時正在寫的那則訊息，之後的行不再算一次（K-13）。
     pub fn resume_staged(&mut self, recent: &[Event], now: u64) {
         let mut staged: BTreeMap<(&str, &str), Card> = BTreeMap::new();
         for e in recent {
+            if e.kind == "usage"
+                && let Some(m) = e.payload["messageId"].as_str()
+            {
+                self.resumed
+                    .entry(e.session.clone())
+                    .or_default()
+                    .last_message
+                    .insert(file_of(&e.agent), m.to_string());
+                continue;
+            }
             let Some(id) = e.payload["toolUseId"].as_str() else {
                 continue;
             };
@@ -401,6 +445,7 @@ impl Merger {
                 (s.seq, s.pos, s.cwd) = (r.seq, r.pos, r.cwd);
                 s.ended_at = r.ended_at;
                 s.last_seen = r.last_seen.unwrap_or(0);
+                s.last_message = r.last_message;
                 for item in r.open {
                     s.status.seed_open(item);
                 }
@@ -427,6 +472,11 @@ impl Merger {
     /// 記憶體裡的 session 數。
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// 記憶體裡這個 session 的卡片數（測試確認完成的卡片會釋放，K-12）
+    pub fn card_count(&self, sid: &str) -> usize {
+        self.sessions.get(sid).map_or(0, |s| s.cards.len())
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Event> {
@@ -607,6 +657,7 @@ impl Merger {
                     last_seen: None,
                     // 移出前暫存的卡片早就逾時降級了
                     cards: Vec::new(),
+                    last_message: s.last_message,
                 };
                 self.resumed.insert(id, r);
             }
@@ -696,6 +747,15 @@ impl Merger {
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
         let mut out = self.evict(now);
+        if self
+            .card_sweep_at
+            .is_none_or(|t| now >= t + CARD_SWEEP_EVERY_MS)
+        {
+            self.card_sweep_at = Some(now);
+            for s in self.sessions.values_mut() {
+                release_done_cards(s, now);
+            }
+        }
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         for sid in sessions {
             let changes = match self.sessions.get_mut(&sid) {
@@ -1719,7 +1779,10 @@ impl Merger {
                 _ => {}
             }
             first_line_of_message =
-                !message_id.is_empty() && s.seen_messages.insert(message_id.clone());
+                !message_id.is_empty() && s.last_message.get(file).is_none_or(|m| *m != message_id);
+            if first_line_of_message {
+                s.last_message.insert(file.to_string(), message_id.clone());
+            }
         }
         if let (Some(from), Some(to)) = (changed, &real_model) {
             let p = ModelChanged {

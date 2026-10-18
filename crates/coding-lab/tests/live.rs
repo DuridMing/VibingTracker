@@ -1760,6 +1760,59 @@ fn session_with_open_attention_stays_until_the_queue_is_empty() {
     );
 }
 
+/// 「已扣回 KPI」的記號和卡片的伴隨 Event 一起放掉（K-12）：session 移出後不留。
+#[test]
+fn reverted_marks_leave_with_the_session() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let edit = b.ev(
+        "s1",
+        "file.edit",
+        "main",
+        DAY + 10,
+        false,
+        json!({"toolUseId": "e1", "path": "a.rs", "hunk": null, "hunkSource": "none"}),
+    );
+    let failed = b.ev(
+        "s1",
+        "tool.updated",
+        "main",
+        DAY + 20,
+        false,
+        json!({"toolUseId": "e1", "status": "failed", "durationMs": null, "error": "denied",
+               "interrupted": null, "danger": null}),
+    );
+    let end = b.ev(
+        "s1",
+        "session.ended",
+        "main",
+        DAY + H,
+        false,
+        json!({"reason": "exit"}),
+    );
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.called(
+                "s1",
+                "e1",
+                "Edit",
+                json!({"file_path": "a.rs"}),
+                DAY + 5,
+                Value::Null,
+            ),
+            edit,
+            failed,
+            end,
+        ],
+    );
+    assert_eq!(l.reverted_count(), 1, "前提：被拒的 Edit 扣回過");
+    l.flush(DAY + 3 * H + 1);
+    assert_eq!(l.session_count(), 0);
+    assert_eq!(l.reverted_count(), 0);
+}
+
 /// #686（R23）：沒有新 Event 時 flush 不重算 KPI（只在有新 Event、跨時間格或跨午夜時算）。
 #[test]
 fn flush_without_new_events_does_not_recompute_kpi() {
