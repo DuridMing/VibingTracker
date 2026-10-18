@@ -166,13 +166,13 @@ https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801�
 ~/.coding-lab/bin/coding-lab hub
 ```
 
-打開 <http://127.0.0.1:4802>：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
+打開 `coding-lab hub` 印出的網址（`http://127.0.0.1:4802/?token=…`）：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
 
 - 某台斷線（網路斷、重開機）：它的 session 標「離線」、分頁變淡，其他台照常；hub 每 1～30 秒重連，連回來會整頁重載那台的內容。
 - 「載入更多」、thinking 點開、檔案樹、分支視窗、回放、「已確認」都由 hub 轉給對應的那台；那台給 hub 的金鑰是 `view` 時按「已確認」會提示要 `operate` 金鑰。
-- hub 自己不存資料、只綁本機、不需要金鑰；要從別台看 hub，請對 hub 這台開 SSH 通道。
+- hub 自己不存資料、只綁本機。127.0.0.1 是整台機器共用的（同一台的其他帳號、其他程式都連得到），hub 又拿著上游的金鑰，所以每次啟動都產生新的 token、只印在執行它的終端機；第一次用網址開會換成 cookie，之後網址列不再帶 token。沒有 token 的 `/api`、`/ws` 回 401。hub 重新啟動後要用新印出的網址；頁面出現「需要 hub 的網址」就是這個原因。要從別台看 hub，請對 hub 這台開 SSH 通道。
 - 上游寫在 `~/.coding-lab/config.toml`（`[[hub.upstream]]`，含金鑰，檔案權限 600）；改埠用 `[hub] bind = "127.0.0.1:4802"` 或 `coding-lab hub --bind …`。上游網址只接受 `http://`：遠端一律走 tailnet（WireGuard 加密）或 SSH 通道。
-- `curl 127.0.0.1:4802/healthz` 看每台連上了沒。
+- `curl -H "Authorization: Bearer <token>" 127.0.0.1:4802/healthz` 看每台連上了沒（不帶 token 只回版本）。
 
 ## 同一台機器上有好幾個專案
 
