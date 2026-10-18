@@ -1378,3 +1378,78 @@ async fn commit_diff_of_a_commit_and_of_the_worktree() {
         assert_eq!(code, 400, "{bad}：{body}");
     }
 }
+
+// ── /api/projects/replay（主頁時間軸回放，#729）
+
+fn attention_ev(s: &str, seq: u64, ts: u64, kind: &str, r: &str, raised: bool) -> Event {
+    ev(
+        s,
+        seq,
+        if raised {
+            "attention.raised"
+        } else {
+            "attention.cleared"
+        },
+        None,
+        ts,
+        json!({"kind": kind, "ref": r, "reason": "測試"}),
+    )
+}
+
+#[tokio::test]
+async fn project_replay_rebuilds_the_main_page_at_any_time() {
+    let home = tmp("project-replay");
+    let store = store_with(
+        &home,
+        &[
+            started("s1", 1, 1000, "/p"),
+            text("s1", 2, 1, 1500),
+            attention_ev("s1", 3, 4000, "done", "p1", true),
+            started("s2", 1, 5000, "/p/worktrees/a"),
+            started("s3", 1, 1000, "/other"),
+            text("s3", 2, 1, 1600),
+        ],
+    );
+    store.lock().unwrap().ack("s1", "done", "p1", 6000).unwrap();
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+
+    let sessions = |b: &Value| -> Vec<String> {
+        b["snapshot"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let attention = |b: &Value| b["snapshot"]["attention"].as_array().unwrap().len();
+
+    let (code, b) = get(addr, "/api/projects/replay?cwd=%2Fp&at=4500").await;
+    assert_eq!(code, 200, "{b}");
+    assert_eq!(sessions(&b), ["s1"], "別的專案的 s3 不算、s2 還沒開始");
+    assert_eq!(attention(&b), 1, "4000 的完成待確認還在");
+
+    let (_, b) = get(addr, "/api/projects/replay?cwd=%2Fp&at=6500").await;
+    assert_eq!(sessions(&b), ["s1", "s2"], "worktree 的 s2 算進來");
+    assert_eq!(attention(&b), 0, "6000 已確認（store 的 acked_at）");
+
+    let (_, b) = get(addr, "/api/projects/replay?cwd=%2Fp&at=1200&until=8000").await;
+    let ts: Vec<u64> = b["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["ts"].as_u64().unwrap())
+        .collect();
+    assert!(
+        ts.contains(&4000) && ts.contains(&5000) && ts.contains(&6000),
+        "{ts:?}"
+    );
+    assert!(!ts.contains(&1600), "s3 的事件不能出現：{ts:?}");
+
+    for bad in [
+        "/api/projects/replay?at=1",
+        "/api/projects/replay?cwd=%2Fp",
+        "/api/projects/replay?cwd=%2Fp&at=x",
+    ] {
+        assert_eq!(get(addr, bad).await.0, 400, "{bad}");
+    }
+}

@@ -381,6 +381,46 @@ function createWorld(n, { bigtree = false } = {}) {
     return { status: 200, body: { cwd, from, to, events: [...bySession.values()].flat(), next: last && { ts: last.ts_seen, session: last.session, pos: last.pos } } };
   }
 
+  // 主頁時間軸回放（#729）：簡化版——列（sessions、agents、注意佇列、KPI）用現況，串流與改動只取 at 之前的；
+  // frame 是 (at, until] 之間進串流的 Event 依 ts_seen 分組，列不變。只用來在前端試時間軸與播放
+  function projectReplay(q, snap) {
+    const cwd = (q.get("cwd") ?? "").replace(/\/$/, "");
+    const at = Number(q.get("at"));
+    if (!cwd) return err(400, "缺少 cwd（專案根目錄）");
+    if (!Number.isFinite(at)) return err(400, "at 要是 epoch ms");
+    const until = Number(q.get("until") ?? at + 3_600_000);
+    const limit = Math.min(10_000, Number(q.get("limit") ?? 2000));
+    const under = new Set(sessions.filter((s) => s.cwd === cwd || s.cwd.startsWith(`${cwd}/`)).map((s) => s.id));
+    const mine = (x) => under.has(x.session ?? x.id);
+    const groups = new Map();
+    for (const e of glog) {
+      if (!under.has(e.session) || e.ts_seen <= at || e.ts_seen > until) continue;
+      if (!groups.has(e.ts_seen)) groups.set(e.ts_seen, []);
+      groups.get(e.ts_seen).push(...expand(e));
+    }
+    const frames = [];
+    let placed = 0;
+    let next = null;
+    for (const [ts, events] of [...groups].sort((a, b) => a[0] - b[0])) {
+      if (placed >= limit) { next = frames[frames.length - 1].ts; break; }
+      placed += events.length;
+      frames.push({ t: "frame", ch: "*", frame: frames.length + 1, ts, events, rows: {} });
+    }
+    const body = { cwd, at, until, frames, next };
+    if (q.get("snapshot") !== "0") {
+      body.snapshot = {
+        ...snap,
+        sessions: snap.sessions.filter(mine),
+        agents: snap.agents.filter(mine),
+        attention: snap.attention.filter(mine),
+        changes: snap.changes.filter((e) => mine(e) && e.ts_seen <= at),
+        staged: [],
+        stream: snap.stream.filter((e) => mine(e) && e.ts_seen <= at),
+      };
+    }
+    return { status: 200, body };
+  }
+
   // contracts §7 的 /api/graph、/api/branches、/api/commit（#696）：假的歷史，develop 主線＋每個 worktree 一條 feature 分支
   const hx = (n) => (n * 2654435761 >>> 0).toString(16).padStart(8, "0").repeat(5);
   const wts = [...new Map(sessions.filter((s) => rootOf(s.cwd) === ROOT).map((s) => [s.cwd, s.branch])).entries()];
@@ -472,6 +512,7 @@ function createWorld(n, { bigtree = false } = {}) {
       const u = new URL(url, "http://mock");
       if (u.pathname === "/api/files") return files(u.searchParams);
       if (u.pathname === "/api/projects/events") return projectEvents(u.searchParams);
+      if (u.pathname === "/api/projects/replay") return projectReplay(u.searchParams, this.snapshot());
       if (u.pathname === "/api/branches") return branches(u.searchParams);
       if (u.pathname === "/api/branch-diff") return branchDiff(u.searchParams);
       if (u.pathname === "/api/graph") return { status: 200, body: { root: ROOT, integration: "develop", commits: history, truncated: false } };

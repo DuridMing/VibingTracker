@@ -626,6 +626,61 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// 主頁時間軸回放（#729）：專案根 `root` 底下（含 worktree、子目錄）在 [`from`, `until`] 之間還會出現在 live 的
+    /// session（開始不晚於 `until`，沒結束、或結束不早於 `from` 往前 [`crate::live::ENDED_KEPT_MS`]）的所有 Event
+    /// （`ts_seen ≤ until`，依 (ts_seen, session, seq)），與這些 session 注意項目的確認時間。
+    pub fn timeline(
+        &self,
+        root: &str,
+        from: u64,
+        until: u64,
+    ) -> Result<(Vec<Event>, Vec<crate::timeline::Ack>), StoreError> {
+        let root = root.trim_end_matches('/');
+        let until_i = until.min(i64::MAX as u64) as i64;
+        let since = from
+            .saturating_sub(crate::live::ENDED_KEPT_MS)
+            .min(i64::MAX as u64) as i64;
+        let ids: Vec<String> = self
+            .db
+            .prepare(
+                "SELECT id FROM sessions s
+                 WHERE (s.cwd = ?1 OR substr(s.cwd, 1, length(?1) + 1) = ?1 || '/')
+                   AND s.started_at <= ?2 AND (s.ended_at IS NULL OR s.ended_at >= ?3)
+                 ORDER BY id",
+            )?
+            .query_map(params![root, until_i, since], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut events = Vec::new();
+        let mut acks = Vec::new();
+        for id in &ids {
+            let offsets: Vec<i64> = self
+                .db
+                .prepare(
+                    "SELECT offset FROM events WHERE session = ?1 AND ts_seen <= ?2 ORDER BY seq",
+                )?
+                .query_map(params![id, until_i], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            events.extend(self.read_at(id, offsets)?);
+            let rows = self
+                .db
+                .prepare(
+                    "SELECT kind, ref, acked_at FROM attention WHERE session = ?1 AND acked_at IS NOT NULL",
+                )?
+                .query_map(params![id], |r| {
+                    Ok(crate::timeline::Ack {
+                        session: id.clone(),
+                        kind: r.get(0)?,
+                        reference: r.get(1)?,
+                        at: r.get::<_, i64>(2)? as u64,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            acks.extend(rows);
+        }
+        events.sort_by(|a, b| (a.ts_seen, &a.session, a.seq).cmp(&(b.ts_seen, &b.session, b.seq)));
+        Ok((events, acks))
+    }
+
     /// 某 session 在 seq 範圍（含兩端）內的所有 Event，依 seq 排序。
     pub fn events_by_seq(
         &self,

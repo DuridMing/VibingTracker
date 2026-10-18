@@ -265,6 +265,64 @@ pub async fn project_events(
     .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+// ── /api/projects/replay（主頁時間軸回放，#729）
+
+const REPLAY_DEFAULT_SPAN_MS: u64 = 60 * 60 * 1000;
+const REPLAY_DEFAULT_LIMIT: usize = 2000;
+const REPLAY_MAX_LIMIT: usize = 10_000;
+
+/// `cwd`、`at`（epoch ms）必填；`until` 預設 at 之後 1 小時；`limit` 是這一段最多放幾個 Event；
+/// `offset` 是前端的 UTC 位移（分，同 hello 的 utcOffsetMin），KPI 的「今天」依它算；`snapshot=0` 只要 frame（接續下一段）。
+pub async fn project_replay(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    uri: Uri,
+) -> Response {
+    let q = query(&uri);
+    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
+        return error(StatusCode::BAD_REQUEST, "缺少 cwd（專案根目錄）");
+    };
+    let Some(Ok(at)) = q.get("at").map(|v| v.parse::<u64>()) else {
+        return error(StatusCode::BAD_REQUEST, "at 要是 epoch ms");
+    };
+    let until = match q.get("until").map(|v| v.parse::<u64>()) {
+        None => at.saturating_add(REPLAY_DEFAULT_SPAN_MS),
+        Some(Ok(u)) => u.max(at),
+        Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "until 要是 epoch ms"),
+    };
+    let offset = match q.get("offset").map(|v| v.parse::<i32>()) {
+        None => 0,
+        Some(Ok(o)) if o.abs() <= 14 * 60 => o,
+        Some(_) => return error(StatusCode::BAD_REQUEST, "offset 是 UTC 位移（分）"),
+    };
+    let with_snapshot = q.get("snapshot").is_none_or(|v| v != "0");
+    let n = limit(&q, REPLAY_DEFAULT_LIMIT, REPLAY_MAX_LIMIT);
+    let Some(store) = state.store().cloned() else {
+        return ok(&json!({ "at": at, "until": until, "frames": [], "next": null }));
+    };
+    let state2 = state.clone();
+    // SQLite 與讀 JSONL 都會阻塞；重放也是 CPU 工作，一起放到 blocking 執行緒
+    tokio::task::spawn_blocking(move || {
+        let read = store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .timeline(&cwd, at, until);
+        match read {
+            Ok((events, acks)) => {
+                let mut body =
+                    crate::timeline::replay(&events, &acks, at, until, n, offset, with_snapshot);
+                body["cwd"] = json!(cwd);
+                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
+                state2.redact_for_peer(peer, &mut body);
+                ok(&body)
+            }
+            Err(e) => store_error(e),
+        }
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
 // ── /api/files
 
 enum Base {

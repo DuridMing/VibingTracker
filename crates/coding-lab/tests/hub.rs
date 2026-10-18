@@ -651,6 +651,22 @@ async fn hub_merges_two_collectors_and_follows_frames_from_both() {
     assert_eq!(body["events"][0]["host"], "alpha");
     let (st, _) = http_get(hub_addr, "/api/sessions/unknown/events").await;
     assert_eq!(st, 404);
+    // 主頁時間軸回放（#729）：依 cwd 轉給那台；巢狀的 snapshot 與 frames 裡的列和 Event 也標 host
+    let (st, body) = http_get(
+        hub_addr,
+        "/api/projects/replay?cwd=%2Fsrv%2Fapp&at=1000&until=5000",
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["snapshot"]["sessions"][0]["host"], "alpha", "{body}");
+    let events: Vec<&Value> = body["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["events"].as_array().unwrap())
+        .collect();
+    assert!(!events.is_empty(), "{body}");
+    assert!(events.iter().all(|e| e["host"] == "alpha"), "{body}");
 }
 
 #[tokio::test]

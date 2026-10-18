@@ -58,8 +58,8 @@
 
   <section class="col col-work">
     <nav class="stabs" id="stabs"></nav>
-    <div class="blk" id="replayblk" hidden>
-      <div class="ovh"><h2>專案回放<small>選專案與時間範圍，所有 session（含已結束）合成一條串流</small></h2><span class="rptag">回放</span></div>
+    <div class="blk tlblk" id="replayblk" hidden>
+      <div class="ovh"><h2>專案回放<small>整個主頁回到選的時間點：串流、注意佇列、改動紀錄、Agents、KPI 都跟著時間軸走</small></h2><span class="rptag">回放</span></div>
       <div class="filters rpform">
         <select id="rpProj" title="專案（session 的 cwd；worktree 與子目錄歸到上層）"></select>
         <select id="rpRange" title="時間範圍">
@@ -70,14 +70,17 @@
         </select>
         <span id="rpCustom" hidden><input type="datetime-local" id="rpFrom" aria-label="開始"> – <input type="datetime-local" id="rpTo" aria-label="結束"></span>
         <button class="btn sm" id="rpGo">載入</button>
-        <small class="tinfo" id="rpInfo"></small>
       </div>
-      <div class="filters"><span class="lab">session：</span><span id="rpSess"><span class="none">無</span></span></div>
-      <div class="filters"><span class="lab">類型：</span><span id="rpKind"></span></div>
-      <div class="streamwrap rpwrap"><div class="stream" id="rpStream"></div></div>
+      <div class="filters tlbar">
+        <button class="btn sm" id="tlPlay" aria-label="播放">▶</button>
+        <select id="tlSpeed" title="播放速度"></select>
+        <input type="range" id="tlSlider" min="0" max="1" step="1000" value="0" aria-label="時間軸">
+        <b class="mono" id="tlTime"></b>
+      </div>
+      <small class="tinfo" id="rpInfo"></small>
     </div>
     <div class="blk" id="allblk">
-      <div class="ovh"><h2>專案即時串流<small>所有 session 合在一起，每行標示 [session id] [agent]</small></h2><span class="hint">點 session 標籤只看它；⧉ 開成監視器視窗</span></div>
+      <div class="ovh"><h2 id="allTitle">專案即時串流<small>所有 session 合在一起，每行標示 [session id] [agent]</small></h2><span class="hint">點 session 標籤只看它；⧉ 開成監視器視窗</span></div>
       <div class="degraded-note" id="degradedNote" role="status" hidden></div>
       <div class="filters"><span class="lab">session：</span><span id="fSess"><span class="none">無</span></span></div>
       <div class="filters"><span class="lab">類型：</span><span id="fKind"></span></div>
