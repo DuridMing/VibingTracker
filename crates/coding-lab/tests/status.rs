@@ -1605,6 +1605,48 @@ fn acked_done_before_restart_prompt_reports_run() {
     assert_eq!(r.statuses(), ["run"]);
 }
 
+/// 重啟前 done 已確認（不種回注意項目）：store 與 live 是 done。重啟後在下一個 prompt 之前，上一輪晚到的工具結束
+/// 不能讓 merge 算成 run——沒重啟時 merge 不知道 ack、done 一直開著，會停在 done（#749 長情境找到）。
+#[test]
+fn acked_done_survives_a_restart_until_the_next_prompt() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.m.resume_status(S, coding_lab::event::SessionState::Done);
+    r.feed(pre("t1", "ls", 20_000)).feed(ok("t1", 20_100));
+    assert_eq!(
+        r.last_status(),
+        "run",
+        "main 的 PreToolUse 是新的工作（K-4），撤回 done"
+    );
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.m.resume_status(S, coding_lab::event::SessionState::Done);
+    r.feed(ok("t0", 20_100)).tick(30_000);
+    assert_eq!(
+        r.last_status(),
+        "done",
+        "上一輪晚到的結束：{:?}",
+        r.statuses()
+    );
+    r.feed(prompt("again", 31_000));
+    assert_eq!(r.last_status(), "run");
+}
+
+/// 同上，已確認的 fail：沒重啟時要等那個 agent 的 Bash 成功（或 agent 結束）才解除，prompt 解不掉。
+#[test]
+fn acked_fail_survives_a_restart_until_a_success() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.m.resume_status(S, coding_lab::event::SessionState::Fail);
+    r.feed(prompt("again", 20_000));
+    assert_eq!(r.last_status(), "fail", "{:?}", r.statuses());
+    r.feed(pre("t2", "ls", 21_000)).feed(ok("t2", 21_100));
+    assert_eq!(r.last_status(), "run");
+}
+
 /// 重啟前就沒有 SessionEnd、之後也沒再回來的 session：沒有輸入滿 24 小時後一樣補 abandoned。
 #[test]
 fn session_abandoned_before_restart_is_ended_later() {
@@ -1820,4 +1862,383 @@ fn powershell_danger_enters_the_queue() {
     };
     r.feed(ps_pre("p1", "Remove-Item C:\\proj -Recurse -Force", 1000));
     assert_eq!(r.attention(), [a("raised", "danger", "p1")]);
+}
+
+// ── 狀態機長情境（#749「發佈前最該補的 5 個測試」第 2 條）：K-1、K-2、K-5、K-6、K-8 與 ack 接在一起。
+// 每一步都斷言 merge 最後送出的 session.status、live 的 sessions 列、store 的 sessions 列三邊一致（不變式 8），
+// live 與 store 的注意佇列也一致。hook 用 fixture 的 hook 範本改欄位、transcript 用 fixture 的真實行，不手捏。
+
+mod long {
+    use coding_lab::event::{AttentionKind, Event};
+    use coding_lab::hook::HookInput;
+    use coding_lab::live::{Channel, Live};
+    use coding_lab::merge::{Input, Merger};
+    use coding_lab::rules::RuleSet;
+    use coding_lab::store::Store;
+    use serde_json::{Value, json};
+    use std::path::{Path, PathBuf};
+
+    const S: &str = "long-1";
+    const T0: u64 = 1_800_000_000_000;
+
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/samples")
+    }
+
+    /// fixture 的 hook 範本（`template`）改成 `event`、蓋上 `patch`（值是 null 的欄位刪掉）。
+    fn hook(event: &str, template: &str, patch: Value, ts: u64) -> Input {
+        let p = fixture().join(format!("hooks/{template}.json"));
+        let mut v: Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
+        v["hook_event_name"] = json!(event);
+        v["session_id"] = json!(S);
+        v["transcript_path"] = json!("/nonexistent/long-1.jsonl");
+        for (k, x) in patch.as_object().unwrap() {
+            match x {
+                Value::Null => {
+                    v.as_object_mut().unwrap().remove(k);
+                }
+                x => v[k] = x.clone(),
+            }
+        }
+        Input::Hook {
+            hook: HookInput::from_json(v.to_string().as_bytes()).unwrap(),
+            ts_seen: ts,
+        }
+    }
+
+    /// fixture 主 transcript 的第 `no` 行（真實的行），換上這個情境的 uuid 與工具 id。
+    fn line(no: u64, uuid: &str, tool_id: &str, ts: u64) -> Input {
+        let text =
+            std::fs::read_to_string(fixture().join("sessions/9addaaff/transcript.jsonl")).unwrap();
+        let mut v: Value =
+            serde_json::from_str(text.lines().nth(no as usize - 1).unwrap()).unwrap();
+        v["uuid"] = json!(uuid);
+        let block = &mut v["message"]["content"][0];
+        if block["type"] == "tool_use" {
+            block["id"] = json!(tool_id);
+        } else {
+            block["tool_use_id"] = json!(tool_id);
+        }
+        Input::Line {
+            session: S.into(),
+            file: "main".into(),
+            no,
+            value: v,
+            ts_seen: ts,
+        }
+    }
+
+    fn bash(id: &str, command: &str, agent: Option<&str>) -> Value {
+        let mut v =
+            json!({"tool_name": "Bash", "tool_use_id": id, "tool_input": {"command": command}});
+        if let Some(a) = agent {
+            v["agent_id"] = json!(a);
+            v["agent_type"] = json!("general-purpose");
+        } else {
+            v["agent_id"] = Value::Null;
+            v["agent_type"] = Value::Null;
+        }
+        v
+    }
+
+    fn failed(id: &str, agent: Option<&str>) -> Value {
+        let mut v = bash(id, "false", agent);
+        v["tool_response"] = Value::Null;
+        v["error"] = json!("Exit code 1");
+        v["is_interrupt"] = json!(false);
+        v
+    }
+
+    /// merge 的輸出同時送進 live 與 store（collector 的 sink 做的事）；重啟依 serve.rs 的順序種回。
+    struct Long {
+        home: PathBuf,
+        m: Merger,
+        live: Live,
+        store: Store,
+        evs: Vec<Event>,
+    }
+
+    impl Long {
+        fn new() -> Long {
+            let home = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("status-long-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&home);
+            Long {
+                m: Merger::new(Box::new(RuleSet::builtin())),
+                live: Live::new(),
+                store: Store::open(&home).unwrap(),
+                home,
+                evs: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, evs: Vec<Event>) {
+            for e in &evs {
+                self.live.apply(e);
+                self.store.append(e.clone());
+            }
+            self.store.flush().unwrap();
+            self.evs.extend(evs);
+        }
+
+        fn feed(&mut self, i: Input) -> &mut Self {
+            let evs = self.m.handle(i);
+            self.push(evs);
+            self
+        }
+
+        fn tick(&mut self, now: u64) -> &mut Self {
+            let evs = self.m.tick(now);
+            self.push(evs);
+            self
+        }
+
+        /// 「已確認」：store 記 acked_at、live 移除那一列；merge 不知道（ack 不是 Event）。
+        fn ack(&mut self, kind: &str, r: &str, ts: u64) {
+            assert!(
+                self.store.ack(S, kind, r, ts).unwrap(),
+                "{kind}/{r} 要在佇列裡"
+            );
+            assert!(self.live.ack(S, kind, r));
+        }
+
+        /// collector 重啟：照 serve.rs 的順序，store 重開、live 重建後對齊佇列，merge 種回計數、狀態、注意項目與暫存卡。
+        fn restart(&mut self, now: u64) {
+            drop(std::mem::replace(
+                &mut self.store,
+                Store::open(&self.home.join("tmp-swap")).unwrap(),
+            ));
+            self.store = Store::open(&self.home).unwrap();
+            let recent = self.store.recent_events(0).unwrap();
+            let open = self.store.open_attention().unwrap();
+            self.live = Live::new();
+            for e in &recent {
+                self.live.apply(e);
+            }
+            self.live.keep_attention(
+                &open
+                    .iter()
+                    .map(|a| format!("{}/{}/{}", a.session, a.kind, a.reference))
+                    .collect(),
+            );
+            self.live.discard_pending();
+            self.m = Merger::new(Box::new(RuleSet::builtin()));
+            for (sid, c) in self.store.counters().unwrap() {
+                self.m.resume(&sid, c.seq, c.pos, &c.cwd);
+                self.m
+                    .resume_state(&sid, c.ended_at, c.status == "idle", c.last_seen);
+                if let Ok(st) = serde_json::from_value(json!(c.status)) {
+                    self.m.resume_status(&sid, st);
+                }
+            }
+            // serve.rs 的 resume_attention：解除了但還沒確認的 danger 不交給 merge
+            for a in open.iter().filter(|a| a.cleared_at.is_none()) {
+                let kind: AttentionKind = serde_json::from_value(json!(a.kind)).unwrap();
+                let agent = recent
+                    .iter()
+                    .find(|e| {
+                        e.kind == "attention.raised"
+                            && e.payload["kind"] == a.kind.as_str()
+                            && e.payload["ref"] == a.reference.as_str()
+                    })
+                    .map_or("main", |e| e.agent.as_str());
+                self.m
+                    .resume_attention(&a.session, kind, &a.reference, agent, a.raised_at);
+            }
+            self.m.resume_staged(&recent, now);
+        }
+
+        /// 這一步之後：三邊的 status 都是 `want`，live 與 store 的佇列都是 `queue`（`kind/ref`）。
+        fn check(&self, step: &str, want: &str, queue: &[&str]) {
+            let merged = self
+                .evs
+                .iter()
+                .rfind(|e| e.kind == "session.status")
+                .map_or("run".to_string(), |e| {
+                    e.payload["status"].as_str().unwrap().to_string()
+                });
+            let live = self.live.session_row(S).map(|r| r["status"].clone());
+            let stored = self.store.session(S).unwrap().map(|r| r.status);
+            assert_eq!(
+                (
+                    merged.as_str(),
+                    live.as_ref().and_then(Value::as_str),
+                    stored.as_deref()
+                ),
+                (want, Some(want), Some(want)),
+                "{step}：merge／live／store 的 status"
+            );
+            let snap = self.live.snapshot(&Channel::All, 0, T0 + 10_000_000);
+            let mut in_live: Vec<String> = snap["attention"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{}/{}",
+                        a["kind"].as_str().unwrap(),
+                        a["ref"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            let mut in_store: Vec<String> = self
+                .store
+                .open_attention()
+                .unwrap()
+                .iter()
+                .map(|a| format!("{}/{}", a.kind, a.reference))
+                .collect();
+            in_live.sort();
+            in_store.sort();
+            let mut want_q: Vec<String> = queue.iter().map(|q| q.to_string()).collect();
+            want_q.sort();
+            assert_eq!(in_live, want_q, "{step}：live 的注意佇列");
+            assert_eq!(in_store, want_q, "{step}：store 的注意佇列");
+        }
+
+        fn called(&self, id: &str) -> usize {
+            self.evs
+                .iter()
+                .filter(|e| e.kind == "tool.called" && e.payload["toolUseId"] == id)
+                .count()
+        }
+    }
+
+    #[test]
+    fn subagent_failure_resume_compact_restart_and_ack_stay_consistent() {
+        let mut r = Long::new();
+        let prompt = |id: &str, ts: u64| {
+            hook(
+                "UserPromptSubmit",
+                "UserPromptSubmit",
+                json!({"prompt": "做事", "prompt_id": id}),
+                ts,
+            )
+        };
+        let stop = |ts: u64| hook("Stop", "Stop", json!({"stop_hook_active": false}), ts);
+        r.feed(hook(
+            "SessionStart",
+            "SessionStart",
+            json!({"source": "startup"}),
+            T0,
+        ))
+        .feed(prompt("p1", T0 + 10));
+        r.check("開始", "run", &[]);
+
+        // K-1：subagent 的 Bash 連續失敗兩次進 fail，subagent 結束後解除
+        r.feed(hook(
+            "SubagentStart",
+            "SubagentStart",
+            json!({"agent_id": "a1", "agent_type": "general-purpose"}),
+            T0 + 100,
+        ));
+        for (k, id) in ["t1", "t2"].iter().enumerate() {
+            let at = T0 + 200 + 200 * k as u64;
+            r.feed(hook(
+                "PreToolUse",
+                "PreToolUse",
+                bash(id, "false", Some("a1")),
+                at,
+            ))
+            .feed(hook(
+                "PostToolUseFailure",
+                "PostToolUse",
+                failed(id, Some("a1")),
+                at + 100,
+            ));
+        }
+        r.check("subagent 連續失敗兩次", "fail", &["fail/t2"]);
+        r.feed(hook(
+            "SubagentStop",
+            "SubagentStop",
+            json!({"agent_id": "a1", "agent_type": "general-purpose"}),
+            T0 + 700,
+        ));
+        r.check("subagent 結束（K-1）", "run", &[]);
+
+        // 完成待確認，新的 prompt 撤回
+        r.feed(stop(T0 + 1_000)).tick(T0 + 7_000);
+        r.check("完成", "done", &["done/p1"]);
+        r.feed(prompt("p2", T0 + 10_000));
+        r.check("新的 prompt", "run", &[]);
+
+        // K-2：危險指令跑到一半 session 結束，resume 後解除（danger 列留到確認）
+        r.feed(hook(
+            "PreToolUse",
+            "PreToolUse",
+            bash("t3", "rm -rf /srv/data", None),
+            T0 + 10_100,
+        ));
+        r.check("危險指令", "danger", &["danger/t3"]);
+        r.feed(hook(
+            "SessionEnd",
+            "SessionEnd",
+            json!({"reason": "prompt_input_exit"}),
+            T0 + 12_000,
+        ));
+        r.check("session 結束", "ended", &["danger/t3"]);
+        r.feed(hook(
+            "SessionStart",
+            "SessionStart",
+            json!({"source": "resume"}),
+            T0 + 60_000,
+        ));
+        r.check("resume（K-2）", "run", &["danger/t3"]);
+        r.ack("danger", "t3", T0 + 61_000);
+        r.check("確認 danger", "run", &[]);
+
+        // 新的一輪：工具的 hook 到了、transcript 行還沒到（暫存卡），然後完成
+        r.feed(prompt("p3", T0 + 62_000))
+            .feed(hook(
+                "PreToolUse",
+                "PreToolUse",
+                bash("t4", "ls", None),
+                T0 + 62_100,
+            ))
+            .feed(hook(
+                "PostToolUse",
+                "PostToolUse",
+                bash("t4", "ls", None),
+                T0 + 62_200,
+            ))
+            .feed(stop(T0 + 63_000))
+            .tick(T0 + 69_000);
+        r.check("完成 p3", "done", &["done/p3"]);
+
+        // K-5：/compact 不改變狀態
+        r.feed(hook(
+            "PreCompact",
+            "PostToolBatch",
+            json!({"trigger": "manual"}),
+            T0 + 70_000,
+        ))
+        .feed(hook(
+            "SessionStart",
+            "SessionStart",
+            json!({"source": "compact"}),
+            T0 + 71_000,
+        ));
+        r.check("compact（K-5）", "done", &["done/p3"]);
+        r.ack("done", "p3", T0 + 72_000);
+        r.check("確認 done", "done", &[]);
+
+        // K-6、K-8：重啟。已確認的 done 不種回；暫存卡種回，行到了不再發第二筆 tool.called
+        r.restart(T0 + 80_000);
+        r.check("重啟", "done", &[]);
+        // collector 每秒 tick：重啟後的第一次重算不能把已確認、還沒有下一個 prompt 的 done 改成 run
+        r.tick(T0 + 80_500).tick(T0 + 81_000);
+        r.check("重啟後的 tick", "done", &[]);
+        r.feed(line(50, "long-u50", "t4", T0 + 81_000)).feed(line(
+            51,
+            "long-u51",
+            "t4",
+            T0 + 81_100,
+        ));
+        r.check("重啟後補到上一輪的行", "done", &[]);
+        assert_eq!(r.called("t4"), 1, "暫存卡種回後不能再建一張（K-8）");
+        r.feed(prompt("p4", T0 + 90_000));
+        r.check("重啟後的 prompt（K-6）", "run", &[]);
+        r.feed(stop(T0 + 91_000)).tick(T0 + 97_000);
+        r.check("重啟後的完成", "done", &["done/p4"]);
+    }
 }
