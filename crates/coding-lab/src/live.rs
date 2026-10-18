@@ -998,8 +998,9 @@ impl Live {
         for off in offsets {
             let current = self.kpi(off, now);
             let day = day_start(off, now);
-            let changed = match self.offsets.get(&off).cloned().flatten() {
-                Some((prev_day, prev)) if prev_day == day => {
+            // 和上次送出的比，借用不拷貝上一份（E-L3）
+            let changed = match self.offsets.get(&off).and_then(Option::as_ref) {
+                Some((prev_day, prev)) if *prev_day == day => {
                     let mut diff = Map::new();
                     if let (Some(c), Some(p)) = (current.as_object(), prev.as_object()) {
                         for (k, v) in c {
@@ -1279,32 +1280,35 @@ impl Live {
     }
 
     fn kpi(&self, offset_min: i32, now: u64) -> Value {
+        // 加總時借用時間格裡的字串，不逐格 clone（E-L3：即時每次 flush、回放每個 frame 都算一次）
         let start = day_start(offset_min, now);
-        let mut total = Counts::default();
+        let mut sessions: HashSet<&str> = HashSet::new();
+        let mut agents: HashSet<&str> = HashSet::new();
+        let mut models: BTreeMap<&str, (f64, u64, BTreeSet<&str>)> = BTreeMap::new();
+        let mut sum = Counts::default();
         for c in self.slots.range(start / SLOT_MS..).map(|(_, c)| c) {
-            total.sessions.extend(c.sessions.iter().cloned());
-            total.agents.extend(c.agents.iter().cloned());
-            total.edits += c.edits;
-            total.writes += c.writes;
-            total.commands += c.commands;
-            total.failures += c.failures;
-            total.dangers += c.dangers;
-            total.commits += c.commits;
-            total.thinking += c.thinking;
-            total.cost += c.cost;
+            sessions.extend(c.sessions.iter().map(String::as_str));
+            agents.extend(c.agents.iter().map(String::as_str));
+            sum.edits += c.edits;
+            sum.writes += c.writes;
+            sum.commands += c.commands;
+            sum.failures += c.failures;
+            sum.dangers += c.dangers;
+            sum.commits += c.commits;
+            sum.thinking += c.thinking;
+            sum.cost += c.cost;
             for (name, (cost, thinking, ids)) in &c.models {
-                let m = total.models.entry(name.clone()).or_default();
+                let m = models.entry(name).or_default();
                 m.0 += cost;
                 m.1 += thinking;
-                m.2.extend(ids.iter().cloned());
+                m.2.extend(ids.iter().map(String::as_str));
             }
         }
-        let models: Map<String, Value> = total
-            .models
-            .iter()
+        let models: Map<String, Value> = models
+            .into_iter()
             .map(|(name, (cost, thinking, ids))| {
                 (
-                    name.clone(),
+                    name.to_string(),
                     json!({ "costUsd": cost, "thinkingTokens": thinking, "ids": ids }),
                 )
             })
@@ -1312,16 +1316,16 @@ impl Live {
         json!({
             "live": self.sessions.values().filter(|s| s.status == "run").count(),
             "attention": self.attention.len(),
-            "sessions": total.sessions.len(),
-            "agents": total.agents.len(),
-            "edits": total.edits,
-            "writes": total.writes,
-            "commands": total.commands,
-            "failures": total.failures,
-            "dangers": total.dangers,
-            "commits": total.commits,
-            "thinkingTokens": total.thinking,
-            "costUsd": total.cost,
+            "sessions": sessions.len(),
+            "agents": agents.len(),
+            "edits": sum.edits,
+            "writes": sum.writes,
+            "commands": sum.commands,
+            "failures": sum.failures,
+            "dangers": sum.dangers,
+            "commits": sum.commits,
+            "thinkingTokens": sum.thinking,
+            "costUsd": sum.cost,
             "models": models,
         })
     }
