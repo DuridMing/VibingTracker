@@ -1025,7 +1025,8 @@ impl Merger {
             && !matches!(h.event_name(), "SessionStart" | "SessionEnd")
             && self.path_base(&sid).is_none()
         {
-            let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
+            // 磁碟機代號大寫（L-11）；transcript_path 只換斜線，tail 用原樣的路徑比對重啟前的紀錄
+            let cwd = crate::paths::normalize(h.str_field("cwd").unwrap_or_default());
             if !cwd.is_empty() {
                 let p = SessionStarted {
                     cwd,
@@ -1040,7 +1041,7 @@ impl Merger {
         match h.event_name() {
             "SessionStart" => {
                 let p = SessionStarted {
-                    cwd: s("cwd").unwrap_or_default().replace('\\', "/"),
+                    cwd: crate::paths::normalize(h.str_field("cwd").unwrap_or_default()),
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
                     transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),

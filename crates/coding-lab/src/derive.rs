@@ -609,15 +609,9 @@ impl Lexer {
 }
 
 /// 路徑相對 `cwd`、一律 `/` 分隔；不在 `cwd` 底下就回傳正規化後的完整路徑。
+/// 比對依平台的大小寫規則、磁碟機代號一律大寫（L-11，見 [`crate::paths`]）。
 pub fn relative_path(cwd: &str, path: &str) -> String {
-    let norm = |s: &str| s.replace('\\', "/");
-    let cwd = norm(cwd);
-    let cwd = cwd.trim_end_matches('/');
-    let path = norm(path);
-    match path.strip_prefix(cwd).and_then(|r| r.strip_prefix('/')) {
-        Some(rel) if !cwd.is_empty() => rel.to_string(),
-        _ => path,
-    }
+    crate::paths::strip_dir(cwd, path).unwrap_or_else(|| crate::paths::normalize(path))
 }
 
 /// 這個 hook 要不要讀檔探測（PreToolUse 的 Edit／Write）。
@@ -656,20 +650,7 @@ pub fn is_unc(path: &str) -> bool {
 
 /// `path` 在 `cwd` 底下（`/` 與 `\\` 視為相同；Windows、macOS 不分大小寫）。
 fn is_under(cwd: &str, path: &str) -> bool {
-    let norm = |p: &str| {
-        let p = p.replace('\\', "/");
-        let p = p.trim_end_matches('/').to_string();
-        if cfg!(any(windows, target_os = "macos")) {
-            p.to_lowercase()
-        } else {
-            p
-        }
-    };
-    let (cwd, path) = (norm(cwd), norm(path));
-    !cwd.is_empty()
-        && path.len() > cwd.len()
-        && path.starts_with(&cwd)
-        && path[cwd.len()..].starts_with('/')
+    crate::paths::strip_dir(cwd, path).is_some()
 }
 
 /// 這個 hook 要不要讀檔探測，要的話把需要的欄位複製出來。UNC 路徑一律不碰。

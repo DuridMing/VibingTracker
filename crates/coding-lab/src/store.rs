@@ -879,18 +879,26 @@ impl Store {
         until: u64,
         limit: usize,
     ) -> Result<(Reads, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
-        let root = root.replace('\\', "/");
+        // 依平台的大小寫規則比對（L-11）：Windows、macOS 兩邊都轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）
+        let root = crate::paths::normalize(root);
         let root = root.trim_end_matches('/');
+        let (root, cwd) = if crate::paths::CASE_INSENSITIVE {
+            (
+                root.to_ascii_lowercase(),
+                "lower(REPLACE(s.cwd, '\\', '/'))",
+            )
+        } else {
+            (root.to_string(), "REPLACE(s.cwd, '\\', '/')")
+        };
         let ms = |t: u64| t.min(i64::MAX as u64) as i64;
         let ids: Vec<String> = self
             .db
-            .prepare(
+            .prepare(&format!(
                 "SELECT id FROM sessions s
-                 WHERE (REPLACE(s.cwd, '\\', '/') = ?1
-                        OR substr(REPLACE(s.cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/')
+                 WHERE ({cwd} = ?1 OR substr({cwd}, 1, length(?1) + 1) = ?1 || '/')
                    AND s.started_at <= ?2 AND (s.ended_at IS NULL OR s.ended_at >= ?3)
-                 ORDER BY id",
-            )?
+                 ORDER BY id"
+            ))?
             .query_map(params![root, ms(until), ms(since)], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         if ids.is_empty() {
