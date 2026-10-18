@@ -67,8 +67,11 @@ pub async fn sessions(
         return ok(&json!({ "sessions": [] }));
     };
     let n = limit(&q, SESSIONS_DEFAULT, SESSIONS_MAX);
+    // live 裡的 session 整列用 live 的（只有 model 可能沿用 store 的），最後一個 prompt 不用從 JSONL 讀（E-H3）
+    let in_live = state.live().session_ids();
     // SQLite 與 JSONL 都會阻塞：放到 blocking 執行緒，不佔住 async worker（#683）。先讀完 store 再碰 live，不同時拿兩把鎖
-    let stored = tokio::task::spawn_blocking(move || stored_rows(&store, cwd.as_deref(), n)).await;
+    let stored =
+        tokio::task::spawn_blocking(move || stored_rows(&store, cwd.as_deref(), n, &in_live)).await;
     let stored = match stored {
         Ok(Ok(rows)) => rows,
         Ok(Err(e)) => return store_error(e),
@@ -97,16 +100,22 @@ pub async fn sessions(
 
 /// store 的 sessions 列，組成與 WS 相同欄位（不在 live 狀態裡的 session 直接用）。
 /// 最後一個 prompt 與 `lastPos` 用兩句批次查詢取，不是每列各查一次。
+/// `skip`：live 裡已有的 session，它們的列會整列換成 live 的，不用查最後一個 prompt（E-H3）。
 fn stored_rows(
     store: &std::sync::Mutex<Store>,
     cwd: Option<&str>,
     limit: usize,
+    skip: &std::collections::HashSet<String>,
 ) -> Result<Vec<(String, Value)>, crate::store::StoreError> {
     // 鎖內只查 SQLite 與 offset，最後一個 prompt 的文字在鎖外讀 JSONL（L-7、X1）
     let (rows, mut extra, reads, reader) = {
         let s = store.lock().unwrap_or_else(|e| e.into_inner());
         let rows = s.sessions(cwd, limit)?;
-        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+        let ids: Vec<String> = rows
+            .iter()
+            .filter(|r| !skip.contains(&r.id))
+            .map(|r| r.id.clone())
+            .collect();
         let (extra, reads) = s.last_prompt_and_pos_reads(&ids)?;
         (rows, extra, reads, s.reader())
     };
