@@ -378,7 +378,14 @@ body.stale .main{opacity:.6;transition:opacity .3s}
 
 /* 監視器視窗（#650）：只留連線狀態與單 session 畫面 */
 .spane .ph .right{display:inline-flex;gap:8px;align-items:center}
-#replayblk .rpwrap{flex:1}
+/* 主頁時間軸回放（#730）：時間軸列在主頁串流上方，不佔滿欄 */
+#replayblk.tlblk{flex:0 0 auto}
+.tlbar{gap:8px;align-items:center}
+.tlbar input[type=range]{flex:1;min-width:120px;accent-color:var(--accent)}
+.tlbar select{font:inherit;font-size:12px}
+#tlTime{font-size:12px;white-space:nowrap}
+#replayblk .tinfo{display:block;padding:0 12px 6px}
+body.replaying #allTitle{color:var(--accent)}
 #replayblk .rptag,.stab.rp{color:var(--accent)}
 .rpform{gap:6px;align-items:center}
 .rpform select,.rpform input{font:inherit;font-size:12px}

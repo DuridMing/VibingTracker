@@ -11,7 +11,8 @@ import { fmtKpi, modelBreakdown } from "./kpi.js";
 import { sortAttention, sessionDangers, ackAllTargets, KIND_TEXT } from "./attention.js";
 import { agentView, agentLabel, agentWho } from "./agents.js";
 import { createSessionPane, nowOf, switchTab, sessionTitle, snapshotLoad, isSessionTab } from "./session-pane.js";
-import { REPLAY_TAB, rangeFor, replayUrl, createReplay } from "./replay.js";
+import { REPLAY_TAB, rangeFor } from "./replay.js";
+import { SPEEDS, timelineUrl, createTimeline } from "./timeline.js";
 import { parseMonitor, channelsFor, monitorUrl } from "./monitor.js";
 import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "./notify.js";
 import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
@@ -353,7 +354,7 @@ function renderAgents() {
   let prev = null;
   for (const s of live) {
     keep.add(s.id);
-    const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model, now: Date.now() });
+    const v = agentView(bySession.get(s.id) ?? [], s.id, { sessionModel: s.model, now: viewNow() });
     if (v.recent.length) lingerRecheck();
     const chips = [v.main, v.bg, ...v.active, ...v.recent].filter(Boolean);
     const sig = chips.map((a) => `${a.id}:${a.status}:${a.label}:${a.model ?? ""}:${a.current ?? ""}`).join("|") + `|done:${v.done.map((a) => a.id).join(",")}|${s.doing ?? ""}`;
@@ -456,8 +457,8 @@ function renderAttention() {
   const allRows = sortAttention([...store.attention.values()]);
   const rows = allRows.filter((r) => inProject(r.session));
   const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
-  const now = Date.now();
-  const canAck = ui.welcome?.scope !== "view";
+  const now = viewNow();
+  const canAck = ui.welcome?.scope !== "view" && !tl.active; // 回放中不能確認（#730）
   const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
   if (!changed("att", sig)) return;
   const todo = canAck ? ackAllTargets(rows, ackPending) : [];
@@ -1383,7 +1384,9 @@ function lane(a) {
 
 function renderPane() {
   const on = isSessionTab(ui.tab);
-  $("#allblk").hidden = ui.tab !== "all";
+  $("#allblk").hidden = ui.tab !== "all" && ui.tab !== REPLAY_TAB;
+  const title = tl.active ? `專案回放 · ${fmtClock(tl.t)}` : "專案即時串流";
+  if (changed("allTitle", title)) $("#allTitle").firstChild.textContent = title;
   $("#spane").hidden = !on;
   $("#replayblk").hidden = ui.tab !== REPLAY_TAB;
   if (ui.tab === REPLAY_TAB) renderReplay();
@@ -1753,100 +1756,171 @@ function benchFrame(m) {
   return ops;
 }
 
-// ---------- 全專案回放（#702）：所有 session（含已結束）合成一條串流，從 /api/projects/events 由新往舊讀，不接即時更新 ----------
-const rp = createReplay();
-let rpReq = 0; // 換範圍後，舊的回應丟掉
-const rpView = createStreamView({ scroller: $("#rpStream"), model: rp.stream, agentName, thinkingMode: (row) => thinkingModeOf(row.session), onExpand: (row) => loadThinking(row, rpView), onNeedMore: () => replayMore(), onFollow: () => {} });
+// ---------- 主頁時間軸回放（#729、#730）：整個主頁回到選的時間點，播放時依 frame 的 ts 前進 ----------
+// 資料來自 GET /api/projects/replay（collector 重放記錄的 Event，狀態一樣只在 collector 算）；套用沿用即時的路徑。
+// 回放中擋下即時的 `*`（不改回放畫面、不發通知），離開時重訂 `*` 拿新的 snapshot 換回現況。
+const tl = createTimeline();
+const TICK_MS = 100;
 const fmtTime = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+const fmtClock = (ms) => new Date(ms).toLocaleString("zh-TW", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const utcOffset = () => -new Date().getTimezoneOffset();
+// 「幾分鐘前」：回放中以回放的時刻算
+const viewNow = () => (tl.active ? tl.t : Date.now());
+let tlProjBefore = null; // 進回放前選的專案，離開時還原
 
 function fillReplayProjects() {
   const roots = projectRoots(allSessions());
   const sel = $("#rpProj");
   if (!changed("rpProj", roots.map((r) => r.cwd).join("|"))) return;
-  const keep = sel.value || rp.cwd || proj.cur;
+  const keep = sel.value || tl.cwd || proj.cur;
   sel.replaceChildren(...roots.map((r) => h("option", { value: r.cwd }, r.cwd)));
   if (roots.some((r) => r.cwd === keep)) sel.value = keep;
 }
 
-function startReplay() {
+// 主頁的資料清空：串流、改動紀錄、彙總列、檔案樹的活動標記（檔案清單是 git 現況，重抓）
+function resetMain() {
+  left.fileEvents = [];
+  left.trees.clear();
+  left.flash.clear();
+  left.lit.clear();
+  left.els.clear();
+  $("#tree").replaceChildren();
+  left.dirty = true;
+}
+
+function applyMainSnapshot(m) {
+  applySnapshot(store, m);
+  onStreamSnapshot(m);
+  changes.load(m.changes);
+  syncProjects();
+  feedFiles([...(m.stream ?? []), ...(m.changes ?? []), ...(m.staged ?? [])]);
+}
+
+function applyMainFrame(m) {
+  applyFrame(store, m);
+  onStreamFrame(m);
+  changes.apply(m.events);
+  if (m.rows?.sessions?.length) syncProjects();
+  feedFiles(m.events);
+}
+
+function startTimeline() {
   const cwd = $("#rpProj").value;
   if (!cwd) return;
   const choice = $("#rpRange").value;
-  let { from, to } = rangeFor(choice, Date.now(), -new Date().getTimezoneOffset());
+  let { from, to } = rangeFor(choice, Date.now(), utcOffset());
   if (choice === "custom") {
     // datetime-local 沒有時區，Date.parse 當成本地時間
     from = Date.parse($("#rpFrom").value);
     to = Date.parse($("#rpTo").value);
     if (!(from <= to)) {
-      rp.error = "自訂範圍要填開始與結束，而且開始不能晚於結束";
+      tl.error = "自訂範圍要填開始與結束，而且開始不能晚於結束";
       render(true);
       return;
     }
   }
-  rpReq++;
-  rp.reset({ cwd, from, to });
-  rpView.reset();
-  rpView.setHasMore(false);
-  replayMore();
+  if (!tl.active) tlProjBefore = proj.cur;
+  tl.start({ cwd, from, to });
+  document.body.classList.add("replaying");
+  // 回放只看這個專案：專案篩選跟著切（不存偏好，離開時還原）
+  proj.cur = cwd;
+  seekTimeline(from);
 }
 
-async function replayMore() {
-  if (rp.loading || rp.done || !rp.cwd) return;
-  rp.loading = true;
-  const req = rpReq;
+async function seekTimeline(at) {
+  const req = tl.seek(at);
   render(true);
   try {
-    const res = await apiFetch(replayUrl({ cwd: rp.cwd, from: rp.from, to: rp.to, before: rp.next }));
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.t, until: tl.to, offset: utcOffset() }));
     const body = await res.json();
-    if (req !== rpReq) return;
-    if (!res.ok) {
-      rp.loading = false;
-      rp.error = body?.error ?? `讀取失敗（HTTP ${res.status}）`;
-    } else {
-      rpView.prepended(rp.load(body));
-      rpView.setHasMore(!rp.done);
-    }
+    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    const snap = tl.loaded(req, body);
+    if (!snap) return;
+    resetMain();
+    applyMainSnapshot(snap);
   } catch {
-    if (req !== rpReq) return;
-    rp.loading = false;
-    rp.error = "讀取失敗（collector 沒有回應，或版本太舊不支援專案回放）";
+    tl.failed(req, "讀取失敗（collector 沒有回應，或版本太舊不支援主頁回放）");
+  } finally {
+    render(true);
   }
-  render(true);
 }
+
+async function moreTimeline() {
+  const req = tl.loadingMore();
+  try {
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }));
+    const body = await res.json();
+    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    tl.appended(req, body);
+  } catch {
+    tl.failed(req, "讀取下一段失敗");
+  }
+}
+
+// 離開回放：主頁換回現況（重訂 `*`，collector 送新的 snapshot）
+function exitTimeline() {
+  if (!tl.active) return;
+  tl.stop();
+  document.body.classList.remove("replaying");
+  proj.cur = tlProjBefore;
+  resetMain();
+  client.unsubscribe("*");
+  client.subscribe("*");
+}
+
+let tlLast = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const dt = now - tlLast;
+  tlLast = now;
+  if (!tl.active || !tl.playing) return;
+  for (const f of tl.tick(dt)) applyMainFrame(f);
+  if (tl.needsMore()) moreTimeline();
+  render();
+}, TICK_MS);
 
 function renderReplay() {
   fillReplayProjects();
   $("#rpCustom").hidden = $("#rpRange").value !== "custom";
-  const ids = rp.sessions();
-  const n = rp.stream.rows.length;
-  const info = rp.error ?? (rp.cwd ? `${fmtTime(rp.from)} – ${fmtTime(rp.to)} · ${ids.length} 個 session · ${n} 行${rp.loading ? " · 載入中…" : rp.done ? (n ? " · 已到範圍開頭" : " · 這段時間沒有動作") : " · 捲到頂按「↑ 載入更多」看更早的"}` : "");
+  if (changed("tlSpeedOpts", SPEEDS.join("|"))) {
+    $("#tlSpeed").replaceChildren(...SPEEDS.map((x) => h("option", { value: String(x) }, `${x}×`)));
+    $("#tlSpeed").value = String(tl.speed);
+  }
+  const slider = $("#tlSlider");
+  slider.disabled = !tl.active;
+  $("#tlPlay").disabled = !tl.active || tl.loading && !tl.queue.length;
+  $("#tlPlay").textContent = tl.playing ? "⏸" : "▶";
+  $("#tlPlay").setAttribute("aria-label", tl.playing ? "暫停" : "播放");
+  if (tl.active && !slider.matches(":active")) {
+    slider.min = String(tl.from);
+    slider.max = String(tl.to);
+    slider.value = String(tl.t);
+  }
+  $("#tlTime").textContent = tl.active ? fmtClock(tl.t) : "";
+  const info = tl.error ?? (tl.active ? `${fmtTime(tl.from)} – ${fmtTime(tl.to)} · ${store.sessions.size} 個 session${tl.loading ? " · 載入中…" : tl.ended ? " · 已播到範圍結尾" : ""} · 回放中「已確認」與通知停用；檔案樹的檔案清單是 git 現況，只有活動標記跟著時間軸` : "選專案與範圍後按「載入」");
   if (changed("rpInfo", info)) $("#rpInfo").textContent = info;
-  if (changed("rpSess", ids.map((id) => `${id}:${rp.stream.hiddenSessions.has(id)}`).join("|"))) {
-    $("#rpSess").replaceChildren(
-      ...(ids.length
-        ? ids.map((id) => {
-            const off = rp.stream.hiddenSessions.has(id);
-            return h("button", { class: `fchip${off ? " off" : ""}`, title: `${id}\n點一下${off ? "顯示" : "隱藏"}這個 session`, "aria-pressed": String(!off), onclick: () => { rp.stream.setSessionHidden(id, !off); rpView.filterChanged(); render(true); } },
-              h("i", { style: `background:${sessionColor(id)}` }), h("span", { class: "mono" }, shortId(id)));
-          })
-        : [h("span", { class: "none" }, "無")]),
-    );
-  }
-  if (changed("rpKind", [...rp.stream.hiddenKinds].sort().join("|"))) {
-    $("#rpKind").replaceChildren(
-      ...KIND_LABEL.map(([k, label]) => {
-        const off = rp.stream.hiddenKinds.has(k);
-        return h("button", { class: `fchip${off ? " off" : ""}`, "aria-pressed": String(!off), onclick: () => { rp.stream.setKindHidden(k, !off); rpView.filterChanged(); render(true); } }, label);
-      }),
-    );
-  }
 }
-$("#rpGo").addEventListener("click", startReplay);
+$("#rpGo").addEventListener("click", startTimeline);
 $("#rpRange").addEventListener("change", () => {
-  if ($("#rpRange").value !== "custom") startReplay();
+  if ($("#rpRange").value !== "custom") startTimeline();
   else render(true);
 });
-$("#rpProj").addEventListener("change", startReplay);
+$("#rpProj").addEventListener("change", startTimeline);
+$("#tlPlay").addEventListener("click", () => {
+  if (tl.playing) tl.pause();
+  else {
+    if (tl.ended) seekTimeline(tl.from);
+    tl.play(Number($("#tlSpeed").value) || tl.speed);
+  }
+  render(true);
+});
+$("#tlSpeed").addEventListener("change", () => { tl.speed = Number($("#tlSpeed").value) || tl.speed; });
+// 拖動時只更新時刻的字；放開才重新取那個時刻的畫面
+$("#tlSlider").addEventListener("input", () => { $("#tlTime").textContent = fmtClock(Number($("#tlSlider").value)); });
+$("#tlSlider").addEventListener("change", () => {
+  const playing = tl.playing;
+  seekTimeline(Number($("#tlSlider").value)).then(() => { if (playing) tl.play(); });
+});
 
 // ---------- 互動 ----------
 // ▶ 回放（#690）：已經開著就清空後從 JSONL 由最新往前讀；否則開 tab，等 session 頻道的 snapshot 進來時改走回放
@@ -1868,11 +1942,12 @@ function replaySession(id) {
 function selectTab(id) {
   if (id === ui.tab) return;
   switchTab(client, ui.tab, id);
+  if (ui.tab === REPLAY_TAB) exitTimeline();
   ui.tab = id;
-  // 第一次打開專案回放：用目前的專案、最近 3 小時直接載入
-  if (id === REPLAY_TAB && !rp.cwd) {
+  // 打開專案回放：用目前的專案、最近 3 小時直接載入
+  if (id === REPLAY_TAB) {
     fillReplayProjects();
-    startReplay();
+    startTimeline();
   }
   if (isSessionTab(id)) {
     // 先清空，等 session 頻道的 snapshot 進來再畫（subscribe 一定會回 snapshot，contracts §6）
@@ -1921,17 +1996,15 @@ const client = createClient({
         paneHasMore();
         if (r.replay) paneMore(true);
       }
-      if (m.ch === "*") {
-        applySnapshot(store, m);
+      // 回放中（#730）即時的 `*` 不碰主頁；離開回放時重訂 `*` 再拿一次
+      if (m.ch === "*" && !tl.blocksLive()) {
         notifier.snapshot(m.attention);
-        onStreamSnapshot(m);
-        changes.load(m.changes);
-        syncProjects();
-        feedFiles([...(m.stream ?? []), ...(m.changes ?? []), ...(m.staged ?? [])]);
+        applyMainSnapshot(m);
       }
       render(true);
     },
     frame: (m) => {
+      if (m.ch === "*" && tl.blocksLive()) return;
       applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
       // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
