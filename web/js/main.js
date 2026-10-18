@@ -846,7 +846,8 @@ async function loadFiles(cwd = null) {
   const ent = treeFor(cwd);
   const base = currentBase();
   // 樹還沒載入時，commit 基準先用專案的 cwd（另一個 worktree 的根不同，樹要以專案為準）
-  const url = base && filesUrl(cwd, ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const fbase = base && (ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const url = base && filesUrl(cwd, fbase);
   if (!url) {
     ent.error = base ? "commit hash 要 4–64 位十六進位" : "這個專案沒有 session";
     render(true);
@@ -863,10 +864,14 @@ async function loadFiles(cwd = null) {
   ent.loading = true;
   render(true);
   try {
-    const res = await apiFetch(url);
-    const body = await res.json().catch(() => ({}));
+    // 樹已經在手上就帶 treeHash：沒變時回應省略 tree（2 萬筆路徑不必每 3 秒重送，#766 F-6）
+    const have = cached?.url === url && ent.tree.root != null ? cached.body.treeHash : null;
+    const res = await apiFetch(have ? filesUrl(cwd, fbase, have) : url);
+    let body = await res.json().catch(() => ({}));
     if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    // 省略 tree 的回應：補上手上那份，快取（回放 reset 時重建用）與 applyFiles 都拿完整的
+    if (body.tree == null && cached?.body?.tree) body = { ...body, tree: cached.body.tree, treeTruncated: cached.body.treeTruncated };
     left.bodies.set(cwd, { url, body });
     applyFiles(ent, cwd, base, body);
   } catch (e) {
