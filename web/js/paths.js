@@ -13,10 +13,15 @@ const isWin = (p) => /^[A-Za-z]:/.test(p);
 export const same = (a, b) => a === b || (isWin(a) && isWin(b) && a.toLowerCase() === b.toLowerCase());
 
 // p 在 base 底下（兩個都已正規化）時回傳相對的部分（相同是 ""），否則 null
+// 檔案樹對每個檔都會呼叫：先走一般的字串比對，只有 Windows 路徑才另外不分大小寫比
 export function relUnder(p, base) {
-  if (same(p, base)) return "";
-  if (p.length > base.length && p[base.length] === "/" && same(p.slice(0, base.length), base)) return p.slice(base.length + 1);
-  return null;
+  if (p === base) return "";
+  if (p.length > base.length && p[base.length] === "/") {
+    if (p.startsWith(base)) return p.slice(base.length + 1);
+    if (isWin(p) && isWin(base) && p.slice(0, base.length).toLowerCase() === base.toLowerCase()) return p.slice(base.length + 1);
+    return null;
+  }
+  return same(p, base) ? "" : null;
 }
 
 export const under = (p, base) => relUnder(p, base) != null;

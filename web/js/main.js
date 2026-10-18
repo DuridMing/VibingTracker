@@ -1886,7 +1886,7 @@ async function seekTimeline(at) {
 async function moreTimeline() {
   const req = tl.loadingMore();
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }), {
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false, from: tl.lower }), {
       signal: tlSignal(),
     });
     const body = await res.json();
