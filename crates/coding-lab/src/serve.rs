@@ -431,15 +431,16 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             }
             if let Input::Hook { hook, .. } = &input {
                 last_hook = Instant::now();
-                if hook.event_name() == "SessionEnd" {
-                    open_sessions.remove(hook.session_id());
-                } else {
-                    open_sessions.insert(hook.session_id().to_string());
-                }
                 if hook.event_name() == "SubagentStart" {
                     read_agent_meta(hook, &tx);
                 }
                 let actions = planner.on_hook(hook);
+                if hook.event_name() == "SessionEnd" {
+                    open_sessions.remove(hook.session_id());
+                } else if !planner.is_ended(hook.session_id()) {
+                    // 結束之後晚到的 hook（C12）不讓 session 重新算成開著，否則閒置結束要多等 ABANDONED_AFTER
+                    open_sessions.insert(hook.session_id().to_string());
+                }
                 if !actions.is_empty() {
                     for action in actions {
                         let id = next_tail;
@@ -478,10 +479,22 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                 let lag = Instant::now().saturating_duration_since(scheduled.into_std());
                 let events = merger.tick(crate::now_ms());
                 // merge 結束了被丟棄的 session（#679）：閒置結束不必再等它
-                for e in events.iter().filter(|e| e.kind == "session.ended") {
-                    open_sessions.remove(&e.session);
-                }
+                let ended: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.kind == "session.ended")
+                    .map(|e| e.session.clone())
+                    .collect();
                 sink(events);
+                // 也停掉它的 tail（L-8）：常駐服務不閒置結束，沒有 SessionEnd 的 session 的 tail 會一直留著
+                for session in ended {
+                    open_sessions.remove(&session);
+                    // 不送 TailReset：merge 已把這個 session 移出記憶體，reset 會把它重新建回來
+                    for action in planner.on_session_ended(&session) {
+                        let id = next_tail;
+                        next_tail += 1;
+                        apply_tail(action, id, &mut tails, &tx);
+                    }
+                }
                 web.set_health(health(tails.len(), lag.as_millis() as u64, &hooks));
                 let quiet = last_hook.elapsed();
                 let idle_now = !idle.is_zero()

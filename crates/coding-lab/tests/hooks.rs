@@ -947,3 +947,69 @@ async fn hooks_of_the_same_account_or_without_a_user_are_kept() {
         );
     }
 }
+
+/// C12（#741）：SessionEnd 之後（例如 /clear 換了新 id），同一個舊 id 帶 transcript_path 的 hook（背景 agent 晚到的結果）
+/// 不重開 tail，subagent 的也不開；下一個 SessionStart（resume）才重新開始。
+#[test]
+fn hooks_after_session_end_do_not_reopen_tails_until_the_next_session_start() {
+    let mut p = TailPlanner::default();
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "transcript_path": T})));
+    let end = p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionEnd", "reason": "clear", "transcript_path": T})));
+    assert_eq!(
+        end,
+        [TailAction::StopSession {
+            session: "s1".into()
+        }]
+    );
+    assert!(p.is_ended("s1"));
+    for late in [
+        json!({"session_id": "s1", "hook_event_name": "PostToolUse", "transcript_path": T, "tool_name": "Agent", "tool_use_id": "t"}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "transcript_path": T, "tool_name": "Bash", "tool_use_id": "u",
+               "agent_id": "a1", "agent_type": "Explore"}),
+    ] {
+        assert!(
+            p.on_hook(&h(late)).is_empty(),
+            "結束之後晚到的 hook 不開 tail"
+        );
+    }
+    let resumed = p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "resume", "transcript_path": T})));
+    assert!(
+        matches!(resumed.as_slice(), [TailAction::Start { .. }]),
+        "{resumed:?}"
+    );
+    assert!(!p.is_ended("s1"));
+}
+
+/// L-8（#741）：沒有 SessionEnd、被 merge 判 abandoned 的 session 要停掉它的 tail（含 subagent）；之後晚到的 hook 也不重開。
+#[test]
+fn abandoned_session_stops_its_tails() {
+    let mut p = TailPlanner::default();
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "transcript_path": T})));
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SubagentStart", "transcript_path": T, "agent_id": "a1", "agent_type": "Explore"})));
+    assert_eq!(
+        p.on_session_ended("s1"),
+        [TailAction::StopSession {
+            session: "s1".into()
+        }]
+    );
+    assert!(p.on_session_ended("s1").is_empty(), "第二次沒有東西可停");
+    assert!(p.on_session_ended("nobody").is_empty());
+    assert!(
+        p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "Stop", "transcript_path": T})
+        ))
+        .is_empty()
+    ); // 終端機一直開著、閒置被補 abandoned 後又用起來（merge 依 #679 重新打開，不會有 SessionStart）：
+    // main 的 UserPromptSubmit／PreToolUse 重開 tail，從讀過的行接著讀；subagent 的 hook 不算
+    assert!(
+        p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "PreToolUse", "transcript_path": T,
+                            "agent_id": "a1", "agent_type": "Explore", "tool_name": "Read", "tool_use_id": "t1"})))
+            .is_empty()
+    );
+    assert!(matches!(
+        p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "UserPromptSubmit", "transcript_path": T, "prompt": "再來"})))
+            .as_slice(),
+        [TailAction::Start { file, start: Start::End, .. }] if file == "main"
+    ));
+    assert!(!p.is_ended("s1"));
+}
