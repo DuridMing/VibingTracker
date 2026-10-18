@@ -70,20 +70,24 @@ export function createTimeline() {
 
   tl.play = (speed = tl.speed) => {
     tl.speed = speed;
-    if (tl.t >= tl.to) return;
+    // 讀取失敗（沒有資料）不假裝在播；重新 seek 成功會清掉 error（#765 C14）
+    if (tl.t >= tl.to || tl.error) return;
     tl.playing = true;
     tl.ended = false;
   };
   tl.pause = () => { tl.playing = false; };
 
-  // 經過 wallMs 毫秒（實際時間）：播放中依速度前進，交出到點的 frame（依序，套用的人照這個順序套）
+  // 經過 wallMs 毫秒（實際時間）：播放中依速度前進，交出到點的 frame（依序，套用的人照這個順序套）。
+  // 還有下一段（next 不是 null）時，時鐘最多走到已載入的最後一個時間點 next，等下一段到了再走；
+  // 不然高倍速下時鐘會先跑到結尾、晚到的那段永遠套不到（#765 C4）
   tl.tick = (wallMs) => {
     if (!tl.active || !tl.playing) return [];
-    tl.t = clamp(tl.t + wallMs * tl.speed);
+    const limit = tl.next != null ? Math.min(tl.next, tl.to) : tl.to;
+    tl.t = Math.max(tl.t, Math.min(clamp(tl.t + wallMs * tl.speed), limit));
     let n = 0;
     while (n < tl.queue.length && tl.queue[n].ts <= tl.t) n++;
     const due = tl.queue.splice(0, n);
-    if (tl.t >= tl.to) {
+    if (tl.next == null && tl.t >= tl.to) {
       tl.playing = false;
       tl.ended = true;
     }

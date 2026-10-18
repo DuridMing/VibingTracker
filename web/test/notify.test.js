@@ -172,3 +172,22 @@ test("危險列解除時的更新（帶 clearedAt）不會再通知一次", () =
   c.advance(1000);
   assert.equal(out.length, 1);
 });
+
+test("合併中收到 snapshot（離開回放時重訂 `*`）：還在佇列裡的照發，snapshot 裡沒有的（已確認）不發（#765 C5）", () => {
+  const c = fakeClock();
+  const out = [];
+  const n = createNotifier({ ...c, emit: (x) => out.push(x) });
+  n.connected();
+  n.snapshot([]);
+  n.frame([att("s1/danger/t1", "danger", c.now()), att("s2/wait/t2", "wait", c.now())]);
+  c.advance(200);
+  // 重訂 `*` 送來的 snapshot：s1 的還在佇列，s2 的已經被確認、不在了
+  n.snapshot([att("s1/danger/t1", "danger", c.now() - 200)]);
+  c.advance(1000);
+  assert.equal(out.length, 1, "合併中的通知不能被 snapshot 吃掉");
+  assert.deepEqual(out[0].items.map((x) => x.id), ["s1/danger/t1"]);
+  // 之後同一個 id 不再響
+  n.frame([att("s1/danger/t1", "danger", c.now())]);
+  c.advance(1000);
+  assert.equal(out.length, 1);
+});

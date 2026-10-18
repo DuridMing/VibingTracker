@@ -688,7 +688,7 @@ let fetchedIndex = new Map();
 const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?? null;
 // 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
 const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
-const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }).then(toLogin));
+const apiFetch = (url, { signal } = {}) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin", signal }).then(toLogin));
 const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
 
 function allSessions() {
@@ -726,6 +726,12 @@ function syncProjects() {
 }
 
 function setProject(cwd) {
+  // 回放中（#730）畫面固定在回放的專案：選的專案存成偏好、離開回放時還原成它，畫面與存檔才一致（#765 C23）
+  if (tl.active) {
+    tlProjBefore = cwd || null;
+    pref.set("project", tlProjBefore ?? "");
+    return;
+  }
   proj.cur = cwd || null;
   pref.set("project", proj.cur ?? "");
   br.cwd = null;
@@ -1686,7 +1692,8 @@ const MORE_TIMEOUT_MS = 3000;
 let moreReq = null;
 
 function requestMore() {
-  if (moreReq) return;
+  // 回放中（#730）串流是回放的時刻，WS 的 more 問的是即時 collector，會帶出 t 之後的結果（#765 C24）
+  if (moreReq || tl.active) return;
   const wanted = [...stream.minPos()].filter(([, p]) => p > 1);
   if (!wanted.length) return;
   moreReq = { waiting: new Set(wanted.map(([s]) => s)), got: [], timer: setTimeout(finishMore, MORE_TIMEOUT_MS) };
@@ -1767,6 +1774,15 @@ const utcOffset = () => -new Date().getTimezoneOffset();
 // 「幾分鐘前」：回放中以回放的時刻算
 const viewNow = () => (tl.active ? tl.t : Date.now());
 let tlProjBefore = null; // 進回放前選的專案，離開時還原
+// 回放的請求一次只留一組：換範圍、拖動、離開時取消還在跑的（collector 同時最多處理 2 個，#765 B-N1）
+let tlAbort = null;
+function tlSignal() {
+  tlAbort?.abort();
+  tlAbort = new AbortController();
+  return tlAbort.signal;
+}
+const tlHttpError = (res, body) =>
+  res.status === 429 ? "collector 正在處理其他回放，稍等一下再試" : body?.error ?? `讀取失敗（HTTP ${res.status}）`;
 
 function fillReplayProjects() {
   const roots = projectRoots(allSessions());
@@ -1831,9 +1847,9 @@ async function seekTimeline(at) {
   const req = tl.seek(at);
   render(true);
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.t, until: tl.to, offset: utcOffset() }));
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.t, until: tl.to, offset: utcOffset() }), { signal: tlSignal() });
     const body = await res.json();
-    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    if (!res.ok) return tl.failed(req, tlHttpError(res, body));
     const snap = tl.loaded(req, body);
     if (!snap) return;
     resetMain();
@@ -1848,9 +1864,11 @@ async function seekTimeline(at) {
 async function moreTimeline() {
   const req = tl.loadingMore();
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }));
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }), {
+      signal: tlSignal(),
+    });
     const body = await res.json();
-    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    if (!res.ok) return tl.failed(req, tlHttpError(res, body));
     tl.appended(req, body);
   } catch {
     tl.failed(req, "讀取下一段失敗");
@@ -1860,6 +1878,7 @@ async function moreTimeline() {
 // 離開回放：主頁換回現況（重訂 `*`，collector 送新的 snapshot）
 function exitTimeline() {
   if (!tl.active) return;
+  tlAbort?.abort();
   tl.stop();
   document.body.classList.remove("replaying");
   proj.cur = tlProjBefore;
@@ -1888,6 +1907,8 @@ function renderReplay() {
   }
   const slider = $("#tlSlider");
   slider.disabled = !tl.active;
+  // 回放中專案由回放的選單決定：頂端的專案選單停用，離開時還原的才會和存下來的偏好一致（#765 C23）
+  $("#gProj").disabled = tl.active;
   $("#tlPlay").disabled = !tl.active || tl.loading && !tl.queue.length;
   $("#tlPlay").textContent = tl.playing ? "⏸" : "▶";
   $("#tlPlay").setAttribute("aria-label", tl.playing ? "暫停" : "播放");
@@ -1897,7 +1918,7 @@ function renderReplay() {
     slider.value = String(tl.t);
   }
   $("#tlTime").textContent = tl.active ? fmtClock(tl.t) : "";
-  const info = tl.error ?? (tl.active ? `${fmtTime(tl.from)} – ${fmtTime(tl.to)} · ${store.sessions.size} 個 session${tl.loading ? " · 載入中…" : tl.ended ? " · 已播到範圍結尾" : ""} · 回放中「已確認」與通知停用；檔案樹的檔案清單是 git 現況，只有活動標記跟著時間軸` : "選專案與範圍後按「載入」");
+  const info = tl.error ?? (tl.active ? `${fmtTime(tl.from)} – ${fmtTime(tl.to)} · ${store.sessions.size} 個 session${tl.loading ? " · 載入中…" : tl.ended ? " · 已播到範圍結尾" : ""} · 回放中「已確認」停用，即時的通知照常；檔案樹的檔案清單是 git 現況，只有活動標記跟著時間軸` : "選專案與範圍後按「載入」");
   if (changed("rpInfo", info)) $("#rpInfo").textContent = info;
 }
 $("#rpGo").addEventListener("click", startTimeline);
@@ -1915,11 +1936,18 @@ $("#tlPlay").addEventListener("click", () => {
   render(true);
 });
 $("#tlSpeed").addEventListener("change", () => { tl.speed = Number($("#tlSpeed").value) || tl.speed; });
-// 拖動時只更新時刻的字；放開才重新取那個時刻的畫面
+// 拖動時只更新時刻的字；放開才重新取那個時刻的畫面。用鍵盤連按方向鍵時每下都是 change：停 250 ms 才取（#765 B-N1）
 $("#tlSlider").addEventListener("input", () => { $("#tlTime").textContent = fmtClock(Number($("#tlSlider").value)); });
+let tlSeekTimer = null;
 $("#tlSlider").addEventListener("change", () => {
-  const playing = tl.playing;
-  seekTimeline(Number($("#tlSlider").value)).then(() => { if (playing) tl.play(); });
+  const playing = tl.playing || tlSeekTimer != null;
+  tl.pause();
+  clearTimeout(tlSeekTimer);
+  tlSeekTimer = setTimeout(() => {
+    tlSeekTimer = null;
+    // 讀取失敗時 play 不會開始（timeline.js，#765 C14）
+    seekTimeline(Number($("#tlSlider").value)).then(() => { if (playing) tl.play(); });
+  }, 250);
 });
 
 // ---------- 互動 ----------
@@ -2004,7 +2032,9 @@ const client = createClient({
       render(true);
     },
     frame: (m) => {
-      if (m.ch === "*" && tl.blocksLive()) return;
+      // 回放中（#730）即時的 `*` 不碰主頁，但通知照常：回放期間真的發生的危險、等你不能因為在看回放就漏掉，
+      // 離開時的 snapshot 會把它們當成已知、永遠不再通知（#765 C5）
+      if (m.ch === "*" && tl.blocksLive()) return void notifier.frame(m.rows?.attention);
       applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
       // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
