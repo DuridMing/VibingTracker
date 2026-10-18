@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 
 use crate::event::Payload;
 use crate::live::{clip, short_model};
-use crate::store::ProjectKey;
 use crate::store::{SessionRow, Store};
 use crate::ws::{MORE_LIMIT, Remote, WebState, more_events};
 
@@ -214,74 +213,29 @@ pub async fn events(
     }
 }
 
-// ── /api/projects/events（全專案回放，#702）
-
-/// `before=<ts>,<session>,<pos>`：上一頁回應的 `next`。
-fn parse_project_key(s: &str) -> Option<ProjectKey> {
-    let mut it = s.splitn(3, ',');
-    let ts = it.next()?.parse().ok()?;
-    let session = it.next()?.to_string();
-    let pos = it.next()?.parse().ok()?;
-    (!session.is_empty()).then_some(ProjectKey { ts, session, pos })
-}
-
-pub async fn project_events(
-    State(state): State<Arc<WebState>>,
-    Extension(Remote(remote)): Extension<Remote>,
-    uri: Uri,
-) -> Response {
-    let q = query(&uri);
-    let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
-        return error(StatusCode::BAD_REQUEST, "缺少 cwd（專案根目錄）");
-    };
-    let num = |k: &str| q.get(k).map(|v| v.parse::<u64>());
-    let (from, to) = match (num("from"), num("to")) {
-        (Some(Err(_)), _) | (_, Some(Err(_))) => {
-            return error(StatusCode::BAD_REQUEST, "from、to 要是 epoch ms");
-        }
-        (f, t) => (
-            f.and_then(Result::ok).unwrap_or(0),
-            t.and_then(Result::ok).unwrap_or(u64::MAX),
-        ),
-    };
-    let before = match q.get("before").map(|b| parse_project_key(b)) {
-        Some(None) => {
-            return error(StatusCode::BAD_REQUEST, "before 要是 <ts>,<session>,<pos>");
-        }
-        b => b.flatten(),
-    };
-    let n = limit(&q, EVENTS_DEFAULT, MORE_LIMIT as usize);
-    let Some(store) = state.store().cloned() else {
-        return ok(&json!({ "cwd": cwd, "events": [], "next": null }));
-    };
-    let state2 = state.clone();
-    // SQLite 與讀 JSONL 都會阻塞，放到 blocking 執行緒
-    tokio::task::spawn_blocking(move || {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        match crate::ws::project_events(&store, &cwd, from, to, before.as_ref(), n) {
-            Ok((events, next)) => {
-                let next = next.map(|k| json!({ "ts": k.ts, "session": k.session, "pos": k.pos }));
-                let mut body =
-                    json!({ "cwd": cwd, "from": from, "to": to, "events": events, "next": next });
-                // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-                state2.redact_for(remote, &mut body);
-                ok(&body)
-            }
-            Err(e) => store_error(e),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
 // ── /api/projects/replay（主頁時間軸回放，#729）
 
 const REPLAY_DEFAULT_SPAN_MS: u64 = 60 * 60 * 1000;
+/// 一次回放請求的範圍上限（#742 B-N1）：再長就一段一段要
+const REPLAY_MAX_SPAN_MS: u64 = 24 * 60 * 60 * 1000;
 const REPLAY_DEFAULT_LIMIT: usize = 2000;
 const REPLAY_MAX_LIMIT: usize = 10_000;
+/// 前端的 UTC 位移上限（分）：±14 小時
+const MAX_OFFSET_MIN: i32 = 14 * 60;
 
-/// `cwd`、`at`（epoch ms）必填；`until` 預設 at 之後 1 小時；`limit` 是這一段最多放幾個 Event；
-/// `offset` 是前端的 UTC 位移（分，同 hello 的 utcOffsetMin），KPI 的「今天」依它算；`snapshot=0` 只要 frame（接續下一段）。
+/// 挑 session 的下界（C6）：`at` 前 2 小時（已結束的 session 在 live 留多久），或 `at` 那天的當地午夜，取早的——
+/// KPI 的「今天」算的是當天所有 session，早上結束的 session 到了下午也要算進去。
+fn replay_since(at: u64, offset_min: i32) -> u64 {
+    let day = 24 * 60 * 60 * 1000_i64;
+    let local = at as i64 + i64::from(offset_min) * 60_000;
+    let midnight = (local.div_euclid(day) * day - i64::from(offset_min) * 60_000).max(0) as u64;
+    at.saturating_sub(crate::live::ENDED_KEPT_MS).min(midnight)
+}
+
+/// `cwd`、`at`（epoch ms）必填；`until` 預設 at 之後 1 小時、最多 24 小時；`limit` 是這一段最多放幾個 Event；
+/// `offset` 是前端的 UTC 位移（分，同 hello 的 utcOffsetMin），KPI 的「今天」依它算；`snapshot=0` 只要 frame（接續下一段）；
+/// `from`：挑 session 的下界，續頁帶第一段回應的 `from`（沒帶時依 `at` 算，見 [`replay_since`]）。
+/// 同時最多 [`crate::ws::MAX_REPLAYS`] 個回放請求，超過 429（#742 B-N1）。
 pub async fn project_replay(
     State(state): State<Arc<WebState>>,
     Extension(Remote(remote)): Extension<Remote>,
@@ -299,28 +253,56 @@ pub async fn project_replay(
         Some(Ok(u)) => u.max(at),
         Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "until 要是 epoch ms"),
     };
+    if until - at > REPLAY_MAX_SPAN_MS {
+        return error(StatusCode::BAD_REQUEST, "回放範圍一次最多 24 小時");
+    }
     let offset = match q.get("offset").map(|v| v.parse::<i32>()) {
         None => 0,
-        Some(Ok(o)) if o.abs() <= 14 * 60 => o,
-        Some(_) => return error(StatusCode::BAD_REQUEST, "offset 是 UTC 位移（分）"),
+        Some(Ok(o)) if (-MAX_OFFSET_MIN..=MAX_OFFSET_MIN).contains(&o) => o,
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "offset 是 UTC 位移（分，±14 小時以內）",
+            );
+        }
+    };
+    let since = match q.get("from").map(|v| v.parse::<u64>()) {
+        None => replay_since(at, offset),
+        Some(Ok(f)) => f.min(at),
+        Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "from 要是 epoch ms"),
     };
     let with_snapshot = q.get("snapshot").is_none_or(|v| v != "0");
     let n = limit(&q, REPLAY_DEFAULT_LIMIT, REPLAY_MAX_LIMIT);
     let Some(store) = state.store().cloned() else {
-        return ok(&json!({ "at": at, "until": until, "frames": [], "next": null }));
+        return ok(&json!({ "at": at, "until": until, "from": since, "frames": [], "next": null }));
+    };
+    let Some(slot) = state.replay_slot() else {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "同時進行的回放太多，請稍後再試",
+        );
     };
     let state2 = state.clone();
     // SQLite 與讀 JSONL 都會阻塞；重放也是 CPU 工作，一起放到 blocking 執行緒
     tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         let read = store
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .timeline(&cwd, at, until);
+            .timeline(&cwd, since, at, until, n);
         match read {
-            Ok((events, acks)) => {
-                let mut body =
-                    crate::timeline::replay(&events, &acks, at, until, n, offset, with_snapshot);
+            Ok((events, acks, cut)) => {
+                let page = crate::timeline::Page {
+                    at,
+                    until,
+                    cut,
+                    limit: n,
+                    offset_min: offset,
+                    with_snapshot,
+                };
+                let mut body = crate::timeline::replay_page(&events, &acks, &page);
                 body["cwd"] = json!(cwd);
+                body["from"] = json!(since);
                 // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
                 state2.redact_for(remote, &mut body);
                 ok(&body)

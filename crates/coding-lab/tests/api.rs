@@ -332,7 +332,7 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
         "/api/sessions",
         "/api/sessions/s1/events",
         "/api/files?cwd=%2Fp",
-        "/api/projects/events?cwd=%2Fp",
+        "/api/projects/replay?cwd=%2Fp&at=1",
     ] {
         let (code, _) = get_with(addr, path, &me, Some("http://evil.example")).await;
         assert_eq!(code, 403, "{path}：別的網頁的 Origin");
@@ -343,144 +343,6 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
     assert_eq!(code, 200, "同源的前端可以");
     let (code, _) = get_with(addr, "/api/sessions", &me, None).await;
     assert_eq!(code, 200, "沒帶 Origin 的程式（curl）可以");
-}
-
-// ── /api/projects/events（全專案回放，#702）
-
-/// 專案 /p：s1 在根目錄、s2 在 worktree；s3 是別的專案。時間交錯，s1 有一張完整的工具卡片。
-fn project_events_fixture() -> Vec<Event> {
-    let mut evs = vec![
-        started("s1", 1, 1_000, "/p"),
-        started("s2", 1, 1_000, "/p/worktrees/feature/x"),
-        started("s3", 1, 1_000, "/other"),
-        ev(
-            "s1",
-            2,
-            "tool.called",
-            None,
-            1_001,
-            json!({"toolUseId": "t1", "tool": "Bash",
-            "input": {"command": "ls"}, "status": "running", "placement": "staged", "danger": null}),
-        ),
-        ev(
-            "s1",
-            3,
-            "tool.placed",
-            Some(1),
-            1_002,
-            json!({"toolUseId": "t1", "placement": "stream"}),
-        ),
-        ev(
-            "s1",
-            4,
-            "tool.result",
-            None,
-            1_003,
-            json!({"toolUseId": "t1", "ok": true,
-            "exitCode": 0, "output": "a\n", "truncated": false}),
-        ),
-    ];
-    for i in 0..6u64 {
-        evs.push(text("s1", 5 + i, 2 + i, 1_010 + 2 * i));
-        evs.push(text("s2", 2 + i, 1 + i, 1_011 + 2 * i));
-        evs.push(text("s3", 2 + i, 1 + i, 1_011 + 2 * i));
-    }
-    evs
-}
-
-fn positions(body: &Value) -> Vec<(String, u64)> {
-    body["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| !e["pos"].is_null())
-        .map(|e| {
-            (
-                e["session"].as_str().unwrap().to_string(),
-                e["pos"].as_u64().unwrap(),
-            )
-        })
-        .collect()
-}
-
-#[tokio::test]
-async fn project_events_merge_the_projects_sessions_with_their_cards() {
-    let home = tmp("project-events");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&limit=100").await;
-    assert_eq!(code, 200, "{body}");
-    let mut got = positions(&body);
-    got.sort();
-    let mut want: Vec<_> = (1..=7).map(|p| ("s1".to_string(), p)).collect();
-    want.extend((1..=6).map(|p| ("s2".to_string(), p)));
-    want.sort();
-    assert_eq!(got, want, "worktree 的 s2 算進來，別的專案的 s3 不算");
-    let kinds: Vec<_> = body["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| e["payload"]["toolUseId"] == "t1")
-        .map(|e| e["type"].as_str().unwrap().to_string())
-        .collect();
-    assert!(
-        kinds.contains(&"tool.called".into()) && kinds.contains(&"tool.result".into()),
-        "卡片的呼叫與結果一起帶回來：{kinds:?}"
-    );
-    assert!(body["next"].is_null(), "一頁就拿完時沒有 next");
-}
-
-#[tokio::test]
-async fn project_events_page_back_to_the_start_without_gaps() {
-    let home = tmp("project-pages");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    let mut seen = Vec::new();
-    let mut path = "/api/projects/events?cwd=%2Fp&limit=4".to_string();
-    for _ in 0..20 {
-        let (code, body) = get(addr, &path).await;
-        assert_eq!(code, 200, "{body}");
-        seen.extend(positions(&body));
-        let next = &body["next"];
-        if next.is_null() {
-            break;
-        }
-        path = format!(
-            "/api/projects/events?cwd=%2Fp&limit=4&before={},{},{}",
-            next["ts"],
-            enc(next["session"].as_str().unwrap()),
-            next["pos"]
-        );
-    }
-    let total = seen.len();
-    seen.sort();
-    seen.dedup();
-    assert_eq!(seen.len(), total, "分頁之間不重複");
-    assert_eq!(seen.len(), 13, "s1 的 7 個與 s2 的 6 個都拿到");
-}
-
-#[tokio::test]
-async fn project_events_respect_the_time_range_and_need_a_cwd() {
-    let home = tmp("project-range");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    // s1 的 text 在 1010、1012…；s2 在 1011、1013…
-    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&from=1011&to=1013").await;
-    assert_eq!(code, 200, "{body}");
-    let mut got = positions(&body);
-    got.sort();
-    assert_eq!(
-        got,
-        vec![("s1".into(), 3), ("s2".into(), 1), ("s2".into(), 2)],
-        "兩端都包含"
-    );
-    let (code, _) = get(addr, "/api/projects/events").await;
-    assert_eq!(code, 400, "沒有 cwd");
-    let (code, _) = get(addr, "/api/projects/events?cwd=%2Fp&before=x").await;
-    assert_eq!(code, 400, "游標格式錯");
 }
 
 // ── /api/files
@@ -1747,4 +1609,170 @@ async fn git_calls_never_run_repo_hooks_filters_or_gpg() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(ran.is_empty(), "collector 執行了 repo 設定的程式：{ran:?}");
+}
+
+// ── 回放的上限與續頁（#742：B-N1、C6、C11、C22、D5） ─────────────────────────────
+
+const H_MS: u64 = 3_600_000;
+
+fn usage_ev(s: &str, seq: u64, ts: u64, cost: f64) -> Event {
+    ev(
+        s,
+        seq,
+        "usage",
+        None,
+        ts,
+        json!({"messageId": format!("u{seq}"), "model": "claude-opus-5-5", "input": 1, "output": 1,
+               "thinking": 0, "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": cost}),
+    )
+}
+
+/// 00:00 起：old 01:00 開始、花 5 美元、01:00:02 結束；new 01:00:03 起到 06:00 每 10 秒一行文字＋0.01 美元。
+fn day_of_two_sessions() -> (u64, Vec<Event>) {
+    let day = (1_792_000_000_000 / (24 * H_MS)) * (24 * H_MS) + 24 * H_MS;
+    let mut evs = vec![
+        started("old", 1, day + H_MS, "/p"),
+        usage_ev("old", 2, day + H_MS + 1000, 5.0),
+        ev(
+            "old",
+            3,
+            "session.ended",
+            None,
+            day + H_MS + 2000,
+            json!({"reason": "other"}),
+        ),
+        started("new", 1, day + H_MS + 3000, "/p"),
+    ];
+    let (mut seq, mut pos, mut t) = (1, 0, day + H_MS + 10_000);
+    while t < day + 6 * H_MS {
+        seq += 1;
+        pos += 1;
+        evs.push(text("new", seq, pos, t));
+        seq += 1;
+        evs.push(usage_ev("new", seq, t, 0.01));
+        t += 10_000;
+    }
+    (day, evs)
+}
+
+/// 照前端的方式一段一段要（at=next、snapshot=0，until 固定），「今天」的花費只會增加（C6）。
+#[tokio::test]
+async fn replay_pages_keep_todays_kpi_of_sessions_that_ended_earlier() {
+    let (day, evs) = day_of_two_sessions();
+    let home = tmp("replay-kpi");
+    let addr = start(WebState::new(Some(store_with(&home, &evs)), None, 8)).await;
+    for echo_from in [false, true] {
+        let (until, mut at) = (day + 6 * H_MS, day + H_MS / 2);
+        let mut from: Option<u64> = None;
+        let (mut last, mut pages, mut late_pages) = (None::<f64>, 0, 0);
+        loop {
+            let mut url = format!("/api/projects/replay?cwd=%2Fp&at={at}&until={until}&limit=500");
+            if pages > 0 {
+                url += "&snapshot=0";
+            }
+            if let (true, Some(f)) = (echo_from, from) {
+                url += &format!("&from={f}");
+            }
+            let (code, b) = get(addr, &url).await;
+            assert_eq!(code, 200, "{b}");
+            from = from.or(b["from"].as_u64());
+            pages += 1;
+            if at > day + 3 * H_MS + 2000 {
+                late_pages += 1;
+            }
+            for f in b["frames"].as_array().unwrap() {
+                if let Some(c) = f["rows"]["kpi"]["costUsd"].as_f64() {
+                    assert!(
+                        last.is_none_or(|p| c + 1e-9 >= p),
+                        "花費掉下來：{last:?} → {c}（at={at}）"
+                    );
+                    last = Some(c);
+                }
+            }
+            match b["next"].as_u64() {
+                Some(n) => at = n,
+                None => break,
+            }
+        }
+        assert!(late_pages > 0, "前提：有一段的 at 在 old 結束 2 小時之後");
+        assert!(last.unwrap() > 5.0, "old 的 5 美元一直算在今天裡：{last:?}");
+    }
+}
+
+#[tokio::test]
+async fn replay_limits_its_range_and_concurrency() {
+    let (day, evs) = day_of_two_sessions();
+    let home = tmp("replay-limits");
+    let state = WebState::new(Some(store_with(&home, &evs)), None, 8);
+    let addr = start(state.clone()).await;
+    let at = day + H_MS;
+    let (code, b) = get(
+        addr,
+        &format!(
+            "/api/projects/replay?cwd=%2Fp&at={at}&until={}",
+            at + 24 * H_MS + 1
+        ),
+    )
+    .await;
+    assert_eq!(code, 400, "範圍最多 24 小時：{b}");
+    let (code, _) = get(
+        addr,
+        &format!(
+            "/api/projects/replay?cwd=%2Fp&at={at}&until={}",
+            at + 24 * H_MS
+        ),
+    )
+    .await;
+    assert_eq!(code, 200);
+    let (code, _) = get(
+        addr,
+        &format!("/api/projects/replay?cwd=%2Fp&at={at}&offset=-2147483648"),
+    )
+    .await;
+    assert_eq!(
+        code, 400,
+        "offset 超出 ±14 小時（i32::MIN 不能溢位成合法值，C22）"
+    );
+    // 同時進行的回放滿了就 429（這裡把上限設成 0 模擬兩個都在跑）
+    state.set_max_replays(0);
+    let (code, b) = get(addr, &format!("/api/projects/replay?cwd=%2Fp&at={at}")).await;
+    assert_eq!(code, 429, "{b}");
+    state.set_max_replays(2);
+    assert_eq!(
+        get(addr, &format!("/api/projects/replay?cwd=%2Fp&at={at}"))
+            .await
+            .0,
+        200,
+        "名額有還回來"
+    );
+}
+
+/// #672 之前的 Windows session 存的是 `C:\p`；/api/sessions 列得出來，回放用 `C:/p` 也要查得到（C11）。
+#[tokio::test]
+async fn replay_matches_backslash_cwds_like_sessions_does() {
+    let home = tmp("replay-bs");
+    let store = store_with(
+        &home,
+        &[started("w1", 1, 1000, "C:\\p"), text("w1", 2, 1, 1001)],
+    );
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    let (_, b) = get(addr, "/api/projects/replay?cwd=C%3A%2Fp&at=2000").await;
+    assert_eq!(
+        b["snapshot"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{b}"
+    );
+}
+
+/// 舊的全專案事件 API 已由回放取代（D5）。
+#[tokio::test]
+async fn project_events_api_is_gone() {
+    let home = tmp("pe-gone");
+    let addr = start(WebState::new(
+        Some(store_with(&home, &[started("s1", 1, 1000, "/p")])),
+        None,
+        8,
+    ))
+    .await;
+    assert_eq!(get(addr, "/api/projects/events?cwd=%2Fp").await.0, 404);
 }

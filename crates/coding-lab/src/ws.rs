@@ -31,7 +31,7 @@ use crate::auth::{self, Auth, Denied, Identity};
 use crate::config::{AuthMode, RemoteThinking};
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
-use crate::store::{ProjectKey, SessionRow, Store};
+use crate::store::{SessionRow, Store};
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
@@ -56,6 +56,22 @@ pub struct WebState {
     remote_thinking: Mutex<RemoteThinking>,
     /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
     force_remote: std::sync::atomic::AtomicBool,
+    /// 進行中的回放請求數與上限（#742 B-N1）
+    replays: std::sync::atomic::AtomicUsize,
+    max_replays: std::sync::atomic::AtomicUsize,
+}
+
+/// 同一個 collector 同時最多幾個回放請求（#742 B-N1）：回放要讀整段 JSONL、重放、佔記憶體，
+/// 連續拖動滑桿或遠端送大範圍不能把 collector 拖垮。
+pub const MAX_REPLAYS: usize = 2;
+
+/// 一個回放名額；drop 時還回去。
+pub(crate) struct ReplaySlot(Arc<WebState>);
+
+impl Drop for ReplaySlot {
+    fn drop(&mut self) {
+        self.0.replays.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 同一毫秒建立兩個 [`WebState`]（測試）也要不同
@@ -104,6 +120,8 @@ impl WebState {
             auth,
             remote_thinking: Mutex::new(RemoteThinking::OnDemand),
             force_remote: std::sync::atomic::AtomicBool::new(false),
+            replays: std::sync::atomic::AtomicUsize::new(0),
+            max_replays: std::sync::atomic::AtomicUsize::new(MAX_REPLAYS),
         })
     }
 
@@ -124,6 +142,29 @@ impl WebState {
             .remote_thinking
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 同時進行的回放請求上限（預設 [`MAX_REPLAYS`]）；測試用。
+    pub fn set_max_replays(&self, n: usize) {
+        self.max_replays.store(n, Ordering::Relaxed);
+    }
+
+    /// 佔一個回放名額；滿了回 None（呼叫端回 429）。名額在 [`ReplaySlot`] drop 時還回去。
+    pub(crate) fn replay_slot(self: &Arc<Self>) -> Option<ReplaySlot> {
+        let max = self.max_replays.load(Ordering::Relaxed);
+        let mut n = self.replays.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match self
+                .replays
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(ReplaySlot(self.clone())),
+                Err(now) => n = now,
+            }
+        }
     }
 
     /// 測試用：所有連線都當成遠端（剝除敏感輸出與 thinking）。
@@ -251,7 +292,6 @@ pub async fn serve_web(
         .route("/api/sessions", get(crate::api::sessions))
         .route("/api/sessions/{id}/events", get(crate::api::events))
         .route("/api/files", get(crate::api::files))
-        .route("/api/projects/events", get(crate::api::project_events))
         .route("/api/projects/replay", get(crate::api::project_replay))
         .route("/api/branches", get(crate::api::branches))
         .route("/api/branch-diff", get(crate::api::branch_diff))
@@ -724,8 +764,14 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, i
                             continue;
                         }
                         conn.subs.insert(ch.clone(), f.no);
-                        if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(&mut socket, &conn, &j).await
+                        // 同一個 frame 每種（頻道、offset、模式）只序列化一次，其他連線拿快取（E-L4）
+                        let wire = if conn.remote {
+                            crate::live::Wire::Remote(conn.thinking)
+                        } else {
+                            crate::live::Wire::Local
+                        };
+                        if let Some(text) = f.text_for(&ch, conn.offset, wire)
+                            && socket.send(Message::Text(text)).await.is_err()
                         {
                             return;
                         }
@@ -895,45 +941,18 @@ pub(crate) fn more_events(
     };
     let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
     let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
-    let pool = store.events_by_seq(session, from, last.seq + COMPANION_LOOKBACK)?;
+    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經由 stream_before 讀過（E-L9）
+    let pool = store.unplaced_by_seq(
+        session,
+        from,
+        last.seq + COMPANION_LOOKBACK,
+        crate::live::pool_kinds(),
+    )?;
     Ok(crate::live::assemble_stream(
         window,
         pool,
         next.map(|(_, ts)| ts),
     ))
-}
-
-/// 全專案回放（#702）的一頁：先依跨 session 順序鍵挑出 `limit` 個串流位置，再把每個 session 的那一段
-/// 照「載入更多」組回來（卡片的呼叫、狀態、結果一起帶）。回傳 (Event, 下一頁的游標)；沒有更舊的時游標是 None。
-pub(crate) fn project_events(
-    store: &Store,
-    root: &str,
-    from: u64,
-    to: u64,
-    before: Option<&ProjectKey>,
-    limit: usize,
-) -> Result<(Vec<Event>, Option<ProjectKey>), crate::store::StoreError> {
-    let window = store.project_window(root, from, to, before, limit)?;
-    // 同一個 session 在這一頁的 pos 範圍；pos 在 session 內連續，用範圍取不受 ts_seen 偶爾倒退影響
-    let mut spans: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-    for k in &window {
-        let e = spans.entry(&k.session).or_insert((k.pos, k.pos));
-        e.0 = e.0.min(k.pos);
-        e.1 = e.1.max(k.pos);
-    }
-    let mut out = Vec::new();
-    for (session, (lo, hi)) in spans {
-        out.extend(more_events(
-            store,
-            session,
-            Some(hi + 1),
-            (hi - lo + 1) as usize,
-        )?);
-    }
-    let next = (window.len() == limit)
-        .then(|| window.last().cloned())
-        .flatten();
-    Ok((out, next))
 }
 
 async fn healthz(State(state): State<Arc<WebState>>) -> Response {

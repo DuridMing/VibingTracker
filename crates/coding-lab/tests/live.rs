@@ -1961,3 +1961,124 @@ fn discard_pending_drops_the_backlog_but_keeps_the_state() {
     let snap = l.snapshot(&Channel::Session("s1".into()), 0, DAY + 1_000);
     assert_eq!(snap["stream"].as_array().map(Vec::len), Some(50), "{snap}");
 }
+
+/// E-L4（#754）：同一個 frame 對每種（頻道、offset、剝除模式）只序列化一次；遠端模式與本機分開快取，
+/// 本機的全文絕不會送給遠端（X9，不變式 6）。session 頻道不帶 kpi，不同時區的連線共用同一份。
+#[test]
+fn frame_is_serialized_once_per_channel_offset_and_mode() {
+    use coding_lab::config::RemoteThinking;
+    use coding_lab::live::Wire;
+    let mut l = Live::new();
+    l.register_offset(0);
+    l.register_offset(480);
+    let mut b = B::new();
+    let mut evs = vec![b.started("s1", DAY)];
+    evs.push(b.called(
+        "s1",
+        "t1",
+        "Bash",
+        json!({"command": "cat .env"}),
+        DAY + 1,
+        Value::Null,
+    ));
+    evs.push(b.ev("s1", "tool.result", "main", DAY + 2, false,
+        json!({"toolUseId": "t1", "ok": true, "exitCode": 0, "output": "TOKEN=abc", "truncated": false, "sensitive": true})));
+    evs.push(b.ev(
+        "s1",
+        "assistant.thinking",
+        "main",
+        DAY + 3,
+        true,
+        json!({"text": "想一想", "summarized": false, "messageId": "m", "model": null}),
+    ));
+    apply_all(&mut l, &evs);
+    let f = l.flush(DAY + 1_000).expect("有變化");
+    let all = Channel::All;
+    let locals: Vec<String> = (0..3)
+        .map(|_| {
+            f.text_for(&all, 0, Wire::Local)
+                .unwrap()
+                .as_str()
+                .to_string()
+        })
+        .collect();
+    let remote = f
+        .text_for(&all, 0, Wire::Remote(RemoteThinking::OnDemand))
+        .unwrap()
+        .as_str()
+        .to_string();
+    assert_eq!(
+        f.serializations(),
+        2,
+        "3 條本機＋1 條遠端：本機一次、遠端一次"
+    );
+    assert!(locals.iter().all(|t| t == &locals[0]));
+    assert_eq!(
+        serde_json::from_str::<Value>(&locals[0]).unwrap(),
+        f.to_json(&all, 0).unwrap(),
+        "和 to_json 相同"
+    );
+    assert!(locals[0].contains("TOKEN=abc") && locals[0].contains("想一想"));
+    assert!(
+        !remote.contains("TOKEN=abc") && !remote.contains("想一想"),
+        "遠端收到剝除過的：{remote}"
+    );
+    // 不同 offset 的 `*`（kpi 不同）各算一次；session 頻道不分 offset
+    f.text_for(&all, 480, Wire::Local);
+    let s1 = Channel::Session("s1".into());
+    f.text_for(&s1, 0, Wire::Local);
+    f.text_for(&s1, 480, Wire::Local);
+    assert_eq!(f.serializations(), 4);
+}
+
+/// E-L9（#754）：「載入更多」只讀伴隨 Event 與狀態行，組出來的串流和讀範圍內每一行時完全相同（samples 回放）。
+#[test]
+fn more_reads_only_companions_and_status_lines_with_the_same_result() {
+    let dirs = common::sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("沒有 samples，略過");
+        return;
+    }
+    let mut compared = 0;
+    for (n, dir) in dirs.iter().enumerate() {
+        let Some(m) = common::merged_events(dir) else {
+            continue;
+        };
+        let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("live-more-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut store = coding_lab::store::Store::open(&home).unwrap();
+        for e in &m.events {
+            store.append(e.clone());
+        }
+        store.flush().unwrap();
+        let last_pos = m.events.iter().filter_map(|e| e.pos).max().unwrap_or(0);
+        let mut before = Some(last_pos + 1);
+        while let Some(b) = before {
+            let window = store.stream_before(&m.session, Some(b), 20).unwrap();
+            let (Some(first), Some(last)) = (window.first().cloned(), window.last().cloned())
+            else {
+                break;
+            };
+            let (from, to) = (first.seq.saturating_sub(1000), last.seq + 1000);
+            let all = store.events_by_seq(&m.session, from, to).unwrap();
+            let only = store
+                .unplaced_by_seq(&m.session, from, to, coding_lab::live::pool_kinds())
+                .unwrap();
+            assert!(only.len() <= all.len());
+            let until = store
+                .next_pos_after(&m.session, last.pos.unwrap())
+                .unwrap()
+                .map(|(_, ts)| ts);
+            assert_eq!(
+                coding_lab::live::assemble_stream(window.clone(), only, until),
+                coding_lab::live::assemble_stream(window, all, until),
+                "{}：窗口 {b}",
+                dir.display()
+            );
+            compared += 1;
+            before = first.pos.filter(|p| *p > 1);
+        }
+    }
+    eprintln!("比較了 {compared} 個窗口");
+}

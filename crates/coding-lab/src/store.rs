@@ -84,14 +84,6 @@ pub struct TailRow {
     pub line_no: u64,
 }
 
-/// 全專案回放（#702）的一個串流位置：跨 session 的順序鍵 `(ts_seen, session, pos)`（contracts §6），也當分頁游標。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProjectKey {
-    pub ts: u64,
-    pub session: String,
-    pub pos: u64,
-}
-
 /// [`Store::prune`] 清掉了什麼。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
@@ -149,7 +141,7 @@ pub struct AttentionRow {
 }
 
 const SCHEMA_V1: &str = "
-CREATE TABLE sessions (
+CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   host TEXT NOT NULL DEFAULT 'local',
   cwd TEXT NOT NULL,
@@ -170,9 +162,9 @@ CREATE TABLE sessions (
   last_seq INTEGER NOT NULL DEFAULT 0,
   summary TEXT
 );
-CREATE INDEX sessions_by_cwd ON sessions (cwd, started_at);
+CREATE INDEX IF NOT EXISTS sessions_by_cwd ON sessions (cwd, started_at);
 
-CREATE TABLE events (
+CREATE TABLE IF NOT EXISTS events (
   session TEXT NOT NULL,
   seq INTEGER NOT NULL,
   type TEXT NOT NULL,
@@ -181,9 +173,9 @@ CREATE TABLE events (
   offset INTEGER NOT NULL,
   PRIMARY KEY (session, seq)
 ) WITHOUT ROWID;
-CREATE INDEX events_by_pos ON events (session, pos) WHERE pos IS NOT NULL;
+CREATE INDEX IF NOT EXISTS events_by_pos ON events (session, pos) WHERE pos IS NOT NULL;
 
-CREATE TABLE file_touch (
+CREATE TABLE IF NOT EXISTS file_touch (
   cwd TEXT NOT NULL,
   path TEXT NOT NULL,
   session TEXT NOT NULL,
@@ -193,7 +185,7 @@ CREATE TABLE file_touch (
   PRIMARY KEY (cwd, path, session, kind)
 ) WITHOUT ROWID;
 
-CREATE TABLE changes (
+CREATE TABLE IF NOT EXISTS changes (
   session TEXT NOT NULL,
   seq INTEGER NOT NULL,
   tool_use_id TEXT NOT NULL,
@@ -206,9 +198,9 @@ CREATE TABLE changes (
   removed INTEGER,
   PRIMARY KEY (session, seq)
 ) WITHOUT ROWID;
-CREATE INDEX changes_by_ts ON changes (cwd, ts DESC);
+CREATE INDEX IF NOT EXISTS changes_by_ts ON changes (cwd, ts DESC);
 
-CREATE TABLE attention (
+CREATE TABLE IF NOT EXISTS attention (
   session TEXT NOT NULL,
   kind TEXT NOT NULL,
   ref TEXT NOT NULL,
@@ -298,6 +290,35 @@ pub struct Store {
     recover_bytes: u64,
 }
 
+/// 開 store 之前先檢查會讓它起不來的情況（L-1）：index.sqlite 打不開、schema 比支援的新。唯讀、不拿 store 鎖，
+/// 上一個 collector 還在寫的時候也可以查；serve 在綁 hook 埠之前呼叫，失敗的話一個 hook 都還沒收。
+pub fn preflight(home: &Path) -> Result<(), StoreError> {
+    let path = home.join("index.sqlite");
+    if !path.exists() {
+        return Ok(());
+    }
+    let db = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let has_meta: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_meta {
+        return Ok(());
+    }
+    let v: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match v.and_then(|s| s.parse::<u32>().ok()) {
+        Some(v) if v > SCHEMA_VERSION => Err(StoreError::FutureSchema(v)),
+        _ => Ok(()),
+    }
+}
+
 impl Store {
     /// 開啟（或建立）資料目錄：`<home>/events/`、`<home>/index.sqlite`。
     pub fn open(home: &Path) -> Result<Store, StoreError> {
@@ -344,8 +365,20 @@ impl Store {
             if path.extension().is_none_or(|x| x != "jsonl") {
                 continue;
             }
-            for line in BufReader::new(File::open(&path)?).lines() {
-                let Ok(e) = Event::from_json_line(&line?) else {
+            // 讀不到的檔、不是 UTF-8 的行略過，不讓回填失敗（L-14）
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    crate::logging::log(&format!(
+                        "store：回填 tails 時讀不到 {}：{e}",
+                        path.display()
+                    ));
+                    continue;
+                }
+            };
+            for line in BufReader::new(file).split(b'\n') {
+                let Ok(line) = line else { break };
+                let Ok(e) = Event::from_json_line(String::from_utf8_lossy(&line).trim_end()) else {
                     continue;
                 };
                 if let Some(l) = &e.line {
@@ -369,6 +402,7 @@ impl Store {
         for ((sid, file), no) in &last {
             tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
         }
+        tx.execute("DELETE FROM meta WHERE key = 'backfill_tails'", [])?;
         tx.commit()?;
         Ok(())
     }
@@ -492,10 +526,37 @@ impl Store {
             .collect();
         files.sort();
         for path in files {
-            let len = fs::metadata(&path)?.len();
-            let Some(session) = first_session(&path)? else {
-                continue;
-            };
+            // 一個檔讀不到（被防毒或備份軟體鎖住）時跳過它，不讓整個 store 開不了（W-L8）
+            match self.recover_file(&path) {
+                Err(StoreError::Io(e)) => {
+                    crate::logging::log(&format!("store：讀不到 {}，先跳過：{e}", path.display()));
+                }
+                other => other?,
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_file(&mut self, path: &Path) -> Result<(), StoreError> {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let len = fs::metadata(path)?.len();
+        let Some(session) = first_session(path)? else {
+            // 一行完整的 Event 都還沒有：截掉沒寫完的半行，新的寫入才不會黏在後面（L-10）
+            let bytes = fs::read(path)?;
+            let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            if (complete as u64) < len {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(complete as u64)?;
+            }
+            self.file_len.insert(name, complete as u64);
+            return Ok(());
+        };
+        {
             let indexed: Option<i64> = self.db.query_row(
                 "SELECT MAX(offset) FROM events WHERE session = ?1",
                 params![session],
@@ -503,7 +564,7 @@ impl Store {
             )?;
             // 索引超前 JSONL（檔案被截短）時從頭讀
             let from = indexed.map(|o| o as u64).filter(|o| *o < len).unwrap_or(0);
-            let mut file = File::open(&path)?;
+            let mut file = File::open(path)?;
             file.seek(SeekFrom::Start(from))?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes)?;
@@ -511,12 +572,8 @@ impl Store {
             let complete = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
             let end = from + complete as u64;
             if end < len {
-                OpenOptions::new().write(true).open(&path)?.set_len(end)?;
+                OpenOptions::new().write(true).open(path)?.set_len(end)?;
             }
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
             self.file_len.insert(name, end);
 
             let mut start = 0usize;
@@ -581,84 +638,75 @@ impl Store {
         Ok(out)
     }
 
-    /// 全專案回放（#702）：專案根 `root` 底下（含 worktree、子目錄）所有 session、ts_seen 在 [from, to] 的串流位置，
-    /// 比 `before` 舊的 `limit` 個，由新到舊。
-    pub fn project_window(
-        &self,
-        root: &str,
-        from: u64,
-        to: u64,
-        before: Option<&ProjectKey>,
-        limit: usize,
-    ) -> Result<Vec<ProjectKey>, StoreError> {
-        let root = root.trim_end_matches('/');
-        // cwd 等於 root，或以 root + '/' 開頭（用 substr 比，不用 LIKE，路徑裡的 % _ 不會被當萬用字元）
-        let (b_ts, b_session, b_pos) = match before {
-            Some(k) => (k.ts as i64, k.session.as_str(), k.pos as i64),
-            None => (i64::MAX, "", 0),
-        };
-        let mut stmt = self.db.prepare(
-            "SELECT e.ts_seen, e.session, e.pos FROM events e JOIN sessions s ON s.id = e.session
-             WHERE e.pos IS NOT NULL AND e.ts_seen BETWEEN ?2 AND ?3
-               AND (s.cwd = ?1 OR substr(s.cwd, 1, length(?1) + 1) = ?1 || '/')
-               AND (?4 = 1 OR (e.ts_seen, e.session, e.pos) < (?5, ?6, ?7))
-             ORDER BY e.ts_seen DESC, e.session DESC, e.pos DESC LIMIT ?8",
-        )?;
-        let rows = stmt.query_map(
-            params![
-                root,
-                from.min(i64::MAX as u64) as i64,
-                to.min(i64::MAX as u64) as i64,
-                before.is_none(),
-                b_ts,
-                b_session,
-                b_pos,
-                limit as i64
-            ],
-            |r| {
-                Ok(ProjectKey {
-                    ts: r.get::<_, i64>(0)? as u64,
-                    session: r.get(1)?,
-                    pos: r.get::<_, i64>(2)? as u64,
-                })
-            },
-        )?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// 主頁時間軸回放（#729）：專案根 `root` 底下（含 worktree、子目錄）在 [`from`, `until`] 之間還會出現在 live 的
-    /// session（開始不晚於 `until`，沒結束、或結束不早於 `from` 往前 [`crate::live::ENDED_KEPT_MS`]）的所有 Event
-    /// （`ts_seen ≤ until`，依 (ts_seen, session, seq)），與這些 session 注意項目的確認時間。
+    /// 主頁時間軸回放（#729、#742）：專案根 `root` 底下（含 worktree、子目錄；cwd 的 `\` 和 `/api/sessions` 一樣當 `/`，C11）
+    /// 在 [`since`, `until`] 之間還會出現在 live 的 session（開始不晚於 `until`，沒結束或結束不早於 `since`）的 Event，
+    /// 與這些 session 注意項目的確認時間。
+    ///
+    /// 只讀到「本頁」為止（E-L1）：`at` 之後第 `limit` 個 Event 那個時間點的下一個時間點是本頁截止 `cut`
+    /// （回放放滿 `limit` 個就在時間點邊界停下，讀到 `cut` 為止就夠判斷還有沒有下一段）。每個 session 只讀到
+    /// 第一個 `ts_seen ≥ cut` 的 Event 之前（依 seq 的前綴：ts_seen 偶爾倒退也不會跳過中間的）。
+    /// 回傳的 Event 依 session、seq 排（跨 session 的合併由 [`crate::timeline::replay_page`] 做），以及 `cut`（沒截時 None）。
+    #[allow(clippy::type_complexity)]
     pub fn timeline(
         &self,
         root: &str,
-        from: u64,
+        since: u64,
+        at: u64,
         until: u64,
-    ) -> Result<(Vec<Event>, Vec<crate::timeline::Ack>), StoreError> {
+        limit: usize,
+    ) -> Result<(Vec<Event>, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
+        let root = root.replace('\\', "/");
         let root = root.trim_end_matches('/');
-        let until_i = until.min(i64::MAX as u64) as i64;
-        let since = from
-            .saturating_sub(crate::live::ENDED_KEPT_MS)
-            .min(i64::MAX as u64) as i64;
+        let ms = |t: u64| t.min(i64::MAX as u64) as i64;
         let ids: Vec<String> = self
             .db
             .prepare(
                 "SELECT id FROM sessions s
-                 WHERE (s.cwd = ?1 OR substr(s.cwd, 1, length(?1) + 1) = ?1 || '/')
+                 WHERE (REPLACE(s.cwd, '\\', '/') = ?1
+                        OR substr(REPLACE(s.cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/')
                    AND s.started_at <= ?2 AND (s.ended_at IS NULL OR s.ended_at >= ?3)
                  ORDER BY id",
             )?
-            .query_map(params![root, until_i, since], |r| r.get(0))?
+            .query_map(params![root, ms(until), ms(since)], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
+        if ids.is_empty() {
+            return Ok((Vec::new(), Vec::new(), None));
+        }
+        // 兩個 IN 清單用同一組編號（?1..?n）；混用匿名的 ? 會接著往後編號
+        let list = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut args: Vec<rusqlite::types::Value> =
+            ids.iter().map(|id| id.clone().into()).collect();
+        args.push(ms(at).into());
+        args.push((limit.max(1) as i64 - 1).into());
+        let n = ids.len();
+        let cut: Option<i64> = self
+            .db
+            .prepare(&format!(
+                "SELECT MIN(ts_seen) FROM events WHERE session IN ({list}) AND ts_seen > (
+                   SELECT ts_seen FROM events WHERE session IN ({list}) AND ts_seen > ?{a}
+                   ORDER BY ts_seen LIMIT 1 OFFSET ?{o})",
+                a = n + 1,
+                o = n + 2
+            ))?
+            .query_row(rusqlite::params_from_iter(args.iter()), |r| r.get(0))
+            .optional()?
+            .flatten();
+        let cut = cut.map(|c| c as u64).filter(|c| *c <= until);
+        let stop = cut.map_or(ms(until).saturating_add(1), ms);
         let mut events = Vec::new();
         let mut acks = Vec::new();
         for id in &ids {
             let offsets: Vec<i64> = self
                 .db
                 .prepare(
-                    "SELECT offset FROM events WHERE session = ?1 AND ts_seen <= ?2 ORDER BY seq",
+                    "SELECT offset FROM events WHERE session = ?1
+                       AND seq < COALESCE((SELECT MIN(seq) FROM events WHERE session = ?1 AND ts_seen >= ?2), 9223372036854775807)
+                     ORDER BY seq",
                 )?
-                .query_map(params![id, until_i], |r| r.get(0))?
+                .query_map(params![id, stop], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             events.extend(self.read_at(id, offsets)?);
             let rows = self
@@ -677,8 +725,7 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?;
             acks.extend(rows);
         }
-        events.sort_by(|a, b| (a.ts_seen, &a.session, a.seq).cmp(&(b.ts_seen, &b.session, b.seq)));
-        Ok((events, acks))
+        Ok((events, acks, cut))
     }
 
     /// 某 session 在 seq 範圍（含兩端）內的所有 Event，依 seq 排序。
@@ -693,6 +740,40 @@ impl Store {
         )?;
         let offsets: Vec<i64> = stmt
             .query_map(params![session, from as i64, to as i64], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        self.read_at(session, offsets)
+    }
+
+    /// 某 session 在 seq 範圍（含兩端）內、不帶 pos、種類是 `kinds` 之一的 Event，依 seq 排序。
+    /// 「載入更多」只需要伴隨 Event 與狀態行，不用把範圍內的每一行都讀出來解析（E-L9）。
+    pub fn unplaced_by_seq<'a>(
+        &self,
+        session: &str,
+        from: u64,
+        to: u64,
+        kinds: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Event>, StoreError> {
+        let kinds: Vec<&str> = kinds.into_iter().collect();
+        let list = (0..kinds.len())
+            .map(|i| format!("?{}", i + 4))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT offset FROM events WHERE session = ?1 AND seq BETWEEN ?2 AND ?3
+               AND pos IS NULL AND type IN ({list}) ORDER BY seq"
+        ))?;
+        let mut args: Vec<rusqlite::types::Value> = vec![
+            session.to_string().into(),
+            (from.min(i64::MAX as u64) as i64).into(),
+            (to.min(i64::MAX as u64) as i64).into(),
+        ];
+        args.extend(
+            kinds
+                .iter()
+                .map(|k| rusqlite::types::Value::from(k.to_string())),
+        );
+        let offsets: Vec<i64> = stmt
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         self.read_at(session, offsets)
     }
@@ -1067,12 +1148,22 @@ impl Store {
 }
 
 /// JSONL 第一行的 session（檔名經過清理，不一定等於 session id）。
+/// 檔案裡第一個完整、讀得懂的 Event 的 session。第一行可能斷在多位元組字元中間或寫壞了（L-10），
+/// 往下找；最後沒有換行的半行不算。
 fn first_session(path: &Path) -> Result<Option<String>, StoreError> {
-    let mut line = String::new();
-    BufReader::new(File::open(path)?).read_line(&mut line)?;
-    Ok(Event::from_json_line(line.trim_end())
-        .ok()
-        .map(|e| e.session))
+    const TRIES: usize = 64;
+    let mut r = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    for _ in 0..TRIES {
+        line.clear();
+        if r.read_until(b'\n', &mut line)? == 0 || line.last() != Some(&b'\n') {
+            return Ok(None);
+        }
+        if let Ok(e) = Event::from_json_line(String::from_utf8_lossy(&line).trim_end()) {
+            return Ok(Some(e.session));
+        }
+    }
+    Ok(None)
 }
 
 /// session id 只留安全字元當檔名，payload 不能決定寫入路徑。
@@ -1113,18 +1204,22 @@ fn read_version(db: &Connection) -> rusqlite::Result<Option<u32>> {
 }
 
 /// 依版本逐步升級；v0（空資料庫）先建 v1 的表，再一路升上來。
-/// 回傳要不要回填 tails：舊版資料庫升到 v3 時要；新建的不用（JSONL 由 recover 從頭索引，順便填好）。
+/// 回傳要不要回填 tails：舊版資料庫升到 v3 時記下、回填完才清掉（新建的不用）。
 fn migrate(db: &Connection) -> Result<bool, StoreError> {
     let from = read_version(db)?;
     let mut v = match from {
         Some(v) if v > SCHEMA_VERSION => return Err(StoreError::FutureSchema(v)),
         Some(v) => v,
+        // 建表與版本號在同一個交易（L-14）：做到一半當掉的話整個沒做，下次重來；
+        // 舊版留下的半套表靠 SCHEMA_V1 的 IF NOT EXISTS 補完
         None => {
-            db.execute_batch(SCHEMA_V1)?;
-            db.execute(
+            let tx = db.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V1)?;
+            tx.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', '1')",
                 [],
             )?;
+            tx.commit()?;
             1
         }
     };
@@ -1137,6 +1232,11 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         }
         if v == 2 {
             tx.execute_batch(TAILS_V3)?;
+            // 舊的資料庫要從 JSONL 回填 tails：記在 meta，回填成功才刪，中途失敗下次開啟再做（L-14）。
+            // 新建的不用（JSONL 由 recover 從頭索引，順便填好）
+            if from.is_some() {
+                tx.execute(BACKFILL_PENDING, [])?;
+            }
         }
         if v == 3 {
             tx.execute_batch(EVENTS_BY_TS_V4)?;
@@ -1151,8 +1251,18 @@ fn migrate(db: &Connection) -> Result<bool, StoreError> {
         )?;
         tx.commit()?;
     }
-    Ok(from.is_some_and(|v| v < 3))
+    let pending: Option<String> = db
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'backfill_tails'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(pending.is_some())
 }
+
+const BACKFILL_PENDING: &str =
+    "INSERT OR REPLACE INTO meta (key, value) VALUES ('backfill_tails', '1')";
 
 const SESSION_COLUMNS: &str = "id, host, cwd, transcript_path, model, branch, first_prompt, started_at, ended_at,
     end_reason, status, status_since, commits, dangers, failures, cost_usd, thinking_tokens, last_seq";
