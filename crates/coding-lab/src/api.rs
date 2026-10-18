@@ -464,7 +464,7 @@ fn files_blocking(
                     by,
                     entries,
                     dir: None,
-                    head: None,
+                    last: None,
                 }],
             )
         }
@@ -491,7 +491,7 @@ fn files_blocking(
                     by,
                     entries,
                     dir: Some(r.clone()),
-                    head: None,
+                    last: None,
                 }],
             )
         }
@@ -554,14 +554,11 @@ fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
     if let Some(resp) = guard(store, cwd) {
         return resp;
     }
+    // 只查還沒結束的 (id, cwd)，不讀出 1000 列完整資料再過濾（E-H9）
     let live: Vec<(String, String)> = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        match store.sessions(None, SESSIONS_MAX) {
-            Ok(rows) => rows
-                .into_iter()
-                .filter(|r| r.ended_at.is_none())
-                .map(|r| (r.id, norm(&r.cwd)))
-                .collect(),
+        match store.open_session_cwds() {
+            Ok(rows) => rows.into_iter().map(|(id, cwd)| (id, norm(&cwd))).collect(),
             Err(e) => return store_error(e),
         }
     };
@@ -625,19 +622,34 @@ fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
         .map(|((wt, branch), src)| {
             let dir = Path::new(wt);
             let counts = main
-                .and_then(|m| git(dir, &["rev-list", "--left-right", "--count", &format!("{m}...HEAD")]))
+                .and_then(|m| {
+                    git(
+                        dir,
+                        &[
+                            "rev-list",
+                            "--left-right",
+                            "--count",
+                            &format!("{m}...HEAD"),
+                        ],
+                    )
+                })
                 .and_then(|s| {
                     let mut n = s.split_whitespace().map(|v| v.parse::<u64>().ok());
                     Some((n.next()??, n.next()??))
                 });
-            let dirty = git(dir, &["status", "--porcelain"]).map(|s| s.lines().count());
-            let last = git(dir, &["log", "-1", "--format=%H%x00%s%x00%ct"]).and_then(|s| {
-                let mut f = s.trim_end().splitn(3, '\0');
-                let (hash, msg, ct) = (f.next()?, f.next()?, f.next()?);
-                Some(json!({ "hash": hash, "message": msg, "ts": ct.parse::<u64>().ok().map(|t| t * 1000) }))
-            });
+            // 未 commit 的改動：和 HEAD 比的已追蹤檔＋未追蹤檔（算改動時已經掃過，不再讓 status 重掃，E-H9）。
+            // 還沒有 commit 的 repo 沒有 HEAD 可比，退回 status
+            let dirty = match src.head() {
+                Some(_) => git(dir, &["diff", "HEAD", "--name-only", "-z"])
+                    .map(|s| nul_split(&s).len() + untracked_files(dir).len()),
+                None => git(dir, &["status", "--porcelain"]).map(|s| s.lines().count()),
+            };
+            let last = src
+                .last
+                .as_ref()
+                .map(|l| json!({ "hash": l.hash, "message": l.message, "ts": l.ts }));
             json!({
-                "branch": branch, "worktree": wt, "head": src.head,
+                "branch": branch, "worktree": wt, "head": src.head(),
                 "integration": main.is_some() && branch.as_deref() == main,
                 "ahead": counts.map(|c| c.1), "behind": counts.map(|c| c.0),
                 "dirty": dirty, "changed": src.entries.len(), "last": last,
@@ -1075,7 +1087,7 @@ fn integration_sources(
                     .map(|base| git_changes(dir, &[&base]))
                     .unwrap_or_default(),
                 by: json!({ "worktree": wt, "branch": branch }),
-                head: git(dir, &["rev-parse", "HEAD"]).map(|h| h.trim().to_string()),
+                last: last_commit(dir),
                 dir: Some(wt),
             }
         })
@@ -1092,8 +1104,32 @@ struct Source {
     entries: Changes,
     /// git 來源的 worktree 目錄（判斷衝突時讀內容）
     dir: Option<String>,
-    /// 該 worktree 的 HEAD（判斷衝突時找共同祖先）
-    head: Option<String>,
+    /// 該 worktree 的 HEAD 那個 commit（判斷衝突時找共同祖先；分支視窗的「最後一個 commit」）。
+    /// 一次 `log -1` 同時拿 hash、訊息與時間，不再另跑 `rev-parse HEAD`（E-H9）
+    last: Option<LastCommit>,
+}
+
+struct LastCommit {
+    hash: String,
+    message: String,
+    ts: Option<u64>,
+}
+
+impl Source {
+    fn head(&self) -> Option<&str> {
+        self.last.as_ref().map(|l| l.hash.as_str())
+    }
+}
+
+fn last_commit(dir: &Path) -> Option<LastCommit> {
+    let s = git(dir, &["log", "-1", "--format=%H%x00%s%x00%ct"])?;
+    let mut f = s.trim_end().splitn(3, '\0');
+    let (hash, message, ct) = (f.next()?, f.next()?, f.next()?);
+    Some(LastCommit {
+        hash: hash.to_string(),
+        message: message.to_string(),
+        ts: ct.parse::<u64>().ok().map(|t| t * 1000),
+    })
 }
 
 fn merge_sources(sources: &[Source]) -> Vec<Value> {
@@ -1165,13 +1201,13 @@ impl Touched {
         if a.entries.get(path).is_some_and(|(st, _)| st == "?") {
             return true;
         }
-        let (Some(dir), Some(ha), Some(hb)) = (&a.dir, &a.head, &b.head) else {
+        let (Some(dir), Some(ha), Some(hb)) = (&a.dir, a.head(), b.head()) else {
             return true;
         };
         let key = if ha <= hb {
-            (ha.clone(), hb.clone())
+            (ha.to_string(), hb.to_string())
         } else {
-            (hb.clone(), ha.clone())
+            (hb.to_string(), ha.to_string())
         };
         let fork = self
             .forks
@@ -1215,19 +1251,24 @@ fn git_changes(dir: &Path, range: &[&str]) -> Changes {
     let mut args = vec!["diff", "--name-status", "-z"];
     args.extend(range);
     let mut out = parse_name_status(&git(dir, &args).unwrap_or_default());
-    let key = norm(&dir.to_string_lossy());
-    let others = UNTRACKED
-        .with(|u| u.borrow().get(&key).cloned())
-        .unwrap_or_else(|| {
-            nul_split(
-                &git(dir, &["ls-files", "-z", "--others", "--exclude-standard"])
-                    .unwrap_or_default(),
-            )
-        });
+    let others = untracked_files(dir);
     for p in others {
         out.entry(p).or_insert_with(|| ("?".to_string(), None));
     }
     out
+}
+
+/// 這個目錄的未追蹤檔；同一個請求裡掃過就用快取，沒掃過就掃並記下（E-H2、E-H9：樹、改動、分支的 dirty 共用一次）。
+fn untracked_files(dir: &Path) -> Vec<String> {
+    let key = norm(&dir.to_string_lossy());
+    if let Some(cached) = UNTRACKED.with(|u| u.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let found = nul_split(
+        &git(dir, &["ls-files", "-z", "--others", "--exclude-standard"]).unwrap_or_default(),
+    );
+    UNTRACKED.with(|u| u.borrow_mut().insert(key, found.clone()));
+    found
 }
 
 /// `--name-status -z` 的輸出 → path → (status, 原路徑)。

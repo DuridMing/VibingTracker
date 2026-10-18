@@ -1230,6 +1230,17 @@ impl Store {
     }
 
     /// 改動紀錄：最新在前。
+    /// 還沒結束的 session：(id, cwd)。分支視窗把它們歸到各自的 worktree（E-H9：不讀出完整的 sessions 列再過濾）。
+    pub fn open_session_cwds(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare_cached("SELECT id, cwd FROM sessions WHERE ended_at IS NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows)
+    }
+
     /// 某 session 留下的改動：(path, kind, seq)，依 seq。被拒或失敗的已經從表裡刪掉（#682）。
     /// `/api/files` 的 session 基準用它，不必把整個 session 的 Edit／Write／tool.updated 都從 JSONL 讀出來（E-H8）。
     pub fn session_change_rows(
