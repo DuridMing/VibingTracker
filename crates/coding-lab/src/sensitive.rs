@@ -30,29 +30,35 @@ const PATH_PATTERNS: &[&str] = &[
     r"(^|/)\.docker/config\.json$",
 ];
 
+/// 一份清單合成一條 alternation（E-B6）：每個參數只比一次，不是每條各比一次。
 fn compiled(
     list: &'static [&'static str],
-    cell: &'static OnceLock<Vec<Regex>>,
-) -> &'static [Regex] {
-    cell.get_or_init(|| list.iter().filter_map(|p| Regex::new(p).ok()).collect())
+    cell: &'static OnceLock<Option<Regex>>,
+) -> Option<&'static Regex> {
+    cell.get_or_init(|| {
+        let alt: Vec<String> = list.iter().map(|p| format!("(?:{p})")).collect();
+        Regex::new(&alt.join("|")).ok()
+    })
+    .as_ref()
 }
 
 /// 這個路徑的內容可能是機密。
 pub fn is_sensitive_path(path: &str) -> bool {
-    static NAMES: OnceLock<Vec<Regex>> = OnceLock::new();
-    static PATHS: OnceLock<Vec<Regex>> = OnceLock::new();
-    let path = path.replace('\\', "/");
+    static NAMES: OnceLock<Option<Regex>> = OnceLock::new();
+    static PATHS: OnceLock<Option<Regex>> = OnceLock::new();
+    // 大多數參數沒有反斜線：不必配置新字串
+    let path: std::borrow::Cow<str> = if path.contains('\\') {
+        path.replace('\\', "/").into()
+    } else {
+        path.into()
+    };
     let path = path.trim_matches(|c| c == '"' || c == '\'');
     let name = path.rsplit('/').next().unwrap_or(path);
     if name.starts_with(".env") && ENV_TEMPLATES.iter().any(|t| name.ends_with(t)) {
         return false;
     }
-    compiled(NAME_PATTERNS, &NAMES)
-        .iter()
-        .any(|r| r.is_match(name))
-        || compiled(PATH_PATTERNS, &PATHS)
-            .iter()
-            .any(|r| r.is_match(path))
+    compiled(NAME_PATTERNS, &NAMES).is_some_and(|r| r.is_match(name))
+        || compiled(PATH_PATTERNS, &PATHS).is_some_and(|r| r.is_match(path))
 }
 
 /// 這個工具呼叫的輸出會不會含機密。

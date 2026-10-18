@@ -397,19 +397,15 @@ impl DangerRules for RuleSet {
             let command = normalize_command(tool, input["command"].as_str()?);
             return self.check_command(tool, &command, 0);
         }
+        // file_path 的 `\` 換成 `/` 只做一次，不是每條規則各做一次（E-B6）
+        let file_path = input["file_path"].as_str().map(|p| p.replace('\\', "/"));
         self.rules
             .iter()
             .filter(|r| r.spec.scope == Scope::Segment)
             .filter(|r| r.spec.tools.iter().any(|t| t == tool || t == "*"))
-            .find(|r| {
-                let field = r.spec.field.as_deref().unwrap_or("file_path");
-                input[field].as_str().is_some_and(|text| {
-                    if field == "file_path" {
-                        r.hits(&text.replace('\\', "/"))
-                    } else {
-                        r.hits(text)
-                    }
-                })
+            .find(|r| match r.spec.field.as_deref().unwrap_or("file_path") {
+                "file_path" => file_path.as_deref().is_some_and(|p| r.hits(p)),
+                field => input[field].as_str().is_some_and(|text| r.hits(text)),
             })
             .map(|r| Danger {
                 rule: r.spec.id.clone(),
