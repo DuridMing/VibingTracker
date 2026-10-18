@@ -862,6 +862,16 @@ fn prune() -> Result<ExitCode, Failure> {
             return Ok(ExitCode::FAILURE);
         }
     };
+    // 拿著鎖的期間留標記：這時被拉起的 collector 等鎖時說得出是 prune（W-L15）
+    let marker = cfg.home.join(serve::PRUNE_MARKER);
+    let _ = coding_lab::store::write_private(&marker, std::process::id().to_string().as_bytes());
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _marker = RemoveOnDrop(marker);
     let before = coding_lab::now_ms().saturating_sub(days * 24 * 60 * 60 * 1000);
     let result = coding_lab::store::Store::open(&cfg.home).and_then(|mut s| s.prune(before));
     match result {

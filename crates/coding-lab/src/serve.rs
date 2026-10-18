@@ -48,6 +48,8 @@ const AGENT_META_EVERY: Duration = Duration::from_millis(25);
 const AGENT_META_TRIES: u32 = 40;
 /// 等上一個 collector 放掉 store 鎖最多多久（它只剩停 tail 與 flush）
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
+/// `coding-lab prune` 拿著 store 鎖時留的標記檔（W-L15）：等鎖的 collector 才說得出原因
+pub const PRUNE_MARKER: &str = "prune.running";
 pub const STORE_LOCK: &str = "collector.lock";
 /// 執行中 collector 的位址（contracts §5）
 pub const INFO_FILE: &str = "collector.json";
@@ -658,6 +660,23 @@ fn prune_store(store: &mut Store) -> Vec<String> {
 }
 
 /// 拿 store 鎖；上一個 collector 還在結束時等它放掉。
+/// 誰拿著 store 鎖（W-L15）。collector 結束時先刪 collector.json 才放鎖、當掉時鎖會被系統放掉，
+/// 所以鎖被拿著、collector.json 又沒標 closing，就是一個正常在跑的 collector。
+fn lock_holder(home: &Path) -> String {
+    match read_info(home) {
+        Some(i) if !i.closing => format!(
+            "另一個 collector 已經在用這個資料目錄（pid {}、hook 埠 {}）",
+            i.pid,
+            i.hook.map_or_else(|| "未知".to_string(), |a| a.to_string())
+        ),
+        Some(_) => "上一個 collector 還在結束".into(),
+        None => match std::fs::read_to_string(home.join(PRUNE_MARKER)) {
+            Ok(pid) => format!("coding-lab prune 正在執行（pid {}）", pid.trim()),
+            Err(_) => "上一個 collector 還在結束（或別的程序拿著 collector.lock）".into(),
+        },
+    }
+}
+
 async fn lock_store(home: &Path) -> io::Result<std::fs::File> {
     let deadline = Instant::now() + STORE_LOCK_WAIT;
     let mut waited = false;
@@ -666,15 +685,16 @@ async fn lock_store(home: &Path) -> io::Result<std::fs::File> {
             Some(file) => return Ok(file),
             None if Instant::now() < deadline => {
                 if !waited {
-                    log("上一個 collector 還在結束，等它寫完 store");
+                    log(&format!("{}，等它放掉 store", lock_holder(home)));
                     waited = true;
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             None => {
                 return Err(io::Error::other(format!(
-                    "store 被另一個程序鎖住超過 {} 秒",
-                    STORE_LOCK_WAIT.as_secs()
+                    "store 被另一個程序鎖住超過 {} 秒（{}）",
+                    STORE_LOCK_WAIT.as_secs(),
+                    lock_holder(home)
                 )));
             }
         }

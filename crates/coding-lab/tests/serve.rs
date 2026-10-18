@@ -1847,3 +1847,54 @@ fn stop_needs_the_token_from_collector_json() {
     assert!(cmd(&e, &["stop"]).output().unwrap().status.success());
     wait_for("stop 之後結束", || s.0.try_wait().unwrap().is_some());
 }
+
+fn log_text(e: &Env) -> String {
+    std::fs::read_to_string(e.home.join("collector.log")).unwrap_or_default()
+}
+
+/// W-L15（#781）：store 鎖被一個正常在跑的 collector 拿著時，等鎖的 log 說「另一個 collector 已經在用」，
+/// 不是「上一個 collector 還在結束」。同一個 home、別的埠再起一個 serve。
+#[test]
+fn waiting_for_the_store_lock_names_the_running_collector() {
+    let e = env(0);
+    let _a = start_serve(&e);
+    let b = Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+        .args([
+            "serve",
+            "--hook-bind",
+            &format!("127.0.0.1:{}", free_port()),
+        ])
+        .args(["--web-bind", &format!("127.0.0.1:{}", free_port())])
+        .env("CODING_LAB_HOME", &e.home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _b = Kill(b);
+    wait_for("第二個 serve 寫等鎖的原因", || {
+        log_text(&e).contains("另一個 collector 已經在用這個資料目錄")
+    });
+    assert!(
+        !log_text(&e).contains("上一個 collector 還在結束"),
+        "{}",
+        log_text(&e)
+    );
+}
+
+/// W-L15：`coding-lab prune` 拿著鎖時留標記檔，等鎖的 serve 說「prune 正在執行」。
+#[test]
+fn waiting_for_the_store_lock_names_a_running_prune() {
+    let e = env(0);
+    let lock = coding_lab::serve::try_lock_store(&e.home).unwrap().unwrap();
+    std::fs::write(
+        e.home.join(coding_lab::serve::PRUNE_MARKER),
+        format!("{}", std::process::id()),
+    )
+    .unwrap();
+    let child = cmd(&e, &["serve"]).spawn().unwrap();
+    let _c = Kill(child);
+    wait_for("serve 寫等鎖的原因", || {
+        log_text(&e).contains("prune 正在執行")
+    });
+    drop(lock);
+}
