@@ -19,6 +19,7 @@ use crate::event::{
 use crate::hook::HookInput;
 use crate::prices::Prices;
 use crate::status::{self, Change, OpenItem, Signal, Tracker};
+use crate::text;
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
@@ -1317,7 +1318,9 @@ impl Merger {
                     ..Card::new(&agent)
                 },
             );
-            let (input, input_truncated) = truncate_input(input);
+            // tool.called 的 input：每個超過 OUTPUT_LIMIT 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）。
+            // Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
+            let (input, input_truncated) = text::truncated_clone(&input, OUTPUT_LIMIT);
             let p = ToolCalled {
                 tool_use_id: id.clone(),
                 tool,
@@ -1639,7 +1642,8 @@ impl Merger {
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
-                        let (input, input_truncated) = truncate_input(block["input"].clone());
+                        let (input, input_truncated) =
+                            text::truncated_clone(&block["input"], OUTPUT_LIMIT);
                         let p = ToolCalled {
                             tool_use_id: id,
                             tool,
@@ -1730,50 +1734,9 @@ fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
 }
 
 /// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。
-/// tool.called 的 input：每個超過 [`OUTPUT_LIMIT`] 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）；
-/// 回傳有沒有截到。Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
-fn truncate_input(v: Value) -> (Value, bool) {
-    match v {
-        Value::String(s) if s.len() > OUTPUT_LIMIT => {
-            (Value::String(truncate(&s, OUTPUT_LIMIT).0), true)
-        }
-        Value::Array(items) => {
-            let mut cut = false;
-            let items = items
-                .into_iter()
-                .map(|x| {
-                    let (x, c) = truncate_input(x);
-                    cut |= c;
-                    x
-                })
-                .collect();
-            (Value::Array(items), cut)
-        }
-        Value::Object(map) => {
-            let mut cut = false;
-            let map = map
-                .into_iter()
-                .map(|(k, x)| {
-                    let (x, c) = truncate_input(x);
-                    cut |= c;
-                    (k, x)
-                })
-                .collect();
-            (Value::Object(map), cut)
-        }
-        other => (other, false),
-    }
-}
-
 fn truncate(s: &str, max: usize) -> (String, bool) {
-    if s.len() <= max {
-        return (s.to_string(), false);
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (s[..end].to_string(), true)
+    let (kept, cut) = text::truncate_bytes(s, max);
+    (kept.to_string(), cut)
 }
 
 /// PostToolUse 的 `tool_response`：Bash 取 stdout（＋stderr），其他工具用精簡 JSON。

@@ -12,6 +12,18 @@ use serde_json::{Map, Value};
 /// 目前的契約版本（contracts.md §1）。
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// 指令型工具（D12）：`tool_input.command` 是一條 shell 指令的工具。敏感判斷、危險規則、git 操作、
+/// 連續失敗、KPI 的指令數都認這個集合，不寫死 `"Bash"`。cmd 不是工具，只在指令字串裡的 `cmd /c …` 比對。
+/// 危險規則的 `tools` 寫 [`COMMAND_TOOLS_ALIAS`] 等於列出這裡的每一個。
+pub const COMMAND_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
+
+/// 危險規則 `tools` 裡代表「所有指令型工具」的寫法。
+pub const COMMAND_TOOLS_ALIAS: &str = "@command";
+
+pub fn is_command_tool(tool: &str) -> bool {
+    COMMAND_TOOLS.contains(&tool)
+}
+
 #[derive(Debug)]
 pub enum Error {
     Json(serde_json::Error),

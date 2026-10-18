@@ -277,3 +277,91 @@ fn bash_rule_with_an_unsupported_field_warns_on_load() {
     let (_, warning) = RuleSet::load(&p);
     assert!(warning.is_some_and(|w| w.contains("desc")));
 }
+
+// ── 指令型工具（D12、W-H3）：Bash＋PowerShell 共用「依段比對 command」；規則用 `@command` 一次套到兩個
+// PowerShell 的 tool_input 欄位名假設和 Bash 一樣是 `command`：欄位名尚未經實機確認（排在第 1 輪 Windows 驗收）。
+
+#[test]
+fn command_tools_are_bash_and_powershell() {
+    use coding_lab::event::{COMMAND_TOOLS, is_command_tool};
+    assert_eq!(COMMAND_TOOLS, ["Bash", "PowerShell"]);
+    assert!(is_command_tool("Bash"));
+    assert!(is_command_tool("PowerShell"));
+    // cmd 不是工具，只在指令字串裡的 `cmd /c …` 比對；大小寫照 Claude Code 的工具名
+    for t in ["cmd", "bash", "Read", "Write", ""] {
+        assert!(!is_command_tool(t), "{t}");
+    }
+}
+
+fn command(rules: &RuleSet, tool: &str, cmd: &str) -> Option<String> {
+    rules
+        .check(tool, &json!({ "command": cmd }))
+        .map(|d| d.rule)
+}
+
+#[test]
+fn at_command_rule_applies_to_every_command_tool() {
+    let p = rules_file(
+        &json!({ "rules": [{ "id": "boom", "tools": ["@command"], "pattern": "^boom\\b",
+                             "level": "danger", "why": "測試" }] })
+        .to_string(),
+    );
+    let (r, warning) = RuleSet::load(&p);
+    assert!(warning.is_none(), "{warning:?}");
+    assert_eq!(command(&r, "Bash", "boom now"), Some("boom".into()));
+    assert_eq!(command(&r, "PowerShell", "boom now"), Some("boom".into()));
+    assert_eq!(
+        command(&r, "PowerShell", "echo ok; boom"),
+        Some("boom".into()),
+        "依段比對"
+    );
+    assert_eq!(
+        command(&r, "PowerShell", "echo boom"),
+        None,
+        "錨定在段的開頭"
+    );
+    assert!(r.check("Read", &json!({ "file_path": "boom" })).is_none());
+}
+
+#[test]
+fn powershell_only_rule_is_matched_per_segment_and_not_on_bash() {
+    let p = rules_file(
+        &json!({ "rules": [{ "id": "ri", "tools": ["PowerShell"], "pattern": "^Remove-Item\\b",
+                             "level": "danger", "why": "測試" }] })
+        .to_string(),
+    );
+    let (r, warning) = RuleSet::load(&p);
+    assert!(warning.is_none(), "{warning:?}");
+    assert_eq!(
+        command(&r, "PowerShell", "cd x && Remove-Item y"),
+        Some("ri".into())
+    );
+    assert_eq!(command(&r, "Bash", "Remove-Item y"), None);
+}
+
+#[test]
+fn command_tool_rule_with_an_unsupported_field_warns_on_load() {
+    for tools in [json!(["PowerShell"]), json!(["@command"])] {
+        let p = rules_file(
+            &json!({ "rules": [{ "id": "desc", "tools": tools, "field": "description",
+                                 "pattern": "x", "level": "warn", "why": "x" }] })
+            .to_string(),
+        );
+        let (_, warning) = RuleSet::load(&p);
+        assert!(warning.is_some_and(|w| w.contains("desc")), "{tools}");
+    }
+}
+
+/// 欄位名尚未經實機確認：PowerShell 的 input 讀不到 `command` 時安全降級，不判斷、不 panic。
+#[test]
+fn powershell_without_a_command_field_is_not_judged() {
+    let r = RuleSet::builtin();
+    for input in [
+        json!({}),
+        json!({ "script": "git push --force" }),
+        json!({ "command": 42 }),
+        Value::Null,
+    ] {
+        assert!(r.check("PowerShell", &input).is_none(), "{input}");
+    }
+}
