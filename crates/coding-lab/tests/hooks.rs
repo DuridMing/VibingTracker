@@ -265,7 +265,7 @@ async fn edit_hunk_is_read_before_the_response() {
     let file = dir.join("calc.py");
     std::fs::write(&file, "def sub(a, b):\n    return a + b\n").unwrap();
     let (addr, mut rx) = server(8).await;
-    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
                       "tool_input": {"file_path": file, "old_string": "a + b", "new_string": "a - b"},
                       "tool_use_id": "e1"});
     post(addr, body.to_string().as_bytes()).await;
@@ -714,4 +714,96 @@ async fn stop_needs_its_own_header_and_no_origin() {
     tokio::time::timeout(Duration::from_secs(2), stop.notified())
         .await
         .expect("coding-lab stop 帶的標頭要能結束");
+}
+
+// ── 讀檔探測（#762 W-M5）：UNC 路徑不碰（Windows 會去連那台主機、送出 NTLM 憑證），只讀 cwd 底下的檔，
+// 探測有時限（網路磁碟、OneDrive 隨選檔案、離線 NAS 會讓 hook 卡 21 秒）
+
+fn edit_hook(cwd: &str, path: &str) -> HookInput {
+    h(
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd,
+             "tool_use_id": "t1", "tool_input": {"file_path": path, "old_string": "a", "new_string": "b"}}),
+    )
+}
+
+#[test]
+fn unc_paths_are_never_touched() {
+    for path in [
+        "\\\\10.255.255.1\\share\\x.txt",
+        "//10.255.255.1/share/x.txt",
+        "\\\\?\\UNC\\10.255.255.1\\share\\x.txt",
+        "\\\\localhost\\C$\\Windows\\win.ini",
+    ] {
+        let mut hook = edit_hook("//10.255.255.1/share", path);
+        coding_lab::derive::attach_probe(&mut hook);
+        assert!(hook.probe().is_none(), "{path}");
+    }
+}
+
+#[test]
+fn files_outside_the_cwd_are_not_read() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    std::fs::write(dir.join("secret.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("proj/a.txt"), "a\n").unwrap();
+    let cwd = dir.join("proj");
+    let mut outside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("secret.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut outside);
+    let p = outside.probe().expect("存在與否還是看（不讀內容）");
+    assert!(p.exists);
+    assert!(p.hunk.is_none(), "cwd 外的檔不讀內容");
+    let mut inside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("proj/a.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut inside);
+    assert!(
+        inside.probe().is_some_and(|p| p.hunk.is_some()),
+        "cwd 底下照常算 hunk"
+    );
+}
+
+#[tokio::test]
+async fn probe_has_a_time_limit_and_the_hook_still_goes_through() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    // 時限設 0：探測一定逾時（不 sleep，等同探測卡住）
+    server.set_probe_limit(Duration::ZERO);
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                      "cwd": dir, "tool_use_id": "t1",
+                      "tool_input": {"file_path": dir.join("a.txt"), "old_string": "a", "new_string": "b"}});
+    let resp = post(server.addr, body.to_string().as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    match rx.try_recv() {
+        Ok(Input::Hook { hook, .. }) => assert!(hook.probe().is_none(), "逾時就不帶探測結果"),
+        _ => panic!("逾時也要照常交給 merge"),
+    }
+}
+
+/// W-M5：transcript_path 是 UNC 時不 tail（hook 照收，10 秒後依不變式 2 降級進串流）。
+#[test]
+fn unc_transcript_is_not_tailed() {
+    for t in ["\\\\nas\\share\\s1.jsonl", "//nas/share/s1.jsonl"] {
+        let mut p = TailPlanner::default();
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SessionStart",
+                                    "source": "startup", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SubagentStart",
+                                    "agent_id": "a1", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+    }
 }

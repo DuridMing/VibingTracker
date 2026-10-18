@@ -694,12 +694,18 @@ fn read_agent_meta(hook: &crate::hook::HookInput, tx: &mpsc::Sender<Input>) {
         return;
     };
     let path = crate::transcript::subagent_file(Path::new(transcript), agent, "meta.json");
+    let unc = crate::derive::is_unc(transcript);
     let (session, agent, tx) = (hook.session_id().to_string(), agent.to_string(), tx.clone());
     tokio::spawn(async move {
-        let meta = crate::transcript::read_agent_meta(path, AGENT_META_TRIES, || {
-            tokio::time::sleep(AGENT_META_EVERY)
-        })
-        .await;
+        // UNC 路徑不碰（#762 W-M5）：當成讀不到，merge 依呼叫順序配對
+        let meta = if unc {
+            crate::merge::AgentMetaRead::Unreadable
+        } else {
+            crate::transcript::read_agent_meta(path, AGENT_META_TRIES, || {
+                tokio::time::sleep(AGENT_META_EVERY)
+            })
+            .await
+        };
         // 讀不到也要說：merge 收到 Unreadable 就依呼叫順序配對，不必等滿上限
         let input = Input::AgentMeta {
             session,

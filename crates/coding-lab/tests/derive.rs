@@ -644,7 +644,7 @@ fn edit_hunk_is_bounded_in_bytes() {
     let path = f.to_str().unwrap();
     let mut m = Merger::new(Box::new(NoDanger));
     let edit = |new: String, id: &str| {
-        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
                "tool_input": {"file_path": path, "old_string": "OLD", "new_string": new}, "tool_use_id": id})
     };
     // 一行 1.5 MB

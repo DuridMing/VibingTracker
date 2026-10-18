@@ -41,6 +41,8 @@ pub const VIA_HEADER: &str = "x-coding-lab-via";
 pub const STOP_HEADER: &str = "x-coding-lab-stop";
 /// 放掉埠時最多等進行中的請求多久
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// Edit／Write 讀檔探測最多等多久（#762 W-M5）：逾時就不帶探測結果，hook 照常處理
+pub const PROBE_LIMIT: Duration = Duration::from_millis(300);
 
 struct HookState {
     tx: mpsc::Sender<Input>,
@@ -49,6 +51,8 @@ struct HookState {
     stop: Arc<Notify>,
     /// merge 的 channel 滿了而丟掉的 hook 數（之後給 /healthz）
     dropped: AtomicU64,
+    /// 讀檔探測的時限（毫秒）
+    probe_limit_ms: Arc<AtomicU64>,
 }
 
 /// 執行中的 hook 入口。
@@ -56,6 +60,7 @@ pub struct HookServer {
     pub addr: SocketAddr,
     closing: Arc<AtomicBool>,
     stop: Arc<Notify>,
+    probe_limit_ms: Arc<AtomicU64>,
     shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
@@ -64,6 +69,12 @@ impl HookServer {
     /// 決定要結束（或取消結束）：結束中 ensure 轉送的 hook 回 503，其他 hook 照收。
     pub fn set_closing(&self, closing: bool) {
         self.closing.store(closing, Ordering::SeqCst);
+    }
+
+    /// 讀檔探測的時限（預設 [`PROBE_LIMIT`]，0 表示不讀檔；測試用）。
+    pub fn set_probe_limit(&self, limit: Duration) {
+        self.probe_limit_ms
+            .store(limit.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// 收到 `POST /stop` 時完成（#700）；主迴圈拿它放進 select，和閒置結束、Ctrl-C 走同一條路。
@@ -98,7 +109,13 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
     let local = listener.local_addr()?;
     let closing = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(Notify::new());
-    let app = router_with(tx, closing.clone(), stop_flag.clone());
+    let probe_limit_ms = Arc::new(AtomicU64::new(PROBE_LIMIT.as_millis() as u64));
+    let app = router_with(
+        tx,
+        closing.clone(),
+        stop_flag.clone(),
+        probe_limit_ms.clone(),
+    );
     let (shutdown, stop) = oneshot::channel::<()>();
     let stop = async move {
         if stop.await.is_err() {
@@ -117,25 +134,24 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
         addr: local,
         closing,
         stop: stop_flag,
+        probe_limit_ms,
         shutdown: Some(shutdown),
         task,
     })
 }
 
-pub fn router(tx: mpsc::Sender<Input>) -> Router {
-    router_with(
-        tx,
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(Notify::new()),
-    )
-}
-
-fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>, stop: Arc<Notify>) -> Router {
+fn router_with(
+    tx: mpsc::Sender<Input>,
+    closing: Arc<AtomicBool>,
+    stop: Arc<Notify>,
+    probe_limit_ms: Arc<AtomicU64>,
+) -> Router {
     let state = Arc::new(HookState {
         tx,
         closing,
         stop,
         dropped: AtomicU64::new(0),
+        probe_limit_ms,
     });
     Router::new()
         .route(HOOK_PATH, post(handle))
@@ -197,19 +213,19 @@ async fn handle(
         Ok(mut hook) => {
             // Edit／Write 的目標檔要在回應之前讀（Claude Code 等 hook 回應才執行工具，#626）。
             // 讀檔是同步 I/O，放到 blocking 執行緒，不佔住處理其他 hook 的 worker
-            if crate::derive::needs_probe(&hook) {
-                hook = match tokio::task::spawn_blocking(move || {
-                    crate::derive::attach_probe(&mut hook);
-                    hook
-                })
-                .await
+            let limit = Duration::from_millis(state.probe_limit_ms.load(Ordering::SeqCst));
+            // 時限 0 表示不讀檔（和逾時一樣：不帶探測結果、照常處理）
+            if let Some(job) = crate::derive::probe_job(&hook).filter(|_| !limit.is_zero()) {
+                match tokio::time::timeout(limit, tokio::task::spawn_blocking(move || job.run()))
+                    .await
                 {
-                    Ok(h) => h,
-                    Err(e) => {
-                        crate::logging::log(&format!("hooks：讀檔探針失敗：{e}"));
-                        return StatusCode::OK;
-                    }
-                };
+                    Ok(Ok(probe)) => hook.set_probe(probe),
+                    Ok(Err(e)) => crate::logging::log(&format!("hooks：讀檔探針失敗：{e}")),
+                    Err(_) => crate::logging::log(&format!(
+                        "hooks：讀檔探測超過 {} ms，不帶探測結果",
+                        limit.as_millis()
+                    )),
+                }
             }
             if state.tx.try_send(Input::Hook { hook, ts_seen }).is_err() {
                 let n = state.dropped.fetch_add(1, Ordering::Relaxed) + 1;
