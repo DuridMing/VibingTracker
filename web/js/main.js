@@ -492,10 +492,24 @@ function renderAttention() {
   }), other ?? "");
 }
 
+// 送出 ack：沒連上就直接說，不讓那一列卡在「確認中…」；送出後 10 秒還沒被刪掉（斷線、hub 的上游離線）就解除（#747 F-2）
+const ACK_TIMEOUT_MS = 10_000;
+function sendAck(r) {
+  if (!client.ack({ session: r.session, kind: r.kind, ref: r.ref })) {
+    ui.ackError = "沒有連上 collector，連上之後再按";
+    return;
+  }
+  ackPending.add(r.id);
+  setTimeout(() => {
+    if (!ackPending.delete(r.id) || !store.attention.has(r.id)) return;
+    ui.ackError = "確認沒有回應（collector 或 hub 的上游沒有回覆），請再按一次";
+    render(true);
+  }, ACK_TIMEOUT_MS);
+}
+
 function ackRow(r) {
   ui.ackError = null;
-  ackPending.add(r.id);
-  client.ack({ session: r.session, kind: r.kind, ref: r.ref });
+  sendAck(r);
   render(true);
 }
 
@@ -509,10 +523,7 @@ function onServerError(m) {
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
   ui.ackError = null;
-  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) {
-    ackPending.add(r.id);
-    client.ack({ session: r.session, kind: r.kind, ref: r.ref });
-  }
+  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) sendAck(r);
   render(true);
 });
 
@@ -1357,6 +1368,8 @@ const pane = createSessionPane();
 const thinkingModeOf = (sessionId) => store.sessions.get(sessionId)?.thinking ?? ui.welcome?.thinking ?? null;
 pane.thinkingMode = thinkingModeOf;
 let paneMoreReq = null;
+// 逾時之後才到的回覆：對得上最後一次請求就照樣套用，不丟（#747 F-10）
+let paneMoreLate = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
 const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
 
@@ -1365,12 +1378,19 @@ function paneMore(replay = false) {
   if (paneMoreReq || !isSessionTab(ui.tab)) return;
   const beforePos = replay ? null : pane.stream.minPos().get(pane.session);
   if (!replay && !(beforePos > 1)) return;
-  paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
+  paneMoreLate = null;
+  paneMoreReq = {
+    session: pane.session,
+    beforePos,
+    // 逾時：放開「載入更多」讓使用者可以再按，晚到的回覆仍接受
+    timer: setTimeout(() => { paneMoreLate = paneMoreReq; paneMoreReq = null; paneHasMore(); }, MORE_TIMEOUT_MS),
+  };
   client.more({ session: pane.session, beforePos, limit: 200 });
 }
 function onPaneMore(m) {
-  clearTimeout(paneMoreReq.timer);
+  if (paneMoreReq) clearTimeout(paneMoreReq.timer);
   paneMoreReq = null;
+  paneMoreLate = null;
   paneView.prepended(pane.prepend(m.events));
   paneHasMore();
 }
@@ -1689,7 +1709,8 @@ $("#brWinClose").addEventListener("click", () => brWin.close());
 
 // 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
 const MORE_LIMIT = 200;
-const MORE_TIMEOUT_MS = 3000;
+// 回放或大量讀取時 collector 可能要好幾秒才回（C3），3 秒就丟太早（#747 F-10）
+const MORE_TIMEOUT_MS = 15_000;
 let moreReq = null;
 
 function requestMore() {
@@ -2012,7 +2033,8 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; notifier.connected(); loadSessions(); render(true); },
+    // 重連：斷線前送出的 ack 不知道有沒有到，待確認的全部解除，由新的 snapshot 決定哪些還在（#747 F-2）
+    welcome: (m) => { ui.welcome = m; ackPending.clear(); notifier.connected(); loadSessions(); render(true); },
     snapshot: (m) => {
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
@@ -2051,7 +2073,10 @@ const client = createClient({
       }
       render();
     },
-    more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
+    more: (m) => {
+      const req = paneMoreReq ?? paneMoreLate;
+      return req && m.session === req.session && m.beforePos === req.beforePos && pane.session === req.session ? onPaneMore(m) : onMore(m);
+    },
     onStatus: (s) => {
       if (ui.conn !== "incompatible") ui.conn = s;
       // WS 握手被 401 拒絕（cookie 過期、金鑰被撤銷）在瀏覽器只看得到斷線：用一個 API 請求確認，是就導去登入

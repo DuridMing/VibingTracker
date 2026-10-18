@@ -289,3 +289,29 @@ test("專案篩選（#669）：setSessionFilter 只影響可見性，不動 rows
   st.setSessionFilter(null);
   assert.ok(st.rows.every((r) => st.isVisible(r)));
 });
+
+test("展開中的卡片收到結果：高度清掉讓畫面重量，下面的行不會疊上來（#747 F-1）", () => {
+  const st = createStream();
+  st.apply([called(A, "t1", "Bash", { command: "make" }), placed(A, "t1", 1)]);
+  const r = row(st, 0);
+  r.expanded = true;
+  r.h = 40;
+  st.apply([result(A, "t1", true, "a\nb\nc")]);
+  assert.equal(r.h, 0, "展開中的行內容變了，要重新量高度");
+  const other = row(st, 0);
+  other.expanded = false;
+  other.h = 22;
+  st.apply([updated(A, "t1", "done")]);
+  assert.equal(other.h, 22, "沒展開的行高度不變，不必重量");
+});
+
+test("載入更多後停在上方（holding）時串流仍有硬上限：cap 的 3 倍（#766 F-4）", () => {
+  const st = createStream({ cap: 100 });
+  const batch = (n, start) => Array.from({ length: n }, (_, i) => think(A, start + i, "x"));
+  st.apply(batch(100, 1000));
+  st.prepend([batch(10, 900)]);
+  assert.equal(st.holding, true);
+  for (let k = 0; k < 50; k++) st.apply(batch(100, 2000 + k * 100));
+  assert.ok(st.rows.length <= 300, `holding 時留了 ${st.rows.length} 行`);
+  assert.equal(st.rows.at(-1).pos, 2000 + 49 * 100 + 99, "最新的行一定留著");
+});
