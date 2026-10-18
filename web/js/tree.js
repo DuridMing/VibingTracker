@@ -293,7 +293,8 @@ export function createFileTree() {
       const id = pl.toolUseId;
       if (isFail) {
         if (!id) continue;
-        const interrupted = !!pl.interrupted;
+        // Esc 中斷與使用者拒絕（denied）都不算失敗，但改動一樣收回（contracts §4「失敗」的計數，#745 D6）
+        const interrupted = !!pl.interrupted || !!pl.denied;
         if (toolPath.has(id)) failCard(id, interrupted, hits);
         else {
           pendingFail.set(id, interrupted);

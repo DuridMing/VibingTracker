@@ -785,7 +785,7 @@ function feedFiles(events) {
   // 只存檔案樹用得到的欄位：write 的 content、edit 的 hunk 不留（開幾天會累積數十 MB，#766 F-5）
   for (const e of mine) {
     const p = e.payload ?? {};
-    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted } });
+    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted, denied: p.denied } });
   }
   if (left.fileEvents.length > FILE_EVENTS_MAX) left.fileEvents.splice(0, left.fileEvents.length - FILE_EVENTS_MAX);
   let changedFiles = gitOp;
