@@ -388,6 +388,18 @@ impl Hub {
         {
             set_host(s, up);
         }
+        // 主頁時間軸回放（#729）：snapshot 與每個 frame 是同樣的形狀，包在裡面
+        if let Some(snap) = v.get_mut("snapshot") {
+            self.rewrite(up, snap);
+        }
+        for f in v
+            .get_mut("frames")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            self.rewrite(up, f);
+        }
     }
 
     /// 回傳快取裡有、新 snapshot 沒有的 session id（這台重連前後消失的列）

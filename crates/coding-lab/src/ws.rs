@@ -252,6 +252,7 @@ pub async fn serve_web(
         .route("/api/sessions/{id}/events", get(crate::api::events))
         .route("/api/files", get(crate::api::files))
         .route("/api/projects/events", get(crate::api::project_events))
+        .route("/api/projects/replay", get(crate::api::project_replay))
         .route("/api/branches", get(crate::api::branches))
         .route("/api/branch-diff", get(crate::api::branch_diff))
         .route("/api/graph", get(crate::api::graph))
