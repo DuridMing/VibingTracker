@@ -1499,6 +1499,20 @@ fn idle_before_restart_prompt_reports_run() {
     assert_eq!(r.statuses(), ["run"]);
 }
 
+/// 重啟前 done 已被使用者確認（store 標 acked，不再種回）：store 與 live 的 status 是 done，
+/// Tracker 從空的注意項目算出 run。下一個 prompt 要照樣送 run，不能因為「和 Tracker 自己的一樣」就不送（K-6）。
+#[test]
+fn acked_done_before_restart_prompt_reports_run() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.feed(prompt("again", 21_000));
+    assert_eq!(r.statuses(), ["run"]);
+    // 只補送一次：之後狀態沒變就不再送
+    r.feed(pre("t1", "ls", 21_100)).feed(ok("t1", 21_200));
+    assert_eq!(r.statuses(), ["run"]);
+}
+
 /// 重啟前就沒有 SessionEnd、之後也沒再回來的 session：沒有輸入滿 24 小時後一樣補 abandoned。
 #[test]
 fn session_abandoned_before_restart_is_ended_later() {
@@ -1593,4 +1607,66 @@ fn decayed_signals_are_dropped_without_changing_the_score() {
     t.tick(later);
     assert_eq!(t.signal_count(), 1, "只剩還沒衰減完的那個");
     assert_eq!(t.score(later).round(), before);
+}
+
+// ── 同一個 hook 收到兩次（K-3：URL 重複、裝了兩份 plugin）：依 (hook 名稱, tool_use_id) 只處理第一次
+
+#[test]
+fn duplicate_pre_tool_use_danger_is_cleared_by_its_post() {
+    let mut r = Run::with_rules();
+    r.feed(prompt("x", 1000))
+        .feed(pre("t1", "rm -rf /tmp/x", 1100))
+        .feed(pre("t1", "rm -rf /tmp/x", 1101))
+        .feed(ok("t1", 1300));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "danger", "t1"), a("cleared", "danger", "t1")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn duplicate_failure_hook_is_one_failure() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "cargo test", 1000))
+        .feed(fail("t1", 1100))
+        .feed(fail("t1", 1101));
+    assert!(
+        r.attention().is_empty(),
+        "只有一次失敗：{:?}",
+        r.attention()
+    );
+    let failed = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "tool.updated" && e.payload["status"] == "failed")
+        .count();
+    assert_eq!(failed, 1);
+}
+
+#[test]
+fn duplicate_pre_tool_use_edit_derives_once() {
+    let mut r = Run::new();
+    let edit = || {
+        hook(
+            "PreToolUse",
+            json!({ "tool_name": "Edit", "tool_use_id": "e1",
+                    "tool_input": { "file_path": "/p/a.rs", "old_string": "a", "new_string": "b" } }),
+            1000,
+        )
+    };
+    r.feed(edit()).feed(edit());
+    let count = |t: &str| r.evs.iter().filter(|e| e.type_name() == t).count();
+    assert_eq!(count("file.edit"), 1);
+    assert_eq!(count("tool.called"), 1);
+}
+
+#[test]
+fn same_hook_for_a_different_tool_is_not_a_duplicate() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "x", 1200))
+        .feed(fail("t2", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
 }

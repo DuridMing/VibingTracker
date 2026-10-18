@@ -137,6 +137,9 @@ pub struct Tracker {
     fail_open: HashMap<String, String>,
     idle: bool,
     ended: bool,
+    /// 重啟或移出記憶體後種回：store／live 的 status 可能和這裡算的不同（例如已確認的 done 不會種回），
+    /// 下一次重算不論有沒有變都送一次（K-6）
+    report_next: bool,
     signals: Vec<(Signal, u64)>,
     /// 最近 24 小時的 (時間, 費用)，CostSpike 用（#675）
     recent_cost: std::collections::VecDeque<(u64, f64)>,
@@ -160,6 +163,7 @@ impl Default for Tracker {
             fail_open: HashMap::new(),
             idle: false,
             ended: false,
+            report_next: false,
             signals: Vec::new(),
             recent_cost: Default::default(),
             last_spike: None,
@@ -375,12 +379,13 @@ impl Tracker {
         let _ = self.recompute(item.raised_at);
     }
 
-    /// 種回 session 是否已結束、是否中斷（D3：重啟或移出記憶體後回來）。不發 Event：live 與 store
-    /// 已經是這個狀態；之後狀態一變（例如新的 prompt 回到 run）才會照常送 `session.status`。
+    /// 種回 session 是否已結束、是否中斷（D3：重啟或移出記憶體後回來）。不發 Event；之後第一次重算
+    /// 一定送 `session.status`，因為 live 與 store 的狀態不一定和種回的相同（已確認的不種回，K-6）。
     pub fn seed_state(&mut self, ended: bool, idle: bool) {
         self.ended = ended;
         self.idle = idle;
         let _ = self.recompute(0);
+        self.report_next = true;
     }
 
     /// 是否中斷中（使用者按 Esc 之後、下一個 prompt 之前）。
@@ -586,9 +591,10 @@ impl Tracker {
                 _ => SessionState::Run,
             }
         };
-        if next == self.state {
+        if next == self.state && !self.report_next {
             return None;
         }
+        self.report_next = false;
         self.state = next;
         Some(Change::Status(SessionStatus {
             status: next,

@@ -114,6 +114,8 @@ struct Card {
     called: bool,
     /// 命中敏感規則（#654）：tool.result 帶 sensitive，遠端送出時剝除
     sensitive: bool,
+    /// 已處理過的工具 hook（[`tool_hook_bit`]）：同一個 hook 收到兩次只處理第一次（K-3）
+    hooks_seen: u8,
 }
 
 impl Card {
@@ -126,8 +128,20 @@ impl Card {
             finished: false,
             called: false,
             sensitive: false,
+            hooks_seen: 0,
         }
     }
+}
+
+/// 帶 tool_use_id、每張卡片最多一次的 hook。URL 重複或裝了兩份 plugin 時同一個 hook 會收到兩次（K-3）。
+fn tool_hook_bit(event: &str) -> Option<u8> {
+    Some(match event {
+        "PreToolUse" => 1,
+        "PostToolUse" => 2,
+        "PostToolUseFailure" => 4,
+        "PermissionDenied" => 8,
+        _ => return None,
+    })
 }
 
 #[derive(Default)]
@@ -773,6 +787,37 @@ impl Merger {
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
         let agent = self.agent_of_hook(&sid, h);
+        let once = tool_hook_bit(h.event_name()).zip(h.tool_use_id().map(str::to_string));
+        if let Some((bit, id)) = &once
+            && self
+                .sessions
+                .get(&sid)
+                .and_then(|s| s.cards.get(id))
+                .is_some_and(|c| c.hooks_seen & bit != 0)
+        {
+            return Vec::new();
+        }
+        let out = self.on_hook_once(h, &sid, agent, ts_seen);
+        // 只記在已經有的卡片上：背景 agent 先扣著的 PreToolUse 還沒有卡片，不能替它建（建了就當成已知）
+        if let Some((bit, id)) = once
+            && let Some(c) = self
+                .sessions
+                .get_mut(&sid)
+                .and_then(|s| s.cards.get_mut(&id))
+        {
+            c.hooks_seen |= bit;
+        }
+        out
+    }
+
+    fn on_hook_once(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        agent: String,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let sid = sid.to_string();
         let mut out = Vec::new();
         if agent == "bg" {
             let (prefix, done) = self.on_background_tool(h, &sid, ts_seen);
