@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -775,6 +775,8 @@ struct HubState {
     ups: Vec<UpHandle>,
     out: broadcast::Sender<Arc<Outgoing>>,
     web_root: Option<PathBuf>,
+    /// 啟動時的 token（W-M8）
+    token: String,
     instance: String,
     /// 上游 KPI「今天」用的時區：第一個明確帶 `utcOffsetMin` 的客戶端決定，之後不再變（#718：不然瀏覽器與
     /// 不帶時區的腳本輪流連就一直讓所有上游斷線重連）
@@ -859,12 +861,14 @@ impl Outgoing {
     }
 }
 
+/// `token`：啟動時產生、印在網址裡的 token（W-M8），見 [`new_token`]
 pub async fn serve(
     bind: SocketAddr,
     upstreams: Vec<Upstream>,
     web_root: Option<PathBuf>,
+    token: String,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    serve_with_backoff(bind, upstreams, web_root, Duration::from_secs(1)).await
+    serve_with_backoff(bind, upstreams, web_root, token, Duration::from_secs(1)).await
 }
 
 /// `backoff`：上游斷線後多久試著重連（之後翻倍到 30 秒；連上就歸零）
@@ -872,6 +876,7 @@ pub async fn serve_with_backoff(
     bind: SocketAddr,
     upstreams: Vec<Upstream>,
     web_root: Option<PathBuf>,
+    token: String,
     backoff: Duration,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -893,6 +898,7 @@ pub async fn serve_with_backoff(
         ups,
         out,
         web_root,
+        token,
         instance: format!(
             "hub-{}-{}",
             crate::now_ms(),
@@ -913,7 +919,7 @@ pub async fn serve_with_backoff(
         .route("/healthz", get(healthz))
         .route("/api/{*rest}", get(api_proxy))
         .fallback(get(static_file))
-        .layer(middleware::from_fn(gate))
+        .layer(middleware::from_fn_with_state(state.clone(), gate))
         .layer(middleware::map_response(crate::ws::no_framing))
         .with_state(state);
     let task = tokio::spawn(async move {
@@ -925,19 +931,107 @@ pub async fn serve_with_backoff(
     Ok((local, task))
 }
 
-/// hub 只綁本機、免金鑰：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）。
-/// hub 沒有金鑰驗證，反向代理轉來的（帶轉發標頭）一律拒絕：代理後面的人都會變成本機（S-1）。
-async fn gate(req: Request, next: Next) -> Response {
-    let path = req.uri().path();
+/// hub 的 cookie：和 collector 的名稱不同（cookie 不分埠，同一台的 4801 與 4802 會互相收到）
+pub const HUB_COOKIE: &str = "coding-lab-hub";
+
+/// hub 啟動時的 token（W-M8）：32 bytes 系統亂數的 base62，`coding-lab hub` 印在網址裡。
+pub fn new_token(rng: &mut dyn crate::keys::Rng) -> String {
+    crate::keys::random_base62(rng)
+}
+
+/// `/healthz` 是否帶了 token：沒有時不列上游
+#[derive(Clone, Copy)]
+struct Authed(bool);
+
+/// `/auth/login`：說明怎麼拿到網址。前端遇到 401 會導去這裡。
+const NEED_TOKEN_HTML: &str = "<!doctype html><html lang=\"zh-Hant\"><meta charset=\"utf-8\">\
+<title>coding-lab hub</title><body style=\"font-family:sans-serif;max-width:40em;margin:3em auto;line-height:1.6\">\
+<h1>需要 hub 的網址</h1><p>這個 hub 只接受 <code>coding-lab hub</code> 啟動時印出的網址（帶 <code>?token=</code>）。\
+請回到執行 <code>coding-lab hub</code> 的終端機，複製那個網址開啟；hub 重新啟動後要用新印出的網址。</p></body></html>";
+
+/// hub 只綁本機：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）。
+/// 反向代理轉來的（帶轉發標頭）一律拒絕：代理後面的人都會變成本機（S-1）。
+///
+/// 127.0.0.1 是整台機器共用的，hub 又拿著上游的金鑰（常是 operate）：`/api` 與 `/ws` 要帶啟動時的 token
+/// （`?token=`、`Authorization: Bearer`）或用它換到的 cookie，否則 401（W-M8）。`/healthz` 沒帶時不列上游。網頁帶 `?token=` 時換成
+/// HttpOnly、SameSite=Strict 的 cookie，再轉回不帶 token 的網址，token 不留在網址列與歷史紀錄。
+async fn gate(State(state): State<Arc<HubState>>, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
     if crate::ws::proxied(req.headers()) {
         return (StatusCode::FORBIDDEN, "hub 不接受反向代理轉來的連線").into_response();
     }
     if !crate::ws::host_is_loopback(req.headers()) {
         return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
     }
-    if (path.starts_with("/api/") || path == "/ws") && !crate::auth::same_origin(req.headers()) {
+    let api = path.starts_with("/api/") || path == "/ws";
+    if api && !crate::auth::same_origin(req.headers()) {
         return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
     }
+    let valid = |t: &str| {
+        !state.token.is_empty() && crate::keys::ct_eq(t.as_bytes(), state.token.as_bytes())
+    };
+    let from_query = req.uri().query().is_some_and(|q| {
+        q.split('&')
+            .any(|kv| kv.strip_prefix("token=").is_some_and(valid))
+    });
+    let authed = from_query
+        || crate::auth::cookie_named(req.headers(), HUB_COOKIE).is_some_and(|t| valid(&t))
+        || req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(valid);
+    if from_query && !api {
+        let rest: Vec<&str> = req
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("token="))
+            .collect();
+        // `//host` 與 `/\host` 會被瀏覽器當成別的網站
+        let base = if path.starts_with("//") || path.starts_with("/\\") {
+            "/"
+        } else {
+            path.as_str()
+        };
+        let location = if rest.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", rest.join("&"))
+        };
+        let cookie = format!(
+            "{HUB_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
+            state.token
+        );
+        return (
+            StatusCode::SEE_OTHER,
+            [
+                (axum::http::header::LOCATION, location),
+                (axum::http::header::SET_COOKIE, cookie),
+            ],
+        )
+            .into_response();
+    }
+    if api && !authed {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "要用 coding-lab hub 啟動時印出的網址（帶 token）開啟",
+        )
+            .into_response();
+    }
+    // 前端遇到 401 會導去這裡（collector 的登入頁）；hub 沒有登入，只說明怎麼拿到網址
+    if path == "/auth/login" {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            NEED_TOKEN_HTML,
+        )
+            .into_response();
+    }
+    // 網頁本身（HTML／JS／CSS）沒有資料，不擋：從別的網站點進來時，SameSite=Strict 的 cookie 在
+    // 轉址後的第一個請求不會送，擋了反而要重新整理一次；資料都在 /api 與 /ws
+    req.extensions_mut().insert(Authed(authed));
     next.run(req).await
 }
 
@@ -1363,7 +1457,17 @@ async fn on_client_message(
 
 // ── 本機 web：HTTP ─────────────────────────────────────────────────────────
 
-async fn healthz(State(state): State<Arc<HubState>>) -> Response {
+async fn healthz(
+    State(state): State<Arc<HubState>>,
+    Extension(Authed(authed)): Extension<Authed>,
+) -> Response {
+    // 沒帶 token 只回版本：上游的名稱與網址不給別的本機程序看（W-M8）
+    if !authed {
+        return json_response(
+            StatusCode::OK,
+            &json!({ "version": env!("CARGO_PKG_VERSION"), "protocol": crate::ws::PROTOCOL, "hub": true }),
+        );
+    }
     let online = state.hub().online();
     let ups: Vec<Value> = state
         .ups

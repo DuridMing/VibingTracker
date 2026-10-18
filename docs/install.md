@@ -97,7 +97,7 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 
 會印出版本、`user`（這個 collector 是哪個帳號的）、`open`（還開著的 session 數）、`sessions`（記憶體裡的 session 數，含 2 小時內結束的）等資訊。
 
-同一台機器上另一個帳號已經在用 coding-lab 時，4800 被它的 collector 佔著：你這個帳號的 hook 會被它丟掉，這個帳號不會被追蹤，`healthz` 印出「沒在跑」，`~/.coding-lab/collector.log` 有一行說明。目前一台機器只能有一個帳號使用（見 README「多人共用的伺服器」）。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
+同一台機器上另一個帳號已經在用 coding-lab 時，4800 被它的 collector 佔著：你這個帳號的 hook 會被它丟掉，這個帳號不會被追蹤，`healthz` 印出「沒在跑」，`~/.coding-lab/collector.log` 有一行說明。目前一台機器只能有一個帳號使用（見 README「多人共用的伺服器」）。Windows 與它的 WSL2 也算同一台：兩邊共用 4800，只在其中一邊裝 plugin。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
 
 collector 不用自己啟動：每個 session 開始時，plugin 會在它沒在跑時把它拉起來；所有 session 都結束、再閒置 10 分鐘後它會自己退出。
 
@@ -167,13 +167,13 @@ https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801�
 ~/.coding-lab/bin/coding-lab hub
 ```
 
-打開 <http://127.0.0.1:4802>：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
+打開 `coding-lab hub` 印出的網址（`http://127.0.0.1:4802/?token=…`）：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
 
 - 某台斷線（網路斷、重開機）：它的 session 標「離線」、分頁變淡，其他台照常；hub 每 1～30 秒重連，連回來會整頁重載那台的內容。
 - 「載入更多」、thinking 點開、檔案樹、分支視窗、回放、「已確認」都由 hub 轉給對應的那台；那台給 hub 的金鑰是 `view` 時按「已確認」會提示要 `operate` 金鑰。
-- hub 自己不存資料、只綁本機、不需要金鑰；要從別台看 hub，請對 hub 這台開 SSH 通道。
+- hub 自己不存資料、只綁本機。127.0.0.1 是整台機器共用的（同一台的其他帳號、其他程式都連得到），hub 又拿著上游的金鑰，所以每次啟動都產生新的 token、只印在執行它的終端機；第一次用網址開會換成 cookie，之後網址列不再帶 token。沒有 token 的 `/api`、`/ws` 回 401。hub 重新啟動後要用新印出的網址；頁面出現「需要 hub 的網址」就是這個原因。要從別台看 hub，請對 hub 這台開 SSH 通道。
 - 上游寫在 `~/.coding-lab/config.toml`（`[[hub.upstream]]`，含金鑰，檔案權限 600）；改埠用 `[hub] bind = "127.0.0.1:4802"` 或 `coding-lab hub --bind …`。上游網址只接受 `http://`：遠端一律走 tailnet（WireGuard 加密）或 SSH 通道。
-- `curl 127.0.0.1:4802/healthz` 看每台連上了沒。
+- `curl -H "Authorization: Bearer <token>" 127.0.0.1:4802/healthz` 看每台連上了沒（不帶 token 只回版本）。
 
 ## 同一台機器上有好幾個專案
 
@@ -252,6 +252,7 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 - `coding-lab key list` 的狀態是不是「已撤銷」或「已到期」。
 - 連續失敗 10 次會被擋一分鐘（每個來源 IP 各算）。
 - 伺服器的 `~/.coding-lab/collector.log` 會寫被拒的原因；`keys.json` 權限不是 600 時所有金鑰都會失效，照 log 裡的 `chmod 600` 修。
+- 每次 `key create`／`key revoke` 寫入前，原本的內容會留在 `keys.json.bak`。`keys.json` 壞掉（log 寫「格式錯誤」）時，確認 `.bak` 的內容後把它改名回 `keys.json` 就能還原；`.bak` 是上一版，之後建的那一把要重建。
 
 **SSH 通道進來也被要求登入**
 

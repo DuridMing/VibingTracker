@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "common/sh.rs"]
+mod sh;
+
 static N: AtomicU32 = AtomicU32::new(0);
 
 struct Env {
@@ -1498,22 +1501,20 @@ fn ensure_returns_before_the_collector_has_written_its_info() {
 }
 
 /// 同一件事經過 plugin 的 wrapper（Claude Code 實際的呼叫路徑）：wrapper 自己也不能把 pipe 交給 ensure。
-/// 沒有 `sh` 的機器（沒裝 Git Bash 的 Windows）跳過。
+/// Windows 用 Git Bash 的 sh（不一定在 PATH 上，#783）；找不到時印出原因後略過，CODING_LAB_REQUIRE_SH=1 時失敗。
 #[test]
 fn wrapper_ensure_releases_the_callers_std_pipes_too() {
-    if Command::new("sh").arg("-c").arg("true").status().is_err() {
-        eprintln!("沒有 sh，跳過");
+    let Some(sh) = sh::sh_or_skip("wrapper_ensure_releases_the_callers_std_pipes_too") else {
         return;
-    }
+    };
     let e = env(30);
     let start =
         json!({"session_id": "s713", "hook_event_name": "SessionStart", "source": "startup",
                        "transcript_path": e.home.join("t713.jsonl"), "cwd": "/p"})
         .to_string();
-    let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/bin/coding-lab");
-    let mut c = Command::new("sh");
-    c.arg(&wrapper)
-        .arg("ensure")
+    // 真的 coding-lab.exe 是 Windows 原生程式：它讀的路徑照原樣給，不換成 MSYS 的
+    let mut c = sh::wrapper_cmd(&sh);
+    c.arg("ensure")
         .env("CODING_LAB_BIN", env!("CARGO_BIN_EXE_coding-lab"))
         .env("CODING_LAB_HOME", &e.home);
     let (status, out, err) = run_piped(c, &start);

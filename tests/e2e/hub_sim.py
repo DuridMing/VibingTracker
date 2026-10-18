@@ -50,6 +50,25 @@ def http_get(port, path, headers=None):
         return r.status, body.decode(errors="replace")
 
 
+# hub 啟動時印出的 token（W-M8）：hub 的 HTTP 與 WS 都要帶
+HUB = {"port": None, "token": None}
+
+
+def hub_get(path):
+    return http_get(HUB["port"], path, {"Authorization": f"Bearer {HUB['token']}"})
+
+
+def hub_token(log_path, timeout=10):
+    """從 hub 的輸出讀出網址裡的 token。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        m = re.search(r"token=([A-Za-z0-9]+)", log_path.read_text(errors="replace"))
+        if m:
+            return m.group(1)
+        time.sleep(0.1)
+    raise SystemExit("hub 沒印出帶 token 的網址：" + log_path.read_text(errors="replace"))
+
+
 def post_hook(port, payload):
     c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     c.request("POST", "/hook", body=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
@@ -147,7 +166,7 @@ class HubListener:
     """訂 hub 的 `*`，把 welcome／snapshot／frame／error 收進清單。"""
 
     def __init__(self, port, utc_offset_min=None):
-        self.ws = WS(port)
+        self.ws = WS(port, {"Authorization": f"Bearer {HUB['token']}"})
         self.msgs = []
         # 模擬前端 store.js 的 sessions 彙總列：snapshot 整批取代、frame 依 id upsert、deleted 移除（#723）
         self.store = {}
@@ -245,10 +264,14 @@ def main():
     hub_log = open(hub.home / "hub.log", "ab")
     hub_proc = subprocess.Popen([str(BIN), "hub"], env=hub.env(), stdout=hub_log, stderr=hub_log)
     try:
-        t_up = wait_until(lambda: http_get(hub_port, "/healthz")[0] == 200, 10, "hub 起來")
-        h = http_get(hub_port, "/healthz")[1]
+        HUB["port"], HUB["token"] = hub_port, hub_token(hub.home / "hub.log")
+        # W-M8：沒帶 token 的 /api 是 401、healthz 不列上游；帶了才看得到
+        st, _ = http_get(hub_port, "/api/sessions")
+        check(st == 401, f"hub 沒帶 token 的 /api/sessions 是 401（{st}）")
+        t_up = wait_until(lambda: hub_get("/healthz")[0] == 200, 10, "hub 起來")
+        h = hub_get("/healthz")[1]
         check(h.get("hub") is True, f"hub /healthz 標 hub: true（{t_up:.2f} 秒起來）")
-        both = wait_until(lambda: all(u["online"] for u in http_get(hub_port, "/healthz")[1]["upstreams"]), 15, "兩台 online")
+        both = wait_until(lambda: all(u["online"] for u in hub_get("/healthz")[1]["upstreams"]), 15, "兩台 online")
         check(True, f"兩台上游 online（{both:.2f} 秒）：{[u['name'] for u in h['upstreams']]}")
 
         # 像瀏覽器一樣帶時區：hub 用第一個明確的時區連上游（#718），之後的客戶端不再讓上游重連
@@ -267,8 +290,8 @@ def main():
         for pre, post in [tool_pair(sid_b, cwd_b, "echo beta-1")]:
             assert post_hook(beta.hook_port, pre) == 200 and post_hook(beta.hook_port, post) == 200
 
-        wait_until(lambda: {s["id"] for s in http_get(hub_port, "/api/sessions")[1]["sessions"]} >= {sid_a, sid_b}, 15, "hub /api/sessions 有兩台的 session")
-        rows = {s["id"]: s for s in http_get(hub_port, "/api/sessions")[1]["sessions"]}
+        wait_until(lambda: {s["id"] for s in hub_get("/api/sessions")[1]["sessions"]} >= {sid_a, sid_b}, 15, "hub /api/sessions 有兩台的 session")
+        rows = {s["id"]: s for s in hub_get("/api/sessions")[1]["sessions"]}
         check(rows[sid_a].get("host") == "alpha" and rows[sid_b].get("host") == "beta", f"/api/sessions 每列帶 host：{rows[sid_a].get('host')}, {rows[sid_b].get('host')}")
 
         time.sleep(1.0)
@@ -294,32 +317,32 @@ def main():
         check(not errs, "本機（免金鑰）上游的 ack 沒有 error")
 
         # 轉發：thinking API 與 /api/sessions/<id>/events 轉給擁有 session 的那台
-        st, body = http_get(hub_port, f"/api/sessions/{sid_a}/events?limit=10")
+        st, body = hub_get(f"/api/sessions/{sid_a}/events?limit=10")
         check(st == 200 and all(e.get("host") == "alpha" for e in body.get("events", [])), f"/api/sessions/<alpha 的 id>/events 經 hub 轉發且加 host（{st}）")
-        st, _ = http_get(hub_port, f"/api/sessions/{uuid.uuid4()}/events")
+        st, _ = hub_get(f"/api/sessions/{uuid.uuid4()}/events")
         check(st == 404, f"不認得的 session 回 404（{st}）")
 
         # 斷線：SIGKILL alpha
         listener.take()
         alpha.kill()
-        t_off = wait_until(lambda: not [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"], 60, "alpha 標 offline")
+        t_off = wait_until(lambda: not [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"], 60, "alpha 標 offline")
         check(True, f"alpha 被 kill 後 hub 在 {t_off:.1f} 秒標 online=false")
         time.sleep(0.5)
         off_rows = listener.session_rows(listener.take())
         check(off_rows.get(sid_a, {}).get("offline") is True, f"alpha 的 sessions 列送 offline: true：{off_rows.get(sid_a, {}).get('offline')}")
-        beta_up = [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"]
+        beta_up = [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"]
         check(beta_up, "beta 仍 online")
         pre, post = tool_pair(sid_b, cwd_b, "echo beta-while-alpha-down")
         assert post_hook(beta.hook_port, pre) == 200 and post_hook(beta.hook_port, post) == 200
         time.sleep(1.0)
         evs = listener.events(listener.take())
         check(any(e.get("session") == sid_b and e.get("type") == "tool.called" for e in evs), "alpha 離線期間 beta 的事件照常到 hub")
-        st, _ = http_get(hub_port, f"/api/sessions/{sid_a}/events?limit=1")
+        st, _ = hub_get(f"/api/sessions/{sid_a}/events?limit=1")
         check(st == 502, f"離線上游的轉發回 502（{st}）")
 
         # 重新拉起 alpha
         alpha.start()
-        t_on = wait_until(lambda: [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"], 60, "alpha 回到 online")
+        t_on = wait_until(lambda: [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"], 60, "alpha 回到 online")
         check(True, f"alpha 重啟後 hub 在 {t_on:.1f} 秒重連")
         time.sleep(0.5)
         back = listener.take()
@@ -334,16 +357,16 @@ def main():
         # 半開連線（#718）：SIGSTOP beta，TCP 不會 FIN；hub 靠心跳（10 秒 Ping、15 秒沒訊息）才會標離線
         listener.take()
         beta.pause()
-        t_half = wait_until(lambda: not [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 40, "SIGSTOP 的 beta 標 offline")
+        t_half = wait_until(lambda: not [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 40, "SIGSTOP 的 beta 標 offline")
         # 離線判定是「最後一次訊息後 15 秒」，beta 在 SIGSTOP 前可能已經安靜了幾秒，所以是 5～25 秒
         check(5 <= t_half <= 25, f"SIGSTOP（不 FIN）後 hub 在 {t_half:.1f} 秒標 online=false（最後一次訊息後 15 秒；沒有心跳前 54 秒都不會標）")
         time.sleep(0.5)
         off_rows = listener.session_rows(listener.take())
         check(off_rows.get(sid_b, {}).get("offline") is True, f"beta 的 sessions 列送 offline: true：{off_rows.get(sid_b, {}).get('offline')}")
-        alpha_up = [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"]
+        alpha_up = [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "alpha"][0]["online"]
         check(alpha_up, "beta 半開期間 alpha 仍 online")
         beta.resume()
-        t_back = wait_until(lambda: [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "SIGCONT 後 beta 回到 online")
+        t_back = wait_until(lambda: [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "SIGCONT 後 beta 回到 online")
         check(True, f"SIGCONT 後 hub 在 {t_back:.1f} 秒重連 beta")
         time.sleep(0.5)
         rows = listener.session_rows(listener.take())
@@ -354,12 +377,12 @@ def main():
         # #723：上游在離線期間換了一批 session（kill 後用全新的資料目錄重開），重連後舊的列不能留著標離線
         old_ids = set(listener.store)
         beta.kill()
-        wait_until(lambda: not [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 30, "beta kill 後標 offline")
+        wait_until(lambda: not [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 30, "beta kill 後標 offline")
         time.sleep(0.5)
         check(listener.offline_ids(), f"beta 掛掉：store 裡 beta 的列標 offline：{listener.offline_ids()}")
         beta.reset_home()
         beta.start()
-        wait_until(lambda: [u for u in http_get(hub_port, "/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "全新 beta 回到 online")
+        wait_until(lambda: [u for u in hub_get("/healthz")[1]["upstreams"] if u["name"] == "beta"][0]["online"], 60, "全新 beta 回到 online")
         time.sleep(1.0)
         sid_b2 = str(uuid.uuid4())
         pre, post = tool_pair(sid_b2, cwd_b, "echo beta-fresh")
@@ -370,12 +393,12 @@ def main():
         check(not listener.offline_ids(), f"重連後沒有任何列還標 offline：{listener.offline_ids()}")
 
         # 時區（#718）：帶 +480 與不帶 offset 的客戶端輪流連，上游不該重連
-        before = {u["name"]: u.get("connects") for u in http_get(hub_port, "/healthz")[1]["upstreams"]}
+        before = {u["name"]: u.get("connects") for u in hub_get("/healthz")[1]["upstreams"]}
         for off in (480, None, 0, 480):
             extra = HubListener(hub_port, utc_offset_min=off)
             time.sleep(1.2)
             extra.stop.set()
-        after = {u["name"]: u.get("connects") for u in http_get(hub_port, "/healthz")[1]["upstreams"]}
+        after = {u["name"]: u.get("connects") for u in hub_get("/healthz")[1]["upstreams"]}
         check(after == before, f"不同時區的客戶端輪流連，上游連線數不變：{before} → {after}")
         listener.stop.set()
     finally:

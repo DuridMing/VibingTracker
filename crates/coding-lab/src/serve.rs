@@ -436,6 +436,10 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             // 結束、中斷的狀態也種回（D3）：否則 idle 的 session 下一個 prompt 不送 run、
             // 已結束的被補花費建回記憶體後會被當成丟棄
             merger.resume_state(&sid, c.ended_at, c.status == "idle", c.last_seen);
+            // 已確認的 done／fail 不種回注意項目，狀態另外交回：上一輪晚到的行不會把它算成 run（#749）
+            if let Ok(st) = serde_json::from_value(json!(c.status)) {
+                merger.resume_status(&sid, st);
+            }
         }
     }
     // 還沒解除的注意項目種回 merge（#679）：否則之後的 prompt、工具結束解不掉重啟前的列

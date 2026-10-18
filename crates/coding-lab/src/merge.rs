@@ -13,8 +13,8 @@ use crate::event::{
     AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
     FileRead, FileWrite, Hunk, HunkSource, LineRef, ModelChanged, Payload, Placement,
-    PromptSubmitted, SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus,
-    ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
+    PromptSubmitted, SessionEnded, SessionStarted, SessionState, ToolCalled, ToolPlaced,
+    ToolResult, ToolStatus, ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
@@ -353,6 +353,8 @@ struct Resumed {
     cards: Vec<(String, Card)>,
     /// 重啟前每個檔最後算過 usage 的 message.id（K-13）
     last_message: HashMap<String, String>,
+    /// store 的 session 狀態（見 [`Merger::resume_status`]）
+    status: Option<SessionState>,
 }
 
 impl Merger {
@@ -454,6 +456,12 @@ impl Merger {
         r.last_seen = Some(last_seen);
     }
 
+    /// collector 重啟時，把 store 的 session 狀態交給 merge：已確認（不種回注意項目）的 done／fail 在沒重啟也會解除它的
+    /// 事件之前照樣是這個狀態，上一輪晚到的行不會把它算成 run（#749）。
+    pub fn resume_status(&mut self, sid: &str, status: SessionState) {
+        self.resumed.entry(sid.to_string()).or_default().status = Some(status);
+    }
+
     /// collector 重啟時，把 store 裡還開著（未解除、未確認）的注意項目交給 merge，session 回到記憶體時
     /// 種回 Tracker，之後的 prompt、工具結束才解得掉它們。`agent` 是 fail 的連續失敗所屬的 agent。
     pub fn resume_attention(
@@ -498,6 +506,9 @@ impl Merger {
                         s.staged.insert((t, id.clone()));
                     }
                     s.cards.insert(id, card);
+                }
+                if let Some(st) = r.status {
+                    s.status.seed_status(st);
                 }
                 s.status.seed_state(r.ended_at.is_some(), r.idle);
             }
@@ -702,6 +713,7 @@ impl Merger {
                     // 移出前暫存的卡片早就逾時降級了
                     cards: Vec::new(),
                     last_message: s.last_message,
+                    status: s.status.seeded_status(),
                 };
                 self.resumed.insert(id, r);
             }

@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 static N: AtomicU32 = AtomicU32::new(0);
+/// hub 啟動時的 token（W-M8）：測試用固定值，正式由 `coding-lab hub` 產生
+const TOKEN: &str = "hubTestToken0123456789abcdefghijklmnopqrstu";
 
 fn tmp(name: &str) -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -482,7 +484,9 @@ async fn upstream(web: &Arc<WebState>) -> SocketAddr {
 }
 
 async fn connect(addr: SocketAddr) -> Ws {
-    let req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
     tokio_tungstenite::connect_async(req).await.unwrap().0
 }
 
@@ -514,7 +518,7 @@ async fn recv_until(ws: &mut Ws, pred: impl Fn(&Value) -> bool) -> Value {
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Value) {
-    let r = hub::http_get(&format!("http://{addr}"), path, None)
+    let r = hub::http_get(&format!("http://{addr}"), path, Some(TOKEN))
         .await
         .unwrap();
     (
@@ -546,7 +550,7 @@ async fn hub_merges_two_collectors_and_follows_frames_from_both() {
             key: None,
         },
     ];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
 
@@ -719,6 +723,7 @@ async fn upstream_going_away_marks_its_sessions_offline_and_reconnect_restores_t
         "127.0.0.1:0".parse().unwrap(),
         ups,
         None,
+        TOKEN.into(),
         Duration::from_millis(100),
     )
     .await
@@ -814,7 +819,7 @@ async fn clients_with_different_offsets_do_not_make_the_hub_reconnect_its_upstre
         url: format!("http://{addr_a}"),
         key: None,
     }];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     let connects = |h: &Value| h["upstreams"][0]["connects"].as_u64().unwrap_or(0);
@@ -901,7 +906,7 @@ async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
             key: None,
         },
     ];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     let mut ws = connect(hub_addr).await;
@@ -970,13 +975,18 @@ async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
 /// hub 沒有金鑰驗證，反向代理轉來的連線（帶轉發標頭）一律 403：否則代理後面的任何人都是本機（S-1）。
 #[tokio::test]
 async fn hub_refuses_reverse_proxied_requests() {
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), Vec::new(), None)
-        .await
-        .unwrap();
+    let (hub_addr, _task) = hub::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Vec::new(),
+        None,
+        TOKEN.into(),
+    )
+    .await
+    .unwrap();
     let get = |extra: &'static str| async move {
         let mut s = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
         let req = format!(
-            "GET /api/sessions HTTP/1.1\r\nHost: {hub_addr}\r\n{extra}Connection: close\r\n\r\n"
+            "GET /api/sessions HTTP/1.1\r\nHost: {hub_addr}\r\nAuthorization: Bearer {TOKEN}\r\n{extra}Connection: close\r\n\r\n"
         );
         tokio::io::AsyncWriteExt::write_all(&mut s, req.as_bytes())
             .await
@@ -1020,7 +1030,7 @@ async fn hub_finds_the_owner_of_a_project_that_is_only_in_an_upstreams_store() {
         url: format!("http://{up}"),
         key: None,
     }];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     // 等 hub 連上上游、快取有 live1
@@ -1160,7 +1170,7 @@ async fn hub_sessions_asks_upstreams_in_parallel_and_respects_limit() {
             key: None,
         },
     ];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     for _ in 0..100 {
@@ -1240,7 +1250,7 @@ async fn hub_relays_non_rewritten_api_bytes_unchanged() {
         url: format!("http://{up}"),
         key: None,
     }];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     let enc: String = cwd
@@ -1267,7 +1277,7 @@ async fn hub_relays_non_rewritten_api_bytes_unchanged() {
     let direct = hub::http_get(&format!("http://{up}"), &path, None)
         .await
         .unwrap();
-    let via = hub::http_get(&format!("http://{hub_addr}"), &path, None)
+    let via = hub::http_get(&format!("http://{hub_addr}"), &path, Some(TOKEN))
         .await
         .unwrap();
     assert_eq!(direct.status, 200);
@@ -1279,4 +1289,112 @@ async fn hub_relays_non_rewritten_api_bytes_unchanged() {
     // 要改寫的照舊帶 host
     let (_, ev) = http_get(hub_addr, "/api/sessions/s1/events?limit=5").await;
     assert_eq!(ev["events"][0]["host"], "alpha", "{ev}");
+}
+
+/// 不經 helper 的原始請求：回 (狀態碼, 標頭, 內文)。
+async fn raw(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> (u16, String, String) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut s, req.as_bytes())
+        .await
+        .unwrap();
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut s, &mut out)
+        .await
+        .unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let code = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (code, head.to_string(), body.to_string())
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+/// W-M8（#782）：4802 是整台機器共用的 127.0.0.1，hub 又拿著上游的金鑰（常是 operate）。
+/// 沒有啟動時印出的 token、也沒有用它換到的 cookie，`/api` 與 `/ws` 一律 401。
+#[tokio::test]
+async fn hub_requires_its_startup_token_then_a_cookie() {
+    let (hub_addr, _task) = hub::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Vec::new(),
+        None,
+        TOKEN.into(),
+    )
+    .await
+    .unwrap();
+    // 什麼都沒帶、帶錯的 token／cookie：401
+    for extra in [
+        vec![],
+        vec![("Authorization", "Bearer nope")],
+        vec![("Cookie", "coding-lab-hub=nope")],
+    ] {
+        let (code, _, _) = raw(hub_addr, "/api/sessions", &extra).await;
+        assert_eq!(code, 401, "{extra:?}");
+    }
+    let (code, _, _) = raw(hub_addr, "/api/sessions?token=nope", &[]).await;
+    assert_eq!(code, 401);
+    let ws = tokio_tungstenite::connect_async(format!("ws://{hub_addr}/ws")).await;
+    match ws {
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 401),
+        other => panic!("沒帶 token 的 WS 要 401：{:?}", other.map(|_| ())),
+    }
+    // 前端遇到 401 會導去 /auth/login：說明要用 hub 印出的網址開
+    let (code, head, body) = raw(hub_addr, "/auth/login", &[]).await;
+    assert_eq!(code, 200);
+    assert!(
+        header(&head, "content-type")
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(
+        body.contains("coding-lab hub"),
+        "要說明怎麼拿到網址：{body}"
+    );
+    assert!(!body.contains(TOKEN));
+    // healthz 不用 token，但沒有 token 時不列上游
+    let (code, _, body) = raw(hub_addr, "/healthz", &[]).await;
+    assert_eq!(code, 200);
+    let h: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(h["hub"], true);
+    assert!(h.get("upstreams").is_none(), "{h}");
+
+    // 印出的網址：token 換 cookie，轉回不帶 token 的網址（token 不留在網址列與歷史紀錄）
+    let (code, head, _) = raw(hub_addr, &format!("/?token={TOKEN}"), &[]).await;
+    assert_eq!(code, 303);
+    assert_eq!(header(&head, "location"), Some("/"));
+    let set = header(&head, "set-cookie").expect("要發 cookie");
+    for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(set.contains(attr), "{set}");
+    }
+    let cookie = set.split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("coding-lab-hub="), "{cookie}");
+
+    // cookie 與 Bearer 都可以用
+    let (code, _, _) = raw(hub_addr, "/api/sessions", &[("Cookie", &cookie)]).await;
+    assert_eq!(code, 200);
+    let (code, _, _) = raw(
+        hub_addr,
+        "/api/sessions",
+        &[("Cookie", &format!("other=1; {cookie}"))],
+    )
+    .await;
+    assert_eq!(code, 200, "和別的 cookie 一起送也認得");
+    let bearer = format!("Bearer {TOKEN}");
+    let (code, _, body) = raw(hub_addr, "/healthz", &[("Authorization", &bearer)]).await;
+    assert_eq!(code, 200);
+    let h: Value = serde_json::from_str(&body).unwrap();
+    assert!(h["upstreams"].is_array(), "有 token 才列上游：{h}");
+    let mut req = format!("ws://{hub_addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let mut ws = tokio_tungstenite::connect_async(req).await.unwrap().0;
+    send(&mut ws, json!({"op": "hello", "protocol": 1})).await;
+    assert_eq!(recv(&mut ws).await["t"], "welcome");
 }

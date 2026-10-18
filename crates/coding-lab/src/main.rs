@@ -268,23 +268,26 @@ fn hub_inner(cfg: Config, args: HubArgs) -> Result<(), String> {
                 None => cfg.hub_bind,
             };
             if !bind.ip().is_loopback() {
-                return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
+                return Err(format!("hub 的 web 只能綁本機位址，收到 {bind}"));
             }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(worker_threads())
                 .enable_all()
                 .build()
                 .map_err(|e| format!("無法建立 runtime：{e}"))?;
+            // 127.0.0.1 是整台機器共用的：每次啟動產生新的 token，只印在這個終端機（W-M8）
+            let token = coding_lab::hub::new_token(&mut coding_lab::keys::SystemRng);
             rt.block_on(async {
                 let (addr, task) = coding_lab::hub::serve(
                     bind,
                     cfg.hub_upstreams.clone(),
                     cfg.web_root_or_bundled(),
+                    token.clone(),
                 )
                 .await
                 .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
                 eprintln!(
-                    "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
+                    "coding-lab hub：http://{addr}/?token={token}（上游：{}）\n用這個網址開；hub 重新啟動後要用新印出的網址。Ctrl-C 結束",
                     cfg.hub_upstreams
                         .iter()
                         .map(|u| format!("{} {}", u.name, u.url))
@@ -530,7 +533,8 @@ fn key(cmd: KeyCommand) -> ExitCode {
 fn key_inner(cfg: Config, cmd: KeyCommand) -> Result<(), String> {
     let now = coding_lab::now_ms();
     let mut rng = SystemRng;
-    let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
+    // 只讀的子命令用這份；create／revoke 在鎖裡重讀（KeyStore::update，W-L13）
+    let store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
     match cmd {
         KeyCommand::Create {
             name,
@@ -538,9 +542,15 @@ fn key_inner(cfg: Config, cmd: KeyCommand) -> Result<(), String> {
             expires,
         } => {
             let expires_ms = coding_lab::keys::parse_expires(&expires, now)?;
-            let token = store.create(&name, scope, expires_ms, now, &mut rng);
-            store.save(&cfg.home)?;
-            let id = store.list().last().map(|k| k.id.as_str()).unwrap_or("");
+            let (token, id) = KeyStore::update(&cfg.home, &mut rng, |store, rng| {
+                let token = store.create(&name, scope, expires_ms, now, rng);
+                let id = store
+                    .list()
+                    .last()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_default();
+                Ok(((token, id), true))
+            })?;
             println!("金鑰（只顯示這一次，請現在複製）：\n\n    {token}\n");
             println!(
                 "id {id}　name {name}　scope {}　到期 {}",
@@ -644,13 +654,16 @@ fn key_inner(cfg: Config, cmd: KeyCommand) -> Result<(), String> {
             Ok(())
         }
         KeyCommand::Revoke { id } => {
-            if store.get(&id).is_none() {
-                return Err(format!(
-                    "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
-                ));
-            }
-            if store.revoke(&id, now) {
-                store.save(&cfg.home)?;
+            let revoked = KeyStore::update(&cfg.home, &mut rng, |store, _| {
+                if store.get(&id).is_none() {
+                    return Err(format!(
+                        "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
+                    ));
+                }
+                let revoked = store.revoke(&id, now);
+                Ok((revoked, revoked))
+            })?;
+            if revoked {
                 println!("已撤銷 {id}，持有這把金鑰的連線下一次請求起失效");
             } else {
                 println!("{id} 先前已撤銷");
