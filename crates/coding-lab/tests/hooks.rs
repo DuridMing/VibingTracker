@@ -623,3 +623,95 @@ fn restart_reads_a_fresh_file_with_no_recorded_line_from_the_start() {
         "{a:?}"
     );
 }
+
+// ── hook 埠的來源檢查（#762 S-4、D10、contracts §7）：瀏覽器裡任何網頁都能對 127.0.0.1:4800 送 no-cors 的
+// POST（text/plain、不觸發 preflight），偽造 session、危險指令，或 POST /stop 關掉 collector
+
+async fn raw(addr: SocketAddr, req: String) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+fn hook_req(headers: &str, body: &str) -> String {
+    format!(
+        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn stop_req(headers: &str) -> String {
+    format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH
+    )
+}
+
+#[tokio::test]
+async fn hook_with_an_origin_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    let resp = raw(
+        addr,
+        hook_req(
+            "Origin: https://attacker.example\r\nContent-Type: application/json\r\n",
+            &body,
+        ),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    assert!(rx.try_recv().is_err(), "偽造的 hook 不能進 merge");
+}
+
+#[tokio::test]
+async fn hook_that_is_not_json_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    for headers in ["Content-Type: text/plain;charset=UTF-8\r\n", ""] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 415"), "{headers:?}：{resp}");
+    }
+    assert!(rx.try_recv().is_err());
+    // Claude Code 送的是 application/json（帶參數、大小寫不同也算）
+    for headers in [
+        "Content-Type: application/json\r\n",
+        "content-type: Application/JSON; charset=utf-8\r\n",
+    ] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{headers:?}：{resp}");
+        assert!(matches!(rx.try_recv(), Ok(Input::Hook { .. })));
+    }
+}
+
+#[tokio::test]
+async fn stop_needs_its_own_header_and_no_origin() {
+    let (tx, _rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    let stop = server.stop_requested();
+    for headers in [
+        "",
+        "Content-Type: text/plain\r\n",
+        "Origin: https://attacker.example\r\nX-Coding-Lab-Stop: 1\r\n",
+    ] {
+        let resp = raw(addr, stop_req(headers)).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "{headers:?}：{resp}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stop.notified())
+            .await
+            .is_err(),
+        "被拒的 stop 不能觸發結束"
+    );
+    let resp = raw(addr, stop_req("X-Coding-Lab-Stop: 1\r\n")).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    tokio::time::timeout(Duration::from_secs(2), stop.notified())
+        .await
+        .expect("coding-lab stop 帶的標頭要能結束");
+}

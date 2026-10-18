@@ -914,8 +914,9 @@ fn stop() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {hook}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        coding_lab::hooks::STOP_PATH
+        "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH,
+        coding_lab::hooks::STOP_HEADER
     );
     if !http_once(hook, &req).is_ok_and(|r| r.starts_with(b"HTTP/1.1 200")) {
         eprintln!(

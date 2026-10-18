@@ -835,6 +835,19 @@ fn failed(e: &Env) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(e.home.join("collector.failed")).ok()?).ok()
 }
 
+/// 背景的 collector 寫好 collector.failed：ensure 可能比它先回來（例如佔著埠的程式接了連線不回應，
+/// ensure 轉送逾時就結束），負載高時 collector 判斷「埠被別的程式佔用」也要更久（T-4）
+fn wait_failed(e: &Env) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(f) = failed(e) {
+            return f;
+        }
+        assert!(Instant::now() < deadline, "要寫 collector.failed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -896,7 +909,7 @@ fn ensure_gives_up_fast_when_the_store_is_from_a_newer_version() {
     let out = ensure(&e, SESSION_START);
     assert!(out.status.success() && out.stdout.is_empty());
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-    let f = failed(&e).expect("要寫 collector.failed");
+    let f = wait_failed(&e);
     assert!(
         f["file"]
             .as_str()
@@ -923,7 +936,7 @@ fn ensure_gives_up_fast_when_the_hook_port_belongs_to_another_program() {
     let out = ensure(&e, SESSION_START);
     assert!(out.status.success() && out.stdout.is_empty());
     assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
-    let f = failed(&e).expect("要寫 collector.failed");
+    let f = wait_failed(&e);
     assert_eq!(f["addr"], format!("127.0.0.1:{}", e.hook), "{f}");
     drop(squatter);
 }
@@ -1103,7 +1116,7 @@ fn a_hook_during_closing_cancels_the_idle_exit() {
     let via_ensure = |body: &str| {
         let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         let mut out = String::new();
         let _ = c.read_to_string(&mut out);
         out

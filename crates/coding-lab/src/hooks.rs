@@ -10,6 +10,10 @@
 //! `POST /stop`（#700）：`coding-lab stop` 用它請 collector 走同一條正常結束路徑。背景 collector 沒有 console
 //! （Windows 更沒人能按 Ctrl-C），這是三平台都通的停法。和 hook 一樣只綁 loopback、不驗金鑰：能連到這個埠的
 //! 程序本來就能殺掉 collector。
+//!
+//! 來源檢查（#762 S-4、D10）：只綁 loopback 擋不住使用者瀏覽器裡的網頁——它們能對 127.0.0.1 送 no-cors 的 POST
+//! （`text/plain`，不觸發 preflight），偽造 session、危險指令或停掉 collector。所以帶 `Origin` 的一律 403
+//! （Claude Code 不帶，瀏覽器跨站送的一定帶）；`/hook` 不是 `application/json` 回 415；`/stop` 要帶 [`STOP_HEADER`]。
 
 use std::io;
 use std::net::SocketAddr;
@@ -33,6 +37,8 @@ pub const HOOK_PATH: &str = "/hook";
 pub const STOP_PATH: &str = "/stop";
 /// `ensure` 轉送時帶的標頭（值是 `ensure`）
 pub const VIA_HEADER: &str = "x-coding-lab-via";
+/// `POST /stop` 要帶的標頭（值是 `1`）：瀏覽器的 no-cors 請求帶不了自訂標頭
+pub const STOP_HEADER: &str = "x-coding-lab-stop";
 /// 放掉埠時最多等進行中的請求多久
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -137,8 +143,30 @@ fn router_with(tx: mpsc::Sender<Input>, closing: Arc<AtomicBool>, stop: Arc<Noti
         .with_state(state)
 }
 
+/// 瀏覽器送的請求：帶 `Origin`（Claude Code 的 http hook 與 ensure、stop 都不帶）。
+fn from_browser(headers: &HeaderMap) -> bool {
+    headers.contains_key(axum::http::header::ORIGIN)
+}
+
+/// `Content-Type: application/json`（可以帶參數、不分大小寫）。
+fn is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("application/json"))
+}
+
 /// `POST /stop`：記下要結束，立刻回 200；實際結束由主迴圈做（它要先放埠、停 tail、flush）。
-async fn handle_stop(State(state): State<Arc<HookState>>) -> StatusCode {
+async fn handle_stop(State(state): State<Arc<HookState>>, headers: HeaderMap) -> StatusCode {
+    if from_browser(&headers)
+        || headers
+            .get(STOP_HEADER)
+            .is_none_or(|v| v.as_bytes() != b"1")
+    {
+        crate::logging::log("拒收 stop：帶 Origin 或沒有 X-Coding-Lab-Stop");
+        return StatusCode::FORBIDDEN;
+    }
     crate::logging::log("收到 stop");
     state.stop.notify_one();
     StatusCode::OK
@@ -150,6 +178,14 @@ async fn handle(
     body: Bytes,
 ) -> StatusCode {
     let ts_seen = crate::now_ms();
+    if from_browser(&headers) {
+        crate::logging::log("拒收 hook：帶 Origin（瀏覽器送的）");
+        return StatusCode::FORBIDDEN;
+    }
+    if !is_json(&headers) {
+        crate::logging::log("拒收 hook：Content-Type 不是 application/json");
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+    }
     if state.closing.load(Ordering::SeqCst)
         && headers
             .get(VIA_HEADER)
