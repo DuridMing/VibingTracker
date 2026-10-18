@@ -783,3 +783,26 @@ fn once_link_is_redeemed_at_most_once_under_concurrency() {
         assert_eq!(ok, 1, "第 {i} 輪：要有一次成功");
     }
 }
+
+/// E-H11（#756）：不會再來的 IP 也要清掉；換 IPv6 位址不能讓限流表一直長大。
+#[test]
+fn rate_limiter_table_stays_bounded() {
+    let mut r = RateLimiter::new(10, MIN);
+    for i in 0..1100u32 {
+        let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            0,
+            0,
+            0,
+            0,
+            (i >> 16) as u16,
+            i as u16,
+        ));
+        r.record_failure(ip, NOW + u64::from(i));
+    }
+    assert!(r.tracked() <= 1024, "表裡有 {} 個 IP", r.tracked());
+    // 過了窗口之後，舊的整批清掉
+    r.record_failure("10.0.0.1".parse().unwrap(), NOW + 2 * MIN);
+    assert!(r.tracked() <= 2, "過期的要清掉：{}", r.tracked());
+}
