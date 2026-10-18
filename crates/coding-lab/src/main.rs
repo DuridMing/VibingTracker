@@ -779,8 +779,13 @@ fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, S
         .map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
+    // 和 plugin 的 http hook 一樣帶使用者：4800 被別的帳號的 collector 佔著時它會丟掉（#777）
+    let user = coding_lab::hooks::current_user()
+        .filter(|u| !u.contains(['\r', '\n']))
+        .map(|u| format!("{}: {u}\r\n", coding_lab::hooks::USER_HEADER))
+        .unwrap_or_default();
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\n{user}Content-Length: {}\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::HOOK_PATH,
         body.len()
     );
@@ -894,13 +899,15 @@ fn stop() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Some((pid, hook)) = running_info(&cfg, STOP_WAIT).and_then(|i| i.hook.map(|h| (i.pid, h)))
-    else {
+    let Some((pid, hook, token)) = running_info(&cfg, STOP_WAIT).and_then(|i| {
+        i.hook
+            .map(|h| (i.pid, h, i.stop_token.unwrap_or_else(|| "1".into())))
+    }) else {
         eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
         return ExitCode::SUCCESS;
     };
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::STOP_PATH,
         coding_lab::hooks::STOP_HEADER
     );

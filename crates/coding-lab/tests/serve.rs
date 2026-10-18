@@ -1781,3 +1781,33 @@ fn hooks_stay_fast_while_web_requests_pile_up() {
         "最慢一個 hook 花了 {worst:?}"
     );
 }
+
+/// #777：/stop 要帶 collector.json 的 stopToken；別人（另一個帳號讀不到這個檔）送的被拒、collector 照常。
+/// healthz 帶 user，看得出是誰的 collector。
+#[test]
+fn stop_needs_the_token_from_collector_json() {
+    let e = env(0);
+    let mut s = start_serve(&e);
+    let info = collector(&e).unwrap();
+    let token = info["stopToken"]
+        .as_str()
+        .expect("collector.json 要有 stopToken")
+        .to_string();
+    assert!(token.len() >= 32);
+    let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
+    write!(c, "POST /stop HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Stop: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "錯的 token 不能停掉 collector"
+    );
+    let h = http(e.web, "GET", "/healthz", "");
+    let v: Value = serde_json::from_str(h.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap();
+    assert!(v["user"].as_str().is_some_and(|u| !u.is_empty()), "{v}");
+    // coding-lab stop 讀自己的 collector.json 帶上
+    assert!(cmd(&e, &["stop"]).output().unwrap().status.success());
+    wait_for("stop 之後結束", || s.0.try_wait().unwrap().is_some());
+}

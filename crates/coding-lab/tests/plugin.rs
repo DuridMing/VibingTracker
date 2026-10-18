@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use coding_lab::config::DEFAULT_HOOK_BIND;
-use coding_lab::hooks::HOOK_PATH;
+use coding_lab::hooks::{HOOK_PATH, USER_HEADER, USERNAME_HEADER};
 use serde_json::Value;
 
 /// contracts.md §2「訂閱的事件」：SessionStart 只能用 command hook（ensure 轉送），其餘用 http。
@@ -91,17 +91,16 @@ fn http_hooks_post_to_the_loopback_hook_port_with_a_short_timeout() {
             t <= 1,
             "{event}：collector 沒跑時不能拖慢 Claude Code（timeout {t}）"
         );
-        // 多帳號（#778 W-M7）：帶使用者名稱，collector 丟掉別的帳號送來的；不帶任何金鑰（hook 入口不驗金鑰）。
-        // 兩個變數分兩個標頭：「列在 allowedEnvVars 但沒設定」的變數會變成什麼，官方文件沒寫
+        // hook 入口不驗金鑰：只帶使用者（#777，4800 被別的帳號的 collector 佔著時它丟掉這個帳號的 hook）
         assert_eq!(
             h["headers"],
-            serde_json::json!({ "X-Coding-Lab-User": "${USER}", "X-Coding-Lab-Username": "${USERNAME}" }),
+            serde_json::json!({ USER_HEADER: "${USER}", USERNAME_HEADER: "${USERNAME}" }),
             "{event}"
         );
         assert_eq!(
             h["allowedEnvVars"],
             serde_json::json!(["USER", "USERNAME"]),
-            "{event}"
+            "{event}：沒列進來的變數會變成空字串"
         );
     }
 }

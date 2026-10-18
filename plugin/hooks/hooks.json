@@ -20,8 +20,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -39,8 +39,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -58,8 +58,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -77,8 +77,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -96,8 +96,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -115,8 +115,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -134,8 +134,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -153,8 +153,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -172,8 +172,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -191,8 +191,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -210,8 +210,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -229,8 +229,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -248,8 +248,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -267,8 +267,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
@@ -286,8 +286,8 @@
             "url": "http://127.0.0.1:4800/hook",
             "timeout": 1,
             "headers": {
-              "X-Coding-Lab-User": "${USER}",
-              "X-Coding-Lab-Username": "${USERNAME}"
+              "x-coding-lab-user": "${USER}",
+              "x-coding-lab-username": "${USERNAME}"
             },
             "allowedEnvVars": [
               "USER",
