@@ -1813,6 +1813,37 @@ fn reverted_marks_leave_with_the_session() {
     assert_eq!(l.reverted_count(), 0);
 }
 
+/// 「失敗」只算 tool.updated 的 failed、不是 Esc（interrupted）也不是 PermissionDenied（denied）；
+/// tool.result 的 ok=false 不另外算（D6、contracts §4）。KPI 與 sessions 列用同一個判斷。
+#[test]
+fn only_real_failures_are_counted() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let upd = |b: &mut B, id: &str, extra: Value| {
+        let mut p = json!({"toolUseId": id, "status": "failed", "durationMs": null, "error": "x", "interrupted": null});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        b.ev("s1", "tool.updated", "main", DAY + 10, false, p)
+    };
+    let real = upd(&mut b, "t1", json!({}));
+    let esc = upd(&mut b, "t2", json!({"interrupted": true}));
+    let denied = upd(&mut b, "t3", json!({"denied": true}));
+    let result = b.ev(
+        "s1",
+        "tool.result",
+        "main",
+        DAY + 11,
+        false,
+        json!({"toolUseId": "t1", "ok": false, "exitCode": 1, "output": "", "truncated": false}),
+    );
+    apply_all(&mut l, &[b.started("s1", DAY), real, esc, denied, result]);
+    l.register_offset(0);
+    let snap = l.snapshot(&Channel::All, 0, DAY + H);
+    assert_eq!(snap["kpi"]["failures"], 1);
+    assert_eq!(rows(&snap, "sessions")[0]["failures"], 1);
+}
+
 /// #686（R23）：沒有新 Event 時 flush 不重算 KPI（只在有新 Event、跨時間格或跨午夜時算）。
 #[test]
 fn flush_without_new_events_does_not_recompute_kpi() {

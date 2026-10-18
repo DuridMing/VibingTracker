@@ -158,11 +158,11 @@ fn session_row_summarises_events() {
     s.append(ev(
         "s1",
         8,
-        "tool.result",
+        "tool.updated",
         None,
         1600,
         json!({
-            "toolUseId": "t2", "ok": false, "exitCode": 1, "output": "", "truncated": false,
+            "toolUseId": "t2", "status": "failed", "durationMs": 5, "error": "exit 1", "interrupted": null,
         }),
     ));
     s.append(ev(
@@ -234,11 +234,9 @@ fn who_touched_a_file() {
     s.append(file_ev("s1", 3, "file.read", "r2", "src/a.rs", 2100));
     s.append(file_ev("s2", 2, "file.edit", "e1", "src/a.rs", 2200));
     s.append(file_ev("s2", 3, "file.edit", "e2", "src/b.rs", 2300));
-    // 失敗的 Edit 計入 fail
+    // 失敗的 Edit 計入 fail、不算 edit
     s.append(file_ev("s1", 4, "file.edit", "e3", "src/a.rs", 2400));
-    s.append(ev("s1", 5, "tool.result", None, 2410, json!({
-        "toolUseId": "e3", "ok": false, "exitCode": null, "output": "old_string not found", "truncated": false,
-    })));
+    s.append(failed("s1", 5, "e3", 2410));
     s.flush().unwrap();
 
     let mut t = s.touches("/p", "src/a.rs").unwrap();
@@ -249,12 +247,7 @@ fn who_touched_a_file() {
         .collect();
     assert_eq!(
         got,
-        [
-            ("s1", "edit", 1),
-            ("s1", "fail", 1),
-            ("s1", "read", 2),
-            ("s2", "edit", 1)
-        ]
+        [("s1", "fail", 1), ("s1", "read", 2), ("s2", "edit", 1)]
     );
     assert!(
         s.touches("/other", "src/a.rs").unwrap().is_empty(),
@@ -759,6 +752,45 @@ fn failed_edit_and_write_are_not_changes() {
         [("edit".to_string(), 1), ("fail".to_string(), 1)]
     );
     assert_eq!(kinds("b.rs"), [("fail".to_string(), 1)]);
+}
+
+/// 「失敗」只算 tool.updated 的 failed、不是 Esc（interrupted）也不是 PermissionDenied（denied）；
+/// tool.result 的 ok=false 不另外算（D6、contracts §4）。檔案工具失敗時那個檔記一次 fail。
+#[test]
+fn only_real_failures_are_counted() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    let upd = |seq, id: &str, extra: Value| {
+        let mut p = json!({"toolUseId": id, "status": "failed", "durationMs": null, "error": "x", "interrupted": null});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        ev("s1", seq, "tool.updated", None, 2000 + seq, p)
+    };
+    s.append(file_ev("s1", 2, "file.read", "r1", "a.rs", 2000));
+    s.append(upd(3, "r1", json!({})));
+    s.append(ev("s1", 4, "tool.result", None, 2004, json!({
+        "toolUseId": "r1", "ok": false, "exitCode": null, "output": "no such file", "truncated": false,
+    })));
+    s.append(file_ev("s1", 5, "file.read", "r2", "b.rs", 2005));
+    s.append(upd(6, "r2", json!({"interrupted": true})));
+    s.append(file_ev("s1", 7, "file.read", "r3", "c.rs", 2007));
+    s.append(upd(8, "r3", json!({"denied": true})));
+    s.append(ev("s1", 9, "tool.result", None, 2009, json!({
+        "toolUseId": "b9", "ok": false, "exitCode": null, "output": "[Request interrupted by user]", "truncated": false,
+    })));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().failures, 1);
+    let fails = |p: &str| {
+        s.touches("/p", p)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == "fail")
+            .map(|t| t.count)
+            .sum::<u64>()
+    };
+    assert_eq!((fails("a.rs"), fails("b.rs"), fails("c.rs")), (1, 0, 0));
 }
 
 /// file.write 帶全文行數 `lines` 時，改動紀錄用它而不是 200 行的預覽（contracts §4）。
