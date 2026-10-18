@@ -1,5 +1,5 @@
 #!/bin/sh
-# 前端 headless 截圖：起 tests/e2e/web/shotserver.py（127.0.0.1:${SHOT_PORT:-4803}），用 Firefox --screenshot 拍 /shot.html?<query>。
+# 前端 headless 截圖：起 tests/e2e/web/shotserver.py（127.0.0.1 的空閒埠，SHOT_PORT 可指定），用 Firefox --screenshot 拍 /shot.html?<query>。
 # 用法：tests/scripts/web-shot.sh <輸出.png> '<query>'
 #   例：tests/scripts/web-shot.sh target/tmp/web-e2e/mock.png 'mock=12&prefill&delay=8'
 #   query 見 web/js/main.js：mock=<n>、prefill、bench、isolate、freeze=…；delay=<秒> 是截圖前等多久。
@@ -8,7 +8,8 @@
 set -eu
 root=$(cd "$(dirname "$0")/../.." && pwd)
 web=$(cd "${WEB_DIR:-$root/web}" && pwd)
-port=${SHOT_PORT:-4803}
+# 預設取空閒埠（#749 T-7）：固定的 4803 和並行的另一次截圖、或別的程式撞在一起時會拍到別人的頁面
+port=${SHOT_PORT:-$(python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')}
 [ $# -eq 2 ] || { echo "用法：$0 <輸出.png> '<query>'" >&2; exit 2; }
 out=$1
 query=$2
