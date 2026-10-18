@@ -1705,24 +1705,20 @@ fn index_event(
                     "DELETE FROM file_touch WHERE cwd = ?1 AND path = ?2 AND session = ?3 AND kind = ?4 AND count <= 0",
                     params![cwd, path, sid, kind],
                 )?;
-                // Esc 中斷不算失敗（和前端的失敗計數一致）
-                if p.interrupted != Some(true) {
+            }
+            // 「失敗」只算 tool.updated 的 failed、不是 Esc 也不是 PermissionDenied（D6、contracts §4）；
+            // 檔案工具的那個檔記一次 fail。tool.result 的 ok=false 不另外算
+            if p.is_failure() {
+                exec(
+                    tx,
+                    "UPDATE sessions SET failures = failures + 1 WHERE id = ?1",
+                    params![sid],
+                )?;
+                if let Some(path) = path_of_tool.get(&(sid.to_string(), p.tool_use_id.clone())) {
                     touch("fail", path)?;
                 }
             }
-            if !rows.is_empty() {
-                path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
-            }
-        }
-        Payload::ToolResult(p) if !p.ok => {
-            exec(
-                tx,
-                "UPDATE sessions SET failures = failures + 1 WHERE id = ?1",
-                params![sid],
-            )?;
-            if let Some(path) = path_of_tool.get(&(sid.to_string(), p.tool_use_id.clone())) {
-                touch("fail", path)?;
-            }
+            path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
         }
         Payload::FileRead(p) => {
             touch("read", &p.path)?;

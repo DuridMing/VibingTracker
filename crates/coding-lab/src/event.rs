@@ -346,6 +346,17 @@ pub struct ToolUpdated {
     /// transcript 先建卡、PreToolUse 後到時才判斷出的危險；沒有時不輸出。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub danger: Option<Danger>,
+    /// PermissionDenied 衍生的（使用者或自動模式拒絕，不是工具出錯）；false 時不輸出（D6）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
+}
+
+impl ToolUpdated {
+    /// 算不算「失敗」（contracts §4，D6）：failed，而且不是 Esc（interrupted）也不是 PermissionDenied（denied）。
+    /// KPI、sessions 列、file_touch 的 fail 都用這個；「被拒或失敗的改動」的排除另看所有 failed。
+    pub fn is_failure(&self) -> bool {
+        self.status == ToolStatus::Failed && self.interrupted != Some(true) && !self.denied
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

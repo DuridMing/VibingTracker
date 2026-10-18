@@ -1093,6 +1093,7 @@ impl Merger {
                     error: None,
                     interrupted: None,
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
@@ -1123,6 +1124,7 @@ impl Merger {
                     error: Some(truncate(error, MESSAGE_LIMIT).0),
                     interrupted: h.field("is_interrupt").and_then(Value::as_bool),
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
@@ -1149,6 +1151,7 @@ impl Merger {
                     error: s("reason"),
                     interrupted: None,
                     danger: None,
+                    denied: true,
                 };
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 out.extend(self.tool_ended(h, &sid, &id, &agent, None, ts_seen));
@@ -1524,6 +1527,7 @@ impl Merger {
                 error: None,
                 interrupted: None,
                 danger: danger.clone(),
+                denied: false,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1998,6 +2002,7 @@ impl Merger {
                         error,
                         interrupted: rejected.then_some(true),
                         danger: None,
+                        denied: false,
                     };
                     let agent = self
                         .sessions
