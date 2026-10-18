@@ -217,6 +217,79 @@ fn wrapper_runs_the_binary_and_keeps_stdout_empty() {
     );
 }
 
+/// ensure 不在 wrapper 讀 payload，stdin 直接交給二進位（#776 EW1）：二進位拿得到 SessionStart 的 payload；
+/// 呼叫端的 stdin 一直沒關（終端機直接跑 `sh <wrapper> ensure`，R-9）時 wrapper 也不會卡在讀 stdin。
+#[cfg(unix)]
+#[test]
+fn wrapper_hands_stdin_to_the_binary_and_never_waits_for_it() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let dir =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("plugin-stdin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // 讀 stdin 的假二進位：payload 寫進檔案
+    let reader = dir.join("reader");
+    std::fs::write(
+        &reader,
+        format!("#!/bin/sh\ncat > '{}/payload'\n", dir.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&reader, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(plugin_dir().join("bin/coding-lab"))
+        .arg("ensure")
+        .env("CODING_LAB_BIN", &reader)
+        .env("CODING_LAB_HOME", &home)
+        .env("CODING_LAB_RELEASE_URL", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"hook_event_name":"SessionStart"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("payload")).unwrap(),
+        r#"{"hook_event_name":"SessionStart"}"#
+    );
+
+    // 不讀 stdin 的假二進位，stdin 一直開著：wrapper 要跟著二進位馬上結束
+    let quick = dir.join("quick");
+    std::fs::write(&quick, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&quick, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new(plugin_dir().join("bin/coding-lab"))
+        .arg("ensure")
+        .env("CODING_LAB_BIN", &quick)
+        .env("CODING_LAB_HOME", &home)
+        .env("CODING_LAB_RELEASE_URL", "")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _keep_open = child.stdin.take();
+    let started = Instant::now();
+    let done = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            break None;
+        }
+        std::thread::yield_now();
+    };
+    if done.is_none() {
+        let _ = child.kill();
+    }
+    assert!(done.is_some_and(|s| s.success()), "wrapper 卡在讀 stdin");
+}
+
 // ── wrapper 下載二進位（#656）：第一次沒有二進位時，從 Release 下載對應平台的壓縮檔、校驗 sha256，
 // 解到 $CODING_LAB_HOME/bin/。Release 的位置來自 CODING_LAB_RELEASE_URL；測試用 file:// 的假 Release。
 

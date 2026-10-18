@@ -19,7 +19,6 @@
 # 和 Cargo.toml、.claude-plugin/plugin.json 同版（tests/plugin.rs 比對）
 VERSION=0.1.0
 
-self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 home_dir=${CODING_LAB_HOME:-$HOME/.coding-lab}
 # 沒設才用預設；設成空字串＝不自動下載
 release_url=${CODING_LAB_RELEASE_URL-https://github.com/DuridMing/VibingTracker/releases/download/v$VERSION}
@@ -37,28 +36,28 @@ manual() {
 }
 
 is_self() {
+    # 只有走到 PATH 查找才算（每個子殼在 Windows 的 Git Bash 上要數十 ms，#776 EW1）
+    [ -n "$self_dir" ] || self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
     [ "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" = "$self_dir" ]
 }
 
+# 找到就設 bin、回 0。直接設變數，不用 $(find_bin)（少一個子殼，#776 EW1）
 find_bin() {
     if [ -n "$CODING_LAB_BIN" ] && [ -x "$CODING_LAB_BIN" ]; then
-        echo "$CODING_LAB_BIN"
+        bin=$CODING_LAB_BIN
         return 0
     fi
-    for c in "$home_dir/bin/coding-lab" "$home_dir/bin/coding-lab.exe"; do
-        if [ -x "$c" ]; then
-            echo "$c"
-            return 0
-        fi
+    for bin in "$home_dir/bin/coding-lab" "$home_dir/bin/coding-lab.exe"; do
+        [ -x "$bin" ] && return 0
     done
     for name in coding-lab coding-lab.exe; do
-        c=$(command -v "$name" 2>/dev/null) || continue
+        bin=$(command -v "$name" 2>/dev/null) || continue
         # plugin 的 bin/ 可能在 PATH 上：不要找到自己
-        if [ -n "$c" ] && ! is_self "$c"; then
-            echo "$c"
+        if [ -n "$bin" ] && ! is_self "$bin"; then
             return 0
         fi
     done
+    bin=
     return 1
 }
 
@@ -219,7 +218,7 @@ case "$1" in
         ;;
 esac
 
-if ! bin=$(find_bin); then
+if ! find_bin; then
     if [ -n "$release_url" ] && target=$(platform); then
         # hook 有 5 秒限制：背景下載，所有輸出都導開，Claude Code 不會等它
         mkdir -p "$home_dir" 2>/dev/null
@@ -246,15 +245,15 @@ case "$bin" in
 esac
 
 if [ "$1" = ensure ]; then
-    # Windows 的子程序會繼承所有可繼承的 handle：ensure 拉起的 collector 會握著 ensure 的 stdin／stdout／stderr，
-    # 呼叫端（Claude Code、`| cat`）要等到 collector 結束才收到 EOF（#712）。所以不把 Claude Code 給的 pipe 交給
-    # 二進位：payload 先讀進來再用自己的 pipe 餵、stdout 丟掉（ensure 本來就不印 stdout）、stderr 寫進 ensure.log
-    # （ensure 的錯誤本來就寫 collector.log，stderr 只剩 panic 之類的意外）。
-    payload=$(cat)
-    if mkdir -p "$home_dir" 2>/dev/null; then
-        printf '%s' "$payload" | "$bin" "$@" >/dev/null 2>>"$home_dir/ensure.log"
+    # stdin（SessionStart 的 payload）直接交給二進位，wrapper 不先讀：讀 payload 再用 pipe 餵要多開子殼與 cat，
+    # 終端機直接跑時還會卡在等 EOF（#776 EW1、R-9）。ensure 拉起的 collector 不會握著這些 handle
+    # （#712：Windows 由二進位關掉 handle 繼承，Unix 是 Stdio::null），所以呼叫端照樣馬上收到 EOF。
+    # stdout 丟掉（ensure 本來就不印）；stderr 寫進 ensure.log（錯誤本來就寫 collector.log，這裡只剩 panic 之類的意外）。
+    [ -d "$home_dir" ] || mkdir -p "$home_dir" 2>/dev/null
+    if [ -d "$home_dir" ]; then
+        "$bin" "$@" >/dev/null 2>>"$home_dir/ensure.log"
     else
-        printf '%s' "$payload" | "$bin" "$@" >/dev/null 2>&1
+        "$bin" "$@" >/dev/null 2>&1
     fi
 else
     "$bin" "$@" >&2
