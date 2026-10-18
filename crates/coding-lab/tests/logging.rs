@@ -90,3 +90,38 @@ fn panics_are_written_to_the_current_log() {
     );
     assert!(text.contains("logging.rs"), "要有位置：{text}");
 }
+
+/// W-L12（#781）：別的程序把 collector.log 輪替（改名成 `.1`）之後，collector 手上的 handle 跟著改名後的檔走；
+/// 寫下一行前發現路徑上的檔已經不是自己開的那個，就重開，訊息才會出現在使用者看的 collector.log。
+#[test]
+fn a_log_replaced_by_someone_else_is_reopened() {
+    let d = dir("replaced");
+    let path = d.join("collector.log");
+    let mut log = RotatingLog::open(&path, 1000, 5).unwrap();
+    log.write_line("before").unwrap();
+    std::fs::rename(&path, d.join("collector.log.1")).unwrap();
+    std::fs::write(&path, "someone else\n").unwrap();
+    log.write_line("after").unwrap();
+    let current = read(&path);
+    assert!(current.contains("after"), "{current}");
+    assert!(!read(&d.join("collector.log.1")).contains("after"));
+}
+
+/// W-L12：短命的程序（ensure、service、還沒拿到 store 鎖的 serve）只追加、不輪替；
+/// 輪替只由拿著 store 鎖的 collector 做，否則它手上的 handle 會被推進 `.1`。
+#[test]
+fn append_only_logs_never_rotate() {
+    let d = dir("append-only");
+    let path = d.join("collector.log");
+    // 已經到上限的檔（稀疏檔，不真的寫 10 MB）
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(coding_lab::logging::LOG_MAX_BYTES)
+        .unwrap();
+    let mut log = RotatingLog::append_only(&path).unwrap();
+    log.write_line("0123456789").unwrap();
+    assert!(!d.join("collector.log.1").exists());
+    coding_lab::logging::append(&path, "short-lived");
+    assert!(read(&path).contains("short-lived"));
+    assert!(!d.join("collector.log.1").exists());
+}

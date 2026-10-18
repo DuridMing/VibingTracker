@@ -1848,3 +1848,123 @@ fn stop_needs_the_token_from_collector_json() {
     assert!(cmd(&e, &["stop"]).output().unwrap().status.success());
     wait_for("stop 之後結束", || s.0.try_wait().unwrap().is_some());
 }
+
+fn log_text(e: &Env) -> String {
+    std::fs::read_to_string(e.home.join("collector.log")).unwrap_or_default()
+}
+
+/// W-L15（#781）：store 鎖被一個正常在跑的 collector 拿著時，等鎖的 log 說「另一個 collector 已經在用」，
+/// 不是「上一個 collector 還在結束」。同一個 home、別的埠再起一個 serve。
+#[test]
+fn waiting_for_the_store_lock_names_the_running_collector() {
+    let e = env(0);
+    let _a = start_serve(&e);
+    let b = Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+        .args([
+            "serve",
+            "--hook-bind",
+            &format!("127.0.0.1:{}", free_port()),
+        ])
+        .args(["--web-bind", &format!("127.0.0.1:{}", free_port())])
+        .env("CODING_LAB_HOME", &e.home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _b = Kill(b);
+    wait_for("第二個 serve 寫等鎖的原因", || {
+        log_text(&e).contains("另一個 collector 已經在用這個資料目錄")
+    });
+    assert!(
+        !log_text(&e).contains("上一個 collector 還在結束"),
+        "{}",
+        log_text(&e)
+    );
+}
+
+/// W-L15：`coding-lab prune` 拿著鎖時留標記檔，等鎖的 serve 說「prune 正在執行」。
+#[test]
+fn waiting_for_the_store_lock_names_a_running_prune() {
+    let e = env(0);
+    let lock = coding_lab::serve::try_lock_store(&e.home).unwrap().unwrap();
+    std::fs::write(
+        e.home.join(coding_lab::serve::PRUNE_MARKER),
+        format!("{}", std::process::id()),
+    )
+    .unwrap();
+    let child = cmd(&e, &["serve"]).spawn().unwrap();
+    let _c = Kill(child);
+    wait_for("serve 寫等鎖的原因", || {
+        log_text(&e).contains("prune 正在執行")
+    });
+    drop(lock);
+}
+
+#[cfg(unix)]
+fn healthz(e: &Env) -> Value {
+    let r = http(e.web, "GET", "/healthz", "");
+    serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap_or(Value::Null)
+}
+
+/// W-M10（#781）：store 一直寫不進去（這裡把 session 的 JSONL 改成唯讀）時，`/healthz` 有 storeError、log 不會每個 hook
+/// 一行；結束時沒寫進去的 hook 事件存進 `pending-*.jsonl`，下次啟動補回。
+#[cfg(unix)]
+#[test]
+fn an_unwritable_store_is_reported_and_its_hooks_survive_a_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env(0);
+    let child = cmd(&e, &["serve"]).spawn().unwrap();
+    let pid = child.id();
+    let mut serve = Kill(child);
+    wait_for("collector.json", || {
+        collector(&e).is_some_and(|c| c["pid"] == pid)
+    });
+    assert!(
+        healthz(&e)["storeError"].is_null(),
+        "正常時是 null：{}",
+        healthz(&e)
+    );
+    let start = json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    let jsonl = e.home.join("events/s1.jsonl");
+    wait_for("session.started 進 store", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o400)).unwrap();
+    for i in 0..50 {
+        let pre = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                         "tool_input": {"command": "ls"}, "tool_use_id": format!("locked-{i}"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &pre.to_string());
+    }
+    wait_for("healthz 的 storeError", || {
+        healthz(&e)["storeError"]["pending"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    });
+    let err = healthz(&e)["storeError"].clone();
+    assert!(
+        err["message"].is_string() && err["since"].is_u64() && err["dropped"] == 0,
+        "{err}"
+    );
+    let failures = log_text(&e).matches("store 寫不進去").count();
+    assert_eq!(failures, 1, "只在開始失敗時寫一行：{}", log_text(&e));
+
+    let out = cmd(&e, &["stop"]).output().unwrap();
+    assert!(out.status.success());
+    let _ = serve.0.wait();
+    std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dumps: Vec<_> = std::fs::read_dir(&e.home)
+        .unwrap()
+        .flatten()
+        .filter(|f| f.file_name().to_string_lossy().starts_with("pending-"))
+        .collect();
+    assert_eq!(dumps.len(), 1, "{}", log_text(&e));
+
+    let _again = start_serve(&e);
+    let text = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(
+        text.contains("locked-0") && text.contains("locked-49"),
+        "補回來了"
+    );
+    assert!(!dumps[0].path().exists(), "補完就刪");
+}

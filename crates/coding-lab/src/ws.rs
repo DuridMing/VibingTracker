@@ -845,6 +845,8 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote,
                 "thinking": if conn.remote { thinking_str(conn.thinking) } else { "full" },
                 "scope": conn.identity.scope_str(),
+                // store 寫不進去的狀態（W-M10）；之後的改變走 snapshot 與 frame
+                "storeError": state.live().store_error(),
             });
             send(socket, conn, &welcome).await
         }
