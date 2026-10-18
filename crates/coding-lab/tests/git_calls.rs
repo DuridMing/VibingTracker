@@ -182,4 +182,26 @@ async fn filter_drivers_are_looked_up_once_per_directory_per_request() {
         .map(|c| c.lines().count())
         .unwrap_or(0);
     assert_eq!(n, 0, "1 秒內的同一個請求不該再跑 git（跑了 {n} 個）");
+
+    // E-H9（#756）：分支視窗的 git 程序數（印出來比較；正確性由 tests/api.rs 的 branches 測試保證）
+    let _ = std::fs::remove_file(&log);
+    let path = format!("/api/branches?cwd={}", cwd.replace('/', "%2F"));
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    eprintln!(
+        "一次 /api/branches（2 個 worktree）：{} 個 git 程序",
+        calls.lines().count()
+    );
+    assert!(
+        !calls.contains("status --porcelain"),
+        "dirty 不再用 status 重掃未追蹤檔：{calls}"
+    );
 }

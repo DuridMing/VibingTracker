@@ -369,7 +369,7 @@ async fn gate(
         if !host_is_loopback(req.headers()) {
             return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
         }
-        if guarded && !same_origin(req.headers()) {
+        if guarded && !auth::same_origin(req.headers()) {
             return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
         }
         req.extensions_mut().insert(Identity::Local);
@@ -589,16 +589,11 @@ pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
 
 /// `/api/*`：同 `/ws`，使用者瀏覽器裡別的網頁不能讀走 session 資料。
 async fn require_same_origin(req: Request, next: Next) -> Response {
-    if same_origin(req.headers()) {
+    if auth::same_origin(req.headers()) {
         next.run(req).await
     } else {
         (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
     }
-}
-
-/// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
-fn same_origin(headers: &HeaderMap) -> bool {
-    auth::same_origin(headers)
 }
 
 pub fn thinking_str(mode: RemoteThinking) -> &'static str {

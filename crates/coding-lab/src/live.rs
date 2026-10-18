@@ -910,6 +910,11 @@ impl Live {
         }
     }
 
+    /// live 裡所有 session 的 id。
+    pub fn session_ids(&self) -> HashSet<String> {
+        self.sessions.keys().cloned().collect()
+    }
+
     pub fn has_session(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
     }
