@@ -114,6 +114,8 @@ struct Card {
     called: bool,
     /// 命中敏感規則（#654）：tool.result 帶 sensitive，遠端送出時剝除
     sensitive: bool,
+    /// 已處理過的工具 hook（[`tool_hook_bit`]）：同一個 hook 收到兩次只處理第一次（K-3）
+    hooks_seen: u8,
 }
 
 impl Card {
@@ -126,8 +128,20 @@ impl Card {
             finished: false,
             called: false,
             sensitive: false,
+            hooks_seen: 0,
         }
     }
+}
+
+/// 帶 tool_use_id、每張卡片最多一次的 hook。URL 重複或裝了兩份 plugin 時同一個 hook 會收到兩次（K-3）。
+fn tool_hook_bit(event: &str) -> Option<u8> {
+    Some(match event {
+        "PreToolUse" => 1,
+        "PostToolUse" => 2,
+        "PostToolUseFailure" => 4,
+        "PermissionDenied" => 8,
+        _ => return None,
+    })
 }
 
 #[derive(Default)]
@@ -773,6 +787,37 @@ impl Merger {
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
         let agent = self.agent_of_hook(&sid, h);
+        let once = tool_hook_bit(h.event_name()).zip(h.tool_use_id().map(str::to_string));
+        if let Some((bit, id)) = &once
+            && self
+                .sessions
+                .get(&sid)
+                .and_then(|s| s.cards.get(id))
+                .is_some_and(|c| c.hooks_seen & bit != 0)
+        {
+            return Vec::new();
+        }
+        let out = self.on_hook_once(h, &sid, agent, ts_seen);
+        // 只記在已經有的卡片上：背景 agent 先扣著的 PreToolUse 還沒有卡片，不能替它建（建了就當成已知）
+        if let Some((bit, id)) = once
+            && let Some(c) = self
+                .sessions
+                .get_mut(&sid)
+                .and_then(|s| s.cards.get_mut(&id))
+        {
+            c.hooks_seen |= bit;
+        }
+        out
+    }
+
+    fn on_hook_once(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        agent: String,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let sid = sid.to_string();
         let mut out = Vec::new();
         if agent == "bg" {
             let (prefix, done) = self.on_background_tool(h, &sid, ts_seen);
@@ -851,22 +896,14 @@ impl Merger {
                 {
                     self.tracker(&sid).signal(Signal::SubagentFail, ts_seen);
                 }
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                if let Some(n) = &notice {
-                    out.extend(self.agent_by_order(&sid, &n.task_id, ts_seen));
-                }
-                if let Some(n) = notice
-                    && let Some(ss) = self.sessions.get_mut(&sid)
-                    && ss.finished_agents.insert(n.task_id.clone())
-                {
-                    ss.held_bg.retain(|_, h| h.agent_id != n.task_id);
+                if let Some(n) = notice {
                     let p = AgentFinished {
                         agent_id: n.task_id,
                         last_message: None,
                         transcript_path: None,
                         status: n.status,
                     };
-                    out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                    out.extend(self.finish_agent(&sid, p, meta()));
                 }
                 let changes = self.tracker(&sid).prompt(s("prompt_id"), ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
@@ -987,13 +1024,6 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                out.extend(self.agent_by_order(&sid, &agent_id, ts_seen));
-                let ss = self.session(&sid);
-                ss.held_bg.retain(|_, h| h.agent_id != agent_id);
-                if !ss.finished_agents.insert(agent_id.clone()) {
-                    return out;
-                }
                 let p = AgentFinished {
                     agent_id,
                     last_message: s("last_assistant_message")
@@ -1001,7 +1031,7 @@ impl Merger {
                     transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
-                out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                out.extend(self.finish_agent(&sid, p, meta()));
             }
             "PermissionRequest" => {
                 let tool = h.str_field("tool_name").unwrap_or_default().to_string();
@@ -1010,12 +1040,30 @@ impl Merger {
                     .permission_request(&tool, &input, ts_seen);
             }
             "PostToolBatch" => {
-                let changes = self.tracker(&sid).batch_done(ts_seen);
+                let changes = self.tracker(&sid).batch_done(&agent, ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             // Notification（idle_prompt、permission_prompt）只當補強，P3 先不用（PLAN「注意佇列」）
             _ => {}
         }
+        out
+    }
+
+    /// 一個 subagent 結束（SubagentStop，或被 TaskStop 停掉的背景 agent 的 task-notification；E-M9）：
+    /// 先配好還在等配對的、發出 spawn（agent.finished 不能比 agent.spawned 早），每個 agent 只結束一次，
+    /// 它留下的連續失敗跟著解除（K-1）。
+    fn finish_agent(&mut self, sid: &str, p: AgentFinished, meta: Meta) -> Vec<Event> {
+        let ts_seen = meta.ts_seen;
+        let agent_id = p.agent_id.clone();
+        let mut out = self.agent_by_order(sid, &agent_id, ts_seen);
+        let ss = self.session(sid);
+        ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+        if !ss.finished_agents.insert(agent_id.clone()) {
+            return out;
+        }
+        out.push(self.emit(sid, Payload::AgentFinished(p), meta));
+        let changes = self.tracker(sid).agent_finished(&agent_id, ts_seen);
+        out.extend(self.apply(sid, changes, &agent_id, ts_seen));
         out
     }
 
@@ -1287,7 +1335,7 @@ impl Merger {
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
-        session.status.tool_started(&id, &tool, &input);
+        session.status.tool_started(&id, &tool, &input, &agent);
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {
@@ -1343,6 +1391,11 @@ impl Merger {
             }
         }
         out.extend(self.derive_from_pre(h, sid, &id, &agent, ts_seen));
+        // main 開始新的工具：這輪還沒完成（Stop hook 回 block 時不經 UserPromptSubmit，K-4）
+        if agent == "main" {
+            let changes = self.tracker(sid).main_tool_started(ts_seen);
+            out.extend(self.apply(sid, changes, &agent, ts_seen));
+        }
         // 危險不等 transcript：PreToolUse 一到就進注意佇列；warn 只在串流標示
         if let Some(d) = danger.filter(|d| d.level == DangerLevel::Danger) {
             let changes = self.tracker(sid).danger(&id, d.why, ts_seen);

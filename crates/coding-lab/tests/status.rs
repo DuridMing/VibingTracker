@@ -267,6 +267,46 @@ fn wait_is_cleared_by_post_tool_batch_when_auto_denied() {
     assert_eq!(r.attention().last(), Some(&a("cleared", "wait", "t1")));
 }
 
+/// PostToolBatch 只代表送出它的那個 agent 這一批工具結束了：subagent 的不能清掉 main 還在等的權限詢問（K-11）。
+#[test]
+fn subagent_batch_does_not_clear_main_wait() {
+    let mut r = Run::new();
+    r.feed(subagent_start("b1", 900))
+        .feed(pre("t1", "git push", 1000))
+        .feed(ask("git push", 1100))
+        .tick(2200);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(hook(
+        "PostToolBatch",
+        json!({ "agent_id": "b1", "agent_type": "general-purpose", "tool_calls": [] }),
+        2500,
+    ));
+    assert_eq!(r.last_status(), "wait", "{:?}", r.attention());
+    // main 自己的 batch 照常清掉（自動駁回只有這個訊號）
+    r.feed(hook("PostToolBatch", json!({ "tool_calls": [] }), 2600));
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn subagent_batch_clears_its_own_wait() {
+    let mut r = Run::new();
+    r.feed(subagent_start("b1", 900))
+        .feed(pre_agent("t1", "git push", "b1", 1000))
+        .feed(hook(
+            "PermissionRequest",
+            json!({ "tool_name": "Bash", "tool_input": bash("git push"), "agent_id": "b1", "agent_type": "Explore" }),
+            1100,
+        ))
+        .tick(2200);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(hook(
+        "PostToolBatch",
+        json!({ "agent_id": "b1", "agent_type": "Explore", "tool_calls": [] }),
+        2500,
+    ));
+    assert_eq!(r.last_status(), "run");
+}
+
 #[test]
 fn wait_is_cleared_by_transcript_tool_result_when_esc() {
     let mut r = Run::new();
@@ -313,6 +353,52 @@ fn prompt_within_silence_cancels_done() {
         .feed(prompt("再做", 3000))
         .tick(10_000);
     assert!(r.attention().is_empty());
+}
+
+/// Stop hook 回 block 時 Claude Code 接著工作，之後的 Stop 帶 `stop_hook_active`；中間沒有 UserPromptSubmit。
+/// main 開始新的工具就表示這輪還沒完成（K-4）。
+#[test]
+fn main_tool_after_stop_cancels_the_silence_period() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .feed(pre("t1", "cargo fmt", 2000))
+        .tick(6500);
+    assert!(r.attention().is_empty(), "{:?}", r.attention());
+    assert_eq!(r.last_status(), "run");
+    // 做完再 Stop 一次：照常 5 秒後完成
+    r.feed(ok("t1", 3000))
+        .feed(hook("Stop", json!({ "stop_hook_active": true }), 4000))
+        .tick(8999);
+    assert!(r.attention().is_empty());
+    r.tick(9000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
+}
+
+#[test]
+fn main_tool_after_done_withdraws_it() {
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(stop(1000))
+        .tick(6000)
+        .feed(pre("t1", "cargo fmt", 7000));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "done", "p0"), a("cleared", "done", "p0")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn subagent_tool_after_stop_does_not_cancel_done() {
+    // 背景 agent 在 main 的 Stop 之後還會跑工具；那不是 main 這一輪沒完成
+    let mut r = Run::new();
+    r.feed(prompt("做事", 0))
+        .feed(subagent_start("a1", 500))
+        .feed(stop(1000))
+        .feed(pre_agent("t1", "ls", "a1", 2000))
+        .tick(6000);
+    assert_eq!(r.attention(), [a("raised", "done", "p0")]);
 }
 
 #[test]
@@ -577,6 +663,55 @@ fn failures_of_parallel_agents_are_counted_separately() {
         r.attention().is_empty(),
         "main 一次、subagent 一次，不算連續"
     );
+}
+
+/// subagent 連續失敗兩次進 fail；它結束後不會再有它的 Bash 成功，fail 要跟著它結束一起解除（K-1）。
+fn subagent_fails_twice(r: &mut Run) {
+    r.feed(subagent_start("a1", 900))
+        .feed(pre_agent("t1", "x", "a1", 1000))
+        .feed(fail_agent("t1", "a1", 1100))
+        .feed(pre_agent("t2", "y", "a1", 1200))
+        .feed(fail_agent("t2", "a1", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")], "前提");
+    assert_eq!(r.last_status(), "fail");
+}
+
+#[test]
+fn subagent_fail_is_cleared_when_the_subagent_stops() {
+    let mut r = Run::new();
+    subagent_fails_twice(&mut r);
+    r.feed(subagent_stop("a1", 2000));
+    assert_eq!(r.attention().last(), Some(&a("cleared", "fail", "t2")));
+    assert_eq!(r.last_status(), "run");
+    // 之後 main 的一輪照常完成
+    r.feed(stop(3000)).tick(9000);
+    assert_eq!(r.last_status(), "done");
+}
+
+#[test]
+fn subagent_fail_is_cleared_when_its_task_notification_finishes_it() {
+    let mut r = Run::new();
+    subagent_fails_twice(&mut r);
+    r.feed(prompt(&notification("a1", Some("failed")), 2000));
+    assert!(
+        r.attention().contains(&a("cleared", "fail", "t2")),
+        "{:?}",
+        r.attention()
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn main_fail_is_not_cleared_by_a_subagent_stop() {
+    let mut r = Run::new();
+    r.feed(subagent_start("a1", 900))
+        .feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "y", 1200))
+        .feed(fail("t2", 1300))
+        .feed(subagent_stop("a1", 2000));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
+    assert_eq!(r.last_status(), "fail");
 }
 
 #[test]
@@ -1245,6 +1380,43 @@ fn end(ts: u64) -> Input {
     hook("SessionEnd", json!({ "reason": "exit" }), ts)
 }
 
+/// 危險指令還在跑（或等權限）時 session 就結束了，沒有 Post 也沒有 tool_result：resume 之後那個工具
+/// 已經不存在，它的 danger／wait 不能一直蓋住新一輪的狀態（K-2）。
+#[test]
+fn danger_of_a_tool_that_died_with_the_session_is_cleared_on_resume() {
+    let mut r = Run::with_rules();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("x", 1_100))
+        .feed(pre("t1", "rm -rf build/x", 1_200))
+        .feed(end(5_000));
+    assert_eq!(r.last_status(), "ended");
+    r.feed(start("resume", 60_000));
+    assert!(
+        r.attention().contains(&a("cleared", "danger", "t1")),
+        "{:?}",
+        r.attention()
+    );
+    r.feed(prompt("y", 61_000)).feed(stop(62_000)).tick(70_000);
+    assert_eq!(r.last_status(), "done", "{:?}", r.statuses());
+}
+
+/// 同上，等權限中的工具：resume 後不能留著 running，否則 #706 的「等你」推測永遠不會觸發。
+#[test]
+fn wait_of_a_tool_that_died_with_the_session_is_cleared_on_resume() {
+    let mut r = Run::new();
+    r.feed(start("startup", 1_000))
+        .feed(prompt("x", 1_100))
+        .feed(pre("t1", "git push", 1_200))
+        .feed(ask("git push", 1_300))
+        .tick(2_500);
+    assert_eq!(r.last_status(), "wait");
+    r.feed(end(5_000)).feed(start("resume", 60_000));
+    assert_eq!(r.last_status(), "run", "{:?}", r.statuses());
+    // 沒有在跑的工具：main 的文字之後 N 秒沒有動靜要推測「等你」
+    r.feed(said(1, "m1", "main", 61_000)).tick(61_000 + 120_000);
+    assert_eq!(r.last_status(), "wait", "{:?}", r.attention());
+}
+
 #[test]
 fn resume_after_end_reports_status_again() {
     let mut r = Run::with_rules();
@@ -1367,6 +1539,20 @@ fn idle_before_restart_prompt_reports_run() {
     assert_eq!(r.statuses(), ["run"]);
 }
 
+/// 重啟前 done 已被使用者確認（store 標 acked，不再種回）：store 與 live 的 status 是 done，
+/// Tracker 從空的注意項目算出 run。下一個 prompt 要照樣送 run，不能因為「和 Tracker 自己的一樣」就不送（K-6）。
+#[test]
+fn acked_done_before_restart_prompt_reports_run() {
+    let mut r = Run::new();
+    r.m.resume(S, 40, 3, "/p");
+    r.m.resume_state(S, None, false, 1_000);
+    r.feed(prompt("again", 21_000));
+    assert_eq!(r.statuses(), ["run"]);
+    // 只補送一次：之後狀態沒變就不再送
+    r.feed(pre("t1", "ls", 21_100)).feed(ok("t1", 21_200));
+    assert_eq!(r.statuses(), ["run"]);
+}
+
 /// 重啟前就沒有 SessionEnd、之後也沒再回來的 session：沒有輸入滿 24 小時後一樣補 abandoned。
 #[test]
 fn session_abandoned_before_restart_is_ended_later() {
@@ -1461,4 +1647,66 @@ fn decayed_signals_are_dropped_without_changing_the_score() {
     t.tick(later);
     assert_eq!(t.signal_count(), 1, "只剩還沒衰減完的那個");
     assert_eq!(t.score(later).round(), before);
+}
+
+// ── 同一個 hook 收到兩次（K-3：URL 重複、裝了兩份 plugin）：依 (hook 名稱, tool_use_id) 只處理第一次
+
+#[test]
+fn duplicate_pre_tool_use_danger_is_cleared_by_its_post() {
+    let mut r = Run::with_rules();
+    r.feed(prompt("x", 1000))
+        .feed(pre("t1", "rm -rf /tmp/x", 1100))
+        .feed(pre("t1", "rm -rf /tmp/x", 1101))
+        .feed(ok("t1", 1300));
+    assert_eq!(
+        r.attention(),
+        [a("raised", "danger", "t1"), a("cleared", "danger", "t1")]
+    );
+    assert_eq!(r.last_status(), "run");
+}
+
+#[test]
+fn duplicate_failure_hook_is_one_failure() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "cargo test", 1000))
+        .feed(fail("t1", 1100))
+        .feed(fail("t1", 1101));
+    assert!(
+        r.attention().is_empty(),
+        "只有一次失敗：{:?}",
+        r.attention()
+    );
+    let failed = r
+        .evs
+        .iter()
+        .filter(|e| e.type_name() == "tool.updated" && e.payload["status"] == "failed")
+        .count();
+    assert_eq!(failed, 1);
+}
+
+#[test]
+fn duplicate_pre_tool_use_edit_derives_once() {
+    let mut r = Run::new();
+    let edit = || {
+        hook(
+            "PreToolUse",
+            json!({ "tool_name": "Edit", "tool_use_id": "e1",
+                    "tool_input": { "file_path": "/p/a.rs", "old_string": "a", "new_string": "b" } }),
+            1000,
+        )
+    };
+    r.feed(edit()).feed(edit());
+    let count = |t: &str| r.evs.iter().filter(|e| e.type_name() == t).count();
+    assert_eq!(count("file.edit"), 1);
+    assert_eq!(count("tool.called"), 1);
+}
+
+#[test]
+fn same_hook_for_a_different_tool_is_not_a_duplicate() {
+    let mut r = Run::new();
+    r.feed(pre("t1", "x", 1000))
+        .feed(fail("t1", 1100))
+        .feed(pre("t2", "x", 1200))
+        .feed(fail("t2", 1300));
+    assert_eq!(r.attention(), [a("raised", "fail", "t2")]);
 }
