@@ -1453,3 +1453,198 @@ async fn project_replay_rebuilds_the_main_page_at_any_time() {
         assert_eq!(get(addr, bad).await.0, 400, "{bad}");
     }
 }
+
+// ── diff API 的 untracked 備援與遠端剝除（C1、A-N1、C20，#734） ───────────────────────
+
+const ENV_SECRET: &str = "sk-live-VERY-SECRET-0123456789";
+
+/// main 上一個 commit；`.env` 被 .gitignore 忽略、`.env.local` 已追蹤（敏感路徑）；
+/// `secrets.json` 是沒被忽略的 untracked 敏感檔；`notes.txt` 是一般的 untracked 檔。
+fn diff_repo() -> PathBuf {
+    let root = canon(&tmp("diffrepo"));
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, ".gitignore", ".env\n");
+    write(&root, "a.txt", "a\n");
+    write(&root, ".env.local", "OLD=1\n");
+    git(&root, &["add", "."]);
+    git(&root, &["add", "-f", ".env.local"]);
+    git(&root, &["commit", "-qm", "init"]);
+    write(&root, ".env", &format!("API_KEY={ENV_SECRET}\n"));
+    write(&root, ".env.local", &format!("OLD=1\nNEW={ENV_SECRET}\n"));
+    write(
+        &root,
+        "secrets.json",
+        &format!("{{\"k\":\"{ENV_SECRET}\"}}\n"),
+    );
+    write(&root, "notes.txt", "hello untracked\n");
+    root
+}
+
+async fn diff_server(root: &Path, remote: bool) -> SocketAddr {
+    let home = tmp("diffhome");
+    let store = store_with(&home, &[started("s1", 1, 1_000, &s(root))]);
+    let state = WebState::new(Some(store), None, 8);
+    state.set_force_remote(remote);
+    start(state).await
+}
+
+async fn diff_of(addr: SocketAddr, root: &Path, api: &str, path: &str) -> (u16, Value) {
+    let cwd = enc(&s(root));
+    get(
+        addr,
+        &format!("/api/{api}?cwd={cwd}&worktree={cwd}&path={}", enc(path)),
+    )
+    .await
+}
+
+/// gitignored 的檔在 UI 清單裡本來就不會出現，直接打 API 也不讀：本機回空的 diff，遠端 403。
+#[tokio::test]
+async fn untracked_fallback_never_reads_ignored_files() {
+    let root = diff_repo();
+    for remote in [false, true] {
+        let addr = diff_server(&root, remote).await;
+        for api in ["commit-diff", "branch-diff"] {
+            let (code, body) = diff_of(addr, &root, api, ".env").await;
+            assert_eq!(code, if remote { 403 } else { 200 }, "{api}：{body}");
+            assert!(
+                !body.to_string().contains(ENV_SECRET),
+                "remote={remote} {api} 讀到 gitignored 的 .env：{body}"
+            );
+        }
+        // 對照：沒被忽略的一般 untracked 檔照樣整檔當新增
+        let (_, body) = diff_of(addr, &root, "commit-diff", "notes.txt").await;
+        assert!(
+            body["diff"].as_str().unwrap().contains("+hello untracked"),
+            "{body}"
+        );
+    }
+}
+
+/// 遠端看敏感路徑（不論追蹤與否）一律 403；本機照給。
+#[tokio::test]
+async fn remote_diff_of_a_sensitive_path_is_forbidden() {
+    let root = diff_repo();
+    let remote = diff_server(&root, true).await;
+    let local = diff_server(&root, false).await;
+    for path in [".env.local", "secrets.json"] {
+        for api in ["commit-diff", "branch-diff"] {
+            let (code, body) = diff_of(remote, &root, api, path).await;
+            assert_eq!(code, 403, "{api} {path}：{body}");
+            assert!(!body.to_string().contains(ENV_SECRET), "{path}：{body}");
+        }
+        let (_, body) = diff_of(local, &root, "commit-diff", path).await;
+        assert!(
+            body["diff"].as_str().unwrap().contains(ENV_SECRET),
+            "本機照給 {path}：{body}"
+        );
+    }
+    // 不敏感的檔遠端照給
+    let (_, body) = diff_of(remote, &root, "commit-diff", "notes.txt").await;
+    assert!(
+        body["diff"].as_str().unwrap().contains("+hello untracked"),
+        "{body}"
+    );
+}
+
+/// diff 內容裡的 clk_ 金鑰對遠端只留 id（#720 的規則套到 diff）。
+#[tokio::test]
+async fn remote_diff_strips_clk_keys() {
+    let root = diff_repo();
+    let key = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    write(&root, "notes.txt", &format!("token {key}\n"));
+    let addr = diff_server(&root, true).await;
+    let (_, body) = diff_of(addr, &root, "commit-diff", "notes.txt").await;
+    let diff = body["diff"].as_str().unwrap();
+    assert!(
+        !diff.contains(key) && diff.contains("clk_ABCDEFGH_…"),
+        "{diff}"
+    );
+}
+
+/// symlink（檔或目錄）指到 worktree 外：不跟著讀（A-N1）。
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_fallback_does_not_follow_symlinks_out_of_the_worktree() {
+    let root = diff_repo();
+    let outside = canon(&tmp("outside"));
+    write(&outside, "id_ed", "OUTSIDE-PRIVATE-KEY\n");
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+    std::os::unix::fs::symlink(outside.join("id_ed"), root.join("linkfile")).unwrap();
+    let addr = diff_server(&root, false).await;
+    for path in ["linkdir/id_ed", "linkfile"] {
+        let (_, body) = diff_of(addr, &root, "commit-diff", path).await;
+        assert!(
+            !body.to_string().contains("OUTSIDE-PRIVATE-KEY"),
+            "{path}：{body}"
+        );
+    }
+}
+
+/// FIFO 不是一般檔：馬上回，不能卡住 blocking 執行緒（C20）。
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_fallback_skips_fifos() {
+    let root = diff_repo();
+    let fifo = root.join("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let addr = diff_server(&root, false).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        diff_of(addr, &root, "commit-diff", "pipe"),
+    )
+    .await;
+    // 讀端若卡在 FIFO 上（修正前），開一次讀寫端再關掉讓它讀到 EOF，runtime 才關得掉。
+    // 用讀寫模式：沒有讀端時只開寫端會一直等（修正後就是這樣），讀寫模式在 Linux／macOS 都不會卡。
+    let _ = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo);
+    let (code, body) = res.expect("5 秒內沒回：讀 FIFO 卡住");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["diff"], "", "{body}");
+}
+
+/// 大的 untracked 檔只讀前段、標 truncated，回應不超過上限（C20）。
+#[tokio::test]
+async fn untracked_fallback_reads_only_the_head_of_big_files() {
+    let root = diff_repo();
+    let line = "x".repeat(99) + "\n";
+    write(&root, "big.log", &line.repeat(100_000)); // 10 MB
+    let addr = diff_server(&root, false).await;
+    let (code, body) = diff_of(addr, &root, "commit-diff", "big.log").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["truncated"], true);
+    let diff = body["diff"].as_str().unwrap();
+    assert!(diff.len() <= 64 * 1024, "{}", diff.len());
+    assert!(
+        diff.starts_with("--- /dev/null\n+++ b/big.log\n+xxx"),
+        "{}",
+        &diff[..80]
+    );
+}
+
+/// X-1：cwd 白名單只放行已知 cwd、它底下的目錄、它所屬 repo 的主工作樹根；任意的上層目錄（例如 home）不放行。
+#[tokio::test]
+async fn cwd_whitelist_does_not_accept_arbitrary_ancestors() {
+    let r = repo();
+    std::fs::create_dir_all(r.x.join("sub")).unwrap();
+    let addr = files_server(&r).await;
+    let parent = r.root.parent().unwrap();
+    let cases = [
+        (s(&r.x), 200, "session 自己的 cwd"),
+        (s(&r.x.join("sub")), 200, "在 session 的 cwd 底下"),
+        (s(&r.root), 200, "session 所屬 repo 的主工作樹根"),
+        (s(&r.root.join("wt")), 404, "只是上層目錄、不是 repo 根"),
+        (s(parent), 404, "repo 外的上層目錄（像 home）"),
+    ];
+    for (cwd, want, why) in cases {
+        let (code, body) = get(addr, &format!("/api/files?cwd={}", enc(&cwd))).await;
+        assert_eq!(code, want, "{why}（{cwd}）：{body}");
+    }
+}

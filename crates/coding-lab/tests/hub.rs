@@ -966,3 +966,32 @@ async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
     let (st, _) = http_get(hub_addr, "/api/sessions/nope/events").await;
     assert_eq!(st, 404);
 }
+
+/// hub 沒有金鑰驗證，反向代理轉來的連線（帶轉發標頭）一律 403：否則代理後面的任何人都是本機（S-1）。
+#[tokio::test]
+async fn hub_refuses_reverse_proxied_requests() {
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), Vec::new(), None)
+        .await
+        .unwrap();
+    let get = |extra: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
+        let req = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: {hub_addr}\r\n{extra}Connection: close\r\n\r\n"
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut s, req.as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut s, &mut out)
+            .await
+            .unwrap();
+        out.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap()
+    };
+    assert_eq!(get("").await, 200, "本機直連照舊");
+    assert_eq!(get("X-Forwarded-For: 203.0.113.9\r\n").await, 403);
+    assert_eq!(get("Forwarded: for=203.0.113.9\r\n").await, 403);
+}

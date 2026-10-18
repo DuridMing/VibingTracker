@@ -13,6 +13,9 @@ const firstLine = (s) => String(s ?? "").split("\n", 1)[0];
 const LONG = 160; // 超過這個長度就可以展開看全文
 
 
+/** 計數欄位：不是有限數字就當 0。 */
+const num = (n) => (Number.isFinite(Number(n)) ? Number(n) : 0);
+
 function duration(ms) {
   if (ms == null) return "";
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -51,11 +54,12 @@ function toolBody(c) {
     case "Edit":
     case "MultiEdit":
     case "NotebookEdit": {
-      const n = c.edit ? `  <span class="ok">+${c.edit.added}</span> <span class="bad">−${c.edit.removed}</span>` : "";
+      // 計數一律當數字：hub 原樣轉送上游的 JSON，字串不能進 HTML（F-8）
+      const n = c.edit ? `  <span class="ok">+${num(c.edit.added)}</span> <span class="bad">−${num(c.edit.removed)}</span>` : "";
       return `<span class="ed">edit</span>  ${esc(path)}${n}`;
     }
     case "Write": {
-      const n = c.write ? `  <span class="o">（${c.write.isNew ? "新檔案 · " : ""}${c.write.lines} 行）</span>` : "";
+      const n = c.write ? `  <span class="o">（${c.write.isNew ? "新檔案 · " : ""}${num(c.write.lines)} 行）</span>` : "";
       return `<span class="wr">write</span> ${esc(path)}${n}`;
     }
     case "Task":

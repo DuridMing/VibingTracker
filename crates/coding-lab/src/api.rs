@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Path as UrlPath, State};
+use axum::Extension;
+use axum::extract::{Path as UrlPath, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
@@ -17,7 +18,7 @@ use crate::event::Payload;
 use crate::live::{clip, short_model};
 use crate::store::ProjectKey;
 use crate::store::{SessionRow, Store};
-use crate::ws::{MORE_LIMIT, WebState, more_events};
+use crate::ws::{MORE_LIMIT, Remote, WebState, more_events};
 
 const SESSIONS_DEFAULT: usize = 100;
 const SESSIONS_MAX: usize = 1000;
@@ -96,7 +97,11 @@ fn norm(p: &str) -> String {
 
 // ── /api/sessions
 
-pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+pub async fn sessions(
+    State(state): State<Arc<WebState>>,
+    Extension(Remote(remote)): Extension<Remote>,
+    uri: Uri,
+) -> Response {
     let q = query(&uri);
     let cwd = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty());
     let Some(store) = state.store().cloned() else {
@@ -132,7 +137,10 @@ pub async fn sessions(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
             None => v,
         })
         .collect();
-    ok(&json!({ "sessions": rows }))
+    // 遠端連線：prompt 裡的 clk_ 金鑰、來源是 thinking 的 doing 都要剝（S-5、C2），和 WS 同一個剝除
+    let mut body = json!({ "sessions": rows });
+    state.redact_for(remote, &mut body);
+    ok(&body)
 }
 
 /// store 的 sessions 列，組成與 WS 相同欄位（不在 live 狀態裡的 session 直接用）。
@@ -161,7 +169,8 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
         "model": r.model.as_deref().map(short_model), "modelId": r.model,
         "firstPrompt": r.first_prompt.as_deref().map(clip), "lastPrompt": last_prompt,
         "startedAt": r.started_at, "endedAt": r.ended_at,
-        "status": r.status, "statusSince": r.status_since, "doing": Value::Null, "score": 0,
+        "status": r.status, "statusSince": r.status_since, "doing": Value::Null, "doingSource": Value::Null,
+        "score": 0,
         "commits": r.commits, "dangers": r.dangers, "failures": r.failures,
         "agentsLive": 0, "costUsd": r.cost_usd, "thinkingTokens": r.thinking_tokens,
         "lastPos": last_pos,
@@ -174,7 +183,7 @@ fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>
 
 pub async fn events(
     State(state): State<Arc<WebState>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     UrlPath(id): UrlPath<String>,
     uri: Uri,
 ) -> Response {
@@ -198,7 +207,7 @@ pub async fn events(
         Ok(events) => {
             let mut body = json!({ "session": id, "beforePos": before, "events": events });
             // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-            state.redact_for_peer(peer, &mut body);
+            state.redact_for(remote, &mut body);
             ok(&body)
         }
         Err(e) => store_error(e),
@@ -218,7 +227,7 @@ fn parse_project_key(s: &str) -> Option<ProjectKey> {
 
 pub async fn project_events(
     State(state): State<Arc<WebState>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     uri: Uri,
 ) -> Response {
     let q = query(&uri);
@@ -255,7 +264,7 @@ pub async fn project_events(
                 let mut body =
                     json!({ "cwd": cwd, "from": from, "to": to, "events": events, "next": next });
                 // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-                state2.redact_for_peer(peer, &mut body);
+                state2.redact_for(remote, &mut body);
                 ok(&body)
             }
             Err(e) => store_error(e),
@@ -275,7 +284,7 @@ const REPLAY_MAX_LIMIT: usize = 10_000;
 /// `offset` 是前端的 UTC 位移（分，同 hello 的 utcOffsetMin），KPI 的「今天」依它算；`snapshot=0` 只要 frame（接續下一段）。
 pub async fn project_replay(
     State(state): State<Arc<WebState>>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     uri: Uri,
 ) -> Response {
     let q = query(&uri);
@@ -313,7 +322,7 @@ pub async fn project_replay(
                     crate::timeline::replay(&events, &acks, at, until, n, offset, with_snapshot);
                 body["cwd"] = json!(cwd);
                 // 遠端連線剝除敏感輸出（#654）與 thinking（#668），和 WS 一致
-                state2.redact_for_peer(peer, &mut body);
+                state2.redact_for(remote, &mut body);
                 ok(&body)
             }
             Err(e) => store_error(e),
@@ -367,23 +376,31 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-/// 只對 store 裡有 session 的目錄（或它的上層）跑 git：不是的話回拒絕的回應。
-fn reject_unknown(store: &Store, cwd: &str) -> Option<Response> {
-    let known = match store.cwds() {
-        Ok(k) => k,
-        Err(e) => return Some(store_error(e)),
-    };
+/// web 入口可以對哪些目錄跑 git（X-1，contracts §7）：store 裡某個 session 的 cwd、在它底下，或是那個 session
+/// 所屬 repo 的主工作樹根（專案根目錄底下只有 worktree 裡的 session 時要能查）。任意的上層目錄（例如 home）不放行。
+fn cwd_allowed(known: &[String], cwd: &str) -> bool {
+    if known.iter().any(|k| {
+        k == cwd
+            || cwd
+                .strip_prefix(k.as_str())
+                .is_some_and(|r| r.starts_with('/'))
+    }) {
+        return true;
+    }
+    // 上層目錄只在是那個 session 的主工作樹根時放行：只對底下真的有 session 的候選問 git
     let prefix = format!("{cwd}/");
-    (!known.iter().any(|k| k == cwd || k.starts_with(&prefix)))
-        .then(|| error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄"))
+    known
+        .iter()
+        .filter(|k| k.starts_with(&prefix))
+        .any(|k| worktrees(Path::new(k)).first().map(|(p, _)| p.as_str()) == Some(cwd))
 }
 
 fn files_blocking(store: &std::sync::Mutex<Store>, cwd: &str, base: Base) -> Response {
+    if let Some(resp) = guard(store, cwd) {
+        return resp;
+    }
     let session_paths = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(resp) = reject_unknown(&store, cwd) {
-            return resp;
-        }
         match &base {
             Base::Session(id) => match session_changes(&store, id) {
                 Ok(Some(c)) => Some(c),
@@ -505,11 +522,11 @@ pub async fn branches(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
 
 fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
     // 還沒結束的 session：(id, cwd)
+    if let Some(resp) = guard(store, cwd) {
+        return resp;
+    }
     let live: Vec<(String, String)> = {
         let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(resp) = reject_unknown(&store, cwd) {
-            return resp;
-        }
         match store.sessions(None, SESSIONS_MAX) {
             Ok(rows) => rows
                 .into_iter()
@@ -612,7 +629,11 @@ fn plain_rel_path(p: &str) -> bool {
         && p.split('/').all(|c| !c.is_empty() && c != "..")
 }
 
-pub async fn branch_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+pub async fn branch_diff(
+    State(state): State<Arc<WebState>>,
+    Extension(Remote(remote)): Extension<Remote>,
+    uri: Uri,
+) -> Response {
     let q = query(&uri);
     let field = |k: &str| q.get(k).map(|c| norm(c)).filter(|c| !c.is_empty());
     let (Some(cwd), Some(worktree), Some(path)) = (field("cwd"), field("worktree"), field("path"))
@@ -625,22 +646,23 @@ pub async fn branch_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Respon
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || branch_diff_blocking(&store, &cwd, &worktree, &path))
-        .await
-        .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    tokio::task::spawn_blocking(move || {
+        branch_diff_blocking(&state, &store, &cwd, &worktree, &path, remote)
+    })
+    .await
+    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn branch_diff_blocking(
+    state: &WebState,
     store: &std::sync::Mutex<Store>,
     cwd: &str,
     worktree: &str,
     path: &str,
+    remote: bool,
 ) -> Response {
-    {
-        let store = store.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(resp) = reject_unknown(&store, cwd) {
-            return resp;
-        }
+    if let Some(resp) = guard(store, cwd) {
+        return resp;
     }
     let root = git(Path::new(cwd), &["rev-parse", "--show-toplevel"]).map(|s| norm(s.trim()));
     let wts = root
@@ -651,16 +673,21 @@ fn branch_diff_blocking(
         return error(StatusCode::NOT_FOUND, "不是這個 repo 的 worktree");
     };
     let dir = Path::new(&wt);
+    if let Some(resp) = remote_denied(remote, dir, path) {
+        return resp;
+    }
     let main = integration(dir);
     let empty = main.is_none().then(|| empty_tree_if_unborn(dir)).flatten();
     let Some(base) = fork_point(dir, main, empty.as_deref()) else {
         return error(StatusCode::CONFLICT, NO_INTEGRATION);
     };
     let (diff, truncated) = file_diff(dir, &[&base], path, true);
-    ok(&json!({
+    let mut body = json!({
         "worktree": wt, "branch": branch, "base": base, "integration": main,
         "path": path, "diff": diff, "truncated": truncated,
-    }))
+    });
+    state.redact_for(remote, &mut body);
+    ok(&body)
 }
 
 /// 一個檔的 diff（比較 `range`，只有一個時比到工作目錄）。`untracked`：未追蹤的新檔整檔當新增。
@@ -671,15 +698,19 @@ fn file_diff(dir: &Path, range: &[&str], path: &str, untracked: bool) -> (String
     args.extend(range);
     args.extend(["--", &literal]);
     let mut diff = git(dir, &args).unwrap_or_default();
+    let mut head_cut = false;
     if untracked
         && diff.is_empty()
         && git(dir, &["ls-files", "--error-unmatch", "--", &literal]).is_none()
-        && let Ok(text) = std::fs::read_to_string(dir.join(path))
+        // 被忽略的檔（.env 之類）UI 清單本來就不列，直接打 API 也不讀（C1）
+        && git(dir, &["check-ignore", "-q", "--", path]).is_none()
+        && let Some((text, cut)) = read_untracked(dir, path)
     {
+        head_cut = cut;
         diff = format!("--- /dev/null\n+++ b/{path}\n")
             + &text.lines().map(|l| format!("+{l}\n")).collect::<String>();
     }
-    let truncated = diff.len() > DIFF_MAX;
+    let truncated = head_cut || diff.len() > DIFF_MAX;
     if truncated {
         let mut cut = DIFF_MAX;
         while !diff.is_char_boundary(cut) {
@@ -690,9 +721,43 @@ fn file_diff(dir: &Path, range: &[&str], path: &str, untracked: bool) -> (String
     (diff, truncated)
 }
 
-/// store 裡有 session 的 cwd 才放行（拿鎖、查完就放）。
+/// 未追蹤檔的內容（整檔當新增用）：只讀 worktree 底下的一般檔，最多 DIFF_MAX+1 bytes（C20、A-N1）。
+/// symlink（不論指到檔或目錄、或路徑中間有 symlink 目錄）、FIFO、裝置檔都不讀；回傳（內容, 是否只讀了前段）。
+fn read_untracked(dir: &Path, path: &str) -> Option<(String, bool)> {
+    use std::io::Read;
+    let full = dir.join(path);
+    if !std::fs::symlink_metadata(&full).ok()?.is_file() {
+        return None;
+    }
+    let real = full.canonicalize().ok()?;
+    if !real.starts_with(dir.canonicalize().ok()?) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(&real)
+        .ok()?
+        .take(DIFF_MAX as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let cut = buf.len() > DIFF_MAX;
+    Some((String::from_utf8_lossy(&buf).into_owned(), cut))
+}
+
+/// 遠端連線不能看的檔：敏感路徑（§4 的敏感規則，不論追蹤與否、哪個版本）或被 gitignore 的檔，回 403（C1、#734）。
+fn remote_denied(remote: bool, dir: &Path, path: &str) -> Option<Response> {
+    (remote
+        && (crate::sensitive::is_sensitive_path(path)
+            || git(dir, &["check-ignore", "-q", "--", path]).is_some()))
+    .then(|| error(StatusCode::FORBIDDEN, "這個檔不提供給遠端連線"))
+}
+
+/// 不在白名單（[`cwd_allowed`]）的目錄回 404。只在取 cwd 清單時拿 store 鎖，跑 git 時已經放掉。
 fn guard(store: &std::sync::Mutex<Store>, cwd: &str) -> Option<Response> {
-    reject_unknown(&store.lock().unwrap_or_else(|e| e.into_inner()), cwd)
+    let known = match store.lock().unwrap_or_else(|e| e.into_inner()).cwds() {
+        Ok(k) => k,
+        Err(e) => return Some(store_error(e)),
+    };
+    (!cwd_allowed(&known, cwd)).then(|| error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄"))
 }
 
 fn toplevel(cwd: &str) -> Option<String> {
@@ -894,7 +959,11 @@ pub async fn commit(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
-pub async fn commit_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
+pub async fn commit_diff(
+    State(state): State<Arc<WebState>>,
+    Extension(Remote(remote)): Extension<Remote>,
+    uri: Uri,
+) -> Response {
     let q = query(&uri);
     let Some(cwd) = q.get("cwd").map(|c| norm(c)).filter(|c| !c.is_empty()) else {
         return error(StatusCode::BAD_REQUEST, "缺少 cwd");
@@ -917,10 +986,15 @@ pub async fn commit_diff(State(state): State<Arc<WebState>>, uri: Uri) -> Respon
             Ok(x) => x,
             Err((code, msg)) => return error(code, msg),
         };
+        if let Some(resp) = remote_denied(remote, Path::new(&dir), &path) {
+            return resp;
+        }
         let range: Vec<&str> = range.iter().map(String::as_str).collect();
         let untracked = matches!(target, Target::Worktree(_));
         let (diff, truncated) = file_diff(Path::new(&dir), &range, &path, untracked);
-        ok(&json!({ "path": path, "diff": diff, "truncated": truncated }))
+        let mut body = json!({ "path": path, "diff": diff, "truncated": truncated });
+        state.redact_for(remote, &mut body);
+        ok(&body)
     })
     .await
     .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -1273,10 +1347,10 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 pub async fn thinking(
     State(state): State<Arc<WebState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     identity: Option<axum::Extension<crate::auth::Identity>>,
     axum::extract::Path((session, seq)): axum::extract::Path<(String, u64)>,
 ) -> Response {
-    let remote = state.remote_peer(peer);
     if remote && state.remote_thinking() == crate::config::RemoteThinking::Hide {
         return error(
             StatusCode::FORBIDDEN,
@@ -1313,8 +1387,8 @@ pub async fn thinking(
         "messageId": t["messageId"], "model": t["model"],
     });
     if remote {
-        // 全文裡的 clk_ 金鑰也要遮（#720）；這個回應不是 Event，不會被 defer_thinking 動到
-        crate::sensitive::redact_keys(&mut body);
+        // 全文裡的 clk_ 金鑰也要遮（#720）；這個回應不是 Event，以 Show 模式剝除就只會遮金鑰、不會 defer 全文
+        body = crate::ws::redact_remote_copy(&body, crate::config::RemoteThinking::Show);
     }
     ok(&body)
 }

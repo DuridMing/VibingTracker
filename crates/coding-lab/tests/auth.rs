@@ -557,3 +557,124 @@ async fn successful_auth_records_last_used() {
     let op = keys::parse_token(&s.operate).unwrap().0;
     assert!(store.get(op).unwrap().last_used_ms.is_none());
 }
+
+// ── 反向代理（S-1）：loopback 來源帶 X-Forwarded-*／Forwarded 一律當遠端 ─────────
+
+/// 一個有 session 的 store：prompt 裡有 clk_ 金鑰、有一段 thinking（遠端要剝的兩樣東西）。
+fn proxied_server_store(
+    home: &Path,
+    secret: &str,
+) -> std::sync::Arc<std::sync::Mutex<coding_lab::store::Store>> {
+    let ev = |seq: u64, kind: &str, pos: Option<u64>, payload: Value| {
+        coding_lab::event::Event::from_json_line(
+            &json!({"v": 1, "session": "s1", "seq": seq, "type": kind, "agent": "main", "line": null,
+                    "pos": pos, "ts_model": null, "ts_exec": null, "ts_seen": NOW + seq, "host": "local",
+                    "payload": payload})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    let mut s = coding_lab::store::Store::open(home).unwrap();
+    s.append(ev(1, "session.started", None,
+        json!({"cwd": "/p", "source": "startup", "model": "m", "transcriptPath": "/t", "branch": "main"})));
+    s.append(ev(
+        2,
+        "prompt.submitted",
+        None,
+        json!({"text": format!("use {secret} please"), "promptId": "p1"}),
+    ));
+    s.append(ev(
+        3,
+        "assistant.thinking",
+        Some(1),
+        json!({"text": "THINKING-FULL-TEXT", "summarized": false, "messageId": "m", "model": "m"}),
+    ));
+    s.flush().unwrap();
+    std::sync::Arc::new(std::sync::Mutex::new(s))
+}
+
+async fn start_proxied() -> Server {
+    let home = tmp("proxy");
+    let mut store = KeyStore::new_with_secret([9u8; 32]);
+    let mut rng = keys::test_rng(42);
+    let view = store.create("view", Scope::View, None, NOW, &mut rng);
+    let operate = store.create("op", Scope::Operate, None, NOW, &mut rng);
+    store.save(&home).unwrap();
+    let st = proxied_server_store(&home, &operate);
+    let state = WebState::new_with_auth(Some(st), None, 8, home.clone(), AuthMode::LocalOpen);
+    state.set_remote_thinking(coding_lab::config::RemoteThinking::Hide);
+    let (addr, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    Server {
+        addr,
+        home,
+        store,
+        view,
+        operate,
+    }
+}
+
+/// nginx 的 `proxy_pass` 預設把 Host 改成 upstream：來源與 Host 都是 loopback，只剩 X-Forwarded-* 看得出是代理轉來的。
+#[tokio::test]
+async fn proxied_request_on_loopback_needs_a_key() {
+    let s = start_proxied().await;
+    for fwd in [
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("X-Forwarded-Host", "lab.example.com"),
+        ("X-Forwarded-Proto", "https"),
+        ("Forwarded", "for=203.0.113.9;proto=https"),
+    ] {
+        let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[fwd], "").await;
+        assert_eq!(code, 401, "{fwd:?}：代理轉來的請求在 local-open 下也要金鑰");
+    }
+    // 沒有轉發標頭的本機請求照舊免金鑰
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[], "").await;
+    assert_eq!(code, 200);
+}
+
+#[tokio::test]
+async fn proxied_request_with_a_key_is_redacted_like_a_remote_one() {
+    let s = start_proxied().await;
+    let bearer = format!("Bearer {}", s.view);
+    let fwd = [
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("Authorization", bearer.as_str()),
+    ];
+    let (code, _, body) = http(s.addr, "GET", "/api/sessions/s1/events", &fwd, "").await;
+    assert_eq!(code, 200);
+    assert!(
+        !body.contains("THINKING-FULL-TEXT"),
+        "remote_thinking=hide 時 thinking 全文要 defer：{body}"
+    );
+    assert!(!body.contains(&s.operate), "clk_ 金鑰要剝：{body}");
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions/s1/thinking/3", &fwd, "").await;
+    assert_eq!(code, 403, "hide 時遠端讀不到 thinking 全文");
+}
+
+#[tokio::test]
+async fn proxied_ws_needs_a_key_and_is_not_local() {
+    let s = start_proxied().await;
+    assert!(
+        ws_with(s.addr, &[("X-Forwarded-For", "203.0.113.9")])
+            .await
+            .is_err(),
+        "代理轉來的 WS 沒有金鑰要被拒"
+    );
+    let bearer = format!("Bearer {}", s.view);
+    let mut ws = ws_with(
+        s.addr,
+        &[
+            ("X-Forwarded-For", "203.0.113.9"),
+            ("Authorization", &bearer),
+        ],
+    )
+    .await
+    .unwrap();
+    let w = hello(&mut ws).await;
+    assert_eq!(w["scope"], "view");
+    assert_eq!(
+        w["thinking"], "hide",
+        "代理轉來的連線照遠端的 remote_thinking：{w}"
+    );
+}
