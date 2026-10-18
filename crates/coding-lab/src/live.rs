@@ -379,11 +379,22 @@ pub struct Live {
     kpi_dirty: bool,
     kpi_slot: u64,
     kpi_computes: u64,
+    /// （每個 session 的串流筆數, 留幾個 frame 給斷線接續）；None＝即時用的預設
+    limits: Option<(usize, usize)>,
 }
 
 impl Live {
     pub fn new() -> Live {
         Live::default()
+    }
+
+    /// 回放這類不用「載入更多」也沒有人斷線接續的用途（E-L8）：串流每個 session 只留 `stream_cap` 筆
+    /// （`*` 的 snapshot 只送 [`ALL_STREAM_PER_SESSION`]）、history 留 `history_cap` 個 frame。
+    pub fn with_limits(stream_cap: usize, history_cap: usize) -> Live {
+        Live {
+            limits: Some((stream_cap, history_cap)),
+            ..Live::default()
+        }
     }
 
     pub fn frame_no(&self) -> u64 {
@@ -504,9 +515,10 @@ impl Live {
             }
         }
         if let Some(p) = e.pos {
+            let cap = self.limits.map_or(STREAM_PER_SESSION, |(s, _)| s);
             let stream = self.streams.entry(sid.clone()).or_default();
             stream.push_back(e.clone());
-            while stream.len() > STREAM_PER_SESSION {
+            while stream.len() > cap {
                 // 卡片被擠出串流，它的伴隨 Event 也不用留了
                 if let Some(old) = stream.pop_front()
                     && let Some(id) = card_key(&old)
@@ -988,7 +1000,8 @@ impl Live {
             kpi,
         });
         self.history.push_back(frame.clone());
-        while self.history.len() > FRAMES_KEPT {
+        let kept = self.limits.map_or(FRAMES_KEPT, |(_, h)| h);
+        while self.history.len() > kept {
             self.history.pop_front();
         }
         Some(frame)
