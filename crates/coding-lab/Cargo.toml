@@ -5,8 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [package.metadata.dist]
+# publish = false 的 crate 預設不發佈，要明講（#733 R-1：不然 `dist plan` 說沒有東西可以發佈）
+dist = true
 # 前端不內嵌：web/ 跟二進位放進同一個壓縮檔，collector 預設用二進位旁邊的 web/（config::bundled_web）
 include = ["../../web"]
 

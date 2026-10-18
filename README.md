@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：collector、plugin 與網頁已經可以用（P0–P5），還沒有正式發佈的二進位，目前要從原始碼安裝。遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務已完成（P6），等實機驗收。完整規劃在 OpenProject 專案 `vibingtracker`，互動原型見 [Coding Lab / Project Tracker](https://claude.ai/artifact/76E5NRYN747KCFn9tzrgu7)。
+> **狀態**：collector、plugin 與網頁都可以用，遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務也已完成並在 Linux 與 Windows 實機驗收過。正式版 0.1.0 發佈後，plugin 會自動下載對應平台的二進位；在那之前要從原始碼安裝。主頁的時間軸回放是實驗功能，大範圍回放會慢。
 
 ## 它做什麼
 
@@ -83,19 +83,22 @@ wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上�
 
 ### 從 Release 自動下載
 
-有發佈好的二進位時（cargo-dist 產生的 `coding-lab-<平台>.tar.gz`／`.zip` 與 `.sha256`），可以讓 wrapper 自己下載，不必編譯。把 Release 的網址設在 Claude Code 讀得到的環境變數：
+wrapper 找不到二進位時，會在背景從 GitHub Release 下載**和 plugin 同版**的壓縮檔（cargo-dist 產生的 `coding-lab-<平台>.tar.gz`／`.zip` 與 `.sha256`），不必編譯。要改下載來源（自己架的鏡像）或關掉自動下載，設在 Claude Code 讀得到的環境變數：
 
 ```bash
-export CODING_LAB_RELEASE_URL=https://example.com/coding-lab/releases/v0.1.0   # 放下載檔的目錄網址
+export CODING_LAB_RELEASE_URL=https://example.com/coding-lab/releases/v0.1.0   # 放下載檔的目錄網址；只收 https://
+export CODING_LAB_RELEASE_URL=                                                 # 空字串：不自動下載
 ```
 
-wrapper 找不到二進位時，會在背景下載對應平台的壓縮檔，sha256 相符才連同 `web/` 解到 `~/.coding-lab/bin/`。這個 session 不追蹤，下一個 session 開始；過程記在 `~/.coding-lab/install.log`。下載或校驗失敗時只印出手動安裝方式，不會擋住 Claude Code。要在前景下載、直接看到結果：
+sha256 相符才連同 `web/` 解到 `~/.coding-lab/bin/`。這個 session 不追蹤，下一個 session 開始；過程記在 `~/.coding-lab/install.log`。下載或校驗失敗時只印出手動安裝方式，不會擋住 Claude Code。要在前景下載、直接看到結果：
 
 ```bash
 /path/to/VibingTracker/plugin/bin/coding-lab install    # 印出 platform 可看這台機器對應哪個檔
 ```
 
-支援的平台：Linux x86_64／aarch64、macOS x86_64／Apple Silicon、Windows x86_64。目前還沒有正式發佈的 Release，也沒有預設網址。
+plugin 更新之後，wrapper 自己裝的二進位比 plugin 舊時，會照用舊的、同時在背景下載新版，下一個 session 開始用新版（手動放的二進位不會被換掉）。
+
+支援的平台：Linux x86_64／aarch64、macOS x86_64／Apple Silicon、Windows x86_64。
 
 ### 已知限制：collector 沒在跑時的 hook 錯誤提示
 

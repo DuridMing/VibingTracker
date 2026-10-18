@@ -1,0 +1,32 @@
+# commit 前的 scripts/check.sh 在 Linux 與 Windows 各跑一次（#733、W-R1）。
+# 發佈用的 release.yml 由 `dist generate` 產生，不在這裡。
+name: check
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Windows 的 runner 沒有 podman，check.sh 會改用上面裝的 Node 跑前端測試；
+      # bash 是 Git for Windows 的（和開發者在 Windows 上跑 check.sh 的環境一樣）
+      - name: scripts/check.sh
+        shell: bash
+        run: bash scripts/check.sh

@@ -31,11 +31,11 @@ enum Command {
     Healthz,
     /// 請執行中的 collector 正常結束（放掉埠、寫完紀錄）；沒在跑也 exit 0
     Stop,
-    /// 常駐服務（#662）：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
+    /// 常駐服務：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
     Service(ServiceArgs),
-    /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
+    /// 遠端查看用的金鑰：create／list／revoke／login-link（存 <home>/keys.json）
     Key(KeyArgs),
-    /// 多機總覽（#663）：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
+    /// 多機總覽：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
     Hub(HubArgs),
 }
 

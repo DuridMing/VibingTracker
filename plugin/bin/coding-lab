@@ -5,16 +5,24 @@
 # 找不到二進位時只在 stderr 說明，不擋 Claude Code。
 #
 # 尋找順序：$CODING_LAB_BIN → ${CODING_LAB_HOME:-~/.coding-lab}/bin/coding-lab → PATH 上的 coding-lab。
-# 都沒有、而且設了 CODING_LAB_RELEASE_URL 時，在背景下載對應平台的 Release（#656）：
+# 都沒有時在背景下載對應平台的 Release（#656）：
 #   <url>/coding-lab-<target>.tar.gz（Windows 是 .zip）與 <壓縮檔>.sha256，校驗相符才解到 <home>/bin/
 #   （二進位與 web/ 放在一起）。這次 session 不追蹤，下一個 session 開始。
+#   <url> 預設是 GitHub 上和這個 plugin 同版的 Release（#733）；CODING_LAB_RELEASE_URL 可改（只收 https://
+#   與 file://），設成空字串就不自動下載。
+# wrapper 裝的二進位（<home>/bin/，旁邊有 coding-lab.version）比 plugin 舊時，照用舊的、同時在背景換新版。
 #
 # 給人用的子命令（不經 hook）：
 #   install   前景下載並安裝（同上，失敗也 exit 0）
 #   platform  印出這台機器對應的 Release target
 
+# 和 Cargo.toml、.claude-plugin/plugin.json 同版（tests/plugin.rs 比對）
+VERSION=0.1.0
+
 self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 home_dir=${CODING_LAB_HOME:-$HOME/.coding-lab}
+# 沒設才用預設；設成空字串＝不自動下載
+release_url=${CODING_LAB_RELEASE_URL-https://github.com/DuridMing/VibingTracker/releases/download/v$VERSION}
 
 say() {
     echo "coding-lab：$*" >&2
@@ -22,8 +30,9 @@ say() {
 
 manual() {
     {
-        echo "  手動安裝：在原始碼目錄執行 cargo install --path crates/coding-lab，或把二進位放到 $home_dir/bin/coding-lab"
-        echo "  或設定 CODING_LAB_BIN 指向它。"
+        echo "  手動安裝：下載 Release 的壓縮檔，把二進位與 web/ 一起解到 $home_dir/bin/；"
+        echo "  或在原始碼目錄執行 cargo install --path crates/coding-lab，再把原始碼的 web/ 複製到 $home_dir/bin/web/"
+        echo "  （cargo install 只裝二進位，沒有 web/ 時網頁會 404）。也可以設定 CODING_LAB_BIN 指向二進位。"
     } >&2
 }
 
@@ -116,11 +125,20 @@ unzip_to() { # zip 目錄
 
 # 下載、校驗、解壓到 <home>/bin；成功回 0。暫存檔與鎖一律清掉。
 install() {
-    if [ -z "$CODING_LAB_RELEASE_URL" ]; then
-        say "沒有設定 CODING_LAB_RELEASE_URL，無法自動下載。"
+    if [ -z "$release_url" ]; then
+        say "CODING_LAB_RELEASE_URL 是空的（不自動下載）。"
         manual
         return 1
     fi
+    # 只防損毀的 sha256 和壓縮檔從同一個地方來：http 會被中間人一起換掉（#733 R-12）
+    case "$release_url" in
+        https://* | file://*) ;;
+        *)
+            say "Release 網址只接受 https://（收到 $release_url），不下載。"
+            manual
+            return 1
+            ;;
+    esac
     if ! target=$(platform); then
         say "這個平台（$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)）沒有預先編好的二進位。"
         manual
@@ -144,7 +162,7 @@ install() {
     work=$bin_dir/.download.$$
     trap 'rm -rf "$work"; rmdir "$lock" 2>/dev/null' EXIT INT TERM
     mkdir -p "$work" || return 1
-    base=${CODING_LAB_RELEASE_URL%/}
+    base=${release_url%/}
     if ! fetch "$base/$archive" "$work/$archive" || ! fetch "$base/$archive.sha256" "$work/sum"; then
         say "下載 $base/$archive 失敗（離線或沒有這個版本）。"
         manual
@@ -183,7 +201,8 @@ install() {
         [ -d "$bin_dir/web" ] && mv "$bin_dir/web" "$bin_dir/web.old"
         mv "$src/web" "$bin_dir/web" && rm -rf "$bin_dir/web.old"
     fi
-    # 二進位最後才放：wrapper 看到它就表示整套裝好了
+    # 版本記錄先寫、二進位最後才放：wrapper 看到它就表示整套裝好了
+    printf '%s\n' "$VERSION" >"$bin_dir/coding-lab.version"
     mv "$src/$exe" "$bin_dir/$exe.new" && mv -f "$bin_dir/$exe.new" "$bin_dir/$exe" || return 1
     say "已安裝 $bin_dir/$exe（$target）"
     return 0
@@ -201,7 +220,7 @@ case "$1" in
 esac
 
 if ! bin=$(find_bin); then
-    if [ -n "$CODING_LAB_RELEASE_URL" ] && target=$(platform); then
+    if [ -n "$release_url" ] && target=$(platform); then
         # hook 有 5 秒限制：背景下載，所有輸出都導開，Claude Code 不會等它
         mkdir -p "$home_dir" 2>/dev/null
         nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
@@ -212,6 +231,19 @@ if ! bin=$(find_bin); then
     fi
     exit 0
 fi
+
+# wrapper 裝的二進位落後 plugin：這次照用，背景換新版（#733 R-4）。版本記在 coding-lab.version，
+# 不跑二進位問版本（每個 SessionStart 多開一個程序，Windows 上很貴）；沒有記錄的（手動放的）不動。
+case "$bin" in
+    "$home_dir/bin/coding-lab" | "$home_dir/bin/coding-lab.exe")
+        installed=
+        [ -f "$home_dir/bin/coding-lab.version" ] && read -r installed <"$home_dir/bin/coding-lab.version"
+        if [ -n "$installed" ] && [ "$installed" != "$VERSION" ] && [ -n "$release_url" ] && platform >/dev/null; then
+            nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
+            say "collector 二進位是 $installed、plugin 是 $VERSION：已在背景更新（紀錄在 $home_dir/install.log），下一個 session 用新版。"
+        fi
+        ;;
+esac
 
 if [ "$1" = ensure ]; then
     # Windows 的子程序會繼承所有可繼承的 handle：ensure 拉起的 collector 會握著 ensure 的 stdin／stdout／stderr，

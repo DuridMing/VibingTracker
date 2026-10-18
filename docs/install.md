@@ -188,6 +188,8 @@ collector 收這台機器上所有 Claude Code 的事件，不分專案。頁面
 
 ## 更新
 
+由 plugin 自動下載的二進位（`~/.coding-lab/bin/` 旁邊有 `coding-lab.version`）不用手動更新：plugin 更新後，下一個 session 開始時 wrapper 發現二進位比 plugin 舊，會在背景下載同版的 Release，再下一個 session 開始用新版。下面是從原始碼安裝時的做法。
+
 在 clone 下來的資料夾拉新的程式碼、重新編譯，再把執行檔與網頁蓋過去：
 
 ```bash

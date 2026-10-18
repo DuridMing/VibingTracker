@@ -138,6 +138,7 @@ fn wrapper(envs: &[(&str, &Path)]) -> std::process::Output {
         .env_remove("CODING_LAB_BIN")
         .env("CODING_LAB_HOME", &home)
         .env("PATH", "/usr/bin:/bin") // PATH 上沒有 coding-lab
+        .env("CODING_LAB_RELEASE_URL", "") // 空字串＝不自動下載（預設會連 GitHub）
         .stdin(Stdio::null());
     for (k, v) in envs {
         c.env(k, v);
@@ -156,6 +157,19 @@ fn wrapper_without_a_binary_exits_zero_and_prints_instructions_to_stderr() {
         err.contains("coding-lab") && err.contains("cargo install"),
         "{err}"
     );
+    // cargo install 只裝二進位，沒有 web/：提示要說怎麼放（#733 R-13）
+    assert!(err.contains("web/"), "{err}");
+}
+
+/// wrapper 寫死的版號要和 crate、plugin.json 一致：預設 Release URL 與版本比對都靠它（#733 R-3、R-4）
+#[test]
+fn wrapper_version_matches_the_crate() {
+    let text = std::fs::read_to_string(plugin_dir().join("bin/coding-lab")).unwrap();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("VERSION="))
+        .expect("wrapper 要有 VERSION=");
+    assert_eq!(line, format!("VERSION={}", env!("CARGO_PKG_VERSION")));
 }
 
 #[cfg(unix)]
@@ -307,6 +321,15 @@ mod download {
             format!("{hex} *{name}.zip\n"),
         )
         .unwrap();
+    }
+
+    /// PATH 上的假 curl：把參數記到 $FAKE_CURL_LOG 後失敗（測試不連網路）。
+    fn stub_curl(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        exec(
+            &dir.join("curl"),
+            "#!/bin/sh\necho \"$@\" >> \"$FAKE_CURL_LOG\"\nexit 22\n",
+        );
     }
 
     /// 只有 wrapper 安裝時用得到的工具、**沒有 unzip** 的 PATH 目錄（模擬標準的 Git for Windows）。
@@ -582,6 +605,108 @@ mod download {
             .map(|d| d.flatten().map(|x| x.file_name()).collect())
             .unwrap_or_default();
         assert!(left.is_empty(), "留下了 {left:?}");
+    }
+
+    /// 沒設 CODING_LAB_RELEASE_URL 時，從 GitHub Release 下載**和 plugin 同版**的二進位（#733 R-3）
+    #[test]
+    fn install_defaults_to_the_github_release_of_the_plugin_version() {
+        let e = env("default-url");
+        stub_curl(&e.stubs);
+        let log = e.home.join("curl.log");
+        let out = Command::new(plugin_dir().join("bin/coding-lab"))
+            .arg("install")
+            .env_remove("CODING_LAB_BIN")
+            .env_remove("CODING_LAB_RELEASE_URL")
+            .env("CODING_LAB_HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("FAKE_UNAME_S", "Linux")
+            .env("FAKE_UNAME_M", "x86_64")
+            .env("FAKE_CURL_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stdout.is_empty());
+        let urls = std::fs::read_to_string(&log).unwrap_or_default();
+        let want = format!(
+            "https://github.com/DuridMing/VibingTracker/releases/download/v{}/coding-lab-x86_64-unknown-linux-gnu.tar.gz",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(urls.contains(&want), "{urls}");
+    }
+
+    /// 下載只接受 https（和測試用的 file://）：http 會被中間人換掉壓縮檔與 .sha256（#733 R-12）
+    #[test]
+    fn install_refuses_a_plain_http_release_url() {
+        let e = env("http");
+        stub_curl(&e.stubs);
+        let log = e.home.join("curl.log");
+        let out = Command::new(plugin_dir().join("bin/coding-lab"))
+            .arg("install")
+            .env_remove("CODING_LAB_BIN")
+            .env("CODING_LAB_RELEASE_URL", "http://example.invalid/rel")
+            .env("CODING_LAB_HOME", &e.home)
+            .env("PATH", format!("{}:/usr/bin:/bin", e.stubs.display()))
+            .env("FAKE_UNAME_S", "Linux")
+            .env("FAKE_UNAME_M", "x86_64")
+            .env("FAKE_CURL_LOG", &log)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(!log.exists(), "不能用 http 下載");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("https"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// wrapper 裝的二進位版本落後 plugin 時，背景下載新版（這個 session 照用舊的）；同版不下載（#733 R-4）
+    #[test]
+    fn an_installed_binary_older_than_the_plugin_is_updated_in_the_background() {
+        let e = env("update");
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let out = run(&e, &["install"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stamp = e.home.join("bin/coding-lab.version");
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            env!("CARGO_PKG_VERSION"),
+            "安裝時記下版本"
+        );
+
+        // 同版：照常執行、不下載
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("更新"));
+
+        // 舊版：這次照用舊的，同時在背景更新
+        std::fs::write(&stamp, "0.0.1\n").unwrap();
+        std::fs::remove_file(e.home.join("bin/ran")).unwrap();
+        let out = run(&e, &["ensure"], ("Linux", "x86_64"), Some(&url(&e)));
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("更新"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(e.home.join("bin/ran").exists(), "這個 session 照用舊的");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::fs::read_to_string(&stamp).unwrap_or_default().trim()
+            != env!("CARGO_PKG_VERSION")
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap().trim(),
+            env!("CARGO_PKG_VERSION"),
+            "背景更新沒有完成"
+        );
     }
 
     #[test]
