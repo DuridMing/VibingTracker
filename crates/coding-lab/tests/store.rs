@@ -1361,3 +1361,25 @@ fn tails_backfill_skips_lines_that_are_not_utf8() {
         .collect();
     assert_eq!(rows, [("main".to_string(), 4)]);
 }
+
+/// S-6（#762、contracts §5）：資料目錄 0700、底下的檔 0600（Claude Code 自己的 transcript 也是 0600）。
+/// 原本照預設的 umask（0755／0644），同一台機器的其他使用者讀得到 transcript 的內容。
+#[cfg(unix)]
+#[test]
+fn data_dir_and_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home().join(".coding-lab");
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.flush().unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&h), 0o700, "資料目錄");
+    assert_eq!(mode(&h.join("events")), 0o700);
+    assert_eq!(mode(&h.join("events/s1.jsonl")), 0o600);
+    assert_eq!(mode(&h.join("index.sqlite")), 0o600);
+    // 舊版建的目錄也收緊
+    drop(s);
+    std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _s = Store::open(&h).unwrap();
+    assert_eq!(mode(&h), 0o700, "重新開啟時收緊舊版的權限");
+}

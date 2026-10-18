@@ -290,6 +290,86 @@ pub struct Store {
     recover_bytes: u64,
 }
 
+// ── 權限（S-6、contracts §5）：資料目錄與底下的檔只給目前使用者（Claude Code 自己的 transcript 也是 0600）
+
+/// 建（或收緊）資料目錄：unix 0700；Windows 第一次建立時停用 ACL 繼承、只授權目前使用者，底下的檔沿用它。
+pub fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let existed = dir.exists();
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(windows)]
+    if !existed {
+        restrict_dir_acl(dir);
+    }
+    let _ = existed;
+    Ok(())
+}
+
+/// `icacls <dir> /inheritance:r /grant:r <使用者>:(OI)(CI)F`：只在第一次建立時做一次。失敗只寫 log
+/// （%USERPROFILE% 底下預設本來就只有自己能讀）。
+#[cfg(windows)]
+fn restrict_dir_acl(dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(user) = std::env::var("USERNAME") else {
+        return;
+    };
+    let ok = std::process::Command::new("icacls")
+        .arg(dir)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("{user}:(OI)(CI)F"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        crate::logging::log(&format!("store：收緊 {} 的 ACL 失敗", dir.display()));
+    }
+}
+
+/// 以追加模式開檔；新建的檔是 0600（unix）。
+pub fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path)
+}
+
+/// 整個寫入一個檔（collector.json、collector.failed）：0600（unix），已存在的也收緊。
+pub fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let mut o = OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(path)?;
+    restrict_file(path)?;
+    f.write_all(data)
+}
+
+/// 別人建的檔（SQLite 的 index.sqlite）收緊成 0600；Windows 沿用資料目錄的 ACL。
+pub fn restrict_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
 /// 開 store 之前先檢查會讓它起不來的情況（L-1）：index.sqlite 打不開、schema 比支援的新。唯讀、不拿 store 鎖，
 /// 上一個 collector 還在寫的時候也可以查；serve 在綁 hook 埠之前呼叫，失敗的話一個 hook 都還沒收。
 pub fn preflight(home: &Path) -> Result<(), StoreError> {
@@ -323,8 +403,11 @@ impl Store {
     /// 開啟（或建立）資料目錄：`<home>/events/`、`<home>/index.sqlite`。
     pub fn open(home: &Path) -> Result<Store, StoreError> {
         let events_dir = home.join("events");
-        fs::create_dir_all(&events_dir)?;
+        create_private_dir(home)?;
+        create_private_dir(&events_dir)?;
         let db = Connection::open(home.join("index.sqlite"))?;
+        // -wal、-shm 由 SQLite 照資料庫檔的權限建立
+        restrict_file(&home.join("index.sqlite"))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
         let backfill_tails = migrate(&db)?;
@@ -501,7 +584,7 @@ impl Store {
     /// 追加一批到 session 檔；寫到一半失敗就截回原長度，不留半行。
     fn write_batch(&mut self, b: &Batch) -> io::Result<()> {
         let path = self.events_dir.join(&b.name);
-        let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut f = open_private_append(&path)?;
         if let Err(e) = f.write_all(&b.buf) {
             self.file_len.remove(&b.name);
             if let Err(t) = OpenOptions::new()

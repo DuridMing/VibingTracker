@@ -1665,3 +1665,19 @@ fn web_bind_list_serves_every_address() {
         ])
     );
 }
+
+/// S-6：collector 自己寫的 collector.json、collector.log 也是 0600。
+#[cfg(unix)]
+#[test]
+fn collector_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env(0);
+    let mut c = cmd(&e, &["serve"]);
+    // 背景執行才會寫 collector.log（stderr 不是終端機）
+    let _s = Kill(c.spawn().unwrap());
+    wait_for("collector.json", || collector(&e).is_some());
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&e.home), 0o700);
+    assert_eq!(mode(&e.home.join("collector.json")), 0o600);
+    assert_eq!(mode(&e.home.join("collector.log")), 0o600);
+}
