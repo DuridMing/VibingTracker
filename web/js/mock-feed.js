@@ -542,9 +542,10 @@ function createWorld(n, { bigtree = false } = {}) {
       frame++;
       return { t: "frame", frame, ch: "*", events: [], rows: { attention: [{ id, deleted: true }], kpi: { attention: kpi.attention } } };
     },
+    // 和 collector 一樣照請求帶回 beforePos；null（▶ 回放）是從最新的往前讀（#747 F-9）
     more(session, beforePos, limit) {
-      const mine = glog.filter((e) => e.session === session && e.pos != null && e.pos < beforePos);
-      return { t: "more", session, events: mine.slice(-limit).flatMap(expand) };
+      const mine = glog.filter((e) => e.session === session && e.pos != null && e.pos < (beforePos ?? Infinity));
+      return { t: "more", session, beforePos: beforePos ?? null, events: mine.slice(-limit).flatMap(expand) };
     },
     step({ minEvents = 0 } = {}) {
       frame++;
@@ -645,7 +646,9 @@ export function installMock(n, { bench = false, prefill = false, bigtree = false
           : setInterval(() => this.#frame(world.step()), 400);
       }
       if (msg.op === "unsubscribe" && msg.channel.startsWith("session:")) this.subs.delete(msg.channel.slice(8));
-      if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#emit(f); }, 80);
+      if (msg.op === "unsubscribe" && msg.channel === "*") this.all = false; // 離開回放時前端會先取消再重訂（#747 F-9）
+      // 確認後的 deleted 也送到訂了那個 session 頻道的連線（#747 F-9）
+      if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#frame(f); }, 80);
       if (msg.op === "more") setTimeout(() => this.#emit(world.more(msg.session, msg.beforePos, msg.limit)), 60);
     }
     close() { this.#end(); }
