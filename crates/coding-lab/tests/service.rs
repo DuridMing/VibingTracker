@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use coding_lab::service::{self, Ctx, Plan, Platform, Step};
+use coding_lab::service::{self, Ctx, Plan, Platform};
 
 fn ctx(home: &Path) -> Ctx {
     Ctx {
@@ -283,9 +283,9 @@ fn apply_writes_files_then_runs_commands_and_uninstall_leaves_nothing_behind() {
         user: None,
     };
     let install = service::plan_install(Platform::Linux, &c);
-    let mut ran: Vec<Step> = Vec::new();
+    let mut ran: Vec<Vec<String>> = Vec::new();
     service::apply(&install, &mut |cmd| {
-        ran.push(Step::Command(cmd.to_vec()));
+        ran.push(cmd.to_vec());
         Ok(())
     })
     .unwrap();

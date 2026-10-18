@@ -92,12 +92,6 @@ impl Ctx {
     }
 }
 
-/// apply 的一步（測試用來記錄跑了什麼）
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Step {
-    Command(Vec<String>),
-}
-
 /// 要做的事：先寫 `files`、刪 `removes`，再依序跑 `commands`；`notes` 是做完要提醒使用者的話
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -576,7 +570,7 @@ pub fn run_command(cmd: &[String]) -> Result<(), String> {
 }
 
 /// 同 [`run_command`]，成功時回 stdout
-pub fn run_command_capture(cmd: &[String]) -> Result<String, String> {
+fn run_command_capture(cmd: &[String]) -> Result<String, String> {
     capture(cmd, false)
 }
 
