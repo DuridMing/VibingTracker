@@ -5,10 +5,13 @@
 //! （notify 會漏事件或合併事件，輪詢是保底），把每一行轉成 merge 的 [`Input::Line`]。
 //! 同一個 uuid 的去重在 merge 做。
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -278,6 +281,8 @@ pub struct TailOptions {
     pub use_notify: bool,
     /// 這個 tail 的編號（serve 遞增發號）；Degraded／Recovered 帶著它，merge 用來忽略已被取代的 tail（#684 R20）
     pub tail: u64,
+    /// 共用的 notify watcher（E-S6）；None 時這個 tail 自己開一個
+    pub watcher: Option<Arc<SharedWatcher>>,
 }
 
 impl Default for TailOptions {
@@ -286,6 +291,7 @@ impl Default for TailOptions {
             poll_every: Duration::from_millis(500),
             use_notify: true,
             tail: 0,
+            watcher: None,
         }
     }
 }
@@ -374,12 +380,13 @@ async fn run(
         }
     };
     let wake = Arc::new(Notify::new());
-    // watcher 要活到 task 結束；建立失敗（例如 inotify 上限）就只靠輪詢
-    let _watcher = if opts.use_notify {
-        watch(&path, wake.clone())
-    } else {
-        None
+    // 登記要活到 task 結束（結束時 unwatch）；失敗（例如 inotify 上限）就只靠輪詢
+    let shared = match (opts.use_notify, opts.watcher) {
+        (false, _) => None,
+        (true, Some(w)) => Some(w),
+        (true, None) => Some(Arc::new(SharedWatcher::default())),
     };
+    let _watch = shared.and_then(|w| w.register(&path, wake.clone()));
     let mut out = Sender {
         tx,
         session,
@@ -399,24 +406,148 @@ async fn run(
     out.send(reader.poll()).await;
 }
 
-/// 監看 transcript 所在的資料夾（檔案可能還不存在，或被 rename 替換）。
-fn watch(path: &Path, wake: Arc<Notify>) -> Option<notify::RecommendedWatcher> {
-    use notify::Watcher;
-    let name = path.file_name()?.to_os_string();
-    let dir = path.parent()?.to_path_buf();
-    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(ev) = res
-            && ev
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(name.as_os_str()))
+/// 整個 collector 共用的 notify watcher（E-S6）。每個 tail 各開一個時，每個就是一條 OS 執行緒加一個
+/// inotify instance（Linux 預設上限 128，用完只剩輪詢），而且主 transcript 都在同一個專案資料夾：
+/// 任何一個檔寫入，所有 tail 一起醒。這裡只開一個，資料夾依引用計數 watch／unwatch，事件依檔名分給等它的 tail。
+#[derive(Default)]
+pub struct SharedWatcher {
+    /// 檔名 → 等它的 tail（登記編號、資料夾、叫醒誰）。notify 的 callback 只拿這把鎖
+    routes: Arc<Mutex<HashMap<OsString, Vec<Route>>>>,
+    /// watcher 與每個資料夾的引用數。呼叫 watch／unwatch 時不能拿著 `routes`：inotify 的 watch 要等事件執行緒回應，
+    /// 事件執行緒若正在 callback 裡等 `routes` 就會互相卡住
+    dirs: Mutex<WatchedDirs>,
+    next: AtomicU64,
+}
+
+struct Route {
+    id: u64,
+    dir: PathBuf,
+    wake: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct WatchedDirs {
+    watcher: Option<notify::RecommendedWatcher>,
+    count: HashMap<PathBuf, usize>,
+}
+
+/// [`SharedWatcher::register`] 的登記；drop 時取消，資料夾沒人用了就 unwatch。跟著 tail task 一起結束。
+pub struct WatchGuard {
+    owner: Arc<SharedWatcher>,
+    dir: PathBuf,
+    name: OsString,
+    id: u64,
+}
+
+impl SharedWatcher {
+    /// 監看 `path` 所在的資料夾（檔案可能還不存在，或被 rename 替換），這個檔有事件時叫醒 `wake`。
+    /// 失敗（watcher 開不起來、資料夾不存在）時回 None，tail 只靠輪詢。
+    pub fn register(self: &Arc<Self>, path: &Path, wake: Arc<Notify>) -> Option<WatchGuard> {
+        use notify::Watcher;
+        let name = path.file_name()?.to_os_string();
+        let dir = path.parent()?.to_path_buf();
         {
-            wake.notify_one();
+            let mut d = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            let WatchedDirs { watcher, count } = &mut *d;
+            if watcher.is_none() {
+                let routes = self.routes.clone();
+                *watcher =
+                    notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        let Ok(ev) = res else { return };
+                        let routes = routes.lock().unwrap_or_else(|e| e.into_inner());
+                        for p in &ev.paths {
+                            let Some(waiting) = p.file_name().and_then(|n| routes.get(n)) else {
+                                continue;
+                            };
+                            // 同名的檔在別的資料夾不叫醒；事件路徑的寫法和登記時不同（macOS 的 /private/var 之類）
+                            // 對不上任何一個時，退回同名的全部叫醒（多讀一次無害）
+                            let exact: Vec<&Route> = waiting
+                                .iter()
+                                .filter(|r| p.parent() == Some(r.dir.as_path()))
+                                .collect();
+                            let wake = if exact.is_empty() {
+                                waiting.iter().collect()
+                            } else {
+                                exact
+                            };
+                            for r in wake {
+                                r.wake.notify_one();
+                            }
+                        }
+                    })
+                    .ok();
+            }
+            let w = watcher.as_mut()?;
+            let n = count.get(&dir).copied().unwrap_or(0);
+            if n == 0 && w.watch(&dir, notify::RecursiveMode::NonRecursive).is_err() {
+                return None;
+            }
+            count.insert(dir.clone(), n + 1);
         }
-    })
-    .ok()?;
-    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
-    Some(w)
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.clone())
+            .or_default()
+            .push(Route {
+                id,
+                dir: dir.clone(),
+                wake,
+            });
+        Some(WatchGuard {
+            owner: self.clone(),
+            dir,
+            name,
+            id,
+        })
+    }
+
+    /// 目前 watch 中的資料夾數。
+    pub fn watched_dirs(&self) -> usize {
+        self.dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count
+            .len()
+    }
+
+    /// 目前登記中的 tail 數。
+    pub fn watched_files(&self) -> usize {
+        self.routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        use notify::Watcher;
+        {
+            let mut routes = self.owner.routes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = routes.get_mut(&self.name) {
+                v.retain(|r| r.id != self.id);
+                if v.is_empty() {
+                    routes.remove(&self.name);
+                }
+            }
+        }
+        let mut d = self.owner.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        let WatchedDirs { watcher, count } = &mut *d;
+        if let Some(n) = count.get_mut(&self.dir) {
+            *n -= 1;
+            if *n == 0 {
+                count.remove(&self.dir);
+                // 資料夾已被刪掉時 watch 早就自己沒了，unwatch 的錯誤不理
+                if let Some(w) = watcher {
+                    let _ = w.unwatch(&self.dir);
+                }
+            }
+        }
+    }
 }
 
 struct Sender {
