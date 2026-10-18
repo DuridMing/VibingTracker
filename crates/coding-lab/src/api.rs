@@ -371,7 +371,7 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
     // git 與 SQLite 都會阻塞，整段放到 blocking 執行緒
-    tokio::task::spawn_blocking(move || files_blocking(&store, &cwd, base))
+    spawn_git(move || files_blocking(&store, &cwd, base))
         .await
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -515,7 +515,7 @@ pub async fn branches(State(state): State<Arc<WebState>>, uri: Uri) -> Response 
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || branches_blocking(&store, &cwd))
+    spawn_git(move || branches_blocking(&store, &cwd))
         .await
         .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
@@ -646,11 +646,9 @@ pub async fn branch_diff(
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || {
-        branch_diff_blocking(&state, &store, &cwd, &worktree, &path, remote)
-    })
-    .await
-    .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    spawn_git(move || branch_diff_blocking(&state, &store, &cwd, &worktree, &path, remote))
+        .await
+        .unwrap_or_else(|e| error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
 fn branch_diff_blocking(
@@ -710,15 +708,8 @@ fn file_diff(dir: &Path, range: &[&str], path: &str, untracked: bool) -> (String
         diff = format!("--- /dev/null\n+++ b/{path}\n")
             + &text.lines().map(|l| format!("+{l}\n")).collect::<String>();
     }
-    let truncated = head_cut || diff.len() > DIFF_MAX;
-    if truncated {
-        let mut cut = DIFF_MAX;
-        while !diff.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        diff.truncate(cut);
-    }
-    (diff, truncated)
+    let cut = crate::text::truncate_string(&mut diff, DIFF_MAX);
+    (diff, head_cut || cut)
 }
 
 /// 未追蹤檔的內容（整檔當新增用）：只讀 worktree 底下的一般檔，最多 DIFF_MAX+1 bytes（C20、A-N1）。
@@ -789,7 +780,7 @@ pub async fn graph(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || {
+    spawn_git(move || {
         if let Some(resp) = guard(&store, &cwd) {
             return resp;
         }
@@ -928,7 +919,7 @@ pub async fn commit(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || {
+    spawn_git(move || {
         if let Some(resp) = guard(&store, &cwd) {
             return resp;
         }
@@ -978,7 +969,7 @@ pub async fn commit_diff(
     let Some(store) = state.store().cloned() else {
         return error(StatusCode::NOT_FOUND, "沒有 session 在這個目錄");
     };
-    tokio::task::spawn_blocking(move || {
+    spawn_git(move || {
         if let Some(resp) = guard(&store, &cwd) {
             return resp;
         }
@@ -1277,6 +1268,55 @@ fn session_changes(store: &Store, id: &str) -> Result<Option<Changes>, crate::st
     Ok(Some(out))
 }
 
+/// 跑 git 的請求放到 blocking 執行緒，並在這個請求期間開一個 [`GitCtx`]（filter driver 的查詢快取）。
+fn spawn_git<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _ctx = GitCtx::begin();
+        f()
+    })
+}
+
+thread_local! {
+    /// 這個 blocking 執行緒上正在處理的請求的 filter driver 快取（目錄 → driver 名稱）；請求之外是 None。
+    static FILTERS: std::cell::RefCell<Option<HashMap<std::path::PathBuf, Vec<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 一個請求內的 git 快取（E-H1、W-L7）：每個 git 指令前原本都多跑一次 `git config` 查 filter driver，行程數加倍；
+/// 同一個請求裡設定不會變，每個目錄查一次就好。請求結束（drop）就清掉，下一個請求重查，改了設定立刻生效。
+struct GitCtx;
+
+impl GitCtx {
+    fn begin() -> GitCtx {
+        FILTERS.with(|f| *f.borrow_mut() = Some(HashMap::new()));
+        GitCtx
+    }
+}
+
+impl Drop for GitCtx {
+    fn drop(&mut self) {
+        FILTERS.with(|f| *f.borrow_mut() = None);
+    }
+}
+
+/// [`filter_drivers`]，請求內有快取就用快取。
+fn cached_filter_drivers(dir: &Path) -> Vec<String> {
+    FILTERS.with(|f| match f.borrow_mut().as_mut() {
+        Some(cache) => cache
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| filter_drivers(dir))
+            .clone(),
+        None => filter_drivers(dir),
+    })
+}
+
+/// `core.hooksPath` 指到不可能有檔案的位置：repo 的 `.git/hooks` 一律不跑（S-2）。
+const NO_HOOKS: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
 fn base_git(dir: &Path) -> Command {
     let mut c = Command::new("git");
     for (k, _) in std::env::vars_os() {
@@ -1291,9 +1331,25 @@ fn base_git(dir: &Path) -> Command {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         c.creation_flags(CREATE_NO_WINDOW);
     }
-    c.arg("-C")
-        .arg(dir)
-        .args(["-c", "core.fsmonitor=false", "-c", "core.quotePath=false"]);
+    // 不執行 repo 設定或 .git/hooks 裡的外部程式（S-2，contracts §7）：
+    // --no-optional-locks：status 不順手寫回 index（寫 index 會觸發 post-index-change）；
+    // hooksPath 指到空處；不進 submodule（submodule 自己的 config 有 filter，頂層的停用管不到）；不驗簽章（gpg.program）。
+    c.arg("--no-optional-locks").arg("-C").arg(dir).args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.quotePath=false",
+        "-c",
+        &format!("core.hooksPath={NO_HOOKS}"),
+        "-c",
+        "diff.ignoreSubmodules=all",
+        "-c",
+        "submodule.recurse=false",
+        "-c",
+        "log.showSignature=false",
+        "-c",
+        "gpg.program=",
+    ]);
     c
 }
 
@@ -1330,7 +1386,7 @@ fn nul_split(s: &str) -> Vec<String> {
 /// repo 設定的 filter 一律停用：和工作目錄比較時 git 會對檔案跑 clean filter，那是 repo 設定裡的外部程式（#682）。
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let mut c = base_git(dir);
-    for driver in filter_drivers(dir) {
+    for driver in cached_filter_drivers(dir) {
         for key in ["clean", "smudge", "process"] {
             c.arg("-c").arg(format!("filter.{driver}.{key}="));
         }
