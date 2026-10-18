@@ -503,6 +503,11 @@ impl Live {
             .count()
     }
 
+    /// 「已扣回 KPI」記號的數量（測試確認它跟著卡片放掉，K-12）
+    pub fn reverted_count(&self) -> usize {
+        self.reverted.len()
+    }
+
     /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
     pub fn kpi_computations(&self) -> u64 {
         self.kpi_computes
@@ -532,6 +537,7 @@ impl Live {
             self.bg_running.remove(&sid);
             self.dirty_sessions.insert(sid.clone());
             self.card_events.retain(|(s, _), _| *s != sid);
+            self.reverted.retain(|(s, _)| *s != sid);
             self.staged.retain(|(s, _), _| *s != sid);
             self.agents.retain(|_, a| a.session != sid);
         }
@@ -621,7 +627,10 @@ impl Live {
                 if let Some(old) = stream.pop_front()
                     && let Some(id) = card_key(&old)
                 {
-                    self.card_events.remove(&(sid.clone(), id));
+                    // 「已扣回」只在伴隨 Event 還在時有用（revert_kpi 找不到就不扣），一起放掉（K-12）
+                    let key = (sid.clone(), id);
+                    self.card_events.remove(&key);
+                    self.reverted.remove(&key);
                 }
             }
             if let Some(s) = self.sessions.get_mut(&sid) {
