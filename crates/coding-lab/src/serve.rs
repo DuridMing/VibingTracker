@@ -34,6 +34,10 @@ const SCORE_EVERY: Duration = Duration::from_secs(10);
 const COST_BASELINE_EVERY: Duration = Duration::from_secs(60 * 60);
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const INPUT_QUEUE: usize = 8192;
+/// hook 的 channel（L-6）
+const HOOK_QUEUE: usize = 4096;
+/// 處理完一個 hook 後，最多再收掉幾個已經在佇列裡的才 flush（E-S7）
+const HOOK_BATCH: usize = 256;
 /// 進行中的 session 沒送 SessionEnd（終端機被直接關掉）時，最多再撐這麼久沒有 hook 才結束。
 const ABANDONED_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 const FRAME_QUEUE: usize = 256;
@@ -167,6 +171,11 @@ fn write_info(home: &Path, me: u32, hook: SocketAddr, webs: &[SocketAddr], closi
     }
 }
 
+/// `/healthz` 的動態部分（contracts §7）：`dropped` 是啟動以來因 hook 佇列滿丟掉的數量（L-6、E-D3）。
+fn health(tails: usize, lag_ms: u64, hooks: &HookServer) -> serde_json::Value {
+    json!({ "tails": tails, "schedLagMs": lag_ms, "dropped": hooks.dropped() })
+}
+
 /// 綁 hook 埠（這也是單例鎖）。被佔用時分三種：上一個 collector 正在結束（collector.json 標 closing，#685）
 /// → 等它放掉再綁；另一個 collector 在跑 → `Ok(None)`；沒有 collector 卻被佔用（別的程式、別的資料目錄）→ 錯誤。
 async fn bind_hooks(cfg: &Config, tx: &mpsc::Sender<Input>) -> io::Result<Option<HookServer>> {
@@ -208,7 +217,9 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         return Err(io::Error::other(msg));
     }
     let (tx, mut rx) = mpsc::channel::<Input>(INPUT_QUEUE);
-    let hooks = match bind_hooks(&cfg, &tx).await {
+    // hook 走自己的 channel（L-6）：tail 補讀把 rx 塞滿時 hook 不會被 try_send 丟掉
+    let (hook_tx, mut hook_rx) = mpsc::channel::<Input>(HOOK_QUEUE);
+    let hooks = match bind_hooks(&cfg, &hook_tx).await {
         Ok(Some(h)) => h,
         Ok(None) => return Ok(Outcome::AlreadyRunning),
         Err(e) => {
@@ -219,13 +230,13 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     };
     let hook_addr = hooks.addr;
     // 等鎖期間已經回 200 的 hook 還在佇列裡，起不來就丟了：至少留下紀錄
-    let lost = |tx: &mpsc::Sender<Input>| INPUT_QUEUE - tx.capacity();
+    let lost = |tx: &mpsc::Sender<Input>| HOOK_QUEUE - tx.capacity();
     let store_lock = match lock_store(&cfg.home).await {
         Ok(lock) => lock,
         Err(e) => {
             let msg = format!(
                 "{e}；放棄啟動，等鎖期間收到的 {} 個 hook 沒有寫入",
-                lost(&tx)
+                lost(&hook_tx)
             );
             write_failed(&cfg.home, &msg, None, Some(&cfg.home.join(STORE_LOCK)));
             return Err(io::Error::other(msg));
@@ -235,7 +246,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     let mut store = match Store::open(&cfg.home) {
         Ok(s) => s,
         Err(e) => {
-            let msg = format!("{e}；放棄啟動，收到的 {} 個 hook 沒有寫入", lost(&tx));
+            let msg = format!("{e}；放棄啟動，收到的 {} 個 hook 沒有寫入", lost(&hook_tx));
             write_failed(&cfg.home, &msg, None, Some(&cfg.home.join("index.sqlite")));
             return Err(io::Error::other(msg));
         }
@@ -402,45 +413,60 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
         web.apply(&events);
     };
 
+    // 一個輸入（hook 或 tail 的行）交給 merge 前後要做的事；hook 與 tail 的兩條 channel 共用
+    macro_rules! process {
+        ($input:expr) => {{
+            let input = $input;
+            if let Input::Line { session, file, no, .. } = &input {
+                planner.saw_line(session, file, *no);
+                // 讀到的位置跟著這批 Event 一起寫進 store：沒產生 Event 的行重啟也不重讀（#713）
+                store.lock().unwrap_or_else(|e| e.into_inner()).saw_line(session, file, *no);
+            }
+            if let Input::Hook { hook, .. } = &input {
+                last_hook = Instant::now();
+                if hook.event_name() == "SessionEnd" {
+                    open_sessions.remove(hook.session_id());
+                } else {
+                    open_sessions.insert(hook.session_id().to_string());
+                }
+                if hook.event_name() == "SubagentStart" {
+                    read_agent_meta(hook, &tx);
+                }
+                let actions = planner.on_hook(hook);
+                if !actions.is_empty() {
+                    for action in actions {
+                        let id = next_tail;
+                        next_tail += 1;
+                        sink(merger.handle(action.reset(crate::now_ms(), id)));
+                        apply_tail(action, id, &mut tails, &tx);
+                    }
+                    web.set_health(health(tails.len(), 0, &hooks));
+                }
+            }
+            sink(merger.handle(input));
+        }};
+    }
     loop {
         tokio::select! {
-            Some(input) = rx.recv() => {
-                if let Input::Line { session, file, no, .. } = &input {
-                    planner.saw_line(session, file, *no);
-                    // 讀到的位置跟著這批 Event 一起寫進 store：沒產生 Event 的行重啟也不重讀（#713）
-                    store.lock().unwrap_or_else(|e| e.into_inner()).saw_line(session, file, *no);
-                }
-                if let Input::Hook { hook, .. } = &input {
-                    last_hook = Instant::now();
-                    if hook.event_name() == "SessionEnd" {
-                        open_sessions.remove(hook.session_id());
-                    } else {
-                        open_sessions.insert(hook.session_id().to_string());
-                    }
-                    if hook.event_name() == "SubagentStart" {
-                        read_agent_meta(hook, &tx);
-                    }
-                    let actions = planner.on_hook(hook);
-                    if !actions.is_empty() {
-                        for action in actions {
-                            let id = next_tail;
-                            next_tail += 1;
-                            sink(merger.handle(action.reset(crate::now_ms(), id)));
-                            apply_tail(action, id, &mut tails, &tx);
-                        }
-                        web.set_health(json!({ "tails": tails.len(), "schedLagMs": 0 }));
+            // 依寫的順序挑：hook 永遠先處理（L-6）
+            biased;
+            // hook 先處理（L-6）：tail 補讀大量行時，hook 不會排在幾千行後面
+            Some(input) = hook_rx.recv() => {
+                process!(input);
+                // 一串平行工具呼叫的 hook 合成一次 flush（E-S7）：只收已經在佇列裡的，不等待，仍符合 #713
+                for _ in 0..HOOK_BATCH {
+                    match hook_rx.try_recv() {
+                        Ok(more) => process!(more),
+                        Err(_) => break,
                     }
                 }
-                let from_hook = matches!(input, Input::Hook { .. });
-                sink(merger.handle(input));
                 // hook 事件沒有別的來源可以補（transcript 的行有）：處理完立刻寫進 store，不等批次（#713）。
                 // hook 的 200 早在 try_send 時就回了，這裡的寫入不在 Claude Code 的等待路徑上
-                if from_hook
-                    && let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush()
-                {
+                if let Err(e) = store.lock().unwrap_or_else(|e| e.into_inner()).flush() {
                     log(&format!("寫入 store 失敗：{e}"));
                 }
             }
+            Some(input) = rx.recv() => process!(input),
             scheduled = tick.tick() => {
                 let lag = Instant::now().saturating_duration_since(scheduled.into_std());
                 let events = merger.tick(crate::now_ms());
@@ -449,7 +475,7 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
                     open_sessions.remove(&e.session);
                 }
                 sink(events);
-                web.set_health(json!({ "tails": tails.len(), "schedLagMs": lag.as_millis() as u64 }));
+                web.set_health(health(tails.len(), lag.as_millis() as u64, &hooks));
                 let quiet = last_hook.elapsed();
                 let idle_now = !idle.is_zero()
                     && quiet >= idle
@@ -525,7 +551,15 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
     // 先放掉 hook 埠：ensure 會拉起新的 collector，它看到 closing 就等這個埠、綁上之後收 hook、等 store 鎖（#685）
     hooks.set_closing(true);
     write_info(&cfg.home, me, hook_addr, &web_addrs, true);
+    let dropped = hooks.dropped();
     hooks.close().await;
+    // 埠放掉前已經收下（回了 200）的 hook 不能丟
+    while let Ok(input) = hook_rx.try_recv() {
+        sink(merger.handle(input));
+    }
+    if dropped > 0 {
+        log(&format!("這次執行因佇列滿丟掉 {dropped} 個 hook"));
+    }
     stop_all(tails.into_values(), &mut rx, |input| {
         sink(merger.handle(input))
     })

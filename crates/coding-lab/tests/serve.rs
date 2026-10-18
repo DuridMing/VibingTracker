@@ -1681,3 +1681,37 @@ fn collector_files_are_private() {
     assert_eq!(mode(&e.home.join("collector.json")), 0o600);
     assert_eq!(mode(&e.home.join("collector.log")), 0o600);
 }
+
+/// L-6（#740）：tail 補讀大量行時塞滿輸入佇列，hook 原本被 try_send 丟掉（實測 100 個丟 32 個）。
+/// hook 走自己的 channel、主迴圈先處理 hook：另一個 session 的 hook 一個都不丟；/healthz 有 dropped。
+#[test]
+fn hooks_are_not_dropped_while_a_tail_catches_up() {
+    let e = env(0);
+    let transcript = e.home.join("big.jsonl");
+    let mut text = String::new();
+    for i in 0..60_000 {
+        text.push_str(&text_line(&format!("u{i}"), &format!("m{i}"), "補讀"));
+    }
+    std::fs::write(&transcript, text).unwrap();
+    let _s = start_serve(&e);
+    let start = json!({"session_id": "big", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    for i in 0..100 {
+        let p = json!({"session_id": "other", "hook_event_name": "UserPromptSubmit",
+                       "prompt": format!("p{i}"), "cwd": "/q"});
+        assert!(http(e.hook, "POST", "/hook", &p.to_string()).starts_with("HTTP/1.1 200"));
+    }
+    let jsonl = e.home.join("events/other.jsonl");
+    let prompts = || {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("prompt.submitted"))
+            .count()
+    };
+    wait_for("100 個 prompt 都進 store", || prompts() == 100);
+    let h = http(e.web, "GET", "/healthz", "");
+    let v: Value = serde_json::from_str(h.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap();
+    assert_eq!(v["dropped"], 0, "{v}");
+}

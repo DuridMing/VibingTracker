@@ -807,3 +807,45 @@ fn unc_transcript_is_not_tailed() {
         assert!(a.is_empty(), "{t}：{a:?}");
     }
 }
+
+// ── body 上限（#740 L-2）：axum 預設 2 MB；編輯超過約 2 MB 的檔時 Edit 的 PostToolUse 帶整份 originalFile，
+// 原本回 413（Claude Code 顯示 hook 錯誤，違反不變式 4）。上限 64 MB，超過的也回 200、寫 log
+
+#[tokio::test]
+async fn big_hook_is_answered_200_and_forwarded() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Edit",
+        "tool_use_id": "e1", "tool_response": {"originalFile": "x".repeat(3_000_000)}})
+    .to_string();
+    let resp = raw(addr, hook_req("Content-Type: application/json\r\n", &body)).await;
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "{}",
+        resp.lines().next().unwrap_or("")
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(Input::Hook { .. })),
+        "3 MB 的 hook 要交給 merge"
+    );
+}
+
+#[tokio::test]
+async fn hook_over_the_limit_is_still_answered_200() {
+    let (addr, mut rx) = server(8).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    // 只送一點 body：宣告的長度超過上限就不讀，直接回 200
+    s.write_all(
+        format!(
+            "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"session_id\"",
+            65 * 1024 * 1024
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp)).await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(rx.try_recv().is_err());
+}
