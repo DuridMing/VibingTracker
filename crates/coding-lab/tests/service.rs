@@ -43,6 +43,12 @@ fn linux_writes_a_systemd_user_unit_that_keeps_the_collector_resident() {
         "ExecStop 的 stop 沒有 --home，要靠環境變數：{unit}"
     );
     assert!(unit.contains("WantedBy=default.target"), "{unit}");
+    // R-7（#739）：開機時 bind 失敗（網路還沒好、埠被佔）要一直重試，不撞 systemd 預設的 5 次／10 秒上限
+    let unit_section = unit.split("[Service]").next().unwrap();
+    assert!(
+        unit_section.contains("StartLimitIntervalSec=0"),
+        "要在 [Unit]：{unit}"
+    );
     let cmds: Vec<String> = plan.commands.iter().map(|c| c.join(" ")).collect();
     assert!(
         cmds.iter().any(|c| c == "systemctl --user daemon-reload"),
@@ -90,6 +96,80 @@ fn macos_writes_a_launch_agent_and_bootstraps_it_for_the_users_gui_domain() {
     );
 }
 
+/// R-15（#739）：systemd 會展開 `%` 指定符，Exec 行還會展開 `$` 變數：路徑裡的要寫成 `%%`、`$$`
+/// （Environment= 只展開 `%`）。有空白、引號、反斜線的路徑加引號、裡面的 `\` 與 `"` 跳脫。
+#[test]
+fn systemd_unit_escapes_specifiers_variables_and_quotes() {
+    let mut c = ctx(Path::new("/home/u/100%/$x/.coding-lab"));
+    c.exe = PathBuf::from("/opt/my apps/coding-lab");
+    let plan = service::plan_install(Platform::Linux, &c);
+    let unit = file_of(&plan, "coding-lab.service");
+    assert!(
+        unit.contains(
+            "ExecStart=\"/opt/my apps/coding-lab\" serve --home /home/u/100%%/$$x/.coding-lab --idle-exit-seconds 0\n"
+        ),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("ExecStop=\"/opt/my apps/coding-lab\" stop\n"),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("Environment=CODING_LAB_HOME=/home/u/100%%/$x/.coding-lab\n"),
+        "{unit}"
+    );
+    let mut c = ctx(Path::new(r#"/home/u/a"b\c"#));
+    c.exe = PathBuf::from("/opt/coding-lab/bin/coding-lab");
+    let unit = file_of(
+        &service::plan_install(Platform::Linux, &c),
+        "coding-lab.service",
+    )
+    .to_string();
+    assert!(unit.contains(r#"--home "/home/u/a\"b\\c" "#), "{unit}");
+}
+
+/// W-M6（#739）：`<Arguments>` 照 Windows 的命令列規則加引號；結尾的 `\` 在引號前要加倍，
+/// 否則 `"C:\x\"` 的引號被跳脫、後面的參數全黏進 home。
+#[test]
+fn windows_task_arguments_survive_a_trailing_backslash() {
+    let c = Ctx {
+        exe: PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe"),
+        home: PathBuf::from(r"D:\data\"),
+        config_home: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
+        user_home: PathBuf::from(r"C:\Users\u"),
+        uid: None,
+        user: None,
+    };
+    let xml = file_of(
+        &service::plan_install(Platform::Windows, &c),
+        "coding-lab-task.xml",
+    )
+    .to_string();
+    assert!(
+        xml.contains(
+            r#"<Arguments>--headless &quot;C:\Program Files\coding-lab\coding-lab.exe&quot; serve --home &quot;D:\data\\&quot; --idle-exit-seconds 0</Arguments>"#
+        ),
+        "{xml}"
+    );
+}
+
+/// R-6（#739）：`coding-lab stop` 停掉的是常駐服務本身，三個平台都不會自己再起來（正常結束不算失敗）；
+/// stop 之後提示用服務管理員的指令把它叫回來。
+#[test]
+fn start_command_brings_the_resident_collector_back() {
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    let j = |p| service::start_command(p, &c).join(" ");
+    assert_eq!(
+        j(Platform::Linux),
+        "systemctl --user start coding-lab.service"
+    );
+    assert_eq!(
+        j(Platform::Macos),
+        "launchctl kickstart gui/1000/io.coding-lab.collector"
+    );
+    assert_eq!(j(Platform::Windows), "schtasks /Run /TN CodingLab");
+}
+
 #[test]
 fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     let c = Ctx {
@@ -103,13 +183,15 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     let plan = service::plan_install(Platform::Windows, &c);
     let xml = file_of(&plan, "coding-lab-task.xml");
     assert!(xml.contains("<LogonTrigger>"), "{xml}");
+    // L-12（#739）：console 程式直接當 Exec 會在登入時開出主控台視窗、關掉就殺掉 collector；
+    // 經 `conhost.exe --headless` 跑就沒有視窗（`<Hidden>` 只是在工作排程器的清單裡隱藏）
     assert!(
-        xml.contains(r"<Command>C:\Users\u\AppData\Local\coding-lab\coding-lab.exe</Command>"),
+        xml.contains(r"<Command>%SystemRoot%\System32\conhost.exe</Command>"),
         "{xml}"
     );
     assert!(
         xml.contains(
-            r#"<Arguments>serve --home "C:\Users\u\.coding-lab" --idle-exit-seconds 0</Arguments>"#
+            r#"<Arguments>--headless &quot;C:\Users\u\AppData\Local\coding-lab\coding-lab.exe&quot; serve --home &quot;C:\Users\u\.coding-lab&quot; --idle-exit-seconds 0</Arguments>"#
         ),
         "{xml}"
     );

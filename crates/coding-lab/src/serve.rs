@@ -782,7 +782,29 @@ async fn shutdown_signal() {
             _ = term.recv() => {}
         }
     }
-    #[cfg(not(unix))]
+    // W-M4：關掉主控台視窗、登出、關機也要照常結束（flush、刪 collector.json）。tokio 收到這三種時讓
+    // handler 停著不回，系統等幾秒（關視窗約 5 秒）才結束程序，結束流程就在這段時間裡跑完
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let (Ok(mut close), Ok(mut logoff), Ok(mut shutdown), Ok(mut brk)) = (
+            windows::ctrl_close(),
+            windows::ctrl_logoff(),
+            windows::ctrl_shutdown(),
+            windows::ctrl_break(),
+        ) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = brk.recv() => {}
+            _ = close.recv() => {}
+            _ = logoff.recv() => {}
+            _ = shutdown.recv() => {}
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }

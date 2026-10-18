@@ -353,6 +353,26 @@ fn ensure_twice_starts_one_collector_and_forwards_session_start() {
     kill_pid(pid);
 }
 
+/// L-9（#739）：ensure 拉起的 collector 的工作目錄是 home，不是第一個 session 的專案目錄
+/// （Windows 上程序的 cwd 會鎖住那個資料夾，刪不掉也改不了名）。用 /proc 看，只在 Linux 跑。
+#[cfg(target_os = "linux")]
+#[test]
+fn ensure_starts_the_collector_in_its_home() {
+    let e = env(5);
+    let project = e.home.with_extension("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut c = cmd(&e, &["ensure"]);
+    c.current_dir(&project).stdin(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    assert!(child.wait().unwrap().success());
+    wait_for("collector.json", || collector(&e).is_some());
+    let pid = collector(&e).unwrap()["pid"].as_u64().unwrap();
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+    kill_pid(pid);
+    assert_eq!(cwd, e.home.canonicalize().unwrap());
+}
+
 #[test]
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
     // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走
