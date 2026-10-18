@@ -1641,3 +1641,33 @@ fn tool_paths_are_forgotten_when_the_result_arrives() {
         .sum();
     assert_eq!(fails, 1);
 }
+
+/// L-17（含 W-L8，#750）：prune 先刪 JSONL、刪成功才刪索引。刪不掉（Windows 上被防毒或備份鎖住）的 session
+/// 索引照留、這次不回報（merge 也就不 forget），下次再清；不能先刪了索引、留下孤兒檔在重啟時被 recover 重新索引。
+#[cfg(unix)]
+#[test]
+fn prune_keeps_the_index_when_the_file_cannot_be_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(text("s1", 2, 1));
+    s.flush().unwrap();
+    let events = h.join("events");
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = s.prune(u64::MAX);
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let first = first.expect("刪不掉的檔不是整個 prune 失敗");
+    assert!(first.sessions.is_empty(), "{:?}", first.sessions);
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.failed[0].0, "s1");
+    assert!(s.session("s1").unwrap().is_some(), "索引留著");
+    // 重開（recover）不會多出東西，下次 prune 清得掉
+    drop(s);
+    let mut s = Store::open(&h).unwrap();
+    let second = s.prune(u64::MAX).unwrap();
+    assert_eq!(second.sessions, ["s1"]);
+    assert!(second.failed.is_empty());
+    assert!(s.session("s1").unwrap().is_none());
+    assert!(!events.join("s1.jsonl").exists());
+}

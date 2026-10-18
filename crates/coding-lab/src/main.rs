@@ -850,7 +850,15 @@ fn prune() -> ExitCode {
                 r.sessions.len(),
                 r.bytes / 1024
             );
-            ExitCode::SUCCESS
+            // 刪不掉的檔（被其他程式鎖住）索引照留，下次再清（L-17）
+            for (sid, why) in &r.failed {
+                eprintln!("coding-lab：{sid} 的事件檔刪不掉（{why}），下次再清");
+            }
+            if r.failed.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");

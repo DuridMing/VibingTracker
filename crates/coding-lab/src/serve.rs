@@ -618,6 +618,10 @@ fn prune_store(store: &mut Store) -> Vec<String> {
                     r.bytes / 1024
                 ));
             }
+            // 刪不掉的檔（被其他程式鎖住）索引照留，下次再清（L-17）
+            for (sid, why) in &r.failed {
+                log(&format!("{sid} 的事件檔刪不掉（{why}），下次再清"));
+            }
             r.sessions
         }
         Err(e) => {

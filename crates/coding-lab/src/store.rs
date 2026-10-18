@@ -90,6 +90,8 @@ pub struct PruneReport {
     pub sessions: Vec<String>,
     /// 刪掉的 JSONL 大小
     pub bytes: u64,
+    /// JSONL 刪不掉的 (session, 原因)：索引照留，下次再清（L-17）
+    pub failed: Vec<(String, String)>,
 }
 
 /// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
@@ -1362,9 +1364,10 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
-    /// 清掉最後活動早於 `before`（epoch ms）的 session：先刪索引列，再刪 JSONL（#655）。
-    /// 中途當掉時 JSONL 還在、索引沒了，下次開啟會被 recover 補回，再清一次即可。
+    /// 清掉最後活動早於 `before`（epoch ms）的 session（#655）：**先刪 JSONL，刪成功才刪索引列**（L-17）。
+    /// 刪不掉的（Windows 上被防毒或備份軟體鎖住）索引照留、記在 `failed`，下次再清；不會先刪了索引、
+    /// 留下孤兒檔在重啟時被 recover 重新索引。刪檔之後、刪索引之前當掉的話，下次 prune 找不到檔也算刪掉。
+    /// `sessions` 只列真的清掉的，呼叫端照這份 forget。
     pub fn prune(&mut self, before: u64) -> Result<PruneReport, StoreError> {
         let old: Vec<String> = {
             let mut stmt = self.db.prepare(
@@ -1378,31 +1381,38 @@ impl Store {
                 .collect::<Result<_, _>>()?
         };
         let mut report = PruneReport::default();
-        if old.is_empty() {
+        let mut gone = Vec::new();
+        for sid in old {
+            let name = file_name(&sid);
+            let path = self.events_dir.join(&name);
+            let len = fs::metadata(&path).map_or(0, |m| m.len());
+            match fs::remove_file(&path) {
+                Ok(()) => report.bytes += len,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    report.failed.push((sid, e.to_string()));
+                    continue;
+                }
+            }
+            self.file_len.remove(&name);
+            gone.push(sid);
+        }
+        if gone.is_empty() {
             return Ok(report);
         }
         let tx = self.db.transaction()?;
-        for sid in &old {
-            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
+        for sid in &gone {
+            exec(&tx, "DELETE FROM sessions WHERE id = ?1", params![sid])?;
             for table in ["events", "file_touch", "changes", "attention", "tails"] {
-                tx.execute(
+                exec(
+                    &tx,
                     &format!("DELETE FROM {table} WHERE session = ?1"),
                     params![sid],
                 )?;
             }
         }
         tx.commit()?;
-        for sid in old {
-            let name = file_name(&sid);
-            let path = self.events_dir.join(&name);
-            if let Ok(meta) = fs::metadata(&path) {
-                report.bytes += meta.len();
-            }
-            match fs::remove_file(&path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-            self.file_len.remove(&name);
+        for sid in gone {
             self.cwd_of.remove(&sid);
             self.known_sessions.remove(&sid);
             self.path_of_tool.retain(|(s, _), _| *s != sid);
@@ -1433,6 +1443,7 @@ impl Store {
         self.path_of_tool.len()
     }
 
+    /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
     pub fn recover_bytes(&self) -> u64 {
         self.recover_bytes
     }
