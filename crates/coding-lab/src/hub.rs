@@ -756,7 +756,12 @@ struct HubState {
     /// snapshot 快取以外的 session 屬於哪台（#726）：`/api/sessions` 合併時與逐台試出來時記下。
     /// 已結束、被移出 live 的 session 只有這裡找得到
     known: Mutex<HashMap<String, String>>,
+    /// 同上，目錄 → 哪台（C13）：live 快取裡沒有 session 的專案，逐台問出來後記下
+    known_cwds: Mutex<HashMap<String, String>>,
 }
+
+/// 記下的目錄對照最多幾筆，超過就整個重來（逐台問一次的成本很低，不用 LRU）
+const KNOWN_CWDS_MAX: usize = 1024;
 
 static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
@@ -837,6 +842,7 @@ pub async fn serve_with_backoff(
         offset_fixed: std::sync::atomic::AtomicBool::new(false),
         subs: Mutex::new(HashMap::new()),
         known: Mutex::new(HashMap::new()),
+        known_cwds: Mutex::new(HashMap::new()),
     });
     let mut tasks = Vec::new();
     for (up, rx) in rxs {
@@ -1103,6 +1109,48 @@ async fn resolve_owner(state: &HubState, sid: &str) -> Option<String> {
     None
 }
 
+/// 擁有這個目錄的上游（C13）：先看 live 快取與記下的對照；都沒有就逐台問上線的上游
+/// `/api/sessions?cwd=<目錄>&limit=1`，有列的那台就是，記下來。已結束、被移出 live 的專案（回放舊的工作）靠這個找到。
+async fn resolve_cwd_owner(state: &HubState, cwd: &str) -> Option<String> {
+    let cached = state.hub().owner_of_cwd(cwd);
+    if cached.is_some() {
+        return cached;
+    }
+    let key = cwd.replace('\\', "/").trim_end_matches('/').to_string();
+    let remembered = state
+        .known_cwds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    if remembered.is_some() {
+        return remembered;
+    }
+    let online = state.hub().online();
+    let path = format!("/api/sessions?cwd={}&limit=1", percent_encode(&key));
+    for u in &state.ups {
+        if !online.iter().any(|(n, on)| *n == u.up.name && *on) {
+            continue;
+        }
+        let Ok(r) = http_get(&u.up.url, &path, u.up.key.as_deref()).await else {
+            continue;
+        };
+        let has = r.status == 200
+            && serde_json::from_slice::<Value>(&r.body)
+                .ok()
+                .is_some_and(|v| v["sessions"].as_array().is_some_and(|a| !a.is_empty()));
+        if has {
+            let mut known = state.known_cwds.lock().unwrap_or_else(|e| e.into_inner());
+            if known.len() >= KNOWN_CWDS_MAX {
+                known.clear();
+            }
+            known.insert(key, u.up.name.clone());
+            return Some(u.up.name.clone());
+        }
+    }
+    None
+}
+
 fn percent_encode(s: &str) -> String {
     s.bytes()
         .map(|b| {
@@ -1335,10 +1383,10 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
     let gateway = |why: String| json_response(StatusCode::BAD_GATEWAY, &json!({ "error": why }));
     if path == "/api/sessions" {
         let cwd = query_param(&uri, "cwd");
-        let owner = cwd.as_deref().map(|c| state.hub().owner_of_cwd(c));
+        // 快取裡找得到這個目錄就只問那台；找不到（已結束、被移出 live 的專案，C13）就每台都問
+        let owner = cwd.as_deref().and_then(|c| state.hub().owner_of_cwd(c));
         let targets: Vec<&UpHandle> = match owner {
-            Some(Some(o)) => state.ups.iter().filter(|u| u.up.name == o).collect(),
-            Some(None) => return not_found("hub 不認得這個目錄（沒有任何一台有它的 session）"),
+            Some(o) => state.ups.iter().filter(|u| u.up.name == o).collect(),
             None => state.ups.iter().collect(),
         };
         let online = state.hub().online();
@@ -1374,7 +1422,7 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
         resolve_owner(&state, &percent_decode(id)).await
     } else {
         match query_param(&uri, "cwd") {
-            Some(c) => state.hub().owner_of_cwd(&c),
+            Some(c) => resolve_cwd_owner(&state, &c).await,
             None => None,
         }
     };
