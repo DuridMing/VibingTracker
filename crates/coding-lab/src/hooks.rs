@@ -26,7 +26,6 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use tokio::sync::{Notify, mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 use crate::hook::HookInput;
 use crate::merge::Input;
@@ -64,7 +63,10 @@ pub struct HookServer {
     probe_limit_ms: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     shutdown: Option<oneshot::Sender<()>>,
-    task: JoinHandle<()>,
+    /// 不再等進行中的請求、直接收掉（close 等過 [`CLOSE_GRACE`] 之後）
+    force: Option<oneshot::Sender<()>>,
+    /// hook 執行緒結束時完成
+    done: oneshot::Receiver<()>,
 }
 
 impl HookServer {
@@ -94,17 +96,23 @@ impl HookServer {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        if tokio::time::timeout(CLOSE_GRACE, &mut self.task)
+        if tokio::time::timeout(CLOSE_GRACE, &mut self.done)
             .await
             .is_err()
         {
-            self.task.abort();
-            let _ = (&mut self.task).await;
+            if let Some(tx) = self.force.take() {
+                let _ = tx.send(());
+            }
+            let _ = (&mut self.done).await;
         }
     }
 }
 
 /// 開始收 hook；回傳實際綁定的位址（測試用 port 0）。非 loopback 位址一律拒絕。
+///
+/// hook 入口跑在自己的執行緒與 current_thread runtime 上（#740 L-7、X3）：web 的 handler 卡住主 runtime 的
+/// worker（例如在 async 裡等 store 的鎖）時，hook 照樣在 100 ms 內回 200（不變式 4）。它只做 try_send 與
+/// 讀檔探測（blocking pool），一條執行緒就夠。
 pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Result<HookServer> {
     if !addr.ip().is_loopback() {
         return Err(io::Error::new(
@@ -112,8 +120,12 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
             format!("hook 入口只能綁 127.0.0.1，收到 {addr}"),
         ));
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     let closing = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::new(Notify::new());
     let probe_limit_ms = Arc::new(AtomicU64::new(PROBE_LIMIT.as_millis() as u64));
@@ -131,14 +143,32 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
             std::future::pending::<()>().await;
         }
     };
-    let task = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(stop)
-            .await
-        {
-            crate::logging::log(&format!("hooks：{e}"));
-        }
-    });
+    let (force, forced) = oneshot::channel::<()>();
+    let (done_tx, done) = oneshot::channel::<()>();
+    std::thread::Builder::new()
+        .name("coding-lab-hooks".into())
+        .spawn(move || {
+            rt.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        crate::logging::log(&format!("hooks：{e}"));
+                        return;
+                    }
+                };
+                let serve = axum::serve(listener, app).with_graceful_shutdown(stop);
+                tokio::select! {
+                    r = serve => {
+                        if let Err(e) = r {
+                            crate::logging::log(&format!("hooks：{e}"));
+                        }
+                    }
+                    // 丟掉 HookServer 不會關閉（sender 被丟掉時是 Err，這條不成立）
+                    Ok(()) = forced => {}
+                }
+            });
+            let _ = done_tx.send(());
+        })?;
     Ok(HookServer {
         addr: local,
         closing,
@@ -146,7 +176,8 @@ pub async fn serve_hooks(addr: SocketAddr, tx: mpsc::Sender<Input>) -> io::Resul
         probe_limit_ms,
         dropped,
         shutdown: Some(shutdown),
-        task,
+        force: Some(force),
+        done,
     })
 }
 

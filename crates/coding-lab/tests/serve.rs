@@ -1733,3 +1733,51 @@ fn hooks_are_not_dropped_while_a_tail_catches_up() {
     let v: Value = serde_json::from_str(h.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap();
     assert_eq!(v["dropped"], 0, "{v}");
 }
+
+/// L-7（#740）：回放與 events 請求並行、web 的 worker 很忙時，hook 仍然很快回 200（不變式 4）。
+/// hook 入口在自己的執行緒上，不和 web 搶 worker。
+#[test]
+fn hooks_stay_fast_while_web_requests_pile_up() {
+    let e = env(0);
+    let _s = start_serve(&e);
+    let start = json!({"session_id": "busy", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("tb.jsonl"), "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    for i in 0..200 {
+        let p = json!({"session_id": "busy", "hook_event_name": "UserPromptSubmit", "prompt": format!("p{i}"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &p.to_string());
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let web = e.web;
+    let load: Vec<_> = (0..16)
+        .map(|i| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let path = if i % 2 == 0 {
+                    "/api/projects/replay?cwd=/p&at=0&until=99999999999999"
+                } else {
+                    "/api/sessions/busy/events?limit=500"
+                };
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = http(web, "GET", path, "");
+                }
+            })
+        })
+        .collect();
+    let mut worst = Duration::ZERO;
+    for i in 0..30 {
+        let body = json!({"session_id": "other", "hook_event_name": "UserPromptSubmit", "prompt": format!("q{i}"), "cwd": "/q"});
+        let t = Instant::now();
+        assert!(http(e.hook, "POST", "/hook", &body.to_string()).starts_with("HTTP/1.1 200"));
+        worst = worst.max(t.elapsed());
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in load {
+        let _ = t.join();
+    }
+    // 預算是 100 ms；check.sh 並行跑時機器很忙，留一點餘裕，測的是「不會被 web 卡住幾秒」
+    assert!(
+        worst < Duration::from_millis(500),
+        "最慢一個 hook 花了 {worst:?}"
+    );
+}
