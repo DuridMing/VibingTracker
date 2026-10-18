@@ -254,6 +254,8 @@ pub async fn run(cfg: Config) -> io::Result<Outcome> {
             return Err(io::Error::other(msg));
         }
     };
+    // 拿著 store 鎖的 collector 只有一個，由它輪替 collector.log（W-L12）
+    crate::logging::start_rotating();
 
     let mut store = match Store::open(&cfg.home) {
         Ok(s) => s,
