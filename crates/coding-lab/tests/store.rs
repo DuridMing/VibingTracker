@@ -1234,3 +1234,130 @@ fn tails_advance_to_the_last_line_read_even_without_events() {
     rows.sort();
     assert_eq!(rows, [("agent-a1".to_string(), 2), ("main".to_string(), 3)]);
 }
+
+// ── 起不來的情況（#738 L-10、L-14）：壞掉的一個檔或做到一半的建表不能讓 collector 永遠起不來
+
+/// L-14：新建資料庫的 v0→v1 原本沒有交易，建表做到一半當掉後，下次再建就撞上已經在的表。
+#[test]
+fn half_created_v1_schema_still_opens() {
+    let h = home();
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE sessions (id TEXT PRIMARY KEY, host TEXT NOT NULL DEFAULT 'local', cwd TEXT NOT NULL,
+           transcript_path TEXT, model TEXT, branch TEXT, first_prompt TEXT, started_at INTEGER NOT NULL,
+           ended_at INTEGER, end_reason TEXT, status TEXT NOT NULL DEFAULT 'run', status_since INTEGER NOT NULL,
+           commits INTEGER NOT NULL DEFAULT 0, dangers INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+           cost_usd REAL NOT NULL DEFAULT 0, thinking_tokens INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+           summary TEXT);",
+    )
+    .unwrap();
+    drop(db);
+    let mut s = Store::open(&h).expect("做到一半的建表要能補完");
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    s.append(started("s1", 1, "/p"));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p");
+}
+
+/// L-10：JSONL 第一行斷在多位元組字元中間（寫到一半當掉、或檔案被截壞），不能讓整個 store 開不了；
+/// 後面完整的行照樣進索引。
+#[test]
+fn a_broken_first_line_does_not_stop_the_store() {
+    let h = home();
+    std::fs::create_dir_all(h.join("events")).unwrap();
+    let good = serde_json::to_string(&started("s1", 2, "/p")).unwrap();
+    let mut bytes = "{\"v\":1,\"session\":\"s1\",\"seq\":1,\"type\":\"prompt.submitted\",\"payload\":{\"text\":\"中"
+        .as_bytes()
+        .to_vec();
+    bytes.truncate(bytes.len() - 1); // 「中」只留兩個 byte
+    bytes.push(b'\n');
+    bytes.extend_from_slice(good.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(h.join("events/s1.jsonl"), &bytes).unwrap();
+    let s = Store::open(&h).expect("壞掉的首行不能擋住啟動");
+    assert_eq!(
+        s.session("s1").unwrap().unwrap().cwd,
+        "/p",
+        "後面完整的行照樣索引"
+    );
+}
+
+/// L-10：只有一個沒寫完的半行（合法 UTF-8、沒有換行）時要截掉，不然新的寫入會黏在它後面。
+#[test]
+fn a_lone_partial_line_is_cut_before_new_writes() {
+    let h = home();
+    std::fs::create_dir_all(h.join("events")).unwrap();
+    let path = h.join("events/s1.jsonl");
+    std::fs::write(&path, "{\"v\":1,\"session\":\"s1\",\"seq\":1,\"ty").unwrap();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.flush().unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    for l in text.lines() {
+        assert!(
+            Event::from_json_line(l).is_ok(),
+            "每一行都要是完整的 Event：{l}"
+        );
+    }
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p");
+}
+
+/// W-L8：一個 JSONL 讀不到（例如被防毒鎖住）時跳過它，其他 session 照常。
+#[cfg(unix)]
+#[test]
+fn an_unreadable_jsonl_is_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("a1", 1, "/a"));
+        s.append(started("b1", 1, "/b"));
+        s.flush().unwrap();
+    }
+    for f in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        let _ = std::fs::remove_file(h.join(f));
+    }
+    let locked = h.join("events/a1.jsonl");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let opened = Store::open(&h);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let s = opened.expect("一個檔讀不到不能讓 store 開不了");
+    assert_eq!(s.session("b1").unwrap().unwrap().cwd, "/b");
+}
+
+/// L-14：v2 升級時的 tails 回填遇到非 UTF-8 的行不能失敗（失敗的話版本已經升上去、之後永遠不再回填）；
+/// 那一行略過，其他行照樣回填。
+#[test]
+fn tails_backfill_skips_lines_that_are_not_utf8() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 4));
+        s.flush().unwrap();
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(h.join("events/s1.jsonl"))
+        .unwrap();
+    f.write_all(b"\xff\xfe not json\n").unwrap();
+    drop(f);
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE IF EXISTS tails; UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+    let s = Store::open(&h).expect("回填遇到非 UTF-8 不能失敗");
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.line_no))
+        .collect();
+    assert_eq!(rows, [("main".to_string(), 4)]);
+}
