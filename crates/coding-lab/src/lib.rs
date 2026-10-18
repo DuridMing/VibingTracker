@@ -14,6 +14,7 @@ pub mod keys;
 pub mod live;
 pub mod logging;
 pub mod merge;
+pub mod paths;
 pub mod prices;
 pub mod rules;
 pub mod sensitive;

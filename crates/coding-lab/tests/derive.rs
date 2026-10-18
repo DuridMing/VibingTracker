@@ -905,3 +905,20 @@ fn notebook_and_multi_edit_derive_file_edit() {
         (&json!("src/b.rs"), &Value::Null)
     );
 }
+
+/// L-11（#748）：VS Code 的終端機給小寫的磁碟機代號。session 的 cwd 存成 `E:/repo`，
+/// 檔案路徑不論大小寫怎麼給都算得出相對路徑；不在底下的存正規化後的絕對路徑。
+#[test]
+fn lowercase_drive_letters_are_normalized_for_cwd_and_paths() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let evs = handle(&mut m, session_start("s1", "e:\\repo", "startup"), 1);
+    assert_eq!(of(&evs, "session.started")[0].payload["cwd"], "E:/repo");
+    let read = |path: &str, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Read", "cwd": "e:\\repo",
+               "tool_input": {"file_path": path}, "tool_use_id": id})
+    };
+    let evs = handle(&mut m, read("e:\\repo\\src\\a.rs", "r1"), 2);
+    assert_eq!(of(&evs, "file.read")[0].payload["path"], "src/a.rs");
+    let evs = handle(&mut m, read("d:\\other\\b.rs", "r2"), 3);
+    assert_eq!(of(&evs, "file.read")[0].payload["path"], "D:/other/b.rs");
+}

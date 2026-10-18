@@ -1565,3 +1565,109 @@ fn events_reader_reads_contiguous_and_scattered_offsets() {
         |w| (w[0].ts_seen, &w[0].session, w[0].seq) <= (w[1].ts_seen, &w[1].session, w[1].seq)
     ));
 }
+
+/// E-S5（#755）：每小時的費用基準走 v6 的 usage 索引，不再全表掃。
+#[test]
+fn usage_since_uses_the_usage_index() {
+    let s = Store::open(&home()).unwrap();
+    let plan = s.usage_since_plan().unwrap();
+    assert!(plan.contains("events_usage_ts"), "{plan}");
+}
+
+/// E-S8（#755）：sessions 列只在第一次看到 session 時建、last_seq 每次 flush 更新一次；
+/// prune 掉的 session 之後又有 Event（同一個 id 回來）時列要重建，last_seq 照樣是最大的 seq。
+#[test]
+fn session_rows_come_back_after_prune_and_last_seq_is_the_max() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    for seq in 2..6 {
+        s.append(text("s1", seq, seq - 1));
+    }
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 5);
+    s.append(text("s1", 6, 5));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 6);
+    assert_eq!(s.prune(u64::MAX).unwrap().sessions, ["s1"]);
+    assert!(s.session("s1").unwrap().is_none());
+    s.append(text("s1", 7, 6));
+    s.flush().unwrap();
+    let row = s
+        .session("s1")
+        .unwrap()
+        .expect("prune 後回來的 session 要有列");
+    assert_eq!(row.last_seq, 7);
+    // 重開之後也認得已有的 session
+    drop(s);
+    let mut s = Store::open(&h).unwrap();
+    s.append(text("s1", 8, 7));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 8);
+}
+
+/// E-S12（#755）：「工具卡片碰的檔」收到 tool.result 就放掉（同一張卡片不會有第二個 tool.result，K-3），
+/// 不用等 session 結束；之前的失敗照樣記 fail（tool.updated 一定在 tool.result 之前）。
+#[test]
+fn tool_paths_are_forgotten_when_the_result_arrives() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(file_ev("s1", 2, "file.read", "r1", "a.rs", 2000));
+    s.append(file_ev("s1", 3, "file.read", "r2", "b.rs", 2001));
+    s.append(failed("s1", 4, "r2", 2002));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 1, "前提：r1 還在等結果");
+    for (seq, id, ok) in [(5, "r1", true), (6, "r2", false)] {
+        s.append(ev(
+            "s1",
+            seq,
+            "tool.result",
+            None,
+            2003,
+            json!({
+                "toolUseId": id, "ok": ok, "exitCode": null, "output": "", "truncated": false,
+            }),
+        ));
+    }
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 0);
+    let fails: u64 = s
+        .touches("/p", "b.rs")
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == "fail")
+        .map(|t| t.count)
+        .sum();
+    assert_eq!(fails, 1);
+}
+
+/// L-17（含 W-L8，#750）：prune 先刪 JSONL、刪成功才刪索引。刪不掉（Windows 上被防毒或備份鎖住）的 session
+/// 索引照留、這次不回報（merge 也就不 forget），下次再清；不能先刪了索引、留下孤兒檔在重啟時被 recover 重新索引。
+#[cfg(unix)]
+#[test]
+fn prune_keeps_the_index_when_the_file_cannot_be_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(text("s1", 2, 1));
+    s.flush().unwrap();
+    let events = h.join("events");
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = s.prune(u64::MAX);
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let first = first.expect("刪不掉的檔不是整個 prune 失敗");
+    assert!(first.sessions.is_empty(), "{:?}", first.sessions);
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.failed[0].0, "s1");
+    assert!(s.session("s1").unwrap().is_some(), "索引留著");
+    // 重開（recover）不會多出東西，下次 prune 清得掉
+    drop(s);
+    let mut s = Store::open(&h).unwrap();
+    let second = s.prune(u64::MAX).unwrap();
+    assert_eq!(second.sessions, ["s1"]);
+    assert!(second.failed.is_empty());
+    assert!(s.session("s1").unwrap().is_none());
+    assert!(!events.join("s1.jsonl").exists());
+}

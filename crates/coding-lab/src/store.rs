@@ -4,7 +4,7 @@
 //! [`Store::open`] 會截掉 JSONL 尾端沒寫完的半行，並把還沒進索引的完整行補進去。
 //! 索引可以整個刪掉，下次開啟時從 JSONL 重建。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -90,6 +90,8 @@ pub struct PruneReport {
     pub sessions: Vec<String>,
     /// 刪掉的 JSONL 大小
     pub bytes: u64,
+    /// JSONL 刪不掉的 (session, 原因)：索引照留，下次再清（L-17）
+    pub failed: Vec<(String, String)>,
 }
 
 /// collector 重啟時交給 merge 接續的狀態，見 [`Store::counters`]。
@@ -292,6 +294,8 @@ pub struct Store {
     /// 索引時需要的狀態：session 的 cwd、工具卡片碰的是哪個檔
     cwd_of: HashMap<String, String>,
     path_of_tool: HashMap<(String, String), String>,
+    /// sessions 表裡已有列的 session：每筆 Event 不必再 `INSERT OR IGNORE`（E-S8）。只在交易 commit 之後加入
+    known_sessions: HashSet<String>,
     /// 已寫進 JSONL、還沒進索引的 (Event, offset)：索引寫入失敗時留到下次 flush
     unindexed: Vec<(Event, u64)>,
     /// tail 讀到的行（(session, file) → 行號），下次 flush 和 Event 同一個交易寫進 `tails`（#713）
@@ -520,6 +524,8 @@ impl Store {
         restrict_file(&home.join("index.sqlite"))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         db.pragma_update(None, "synchronous", "NORMAL")?;
+        // index_event 一筆可能用到二十幾句不同的 SQL，預設的 16 個快取不夠（E-S8）
+        db.set_prepared_statement_cache_capacity(32);
         let backfill_tails = migrate(&db)?;
 
         let mut store = Store {
@@ -529,6 +535,7 @@ impl Store {
             file_len: HashMap::new(),
             cwd_of: HashMap::new(),
             path_of_tool: HashMap::new(),
+            known_sessions: HashSet::new(),
             unindexed: Vec::new(),
             read_lines: BTreeMap::new(),
             recover_bytes: 0,
@@ -539,6 +546,7 @@ impl Store {
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (id, cwd) = row?;
+                store.known_sessions.insert(id.clone());
                 store.cwd_of.insert(id, cwd);
             }
         }
@@ -593,7 +601,7 @@ impl Store {
             tx.execute(UPSERT_TAIL_PATH, params![sid, p, start])?;
         }
         for ((sid, file), no) in &last {
-            tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+            exec(&tx, UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
         }
         tx.execute("DELETE FROM meta WHERE key = 'backfill_tails'", [])?;
         tx.commit()?;
@@ -675,19 +683,30 @@ impl Store {
         }
 
         // 2. 再寫索引（同一個交易）；失敗時交易回滾，整批留到下次
-        let tx = self.db.transaction()?;
-        for (e, off) in &self.unindexed {
-            index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
-        }
         // 有 Event 沒寫進 JSONL（放回 pending）時，tail 讀到的行號先不記（C15）：記了之後在下次成功前當掉，
         // 重啟會從這個行號之後讀，沒寫進去的那些行就永遠不會再進來。留到寫成功的那次一起記
         let lines_ok = failure.is_none();
+        let tx = self.db.transaction()?;
+        let mut batch = IndexBatch::new(&self.known_sessions, lines_ok.then_some(&self.read_lines));
+        for (e, off) in &self.unindexed {
+            index_event(
+                &tx,
+                &mut self.cwd_of,
+                &mut self.path_of_tool,
+                &mut batch,
+                e,
+                *off,
+            )?;
+        }
+        batch.finish(&tx)?;
+        let added = batch.added;
         if lines_ok {
             for ((sid, file), no) in &self.read_lines {
-                tx.execute(UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
+                exec(&tx, UPSERT_TAIL_LINE, params![sid, file, *no as i64])?;
             }
         }
         tx.commit()?;
+        self.known_sessions.extend(added);
         self.unindexed.clear();
         if lines_ok {
             self.read_lines.clear();
@@ -797,12 +816,23 @@ impl Store {
                 params![session],
                 |r| r.get(0),
             )?;
+            let mut batch = IndexBatch::new(&self.known_sessions, None);
             for (e, off) in &lines {
                 if indexed.is_none_or(|max| (*off as i64) > max) {
-                    index_event(&tx, &mut self.cwd_of, &mut self.path_of_tool, e, *off)?;
+                    index_event(
+                        &tx,
+                        &mut self.cwd_of,
+                        &mut self.path_of_tool,
+                        &mut batch,
+                        e,
+                        *off,
+                    )?;
                 }
             }
+            batch.finish(&tx)?;
+            let added = batch.added;
             tx.commit()?;
+            self.known_sessions.extend(added);
         }
         Ok(())
     }
@@ -849,18 +879,26 @@ impl Store {
         until: u64,
         limit: usize,
     ) -> Result<(Reads, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
-        let root = root.replace('\\', "/");
+        // 依平台的大小寫規則比對（L-11）：Windows、macOS 兩邊都轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）
+        let root = crate::paths::normalize(root);
         let root = root.trim_end_matches('/');
+        let (root, cwd) = if crate::paths::CASE_INSENSITIVE {
+            (
+                root.to_ascii_lowercase(),
+                "lower(REPLACE(s.cwd, '\\', '/'))",
+            )
+        } else {
+            (root.to_string(), "REPLACE(s.cwd, '\\', '/')")
+        };
         let ms = |t: u64| t.min(i64::MAX as u64) as i64;
         let ids: Vec<String> = self
             .db
-            .prepare(
+            .prepare(&format!(
                 "SELECT id FROM sessions s
-                 WHERE (REPLACE(s.cwd, '\\', '/') = ?1
-                        OR substr(REPLACE(s.cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/')
+                 WHERE ({cwd} = ?1 OR substr({cwd}, 1, length(?1) + 1) = ?1 || '/')
                    AND s.started_at <= ?2 AND (s.ended_at IS NULL OR s.ended_at >= ?3)
-                 ORDER BY id",
-            )?
+                 ORDER BY id"
+            ))?
             .query_map(params![root, ms(until), ms(since)], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
         if ids.is_empty() {
@@ -890,35 +928,34 @@ impl Store {
             .flatten();
         let cut = cut.map(|c| c as u64).filter(|c| *c <= until);
         let stop = cut.map_or(ms(until).saturating_add(1), ms);
+        // 每個 session 一次的查詢只 prepare 一次；確認時間一次查完（E-S11）
         let mut reads = Reads::default();
-        let mut acks = Vec::new();
+        let mut stmt = self.db.prepare_cached(
+            "SELECT offset FROM events WHERE session = ?1
+               AND seq < COALESCE((SELECT MIN(seq) FROM events WHERE session = ?1 AND ts_seen >= ?2), 9223372036854775807)
+             ORDER BY seq",
+        )?;
         for id in &ids {
-            let offsets: Vec<i64> = self
-                .db
-                .prepare(
-                    "SELECT offset FROM events WHERE session = ?1
-                       AND seq < COALESCE((SELECT MIN(seq) FROM events WHERE session = ?1 AND ts_seen >= ?2), 9223372036854775807)
-                     ORDER BY seq",
-                )?
+            let offsets: Vec<i64> = stmt
                 .query_map(params![id, stop], |r| r.get(0))?
                 .collect::<Result<_, _>>()?;
             reads.groups.push((id.clone(), offsets));
-            let rows = self
-                .db
-                .prepare(
-                    "SELECT kind, ref, acked_at FROM attention WHERE session = ?1 AND acked_at IS NOT NULL",
-                )?
-                .query_map(params![id], |r| {
-                    Ok(crate::timeline::Ack {
-                        session: id.clone(),
-                        kind: r.get(0)?,
-                        reference: r.get(1)?,
-                        at: r.get::<_, i64>(2)? as u64,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            acks.extend(rows);
         }
+        let acks = self
+            .db
+            .prepare(&format!(
+                "SELECT session, kind, ref, acked_at FROM attention
+                 WHERE session IN ({list}) AND acked_at IS NOT NULL ORDER BY session, kind, ref"
+            ))?
+            .query_map(rusqlite::params_from_iter(args[..n].iter()), |r| {
+                Ok(crate::timeline::Ack {
+                    session: r.get(0)?,
+                    kind: r.get(1)?,
+                    reference: r.get(2)?,
+                    at: r.get::<_, i64>(3)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok((reads, acks, cut))
     }
 
@@ -1062,9 +1099,7 @@ impl Store {
 
     /// `since` 之後的 usage：(session, ts_seen, costUsd)（#675 費用基準）。
     pub fn usage_since(&self, since: u64) -> Result<Vec<(String, u64, f64)>, StoreError> {
-        let mut stmt = self.db.prepare(
-            "SELECT session, offset FROM events WHERE type = 'usage' AND ts_seen >= ?1 ORDER BY session, seq",
-        )?;
+        let mut stmt = self.db.prepare_cached(USAGE_SINCE)?;
         let rows: Vec<(String, i64)> = stmt
             .query_map(params![since as i64], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
@@ -1073,7 +1108,9 @@ impl Store {
             by_session.entry(session).or_default().push(off);
         }
         let mut out = Vec::new();
-        for (session, offsets) in by_session {
+        for (session, mut offsets) in by_session {
+            // 同一個 session 的 offset 隨 seq 遞增：依 offset 排就是原本的 seq 順序
+            offsets.sort_unstable();
             for e in self.read_at(&session, offsets)? {
                 out.push((
                     session.clone(),
@@ -1083,6 +1120,17 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// [`Store::usage_since`] 的查詢計畫（測試確認走 v6 的 `events_usage_ts`，E-S5）
+    pub fn usage_since_plan(&self) -> Result<String, StoreError> {
+        let mut stmt = self
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {USAGE_SINCE}"))?;
+        let rows: Vec<String> = stmt
+            .query_map(params![0i64], |r| r.get(3))?
+            .collect::<Result<_, _>>()?;
+        Ok(rows.join("\n"))
     }
 
     fn read_at(&self, session: &str, offsets: Vec<i64>) -> Result<Vec<Event>, StoreError> {
@@ -1193,21 +1241,22 @@ impl Store {
         session: &str,
         types: &[&str],
     ) -> Result<Reads, StoreError> {
-        let mut out = Vec::new();
-        let mut stmt = self
-            .db
-            .prepare_cached("SELECT seq, offset FROM events WHERE session = ?1 AND type = ?2")?;
-        for t in types {
-            let rows: Vec<(i64, i64)> = stmt
-                .query_map(params![session, t], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<Result<_, _>>()?;
-            out.extend(rows);
+        if types.is_empty() {
+            return Ok(Reads::one(session, Vec::new()));
         }
-        out.sort();
-        Ok(Reads::one(
-            session,
-            out.into_iter().map(|(_, o)| o).collect(),
-        ))
+        // 一次查完（E-S11），走 v6 的 events_by_type
+        let list = (2..types.len() + 2)
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = self.db.prepare_cached(&format!(
+            "SELECT offset FROM events WHERE session = ?1 AND type IN ({list}) ORDER BY seq"
+        ))?;
+        let args = std::iter::once(session).chain(types.iter().copied());
+        let offsets: Vec<i64> = stmt
+            .query_map(rusqlite::params_from_iter(args), |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        Ok(Reads::one(session, offsets))
     }
 
     /// 某 session 最後一個這種 type 的 Event。
@@ -1323,9 +1372,10 @@ impl Store {
         Ok(n > 0)
     }
 
-    /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
-    /// 清掉最後活動早於 `before`（epoch ms）的 session：先刪索引列，再刪 JSONL（#655）。
-    /// 中途當掉時 JSONL 還在、索引沒了，下次開啟會被 recover 補回，再清一次即可。
+    /// 清掉最後活動早於 `before`（epoch ms）的 session（#655）：**先刪 JSONL，刪成功才刪索引列**（L-17）。
+    /// 刪不掉的（Windows 上被防毒或備份軟體鎖住）索引照留、記在 `failed`，下次再清；不會先刪了索引、
+    /// 留下孤兒檔在重啟時被 recover 重新索引。刪檔之後、刪索引之前當掉的話，下次 prune 找不到檔也算刪掉。
+    /// `sessions` 只列真的清掉的，呼叫端照這份 forget。
     pub fn prune(&mut self, before: u64) -> Result<PruneReport, StoreError> {
         let old: Vec<String> = {
             let mut stmt = self.db.prepare(
@@ -1339,32 +1389,40 @@ impl Store {
                 .collect::<Result<_, _>>()?
         };
         let mut report = PruneReport::default();
-        if old.is_empty() {
+        let mut gone = Vec::new();
+        for sid in old {
+            let name = file_name(&sid);
+            let path = self.events_dir.join(&name);
+            let len = fs::metadata(&path).map_or(0, |m| m.len());
+            match fs::remove_file(&path) {
+                Ok(()) => report.bytes += len,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    report.failed.push((sid, e.to_string()));
+                    continue;
+                }
+            }
+            self.file_len.remove(&name);
+            gone.push(sid);
+        }
+        if gone.is_empty() {
             return Ok(report);
         }
         let tx = self.db.transaction()?;
-        for sid in &old {
-            tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])?;
+        for sid in &gone {
+            exec(&tx, "DELETE FROM sessions WHERE id = ?1", params![sid])?;
             for table in ["events", "file_touch", "changes", "attention", "tails"] {
-                tx.execute(
+                exec(
+                    &tx,
                     &format!("DELETE FROM {table} WHERE session = ?1"),
                     params![sid],
                 )?;
             }
         }
         tx.commit()?;
-        for sid in old {
-            let name = file_name(&sid);
-            let path = self.events_dir.join(&name);
-            if let Ok(meta) = fs::metadata(&path) {
-                report.bytes += meta.len();
-            }
-            match fs::remove_file(&path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-            self.file_len.remove(&name);
+        for sid in gone {
             self.cwd_of.remove(&sid);
+            self.known_sessions.remove(&sid);
             self.path_of_tool.retain(|(s, _), _| *s != sid);
             report.sessions.push(sid);
         }
@@ -1393,6 +1451,7 @@ impl Store {
         self.path_of_tool.len()
     }
 
+    /// 上次開啟時 recover 讀了多少 bytes 的 JSONL（測試與 healthz 用）。
     pub fn recover_bytes(&self) -> u64 {
         self.recover_bytes
     }
@@ -1401,6 +1460,11 @@ impl Store {
         Ok(read_version(&self.db)?.unwrap_or(0))
     }
 }
+
+/// `type = 'usage' AND ts_seen >= ?` 剛好是 v6 部分索引 `events_usage_ts` 的形狀（E-S5）。
+/// 不在 SQL 裡排序：`ORDER BY session, seq` 會讓 SQLite 改成沿主鍵全表掃，分組與排序在呼叫端做
+const USAGE_SINCE: &str =
+    "SELECT session, offset FROM events WHERE type = 'usage' AND ts_seen >= ?1";
 
 /// JSONL 第一行的 session（檔名經過清理，不一定等於 session id）。
 /// 檔案裡第一個完整、讀得懂的 Event 的 session。第一行可能斷在多位元組字元中間或寫壞了（L-10），
@@ -1549,10 +1613,48 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     })
 }
 
+/// 一次交易裡 [`index_event`] 共用的狀態（E-S8）：哪些 session 已有列、每個 session 最大的 seq、
+/// 哪些 transcript 檔的行號等一下會整批寫。
+struct IndexBatch<'a> {
+    known: &'a HashSet<String>,
+    /// 這次交易新建了列的 session；commit 之後才併進 `known`（回滾時不能當成已有）
+    added: HashSet<String>,
+    last_seq: HashMap<String, u64>,
+    /// 這次 flush 最後會整批寫的 tail 行號（`read_lines`）：同一個檔不必每筆 Event 各寫一次
+    lines_later: Option<&'a BTreeMap<(String, String), u64>>,
+}
+
+impl<'a> IndexBatch<'a> {
+    fn new(
+        known: &'a HashSet<String>,
+        lines_later: Option<&'a BTreeMap<(String, String), u64>>,
+    ) -> Self {
+        IndexBatch {
+            known,
+            added: HashSet::new(),
+            last_seq: HashMap::new(),
+            lines_later,
+        }
+    }
+
+    /// 每個 session 的 last_seq 只更新一次
+    fn finish(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
+        for (sid, seq) in &self.last_seq {
+            exec(
+                tx,
+                "UPDATE sessions SET last_seq = MAX(last_seq, ?2) WHERE id = ?1",
+                params![sid, *seq as i64],
+            )?;
+        }
+        Ok(())
+    }
+}
+
 fn index_event(
     tx: &Transaction<'_>,
     cwd_of: &mut HashMap<String, String>,
     path_of_tool: &mut HashMap<(String, String), String>,
+    batch: &mut IndexBatch<'_>,
     e: &Event,
     offset: u64,
 ) -> rusqlite::Result<()> {
@@ -1575,18 +1677,23 @@ fn index_event(
         return Ok(());
     }
     if let Some(l) = &e.line {
-        exec(tx, UPSERT_TAIL_LINE, params![sid, l.file, l.no as i64])?;
+        let later = batch
+            .lines_later
+            .is_some_and(|r| r.contains_key(&(sid.to_string(), l.file.clone())));
+        if !later {
+            exec(tx, UPSERT_TAIL_LINE, params![sid, l.file, l.no as i64])?;
+        }
     }
-    exec(
-        tx,
-        "INSERT OR IGNORE INTO sessions (id, host, cwd, started_at, status_since) VALUES (?1, ?2, '', ?3, ?3)",
-        params![sid, e.host, ts],
-    )?;
-    exec(
-        tx,
-        "UPDATE sessions SET last_seq = MAX(last_seq, ?2) WHERE id = ?1",
-        params![sid, e.seq as i64],
-    )?;
+    if !batch.known.contains(sid) && !batch.added.contains(sid) {
+        exec(
+            tx,
+            "INSERT OR IGNORE INTO sessions (id, host, cwd, started_at, status_since) VALUES (?1, ?2, '', ?3, ?3)",
+            params![sid, e.host, ts],
+        )?;
+        batch.added.insert(sid.to_string());
+    }
+    let max = batch.last_seq.entry(sid.to_string()).or_default();
+    *max = (*max).max(e.seq);
 
     // 不認得的 type 或格式不符的 payload 只建索引、不做彙總
     let Ok(Some(payload)) = e.payload_typed() else {
@@ -1759,6 +1866,10 @@ fn index_event(
                     touch("fail", path)?;
                 }
             }
+            path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
+        }
+        // 同一張卡片只有一個 tool.result（K-3），之後不會再用到它碰的檔；結果之前的 tool.updated 已經記過 fail（E-S12）
+        Payload::ToolResult(p) => {
             path_of_tool.remove(&(sid.to_string(), p.tool_use_id));
         }
         Payload::FileRead(p) => {
