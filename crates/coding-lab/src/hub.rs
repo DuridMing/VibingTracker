@@ -525,9 +525,10 @@ impl Hub {
 
     /// `cwd` 等於某台某個 session 的 cwd、在它底下（worktree、子目錄）或是它的上層：那台；多台符合取最長的
     pub fn owner_of_cwd(&self, cwd: &str) -> Option<String> {
-        let want = cwd.replace('\\', "/");
+        // 比對依 crate::paths：磁碟機代號的大小寫、Windows 路徑的大小寫都不算差別（L-11）
+        let want = crate::paths::normalize(cwd);
         let want = want.trim_end_matches('/');
-        let under = |p: &str, base: &str| p == base || p.starts_with(&format!("{base}/"));
+        let under = |p: &str, base: &str| crate::paths::within(base, p);
         let mut best: Option<(usize, &str)> = None;
         for n in &self.names {
             let Some(u) = self.ups.get(n) else { continue };
@@ -1277,7 +1278,9 @@ async fn resolve_cwd_owner(state: &HubState, cwd: &str) -> Option<String> {
     if cached.is_some() {
         return cached;
     }
-    let key = cwd.replace('\\', "/").trim_end_matches('/').to_string();
+    let key = crate::paths::normalize(cwd)
+        .trim_end_matches('/')
+        .to_string();
     let remembered = state
         .known_cwds
         .lock()

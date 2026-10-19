@@ -1015,16 +1015,8 @@ impl Store {
         limit: usize,
     ) -> Result<(Reads, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
         // 依平台的大小寫規則比對（L-11）：Windows、macOS 兩邊都轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）
-        let root = crate::paths::normalize(root);
-        let root = root.trim_end_matches('/');
-        let (root, cwd) = if crate::paths::CASE_INSENSITIVE {
-            (
-                root.to_ascii_lowercase(),
-                "lower(REPLACE(s.cwd, '\\', '/'))",
-            )
-        } else {
-            (root.to_string(), "REPLACE(s.cwd, '\\', '/')")
-        };
+        let root = cwd_key(root);
+        let cwd = cwd_expr("s.cwd", crate::paths::CASE_INSENSITIVE);
         let ms = |t: u64| t.min(i64::MAX as u64) as i64;
         let ids: Vec<String> = self
             .db
@@ -1287,20 +1279,23 @@ impl Store {
 
     /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案，否則是 `cwd` 本身與底下（worktree）的。
     pub fn sessions(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<SessionRow>, StoreError> {
+        // 和 crate::paths 同一套比對（L-11）：`e:\x` 與 `E:/x` 是同一個專案，Windows、macOS 不分大小寫
+        let c = cwd_expr("cwd", crate::paths::CASE_INSENSITIVE);
         let mut stmt = self.db.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR REPLACE(cwd, '\\', '/') = ?1
-               OR substr(REPLACE(cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/'
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR {c} = ?1
+               OR substr({c}, 1, length(?1) + 1) = ?1 || '/'
              ORDER BY started_at DESC, id LIMIT ?2"
         ))?;
-        let rows = stmt.query_map(params![cwd, limit as i64], session_row)?;
+        let rows = stmt.query_map(params![cwd.map(cwd_key), limit as i64], session_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// 所有 session 的 `cwd`（`/` 分隔、不重複）。
+    /// 所有 session 的 `cwd`（依 [`crate::paths::normalize`] 正規化、不重複）。
     pub fn cwds(&self) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT DISTINCT REPLACE(cwd, '\\', '/') FROM sessions WHERE cwd != ''")?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT DISTINCT {} FROM sessions WHERE cwd != ''",
+            cwd_expr("cwd", false)
+        ))?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1593,6 +1588,28 @@ impl Store {
 
     pub fn schema_version(&self) -> Result<u32, StoreError> {
         Ok(read_version(&self.db)?.unwrap_or(0))
+    }
+}
+
+/// SQL 裡和 [`crate::paths::normalize`] 相同的正規化（L-11）：`\` 換成 `/`、開頭的磁碟機代號大寫；
+/// `fold`（Windows、macOS 比對用）時再整個轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）。舊資料裡小寫的
+/// 磁碟機代號也比得到。
+fn cwd_expr(col: &str, fold: bool) -> String {
+    let slash = format!("REPLACE({col}, '\\', '/')");
+    let norm = format!(
+        "CASE WHEN substr({slash}, 2, 1) = ':' THEN upper(substr({slash}, 1, 1)) || substr({slash}, 2) ELSE {slash} END"
+    );
+    if fold { format!("lower({norm})") } else { norm }
+}
+
+/// [`cwd_expr`] 要比的另一邊：正規化、去掉結尾的 `/`，依平台轉小寫。
+fn cwd_key(p: &str) -> String {
+    let p = crate::paths::normalize(p);
+    let p = p.trim_end_matches('/');
+    if crate::paths::CASE_INSENSITIVE {
+        p.to_ascii_lowercase()
+    } else {
+        p.to_string()
     }
 }
 

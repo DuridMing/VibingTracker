@@ -49,9 +49,9 @@ fn limit(q: &HashMap<String, String>, default: usize, max: usize) -> usize {
         .clamp(1, max)
 }
 
-/// `/` 分隔、去掉結尾的 `/`。
+/// `/` 分隔、磁碟機代號大寫（[`crate::paths::normalize`]，L-11）、去掉結尾的 `/`。
 fn norm(p: &str) -> String {
-    p.replace('\\', "/").trim_end_matches('/').to_string()
+    crate::paths::normalize(p).trim_end_matches('/').to_string()
 }
 
 // ── /api/sessions
@@ -132,7 +132,7 @@ fn stored_rows(
 
 fn stored_row(r: &SessionRow, last_prompt: Option<String>, last_pos: Option<u64>) -> Value {
     json!({
-        "id": r.id, "host": r.host, "cwd": r.cwd.replace('\\', "/"), "branch": r.branch,
+        "id": r.id, "host": r.host, "cwd": norm(&r.cwd), "branch": r.branch,
         "model": r.model.as_deref().map(short_model), "modelId": r.model,
         "firstPrompt": r.first_prompt.as_deref().map(clip), "lastPrompt": last_prompt,
         "startedAt": r.started_at, "endedAt": r.ended_at,
@@ -336,21 +336,20 @@ pub async fn files(State(state): State<Arc<WebState>>, uri: Uri) -> Response {
 
 /// web 入口可以對哪些目錄跑 git（X-1，contracts §7）：store 裡某個 session 的 cwd、在它底下，或是那個 session
 /// 所屬 repo 的主工作樹根（專案根目錄底下只有 worktree 裡的 session 時要能查）。任意的上層目錄（例如 home）不放行。
+/// 比對依 [`crate::paths`]：磁碟機代號的大小寫不算差別，Windows、macOS 整個不分大小寫（L-11）。
 fn cwd_allowed(known: &[String], cwd: &str) -> bool {
-    if known.iter().any(|k| {
-        k == cwd
-            || cwd
-                .strip_prefix(k.as_str())
-                .is_some_and(|r| r.starts_with('/'))
-    }) {
+    if known.iter().any(|k| crate::paths::within(k, cwd)) {
         return true;
     }
     // 上層目錄只在是那個 session 的主工作樹根時放行：只對底下真的有 session 的候選問 git
-    let prefix = format!("{cwd}/");
     known
         .iter()
-        .filter(|k| k.starts_with(&prefix))
-        .any(|k| worktrees(Path::new(k)).first().map(|(p, _)| p.as_str()) == Some(cwd))
+        .filter(|k| crate::paths::strip_dir(cwd, k).is_some())
+        .any(|k| {
+            worktrees(Path::new(k))
+                .first()
+                .is_some_and(|(p, _)| crate::paths::same(p, cwd))
+        })
 }
 
 fn files_blocking(
@@ -574,7 +573,7 @@ fn branches_blocking(store: &std::sync::Mutex<Store>, cwd: &str) -> Response {
     let owner = |sc: &str| {
         wts.iter()
             .map(|(p, _)| p)
-            .filter(|p| sc == p.as_str() || sc.starts_with(&format!("{p}/")))
+            .filter(|p| crate::paths::within(p, sc))
             .max_by_key(|p| p.len())
             .cloned()
     };

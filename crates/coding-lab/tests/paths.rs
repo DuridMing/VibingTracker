@@ -60,3 +60,17 @@ fn strip_dir_keeps_the_original_case_of_the_rest() {
     assert!(within_with("/home/u/p", "/home/u/p", false));
     assert!(!within_with("/home/u/p", "/home/u", false));
 }
+
+/// Windows 路徑（`X:/` 開頭）在任何平台上都不分大小寫，和前端的 paths.js 一樣：hub 可能在 Linux 上比對
+/// Windows 上游送來的 cwd（#748 L-11、X19）。其他路徑照平台規則。
+#[test]
+fn windows_paths_compare_case_insensitively_everywhere() {
+    use coding_lab::paths::{same, strip_dir, within};
+    assert!(same("e:\\Proj", "E:/proj"));
+    assert_eq!(
+        strip_dir("E:/Proj", "e:\\proj\\Src\\a.rs").as_deref(),
+        Some("Src/a.rs")
+    );
+    assert!(within("E:/proj", "e:/PROJ/sub"));
+    assert!(!same("E:/proj", "/proj"));
+}
