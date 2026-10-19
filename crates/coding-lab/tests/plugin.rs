@@ -240,6 +240,59 @@ fn wrapper_runs_the_binary_and_keeps_stdout_empty() {
     );
 }
 
+/// W-L10-4（#739，第 1 輪 Windows 驗收）：Windows 上資料目錄以 USERPROFILE 為準（和二進位的 config 一致）。
+/// Git Bash 的 HOME 被改掉時，wrapper 原本用 `$HOME/.coding-lab` 找二進位，找不到就整個 session 不追蹤，
+/// 自動下載還會裝出第二個資料目錄。平台用 bash 的 OSTYPE 判斷（msys／cygwin），不多叫一次 uname。
+#[test]
+fn wrapper_on_windows_uses_userprofile_not_a_changed_home() {
+    let Some(sh) = sh_or_skip("wrapper_on_windows_uses_userprofile") else {
+        return;
+    };
+    let dir = tmp_dir("userprofile");
+    let profile = dir.join("profile");
+    let fake_home = dir.join("fakehome");
+    std::fs::create_dir_all(profile.join(".coding-lab/bin")).unwrap();
+    std::fs::create_dir_all(&fake_home).unwrap();
+    write_script(
+        &profile.join(".coding-lab/bin/coding-lab"),
+        &format!("#!/bin/sh\necho \"$@\" > '{}/args'\n", to_sh(&dir)),
+    );
+    // USERPROFILE 在 Windows 是原生路徑（wrapper 自己用 cygpath 換），其他平台直接給 sh 的路徑
+    let userprofile = if cfg!(windows) {
+        profile.to_string_lossy().into_owned()
+    } else {
+        to_sh(&profile)
+    };
+    let run = |ostype: &str| {
+        let _ = std::fs::remove_file(dir.join("args"));
+        let mut c = wrapper_cmd(&sh);
+        c.arg("ensure")
+            .env_remove("CODING_LAB_BIN")
+            .env_remove("CODING_LAB_HOME")
+            .env("HOME", to_sh(&fake_home))
+            .env("USERPROFILE", &userprofile)
+            .env("OSTYPE", ostype)
+            .env("PATH", path_env(&sh, &[]))
+            .env("CODING_LAB_RELEASE_URL", "")
+            .stdin(Stdio::null());
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir.join("args").exists()
+    };
+    assert!(
+        run("msys"),
+        "Git Bash：要用 USERPROFILE 底下的二進位，不是改過的 HOME"
+    );
+    // 其他平台照舊看 HOME（Windows 的 bash 一定是 msys，這半段只在非 Windows 跑）
+    if !cfg!(windows) {
+        assert!(!run("linux-gnu"), "Linux：不看 USERPROFILE");
+    }
+}
+
 /// ensure 不在 wrapper 讀 payload，stdin 直接交給二進位（#776 EW1）：二進位拿得到 SessionStart 的 payload；
 /// 呼叫端的 stdin 一直沒關（終端機直接跑 `sh <wrapper> ensure`，R-9）時 wrapper 也不會卡在讀 stdin。
 #[test]
