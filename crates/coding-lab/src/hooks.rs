@@ -308,7 +308,7 @@ async fn handle(
     {
         if !state.foreign_logged.swap(true, Ordering::Relaxed) {
             crate::logging::log(&format!(
-                "收到其他使用者（{them}）的 hook，已忽略：這台機器的 4800 被 {me} 的 collector 佔著，{them} 不會被追蹤"
+                "收到其他使用者（{them}）的 hook，已忽略：這台機器的 hook 埠被 {me} 的 collector 佔著，{them} 不會被追蹤"
             ));
         }
         return StatusCode::OK;

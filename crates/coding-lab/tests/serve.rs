@@ -119,13 +119,15 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> String {
     out
 }
 
+/// 子程序先交給 Kill 再等：等不到 collector.json 而 panic 時也會收掉它。
+/// 不然 idle_exit_seconds = 0 的 collector 會一直跑下去（Windows 驗收第 1 輪看到一個跑了一小時多）。
 fn start_serve(e: &Env) -> Kill {
-    let child = cmd(e, &["serve"]).spawn().unwrap();
-    let pid = child.id();
+    let child = Kill(cmd(e, &["serve"]).spawn().unwrap());
+    let pid = child.0.id();
     wait_for("collector.json", || {
         collector(e).is_some_and(|c| c["pid"] == pid)
     });
-    Kill(child)
+    child
 }
 
 #[test]
@@ -1525,15 +1527,17 @@ fn wrapper_ensure_releases_the_callers_std_pipes_too() {
 
 /// 像 `start_serve`，但 store 的批次 flush 調成 60 秒：測試裡「還沒 flush 就當掉」的時序由此控制，不靠 sleep。
 fn start_serve_slow_flush(e: &Env) -> Kill {
-    let child = cmd(e, &["serve"])
-        .env("CODING_LAB_STORE_FLUSH_MS", "60000")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = Kill(
+        cmd(e, &["serve"])
+            .env("CODING_LAB_STORE_FLUSH_MS", "60000")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
     wait_for("collector.json", || {
         collector(e).is_some_and(|c| c["pid"] == pid)
     });
-    Kill(child)
+    child
 }
 
 /// live 裡的 session 列（WS `hello` 後 `subscribe *` 的 snapshot）：`/api/sessions` 讀的是 store，
