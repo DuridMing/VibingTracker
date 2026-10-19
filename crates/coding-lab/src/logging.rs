@@ -157,7 +157,11 @@ pub fn log(msg: &str) {
                 .unwrap_or_else(|e| e.into_inner())
                 .write_line(&line);
         }
-        None => eprintln!("{line}"),
+        // 寫不出去就算了：主控台不在、pipe 關了時 `eprintln!` 會 panic，release 的 panic = "abort" 會讓 collector
+        // 不走正常結束就死掉（#739 B-S2）
+        None => {
+            let _ = writeln!(io::stderr(), "{line}");
+        }
     }
 }
 
@@ -179,6 +183,13 @@ pub fn log_panics() {
             None => default(info),
         }
     }));
+}
+
+/// serve 要不要自己寫 collector.log：帶了 `--log-file`（常駐服務）一律寫；沒帶時 stderr 不是終端機（ensure 拉起、
+/// stderr 導到檔案）才寫，前景開發照舊印到畫面。Windows 的服務經 `conhost --headless` 跑，stderr 是看不到的主控台、
+/// is_terminal 成立，所以服務要明確帶旗標，不靠偵測（#739 B-S1）。
+pub fn use_log_file(forced: bool, stderr_is_terminal: bool) -> bool {
+    forced || !stderr_is_terminal
 }
 
 /// 短命的子命令（ensure）直接追加一行到 `path`；不輪替（W-L12）。

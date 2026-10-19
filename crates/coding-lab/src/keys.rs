@@ -304,7 +304,9 @@ impl KeyStore {
     /// 寫回 `<home>/keys.json`：先寫暫存檔（600）再 rename，不會留下半個檔；原本的內容留在 `keys.json.bak`。
     /// 和別的程序並行時要在 [`KeyStore::update`] 裡呼叫。
     pub fn save(&self, home: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+        // 資料目錄一律走 create_private_dir（#762 B-S3）
+        crate::store::create_private_dir(home)
+            .map_err(|e| format!("建不了 {}：{e}", home.display()))?;
         let path = KeyStore::path(home);
         let f = FileFormat {
             version: FILE_VERSION,
@@ -340,7 +342,9 @@ fn backup_path(path: &Path) -> PathBuf {
 /// 拿 `<home>/keys.lock` 的獨佔鎖（跨程序；檔案關掉就放掉）：`keys.json` 與 `login-links.json`
 /// 的讀、改、寫整段拿著（W-L13）。CLI 只拿一下；別的程序拿著時等它放掉。
 pub(crate) fn lock_home(home: &Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+    // `key create` 常是第一個建資料目錄的子命令（#762 B-S3）
+    crate::store::create_private_dir(home)
+        .map_err(|e| format!("建不了 {}：{e}", home.display()))?;
     let path = home.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
         .create(true)

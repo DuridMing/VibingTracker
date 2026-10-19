@@ -335,8 +335,8 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `icacls <dir> /inheritance:r /grant:r <使用者>:(OI)(CI)F`：只在第一次建立時做一次。失敗只寫 log
-/// （%USERPROFILE% 底下預設本來就只有自己能讀）。
+/// `icacls <dir> /inheritance:r /grant:r <使用者>:(OI)(CI)F`：第一次建立時，與 serve 啟動時資料目錄在 %USERPROFILE%
+/// 以外（[`tighten_existing_home`]）。繼承來的 ACE 拿掉後，底下沿用繼承的檔跟著只剩自己。失敗只寫 log。
 #[cfg(windows)]
 fn restrict_dir_acl(dir: &Path) {
     use std::os::windows::process::CommandExt;
@@ -357,6 +357,25 @@ fn restrict_dir_acl(dir: &Path) {
     if !ok {
         crate::logging::log(&format!("store：收緊 {} 的 ACL 失敗", dir.display()));
     }
+}
+
+/// 資料目錄的 ACL 要不要收緊（Windows；#762 B-S3）：剛建立的一律要；已經存在的只有不在 %USERPROFILE% 底下時要
+/// （那裡預設只有自己能讀；`C:\` 根目錄、別的磁碟會繼承 Users:(RX)、Authenticated Users:(M)）。不知道 profile 時也收緊。
+/// 純函式，Linux 也測得到；比對照 `paths::within`（Windows 路徑不分大小寫）。
+pub fn acl_restrict_needed(home: &Path, user_profile: Option<&Path>, created_now: bool) -> bool {
+    created_now
+        || !user_profile
+            .is_some_and(|p| crate::paths::within(&p.to_string_lossy(), &home.to_string_lossy()))
+}
+
+/// serve 啟動時對已經存在的資料目錄再檢查一次（#762 B-S3）：使用者先手動建好、或舊版的子命令用一般的
+/// create_dir_all 建出來的目錄，`create_private_dir` 不會再碰。只有 serve 起來時多跑一次 icacls，ensure 與 hook 不受影響。
+pub fn tighten_existing_home(home: &Path) {
+    #[cfg(windows)]
+    if acl_restrict_needed(home, crate::config::user_home().as_deref(), false) {
+        restrict_dir_acl(home);
+    }
+    let _ = home;
 }
 
 /// 以追加模式開檔；新建的檔是 0600（unix）。

@@ -141,6 +141,9 @@ struct ServeArgs {
     /// 所有 session 都結束後，閒置多久就自動結束（秒，0＝不結束）
     #[arg(long)]
     idle_exit_seconds: Option<u64>,
+    /// 一律寫 <home>/collector.log（常駐服務用；沒帶時 stderr 是終端機就印到畫面）
+    #[arg(long)]
+    log_file: bool,
 }
 
 impl ServeArgs {
@@ -151,6 +154,7 @@ impl ServeArgs {
             web_bind: self.web_bind.clone(),
             web_root: self.web_root.clone(),
             idle_exit_seconds: self.idle_exit_seconds,
+            log_file: self.log_file,
         }
     }
 }
@@ -209,12 +213,13 @@ fn config(overrides: &Overrides) -> Result<Config, Failure> {
 fn run(f: impl FnOnce() -> Result<ExitCode, Failure>) -> ExitCode {
     match f() {
         Ok(code) => code,
+        // serve 也走這裡：服務的主控台不在時 `eprintln!` 會 panic（#739 B-S2），寫不出去就算了
         Err(Failure::Config(e)) => {
-            eprintln!("coding-lab：{e}");
+            let _ = writeln!(std::io::stderr(), "coding-lab：{e}");
             ExitCode::from(2)
         }
         Err(Failure::Other(e)) => {
-            eprintln!("coding-lab：{e}");
+            let _ = writeln!(std::io::stderr(), "coding-lab：{e}");
             ExitCode::FAILURE
         }
     }
@@ -340,7 +345,7 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
     })?;
     let ctx = service::Ctx::detect(&cfg.home)?;
     // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）
-    let _ = std::fs::create_dir_all(&cfg.home);
+    let _ = coding_lab::store::create_private_dir(&cfg.home);
     let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
     let describe = |plan: &service::Plan| {
         for (p, _) in &plan.files {

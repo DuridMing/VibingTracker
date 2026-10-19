@@ -106,7 +106,7 @@ fn systemd_unit_escapes_specifiers_variables_and_quotes() {
     let unit = file_of(&plan, "coding-lab.service");
     assert!(
         unit.contains(
-            "ExecStart=\"/opt/my apps/coding-lab\" serve --home /home/u/100%%/$$x/.coding-lab --idle-exit-seconds 0\n"
+            "ExecStart=\"/opt/my apps/coding-lab\" serve --home /home/u/100%%/$$x/.coding-lab --idle-exit-seconds 0 --log-file\n"
         ),
         "{unit}"
     );
@@ -147,7 +147,7 @@ fn windows_task_arguments_survive_a_trailing_backslash() {
     .to_string();
     assert!(
         xml.contains(
-            r#"<Arguments>--headless &quot;C:\Program Files\coding-lab\coding-lab.exe&quot; serve --home &quot;D:\data\\&quot; --idle-exit-seconds 0</Arguments>"#
+            r#"<Arguments>--headless &quot;C:\Program Files\coding-lab\coding-lab.exe&quot; serve --home &quot;D:\data\\&quot; --idle-exit-seconds 0 --log-file</Arguments>"#
         ),
         "{xml}"
     );
@@ -194,7 +194,7 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     );
     assert!(
         xml.contains(
-            r#"<Arguments>--headless &quot;C:\Users\u\AppData\Local\coding-lab\coding-lab.exe&quot; serve --home &quot;C:\Users\u\.coding-lab&quot; --idle-exit-seconds 0</Arguments>"#
+            r#"<Arguments>--headless &quot;C:\Users\u\AppData\Local\coding-lab\coding-lab.exe&quot; serve --home &quot;C:\Users\u\.coding-lab&quot; --idle-exit-seconds 0 --log-file</Arguments>"#
         ),
         "{xml}"
     );
@@ -606,4 +606,63 @@ fn windows_task_is_named_after_the_user() {
     );
     c.user = Some("we/ird:name".into());
     assert_eq!(service::windows_task(&c), r"\CodingLab\we_ird_name");
+}
+
+/// B-S1（#739，Windows 驗收）：常駐服務的 collector 一律寫 collector.log（`--log-file`）：Windows 的工作經
+/// `conhost --headless` 跑，stderr 是看不到的主控台，只看終端機判斷時一行 log 都沒有。三個平台一致。
+#[test]
+fn every_platform_runs_serve_with_log_file() {
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    let unit = file_of(
+        &service::plan_install(Platform::Linux, &c),
+        "coding-lab.service",
+    )
+    .to_string();
+    let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+    assert!(
+        exec.contains(" serve ") && exec.contains("--log-file"),
+        "{exec}"
+    );
+    let plist = file_of(&service::plan_install(Platform::Macos, &c), ".plist").to_string();
+    assert!(plist.contains("<string>--log-file</string>"), "{plist}");
+    let xml = file_of(
+        &service::plan_install(Platform::Windows, &c),
+        "coding-lab-task.xml",
+    )
+    .to_string();
+    let args = xml
+        .split_once("<Arguments>")
+        .unwrap()
+        .1
+        .split_once("</Arguments>")
+        .unwrap()
+        .0;
+    assert!(
+        args.contains(" serve ") && args.contains("--log-file"),
+        "{args}"
+    );
+    // 讀回 home 的解析不受多一個旗標影響
+    assert_eq!(
+        service::home_from_task_xml(&xml).as_deref(),
+        Some(Path::new("/home/u/.coding-lab"))
+    );
+}
+
+/// B-S2（#739）：Windows 的 `schtasks /End` 只結束 conhost，idle-exit 0 的 collector 子程序留下來繼續聽 hook 埠。
+/// uninstall 先 `coding-lab stop`（帶 stopToken、正常結束），再 /End、/Delete。
+#[test]
+fn windows_uninstall_stops_the_collector_before_ending_the_task() {
+    let mut c = ctx(Path::new(r"C:\Users\u\.coding-lab"));
+    c.exe = PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe");
+    c.user = Some(r"PC\u".into());
+    let cmds: Vec<String> = service::plan_uninstall(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    let stop = cmds
+        .iter()
+        .position(|c| c == r"C:\Program Files\coding-lab\coding-lab.exe stop");
+    let end = cmds.iter().position(|c| c.starts_with("schtasks /End "));
+    assert!(stop.is_some() && end.is_some() && stop < end, "{cmds:?}");
 }

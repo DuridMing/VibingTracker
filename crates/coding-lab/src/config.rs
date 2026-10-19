@@ -79,6 +79,7 @@ pub struct Overrides {
     pub web_bind: Option<String>,
     pub web_root: Option<PathBuf>,
     pub idle_exit_seconds: Option<u64>,
+    pub log_file: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +108,8 @@ pub struct Config {
     pub hub_upstreams: Vec<crate::hub::Upstream>,
     /// 照樣能用、但使用者該知道的設定問題（config.toml 打錯的鍵，L-16）；serve 寫進 log、`config` 印到 stderr
     pub warnings: Vec<String>,
+    /// 一律寫 `<home>/collector.log`（`serve --log-file`、`CODING_LAB_LOG_FILE=1`；常駐服務都帶，#739 B-S1）
+    pub log_file: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -365,6 +368,9 @@ impl Config {
             hub_bind,
             hub_upstreams: f.hub.upstream,
             warnings,
+            log_file: cli.log_file
+                || env("CODING_LAB_LOG_FILE")
+                    .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes")),
         })
     }
 }

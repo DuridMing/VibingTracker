@@ -747,8 +747,10 @@ pub fn append_upstream(
     if let Some(k) = key {
         text.push_str(&format!("key = \"{k}\"\n"));
     }
+    // config.toml 會放上游的金鑰：資料目錄走 create_private_dir；只當 hub 的那台可能從來不跑 serve（#762 B-S3）
     if let Some(dir) = config_path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建不出 {}：{e}", dir.display()))?;
+        crate::store::create_private_dir(dir)
+            .map_err(|e| format!("建不出 {}：{e}", dir.display()))?;
     }
     std::fs::write(config_path, text)
         .map_err(|e| format!("寫不了 {}：{e}", config_path.display()))?;

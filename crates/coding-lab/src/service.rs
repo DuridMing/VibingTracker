@@ -194,7 +194,7 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  [Service]\n\
                  Type=simple\n\
                  Environment=CODING_LAB_HOME={env_home}\n\
-                 ExecStart={exe} serve --home {home} --idle-exit-seconds 0\n\
+                 ExecStart={exe} serve --home {home} --idle-exit-seconds 0 --log-file\n\
                  ExecStop={exe} stop\n\
                  Restart=on-failure\n\
                  RestartSec=2\n\
@@ -237,6 +237,7 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  \t\t<string>{home}</string>\n\
                  \t\t<string>--idle-exit-seconds</string>\n\
                  \t\t<string>0</string>\n\
+                 \t\t<string>--log-file</string>\n\
                  \t</array>\n\
                  \t<key>RunAtLoad</key>\n\
                  \t<true/>\n\
@@ -309,7 +310,7 @@ pub fn plan_install(platform: Platform, ctx: &Ctx) -> Plan {
                  \x20 <Actions Context=\"Author\">\r\n\
                  \x20   <Exec>\r\n\
                  \x20     <Command>%SystemRoot%\\System32\\conhost.exe</Command>\r\n\
-                 \x20     <Arguments>--headless {exe} serve --home {home} --idle-exit-seconds 0</Arguments>\r\n\
+                 \x20     <Arguments>--headless {exe} serve --home {home} --idle-exit-seconds 0 --log-file</Arguments>\r\n\
                  \x20   </Exec>\r\n\
                  \x20 </Actions>\r\n\
                  </Task>\r\n",
@@ -362,7 +363,10 @@ pub fn plan_uninstall(platform: Platform, ctx: &Ctx) -> Plan {
                 &format!("{domain}/{MACOS_LABEL}"),
             ])]
         }
+        // /End 只結束 conhost，idle-exit 0 的 collector 子程序會留下來繼續聽 hook 埠：先請它正常結束（#739 B-S2）。
+        // Linux 的 `disable --now` 會跑 ExecStop（就是 stop）、macOS 的 bootout 送 SIGTERM，都會正常結束
         Platform::Windows => vec![
+            vec![ctx.exe.to_string_lossy().into_owned(), "stop".into()],
             s(&["schtasks", "/End", "/TN", &windows_task(ctx)]),
             s(&["schtasks", "/Delete", "/TN", &windows_task(ctx), "/F"]),
         ],

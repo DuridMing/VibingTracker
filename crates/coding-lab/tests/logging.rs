@@ -125,3 +125,47 @@ fn append_only_logs_never_rotate() {
     assert!(read(&path).contains("short-lived"));
     assert!(!d.join("collector.log.1").exists());
 }
+
+/// B-S2（#739，Windows 驗收）：沒有設定檔案時 log 寫 stderr；stderr 寫不出去（服務的主控台已經不在、pipe 的讀取端關了）
+/// 時不能 panic。release 是 panic = "abort"，原本的 `eprintln!` 一寫失敗就讓 collector 直接死掉、不走正常結束。
+/// 用子程序重跑這個測試：stderr 接一個讀取端已關閉的 pipe，`--nocapture` 讓它真的寫到 stderr。
+#[test]
+fn log_to_a_closed_stderr_does_not_panic() {
+    if std::env::var_os("CODING_LAB_CLOSED_STDERR_CHILD").is_some() {
+        for i in 0..100 {
+            coding_lab::logging::log(&format!("line {i}"));
+        }
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "log_to_a_closed_stderr_does_not_panic",
+            "--nocapture",
+        ])
+        .env("CODING_LAB_CLOSED_STDERR_CHILD", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stderr.take()); // 讀取端關掉：之後寫 stderr 都是 EPIPE
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "寫不出 stderr 時 log 讓程序失敗了：{status}"
+    );
+}
+
+/// B-S1（#739）：服務用 `conhost --headless` 跑時 stderr 是看不到的主控台（is_terminal 成立），只看終端機的話
+/// collector.log 一行都沒有。帶了 `--log-file` 就一律寫檔；沒帶時照舊：stderr 是終端機（開發時前景跑）才印畫面。
+#[test]
+fn log_file_flag_wins_over_a_terminal_stderr() {
+    use coding_lab::logging::use_log_file;
+    assert!(use_log_file(true, true), "服務的 headless 主控台也要寫檔");
+    assert!(use_log_file(true, false));
+    assert!(
+        use_log_file(false, false),
+        "ensure 拉起的（stderr 導到檔案）照舊寫檔"
+    );
+    assert!(!use_log_file(false, true), "前景開發照舊印到畫面");
+}
