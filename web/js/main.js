@@ -1978,16 +1978,23 @@ function exitTimeline() {
   client.subscribe("*");
 }
 
-let tlLast = performance.now();
-setInterval(() => {
-  const now = performance.now();
-  const dt = now - tlLast;
-  tlLast = now;
-  if (!tl.active || !tl.playing) return;
-  for (const f of tl.tick(dt)) applyMainFrame(f);
-  if (tl.needsMore()) moreTimeline();
-  render();
-}, TICK_MS);
+// 只在播放中掛計時器（#757 E-F12）：暫停、播到結尾、離開回放時拿掉
+let tlLast = 0;
+let tlTimer = null;
+tl.onPlayingChange = (on) => {
+  clearInterval(tlTimer);
+  tlTimer = null;
+  if (!on) return;
+  tlLast = performance.now();
+  tlTimer = setInterval(() => {
+    const now = performance.now();
+    const dt = now - tlLast;
+    tlLast = now;
+    for (const f of tl.tick(dt)) applyMainFrame(f);
+    if (tl.needsMore()) moreTimeline();
+    render();
+  }, TICK_MS);
+};
 
 function renderReplay() {
   fillReplayProjects();

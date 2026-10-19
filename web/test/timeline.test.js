@@ -139,3 +139,24 @@ test("續頁帶第一段回應的 from（挑 session 的下界），跨午夜時
   tl.seek(20);
   assert.equal(tl.lower, null, "重新 seek 由伺服器重算");
 });
+
+test("播放狀態改變時通知（主頁只在播放中掛計時器，#757 E-F12）：播放、暫停、播到結尾、讀取失敗、離開回放", () => {
+  const tl = createTimeline();
+  const seen = [];
+  tl.onPlayingChange = (on) => seen.push(on);
+  tl.start({ cwd: "/p", from: 0, to: 1000 });
+  assert.deepEqual(seen, [], "還沒播放：不通知");
+  tl.play(1);
+  tl.play(1);
+  assert.deepEqual(seen, [true], "已經在播：不重複通知");
+  tl.pause();
+  assert.deepEqual(seen, [true, false]);
+  tl.play(1);
+  tl.tick(5000);
+  assert.deepEqual(seen, [true, false, true, false], "播到結尾自己停");
+  tl.seek(0);
+  tl.play(1);
+  tl.stop();
+  assert.deepEqual(seen.slice(-2), [true, false], "離開回放也停");
+  assert.equal(tl.playing, false);
+});
