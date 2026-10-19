@@ -271,11 +271,12 @@ const UPSERT_TAIL_PATH: &str = "INSERT INTO tails (session, file, path, line_no)
   ON CONFLICT (session, file) DO UPDATE SET
     line_no = CASE WHEN tails.path IS excluded.path THEN tails.line_no ELSE excluded.line_no END, path = excluded.path";
 
-/// session.started 時 `tails.line_no` 的起始值（#713）：startup／clear／late 的檔從頭 tail，記 0，
-/// collector 重啟時從第 1 行讀，當掉前還沒 flush 的行補得回來；resume／compact 接的是從檔尾 tail 的檔，
-/// 記 NULL（不知道讀到哪），重啟照舊從檔尾。
+/// session.started 時 `tails.line_no` 的起始值（#713）：startup／clear 的檔從頭 tail，記 0，
+/// collector 重啟時從第 1 行讀，當掉前還沒 flush 的行補得回來；resume／compact／late 接的是從檔尾 tail 的檔，
+/// 記 NULL（不知道讀到哪），重啟照舊從檔尾。late（沒收到 SessionStart，#710）的 tail 也是從檔尾開始：
+/// 記 0 的話，讀到新行之前重啟會把整份歷史重讀進串流與費用（#741 D4）。
 fn initial_tail_line(source: &str) -> Option<i64> {
-    matches!(source, "startup" | "clear" | "late").then_some(0)
+    matches!(source, "startup" | "clear").then_some(0)
 }
 
 /// 一次 flush 裡同一個 session 檔要追加的內容。
