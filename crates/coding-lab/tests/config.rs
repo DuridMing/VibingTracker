@@ -83,29 +83,37 @@ fn home_comes_from_cli_then_env() {
 
 /// W-M6（#739）：home 結尾的分隔符號拿掉。Windows 的 `"C:\x\"` 在命令列上會把結尾的引號跳脫掉，
 /// 工作排程器的 `<Arguments>` 因此壞掉；collector.json 的位址、log 的路徑也跟著一致。
-/// （`PathBuf` 的 `==` 不看結尾的分隔符號，所以比字串）
+/// （`PathBuf` 的 `==` 不看結尾的分隔符號，所以另外檢查字串的結尾；分隔符號在 Windows 上會重組成 `\`，不比寫法）
 #[test]
 fn home_has_no_trailing_separator() {
+    fn no_trailing(home: &std::path::Path, want: &str) {
+        let s = home.to_str().unwrap();
+        assert!(
+            !s.ends_with('/') && !s.ends_with('\\'),
+            "結尾還有分隔符號：{s}"
+        );
+        assert_eq!(home, std::path::Path::new(want));
+    }
     let c = resolve(
         Overrides::default(),
         &[("CODING_LAB_HOME", "/tmp/x/")],
         None,
     )
     .unwrap();
-    assert_eq!(c.home.to_str(), Some("/tmp/x"));
+    no_trailing(&c.home, "/tmp/x");
     let cli = Overrides {
         home: Some("/tmp/y//".into()),
         ..Overrides::default()
     };
-    assert_eq!(
-        resolve(cli, &[], None).unwrap().home.to_str(),
-        Some("/tmp/y")
-    );
+    no_trailing(&resolve(cli, &[], None).unwrap().home, "/tmp/y");
     let root = Overrides {
         home: Some("/".into()),
         ..Overrides::default()
     };
-    assert_eq!(resolve(root, &[], None).unwrap().home.to_str(), Some("/"));
+    assert_eq!(
+        resolve(root, &[], None).unwrap().home,
+        std::path::Path::new("/")
+    );
 }
 
 /// W-L10-4（#739）：家目錄在 Windows 先看 USERPROFILE、其他平台先看 HOME。Git Bash 會設 HOME，

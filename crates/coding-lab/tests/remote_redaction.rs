@@ -60,7 +60,13 @@ fn tmp(name: &str) -> PathBuf {
     ));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d.canonicalize().unwrap()
+    // Windows 的 canonicalize 回傳 `\\?\E:\…`，git worktree list 給的是 `E:/…`；前端送的 worktree 是 API 回的 git 形式，
+    // 這裡拿掉前綴，測試才和正式使用一樣
+    let c = d.canonicalize().unwrap();
+    match c.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) => PathBuf::from(rest),
+        None => c,
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) {

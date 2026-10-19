@@ -91,7 +91,14 @@ pub fn to_sh(p: &Path) -> String {
 pub fn path_env(sh: &Path, dirs: &[&Path]) -> OsString {
     let mut all: Vec<PathBuf> = dirs.iter().map(|d| d.to_path_buf()).collect();
     if cfg!(windows) {
-        all.push(tools_dir(sh));
+        let tools = tools_dir(sh);
+        // curl.exe 在 `Git\mingw64\bin`（Git Bash 的 PATH 有 /mingw64/bin），coreutils 在 `Git\usr\bin`
+        let mingw = tools
+            .parent()
+            .and_then(Path::parent)
+            .map(|g| g.join("mingw64").join("bin"));
+        all.extend(mingw.filter(|m| m.is_dir()));
+        all.push(tools);
     } else {
         all.push("/usr/bin".into());
         all.push("/bin".into());
