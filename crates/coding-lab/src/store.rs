@@ -1324,30 +1324,35 @@ impl Store {
             return Ok((out, Reads::default()));
         }
         let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-        // SQLite 的 MAX() 聚合時，同列的其他欄位取自最大值那一列
-        let mut stmt = self.db.prepare(
-            "SELECT session, offset, MAX(seq) FROM events
-             WHERE type = 'prompt.submitted' AND session IN (SELECT value FROM json_each(?1))
-             GROUP BY session",
-        )?;
+        let mut stmt = self.db.prepare_cached(LAST_PROMPT)?;
         let prompts: Vec<(String, i64)> = stmt
             .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         let reads = Reads {
             groups: prompts.into_iter().map(|(s, o)| (s, vec![o])).collect(),
         };
-        let mut stmt = self.db.prepare(
-            "SELECT session, MAX(pos) FROM events
-             WHERE pos IS NOT NULL AND session IN (SELECT value FROM json_each(?1))
-             GROUP BY session",
-        )?;
-        let rows: Vec<(String, i64)> = stmt
+        let mut stmt = self.db.prepare_cached(LAST_POS)?;
+        let rows: Vec<(String, Option<i64>)> = stmt
             .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         for (session, pos) in rows {
-            out.entry(session).or_default().1 = Some(pos as u64);
+            if let Some(pos) = pos {
+                out.entry(session).or_default().1 = Some(pos as u64);
+            }
         }
         Ok((out, reads))
+    }
+
+    /// [`Store::last_prompt_and_pos_reads`] 兩句查詢的查詢計畫（測試確認走索引，E-H3）
+    pub fn last_prompt_and_pos_plans(&self) -> Result<(String, String), StoreError> {
+        let plan = |q: &str| -> Result<String, StoreError> {
+            let mut stmt = self.db.prepare(&format!("EXPLAIN QUERY PLAN {q}"))?;
+            let rows: Vec<String> = stmt
+                .query_map(params!["[]"], |r| r.get(3))?
+                .collect::<Result<_, _>>()?;
+            Ok(rows.join("\n"))
+        };
+        Ok((plan(LAST_PROMPT)?, plan(LAST_POS)?))
     }
 
     /// 這些 session 各自最後一個 `prompt.submitted` 的文字與串流最後一個 `pos`（#683，Sessions tab）。
@@ -1613,6 +1618,17 @@ fn cwd_key(p: &str) -> String {
         p.to_string()
     }
 }
+
+/// 每個 session 各找一次：`MAX(seq)` 在 `events_by_type (session, type, seq)` 上是一次索引查找（E-H3）。
+/// 寫成 `WHERE session IN (...) GROUP BY session` 時 SQLite 沿主鍵把 session 的每筆 Event 都看過一遍；
+/// 寫成 `ORDER BY seq DESC LIMIT 1` 時也沿主鍵倒著找，上一個 prompt 很遠（長時間的 agent 工作）就一樣慢。
+/// 實測（bundled SQLite 3.53，200 個 session × 1000 筆）：原本 22–25 ms，這樣 0.4 ms。
+const LAST_PROMPT: &str = "SELECT j.value, e.offset FROM json_each(?1) j
+             JOIN events e ON e.session = j.value AND e.seq = (
+               SELECT MAX(x.seq) FROM events x WHERE x.session = j.value AND x.type = 'prompt.submitted')";
+/// 同上：`MAX(pos)` 在 `events_by_pos (session, pos)` 上一次查找；沒有 pos 的 session 是 NULL。
+const LAST_POS: &str = "SELECT j.value, (SELECT MAX(e.pos) FROM events e WHERE e.session = j.value AND e.pos IS NOT NULL)
+             FROM json_each(?1) j";
 
 /// `type = 'usage' AND ts_seen >= ?` 剛好是 v6 部分索引 `events_usage_ts` 的形狀（E-S5）。
 /// 不在 SQL 裡排序：`ORDER BY session, seq` 會讓 SQLite 改成沿主鍵全表掃，分組與排序在呼叫端做
