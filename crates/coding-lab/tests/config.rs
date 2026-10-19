@@ -451,3 +451,24 @@ fn unknown_keys_in_config_toml_are_warned() {
     let c = resolve(Overrides::default(), &[], Some(known)).unwrap();
     assert!(c.warnings.is_empty(), "{:?}", c.warnings);
 }
+
+/// B-S1（#739）：`serve --log-file` 或 `CODING_LAB_LOG_FILE=1` 讓 collector 一律寫 collector.log。
+#[test]
+fn log_file_comes_from_the_flag_or_the_environment() {
+    assert!(!resolve(Overrides::default(), &[], None).unwrap().log_file);
+    let cli = Overrides {
+        log_file: true,
+        ..Overrides::default()
+    };
+    assert!(resolve(cli, &[], None).unwrap().log_file);
+    assert!(
+        resolve(Overrides::default(), &[("CODING_LAB_LOG_FILE", "1")], None)
+            .unwrap()
+            .log_file
+    );
+    assert!(
+        !resolve(Overrides::default(), &[("CODING_LAB_LOG_FILE", "0")], None)
+            .unwrap()
+            .log_file
+    );
+}
