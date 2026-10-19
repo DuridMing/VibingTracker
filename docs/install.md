@@ -2,7 +2,7 @@
 
 這份手冊帶你從零裝好 coding-lab：編譯 collector、裝 Claude Code plugin、確認追蹤有在跑。目前還沒有發佈好的二進位，要從原始碼編譯，大約 10 分鐘（大部分是第一次編譯）。
 
-裝好之後，每次開 Claude Code session 都會自動被追蹤，打開 <http://127.0.0.1:4801> 就能看到所有 session 合在一起的串流。追蹤不花 token，也不會攔截或改變 Claude Code 的行為。
+裝好之後，每次開 Claude Code session 都會自動被追蹤，打開 <http://127.0.0.1:4801> 就能看到所有 session 合在一起的串流。追蹤不花 token，也不會攔截或改變 Claude Code 的行為。網頁各區塊怎麼用見[使用手冊](usage.md)；macOS 使用者先看 [macOS 注意事項](macos-warnings.md)。
 
 ## 目錄
 

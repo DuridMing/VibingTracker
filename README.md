@@ -31,7 +31,7 @@ Claude Code ── http hook（127.0.0.1:4800）──┐
 
 ## 安裝
 
-一步一步的安裝、更新、疑難排解與卸載見 [安裝手冊](docs/install.md)；下面是摘要。
+一步一步的安裝、更新、疑難排解與卸載見 [安裝手冊](docs/install.md)（也可以交給 Claude Code 照[用 AI 安裝](docs/install-with-ai.md)裝）；裝好之後網頁怎麼用見 [使用手冊](docs/usage.md)，macOS 另外見 [macOS 注意事項](docs/macos-warnings.md)。下面是摘要。
 
 需要 Rust stable（`cargo`）與 Claude Code。支援 Linux、macOS、Windows：除了 `SessionStart`，所有事件都用 http hook，不經過 shell，也不需要 Node。`SessionStart` 執行 plugin 內附的 POSIX sh wrapper（`plugin/bin/coding-lab`），Windows 上由 Claude Code 交給 Git Bash 執行，所以 Windows 要先裝 [Git for Windows](https://git-scm.com/download/win)。
 
