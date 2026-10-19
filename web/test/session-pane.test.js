@@ -240,3 +240,20 @@ test("思考條的佔位文案依模式：hide 寫不提供、0 字只寫（思�
   p.load({ staged: [], stream: [{ type: "assistant.thinking", session: "s1", agent: "main", pos: 1, seq: 1, payload: { deferred: true, chars: 9, text: "" } }] });
   assert.equal(p.thinking.text, "（思考 9 字，這個 collector 不對遠端提供）");
 });
+
+test("碰過的檔案沒有變就不重算：files() 回同一份，改動或工具狀態變了才重算（#757 E-F12）", () => {
+  const p = createSessionPane(S);
+  p.load({ staged: [], stream: [called("e1", "Edit", "running"), edit("e1", "src/a.ts", ["+1"])] });
+  const f1 = p.files();
+  assert.equal(p.files(), f1, "什麼都沒變：同一份");
+  p.apply([ev("assistant.text", { text: "繼續" }, { pos: 9 })]);
+  assert.equal(p.files(), f1, "和檔案無關的 Event：同一份");
+  p.apply([updated("e1", "running")]);
+  assert.equal(p.files(), f1, "工具狀態沒變：同一份");
+  p.apply([updated("e1", "done")]);
+  const f2 = p.files();
+  assert.notEqual(f2, f1);
+  assert.equal(f2[0].running, false);
+  p.apply([called("e2", "Edit", "done"), edit("e2", "src/b.ts", ["-1"])]);
+  assert.deepEqual(p.files().map((x) => x.path).sort(), ["src/a.ts", "src/b.ts"]);
+});

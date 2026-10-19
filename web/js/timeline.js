@@ -19,11 +19,24 @@ export function timelineUrl({ cwd, at, until, offset = 0, snapshot = true, limit
 export function createTimeline() {
   const tl = {
     active: false, cwd: null, from: 0, to: 0, t: 0,
-    playing: false, speed: 60, ended: false,
+    speed: 60, ended: false,
     queue: [], next: null, loading: false, req: 0, error: null,
     lower: null, // 伺服器回的挑 session 下界（回應的 from），續頁帶回去
   };
   const clamp = (t) => Math.min(tl.to, Math.max(tl.from, t));
+  // playing 一變就呼叫 tl.onPlayingChange(on)：主頁只在播放中掛計時器（#757 E-F12）。
+  // 用 setter 收在一處，Object.assign 與各處的 tl.playing = … 都會經過它
+  let playing = false;
+  Object.defineProperty(tl, "playing", {
+    enumerable: true,
+    get: () => playing,
+    set: (on) => {
+      on = !!on;
+      if (on === playing) return;
+      playing = on;
+      tl.onPlayingChange?.(on);
+    },
+  });
 
   // 回放中：即時的 `*`（snapshot、frame）不碰主頁，離開回放時重訂 `*` 換回現況
   tl.blocksLive = () => tl.active;

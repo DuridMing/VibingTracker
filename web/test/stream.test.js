@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createStream, kindOf } from "../js/stream.js";
+import { createStream, kindOf, ORPHAN_CAP } from "../js/stream.js";
 
 // Event 照 contracts.md §4；這裡捏的是我們自己的 Event，不是 transcript。
 const A = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -314,4 +314,21 @@ test("載入更多後停在上方（holding）時串流仍有硬上限：cap 的
   for (let k = 0; k < 50; k++) st.apply(batch(100, 2000 + k * 100));
   assert.ok(st.rows.length <= 300, `holding 時留了 ${st.rows.length} 行`);
   assert.equal(st.rows.at(-1).pos, 2000 + 49 * 100 + 99, "最新的行一定留著");
+});
+
+test("結束的 session 留在暫存區的卡片不會一直留在記憶體，最多留 ORPHAN_CAP 張給晚到的 tool.placed（#757 E-F12）", () => {
+  const st = createStream();
+  const n = ORPHAN_CAP * 3;
+  for (let i = 0; i < n; i++) {
+    const s = `s${i}`;
+    st.apply([called(s, `o${i}`, "Bash", { command: `echo ${i}` }), ev(s, "session.ended", { reason: "other" })]);
+  }
+  assert.equal(st.staged.size, 0);
+  assert.ok(st.cardCount() <= ORPHAN_CAP, `cards 留了 ${st.cardCount()} 張`);
+  // 最近結束的那張晚到 tool.placed：卡片內容（工具、指令）還在
+  const last = n - 1;
+  st.apply([placed(`s${last}`, `o${last}`, 5)]);
+  const r = row(st, st.rows.length - 1);
+  assert.equal(r.card.tool, "Bash");
+  assert.equal(r.card.input.command, `echo ${last}`);
 });
