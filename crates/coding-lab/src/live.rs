@@ -710,7 +710,7 @@ impl Live {
             Payload::SessionStarted(p) => {
                 // 第一次的 cwd 是路徑基準（#672），之後的 session.started 不換
                 if s.cwd.is_empty() {
-                    s.cwd = p.cwd.replace('\\', "/");
+                    s.cwd = crate::paths::normalize(&p.cwd);
                 }
                 s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
@@ -960,7 +960,7 @@ impl Live {
                 ..SessionLive::default()
             });
         if !r.cwd.is_empty() {
-            s.cwd = r.cwd.replace('\\', "/");
+            s.cwd = crate::paths::normalize(&r.cwd);
         }
         if let Some(p) = &r.first_prompt {
             s.first_prompt = Some(clip(p));

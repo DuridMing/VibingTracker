@@ -1016,16 +1016,8 @@ impl Store {
         limit: usize,
     ) -> Result<(Reads, Vec<crate::timeline::Ack>, Option<u64>), StoreError> {
         // 依平台的大小寫規則比對（L-11）：Windows、macOS 兩邊都轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）
-        let root = crate::paths::normalize(root);
-        let root = root.trim_end_matches('/');
-        let (root, cwd) = if crate::paths::CASE_INSENSITIVE {
-            (
-                root.to_ascii_lowercase(),
-                "lower(REPLACE(s.cwd, '\\', '/'))",
-            )
-        } else {
-            (root.to_string(), "REPLACE(s.cwd, '\\', '/')")
-        };
+        let root = cwd_key(root);
+        let cwd = cwd_expr("s.cwd", crate::paths::CASE_INSENSITIVE);
         let ms = |t: u64| t.min(i64::MAX as u64) as i64;
         let ids: Vec<String> = self
             .db
@@ -1288,20 +1280,23 @@ impl Store {
 
     /// Sessions tab：最新開始的在前；`cwd` 為 None 時列出全部專案，否則是 `cwd` 本身與底下（worktree）的。
     pub fn sessions(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<SessionRow>, StoreError> {
+        // 和 crate::paths 同一套比對（L-11）：`e:\x` 與 `E:/x` 是同一個專案，Windows、macOS 不分大小寫
+        let c = cwd_expr("cwd", crate::paths::CASE_INSENSITIVE);
         let mut stmt = self.db.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR REPLACE(cwd, '\\', '/') = ?1
-               OR substr(REPLACE(cwd, '\\', '/'), 1, length(?1) + 1) = ?1 || '/'
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR {c} = ?1
+               OR substr({c}, 1, length(?1) + 1) = ?1 || '/'
              ORDER BY started_at DESC, id LIMIT ?2"
         ))?;
-        let rows = stmt.query_map(params![cwd, limit as i64], session_row)?;
+        let rows = stmt.query_map(params![cwd.map(cwd_key), limit as i64], session_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// 所有 session 的 `cwd`（`/` 分隔、不重複）。
+    /// 所有 session 的 `cwd`（依 [`crate::paths::normalize`] 正規化、不重複）。
     pub fn cwds(&self) -> Result<Vec<String>, StoreError> {
-        let mut stmt = self
-            .db
-            .prepare("SELECT DISTINCT REPLACE(cwd, '\\', '/') FROM sessions WHERE cwd != ''")?;
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT DISTINCT {} FROM sessions WHERE cwd != ''",
+            cwd_expr("cwd", false)
+        ))?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -1329,30 +1324,35 @@ impl Store {
             return Ok((out, Reads::default()));
         }
         let list = serde_json::to_string(ids).unwrap_or_else(|_| "[]".into());
-        // SQLite 的 MAX() 聚合時，同列的其他欄位取自最大值那一列
-        let mut stmt = self.db.prepare(
-            "SELECT session, offset, MAX(seq) FROM events
-             WHERE type = 'prompt.submitted' AND session IN (SELECT value FROM json_each(?1))
-             GROUP BY session",
-        )?;
+        let mut stmt = self.db.prepare_cached(LAST_PROMPT)?;
         let prompts: Vec<(String, i64)> = stmt
             .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         let reads = Reads {
             groups: prompts.into_iter().map(|(s, o)| (s, vec![o])).collect(),
         };
-        let mut stmt = self.db.prepare(
-            "SELECT session, MAX(pos) FROM events
-             WHERE pos IS NOT NULL AND session IN (SELECT value FROM json_each(?1))
-             GROUP BY session",
-        )?;
-        let rows: Vec<(String, i64)> = stmt
+        let mut stmt = self.db.prepare_cached(LAST_POS)?;
+        let rows: Vec<(String, Option<i64>)> = stmt
             .query_map(params![list], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
         for (session, pos) in rows {
-            out.entry(session).or_default().1 = Some(pos as u64);
+            if let Some(pos) = pos {
+                out.entry(session).or_default().1 = Some(pos as u64);
+            }
         }
         Ok((out, reads))
+    }
+
+    /// [`Store::last_prompt_and_pos_reads`] 兩句查詢的查詢計畫（測試確認走索引，E-H3）
+    pub fn last_prompt_and_pos_plans(&self) -> Result<(String, String), StoreError> {
+        let plan = |q: &str| -> Result<String, StoreError> {
+            let mut stmt = self.db.prepare(&format!("EXPLAIN QUERY PLAN {q}"))?;
+            let rows: Vec<String> = stmt
+                .query_map(params!["[]"], |r| r.get(3))?
+                .collect::<Result<_, _>>()?;
+            Ok(rows.join("\n"))
+        };
+        Ok((plan(LAST_PROMPT)?, plan(LAST_POS)?))
     }
 
     /// 這些 session 各自最後一個 `prompt.submitted` 的文字與串流最後一個 `pos`（#683，Sessions tab）。
@@ -1596,6 +1596,39 @@ impl Store {
         Ok(read_version(&self.db)?.unwrap_or(0))
     }
 }
+
+/// SQL 裡和 [`crate::paths::normalize`] 相同的正規化（L-11）：`\` 換成 `/`、開頭的磁碟機代號大寫；
+/// `fold`（Windows、macOS 比對用）時再整個轉小寫（SQLite 的 lower 只動 ASCII，和 paths 相同）。舊資料裡小寫的
+/// 磁碟機代號也比得到。
+fn cwd_expr(col: &str, fold: bool) -> String {
+    let slash = format!("REPLACE({col}, '\\', '/')");
+    let norm = format!(
+        "CASE WHEN substr({slash}, 2, 1) = ':' THEN upper(substr({slash}, 1, 1)) || substr({slash}, 2) ELSE {slash} END"
+    );
+    if fold { format!("lower({norm})") } else { norm }
+}
+
+/// [`cwd_expr`] 要比的另一邊：正規化、去掉結尾的 `/`，依平台轉小寫。
+fn cwd_key(p: &str) -> String {
+    let p = crate::paths::normalize(p);
+    let p = p.trim_end_matches('/');
+    if crate::paths::CASE_INSENSITIVE {
+        p.to_ascii_lowercase()
+    } else {
+        p.to_string()
+    }
+}
+
+/// 每個 session 各找一次：`MAX(seq)` 在 `events_by_type (session, type, seq)` 上是一次索引查找（E-H3）。
+/// 寫成 `WHERE session IN (...) GROUP BY session` 時 SQLite 沿主鍵把 session 的每筆 Event 都看過一遍；
+/// 寫成 `ORDER BY seq DESC LIMIT 1` 時也沿主鍵倒著找，上一個 prompt 很遠（長時間的 agent 工作）就一樣慢。
+/// 實測（bundled SQLite 3.53，200 個 session × 1000 筆）：原本 22–25 ms，這樣 0.4 ms。
+const LAST_PROMPT: &str = "SELECT j.value, e.offset FROM json_each(?1) j
+             JOIN events e ON e.session = j.value AND e.seq = (
+               SELECT MAX(x.seq) FROM events x WHERE x.session = j.value AND x.type = 'prompt.submitted')";
+/// 同上：`MAX(pos)` 在 `events_by_pos (session, pos)` 上一次查找；沒有 pos 的 session 是 NULL。
+const LAST_POS: &str = "SELECT j.value, (SELECT MAX(e.pos) FROM events e WHERE e.session = j.value AND e.pos IS NOT NULL)
+             FROM json_each(?1) j";
 
 /// `type = 'usage' AND ts_seen >= ?` 剛好是 v6 部分索引 `events_usage_ts` 的形狀（E-S5）。
 /// 不在 SQL 裡排序：`ORDER BY session, seq` 會讓 SQLite 改成沿主鍵全表掃，分組與排序在呼叫端做

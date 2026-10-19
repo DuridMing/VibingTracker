@@ -26,9 +26,21 @@ fn trimmed(path: &str) -> String {
     p
 }
 
-/// 兩個路徑指的是同一個（依這個平台的大小寫規則）。
+/// `X:` 開頭的是 Windows 路徑。
+fn is_windows(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// 這兩個路徑比對時分不分大小寫：這個平台的規則；兩個都是 Windows 路徑時一律不分（hub 可能在 Linux 上
+/// 比對 Windows 上游的 cwd，和前端 paths.js 的規則相同，X19）。
+fn insensitive(a: &str, b: &str) -> bool {
+    CASE_INSENSITIVE || (is_windows(a) && is_windows(b))
+}
+
+/// 兩個路徑指的是同一個（依這個平台的大小寫規則；Windows 路徑一律不分大小寫）。
 pub fn same(a: &str, b: &str) -> bool {
-    same_with(a, b, CASE_INSENSITIVE)
+    same_with(a, b, insensitive(a, b))
 }
 
 pub fn same_with(a: &str, b: &str, insensitive: bool) -> bool {
@@ -42,7 +54,7 @@ pub fn same_with(a: &str, b: &str, insensitive: bool) -> bool {
 
 /// `path` 在 `dir` 底下時回傳相對路徑（`/` 分隔、保留 `path` 原本的大小寫）；就是 `dir` 本身或不在底下時回 None。
 pub fn strip_dir(dir: &str, path: &str) -> Option<String> {
-    strip_dir_with(dir, path, CASE_INSENSITIVE)
+    strip_dir_with(dir, path, insensitive(dir, path))
 }
 
 pub fn strip_dir_with(dir: &str, path: &str, insensitive: bool) -> Option<String> {
@@ -66,7 +78,7 @@ pub fn strip_dir_with(dir: &str, path: &str, insensitive: bool) -> Option<String
 
 /// `path` 就是 `dir`，或在它底下。
 pub fn within(dir: &str, path: &str) -> bool {
-    within_with(dir, path, CASE_INSENSITIVE)
+    within_with(dir, path, insensitive(dir, path))
 }
 
 pub fn within_with(dir: &str, path: &str, insensitive: bool) -> bool {

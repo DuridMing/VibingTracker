@@ -1799,3 +1799,47 @@ async fn files_omits_the_tree_when_the_client_already_has_it() {
     let (_, other) = get(addr, &format!("/api/files?cwd={cwd}&have=0000000000000000")).await;
     assert_eq!(other["tree"], full["tree"]);
 }
+
+// ── #748 L-11：Windows 的磁碟機代號（VS Code 的終端機給小寫 `e:\`、Windows Terminal 給大寫）
+
+/// 同一個專案、一個 session 的 cwd 是 `e:\proj`、一個是 `E:\proj\sub`：用哪一種寫法查都歸到同一個專案，
+/// 列出來的 cwd 一律 `E:/…`；白名單也認得（contracts §4「路徑正規化與比對」）。
+#[tokio::test]
+async fn drive_letter_case_does_not_split_a_project() {
+    let home = tmp("drive");
+    let store = store_with(
+        &home,
+        &[
+            started("lower", 1, 1_000, "e:\\proj"),
+            started("upper", 1, 2_000, "E:\\proj\\sub"),
+        ],
+    );
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    for q in ["E:/proj", "e:\\proj", "e:/proj/"] {
+        let (code, body) = get(addr, &format!("/api/sessions?cwd={}", enc(q))).await;
+        assert_eq!(code, 200, "{body}");
+        let mut got: Vec<(String, String)> = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().into(),
+                    r["cwd"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("lower".to_string(), "E:/proj".to_string()),
+                ("upper".to_string(), "E:/proj/sub".to_string())
+            ],
+            "查詢 {q}"
+        );
+    }
+    // 白名單：不在任何 session 的 cwd（或它底下）才回 404
+    let (code, body) = get(addr, &format!("/api/branches?cwd={}", enc("E:/proj"))).await;
+    assert_ne!(code, 404, "{body}");
+}

@@ -1852,3 +1852,13 @@ fn late_session_restarted_before_reading_a_line_resumes_from_the_end() {
         "startup：從第 1 行讀"
     );
 }
+
+/// E-H3（#756）：/api/sessions 每列的「最後一個 prompt」走 v6 的 `events_by_type`（依 session 找 MAX(seq)），
+/// 不是沿主鍵把 session 的每筆 Event 看過一遍；「最後一個 pos」走 `events_by_pos` 的 MAX。
+#[test]
+fn last_prompt_and_pos_use_the_indexes() {
+    let s = Store::open(&home()).unwrap();
+    let (prompt, pos) = s.last_prompt_and_pos_plans().unwrap();
+    assert!(prompt.contains("events_by_type"), "{prompt}");
+    assert!(pos.contains("events_by_pos"), "{pos}");
+}
