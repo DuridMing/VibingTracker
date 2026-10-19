@@ -1240,8 +1240,8 @@ fn raw_tail_line_no(h: &std::path::Path, session: &str) -> Option<Option<i64>> {
     .ok()
 }
 
-/// startup／clear／late 的 session.started 是從檔頭讀的檔：還沒有行產生 Event 時記 0，重啟從第 1 行讀；
-/// resume／compact 接的是從檔尾 tail 的檔：記 NULL，重啟照舊從檔尾，不整份重讀。
+/// startup／clear 的 session.started 是從檔頭讀的檔：還沒有行產生 Event 時記 0，重啟從第 1 行讀；
+/// resume／compact／late 接的是從檔尾 tail 的檔：記 NULL，重啟照舊從檔尾，不整份重讀（late：#741 D4）。
 #[test]
 fn tails_of_a_fresh_file_start_at_zero_and_of_a_resumed_file_are_unknown() {
     let h = home();
@@ -1261,15 +1261,16 @@ fn tails_of_a_fresh_file_start_at_zero_and_of_a_resumed_file_are_unknown() {
     rows.sort();
     assert_eq!(
         rows,
-        [
-            ("cleared".to_string(), 0),
-            ("fresh".to_string(), 0),
-            ("late".to_string(), 0)
-        ],
-        "從頭讀的檔記 0 並交給 TailPlanner；resume／compact 的不交（NULL）"
+        [("cleared".to_string(), 0), ("fresh".to_string(), 0)],
+        "從頭讀的檔記 0 並交給 TailPlanner；resume／compact／late 的不交（NULL）"
     );
     assert_eq!(raw_tail_line_no(&h, "resumed"), Some(None), "NULL＝不知道");
     assert_eq!(raw_tail_line_no(&h, "compacted"), Some(None));
+    assert_eq!(
+        raw_tail_line_no(&h, "late"),
+        Some(None),
+        "late 的 tail 從檔尾開始，不是從頭"
+    );
 
     // 之後讀到的行照常更新；resume 的檔讀到行之後也會接著讀
     s.append(at_line("resumed", 2, "main", 7));
@@ -1805,4 +1806,49 @@ fn pending_hook_events_survive_a_shutdown_while_the_store_is_unwritable() {
     assert!(!text.contains("\"no\":7"), "transcript 的不寫（會重讀）");
     assert!(s.events_by_seq("s1", 2, 1).is_ok());
     assert!(!dumps[0].path().exists(), "補完就刪");
+}
+
+/// #741 D4：late session（沒收到 SessionStart）的 tail 從檔尾開始；讀到新行之前 collector 重啟，
+/// 重啟後也要從檔尾接，不能把整份歷史重讀進串流與費用。走 serve 的同一條路：store 的 `tail_lines`
+/// 交給 `TailPlanner::seed`，再來一個 hook。startup 的對照組從第 1 行讀（當掉前沒 flush 的行補得回來）。
+#[test]
+fn late_session_restarted_before_reading_a_line_resumes_from_the_end() {
+    use coding_lab::hook::HookInput;
+    use coding_lab::transcript::{Start, TailAction, TailPlanner};
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_from("late", "/t/late.jsonl", "late"));
+        s.append(started_from("fresh", "/t/fresh.jsonl", "startup"));
+        s.flush().unwrap();
+    }
+    // 重啟
+    let s = Store::open(&h).unwrap();
+    let mut planner = TailPlanner::default();
+    for t in s.tail_lines().unwrap() {
+        planner.seed(&t.session, &t.file, t.path.as_deref(), t.line_no);
+    }
+    let start_of = |planner: &mut TailPlanner, sid: &str, path: &str| {
+        let hook = HookInput::from_json(
+            json!({"session_id": sid, "hook_event_name": "PreToolUse", "transcript_path": path,
+                   "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "ls"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        match planner.on_hook(&hook).as_slice() {
+            [TailAction::Start { start, .. }] => *start,
+            other => panic!("{sid}：要開 tail：{other:?}"),
+        }
+    };
+    assert_eq!(
+        start_of(&mut planner, "late", "/t/late.jsonl"),
+        Start::End,
+        "late：重啟前一行都還沒讀到，照舊從檔尾"
+    );
+    assert_eq!(
+        start_of(&mut planner, "fresh", "/t/fresh.jsonl"),
+        Start::After(0),
+        "startup：從第 1 行讀"
+    );
 }
