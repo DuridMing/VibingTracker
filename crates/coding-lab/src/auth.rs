@@ -175,7 +175,8 @@ fn read_links(home: &Path) -> Result<Vec<OnceLink>, String> {
 }
 
 fn write_links(home: &Path, links: &[OnceLink]) -> Result<(), String> {
-    std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+    crate::store::create_private_dir(home)
+        .map_err(|e| format!("建不了 {}：{e}", home.display()))?;
     let text = serde_json::to_string_pretty(links).map_err(|e| e.to_string())?;
     keys::save_secret_json_with_backup(&home.join(LINKS_FILE), &text)
 }

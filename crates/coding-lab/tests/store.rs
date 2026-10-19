@@ -1862,3 +1862,41 @@ fn last_prompt_and_pos_use_the_indexes() {
     assert!(prompt.contains("events_by_type"), "{prompt}");
     assert!(pos.contains("events_by_pos"), "{pos}");
 }
+
+/// B-S3（#762，Windows 驗收）：資料目錄的 ACL 什麼時候要收緊。剛建立的一律收緊；已經存在的（使用者先手動建好、
+/// 或舊版的子命令用一般的 create_dir_all 建的）只有不在 %USERPROFILE% 底下時才要——那裡預設只有自己能讀，
+/// `C:\` 根目錄底下則繼承 Users:(RX)、Authenticated Users:(M)，collector.json 的 stopToken、config.toml 的上游金鑰都露出去。
+#[test]
+fn acl_is_tightened_for_new_homes_and_homes_outside_the_profile() {
+    use coding_lab::store::acl_restrict_needed;
+    use std::path::Path;
+    let profile = Some(Path::new(r"C:\Users\u"));
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\Users\u\.coding-lab"), profile, true),
+        "剛建立的一律收緊"
+    );
+    assert!(
+        !acl_restrict_needed(Path::new(r"C:\Users\u\.coding-lab"), profile, false),
+        "在 profile 底下"
+    );
+    assert!(
+        !acl_restrict_needed(Path::new(r"c:\users\U\.coding-lab"), profile, false),
+        "Windows 不分大小寫"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\cl-test\k5"), profile, false),
+        "C:\\ 根目錄底下"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"D:\data"), profile, false),
+        "別的磁碟"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\Users\u2\.coding-lab"), profile, false),
+        "前綴相同不算在底下"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\x"), None, false),
+        "不知道 profile 時收緊"
+    );
+}

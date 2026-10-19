@@ -274,7 +274,11 @@ async fn bind_hooks(cfg: &Config, tx: &mpsc::Sender<Input>) -> io::Result<Option
 }
 
 pub async fn run(cfg: Config) -> io::Result<Outcome> {
+    let existed = cfg.home.exists();
     crate::store::create_private_dir(&cfg.home)?;
+    if existed {
+        crate::store::tighten_existing_home(&cfg.home);
+    }
     // 背景執行（ensure 拉起）時自己寫 collector.log 並輪替；前景跑時照舊印到終端機
     if crate::logging::use_log_file(
         cfg.log_file,

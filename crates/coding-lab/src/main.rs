@@ -345,7 +345,7 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
     })?;
     let ctx = service::Ctx::detect(&cfg.home)?;
     // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）
-    let _ = std::fs::create_dir_all(&cfg.home);
+    let _ = coding_lab::store::create_private_dir(&cfg.home);
     let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
     let describe = |plan: &service::Plan| {
         for (p, _) in &plan.files {
