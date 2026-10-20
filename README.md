@@ -47,7 +47,7 @@ irm https://claude.ai/install.ps1 | iex               # Windows PowerShell
 二進位和 `web/` 要放在同一個資料夾：collector 沒有另外設定網頁位置時，會用二進位旁邊的 `web/`。Windows 在 Git Bash 執行下面的指令（`~` 是 `%USERPROFILE%`）。
 
 ```bash
-git clone -b develop https://github.com/DuridMing/VibingTracker.git && cd VibingTracker
+git clone -b main https://github.com/DuridMing/VibingTracker.git && cd VibingTracker
 cargo build --release -p coding-lab
 mkdir -p ~/.coding-lab/bin
 cp target/release/coding-lab ~/.coding-lab/bin/     # Windows：target/release/coding-lab.exe
@@ -63,7 +63,7 @@ claude plugin marketplace add /path/to/VibingTracker
 claude plugin install coding-lab@coding-lab
 ```
 
-`/path/to/VibingTracker` 是上一步 clone 下來的資料夾（Windows 例如 `C:\src\VibingTracker`）。目前程式碼在 `develop` 分支，`main` 還沒有發佈的版本，所以 marketplace 要用本機的 clone，不要直接給 GitHub 的 `DuridMing/VibingTracker`（會讀到 `main`）。也可以在 Claude Code 裡輸入 `/plugin` 用選單安裝。
+`/path/to/VibingTracker` 是上一步 clone 下來的資料夾（Windows 例如 `C:\src\VibingTracker`）。`main` 是發佈的版本、`develop` 是開發中的版本。marketplace 用本機的 clone，plugin 和上一步編好的二進位就是同一個版本。也可以在 Claude Code 裡輸入 `/plugin` 用選單安裝。
 
 plugin 裝在使用者層級（`~/.claude/`），Claude Desktop 的 Code 分頁開的本機 session 也會載入，一樣會被追蹤（Windows 上實測過）。
 
