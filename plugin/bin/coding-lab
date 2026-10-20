@@ -32,6 +32,15 @@ case ${OSTYPE-} in
     *) profile=$HOME ;;
 esac
 home_dir=${CODING_LAB_HOME:-$profile/.coding-lab}
+# Windows 原生寫法（`C:\…`）轉成 POSIX 的再用：Git 的 GNU tar 把 `C:` 當成遠端主機，sha256sum 遇到 `\` 會改輸出格式。
+# 只在真的有 `\` 或 `:` 時才轉，預設的 home（上面已經 cygpath 過）不多 fork 一次
+case ${OSTYPE-} in
+    msys* | cygwin*)
+        case $home_dir in
+            *\\* | *:*) home_dir=$(cygpath -u "$home_dir" 2>/dev/null || echo "$home_dir") ;;
+        esac
+        ;;
+esac
 # 沒設才用預設；設成空字串＝不自動下載
 release_url=${CODING_LAB_RELEASE_URL-https://github.com/DuridMing/VibingTracker/releases/download/v$VERSION}
 
