@@ -2,6 +2,12 @@
 
 版號依 [SemVer](https://semver.org/lang/zh-TW/)。發佈時 cargo-dist 會拿對應版號的段落當作 GitHub Release 的說明。
 
+## 下一版（尚未發佈）
+
+### 修正
+
+- Windows 上用 `C:\…` 這種反斜線寫法設 `CODING_LAB_HOME` 時，plugin 的自動下載與背景更新一直說「sha256 不符」而裝不起來（每個 session 開始都重新下載一次）。
+
 ## 0.1.0（2026-10-20）
 
 第一個公開版本。
@@ -25,4 +31,5 @@
 - 主頁的時間軸回放是實驗功能：一次最多回放 24 小時。範圍大時載入會慢：每一段都從各 session 開頭重放，約 10 萬個事件時每段約半秒，期間新事件進畫面會慢一點（Claude Code 的 hook 不受影響）。之後的版本改成從上一段接著算。
 - 一台機器同時只能追蹤一個帳號：hook 的 4800 埠是整台機器共用的，後來的帳號的事件會被先啟動的 collector 丟掉（`coding-lab healthz` 顯示「沒在跑」，`collector.log` 有說明）。Windows 和它的 WSL2 也算同一台，只在其中一邊裝 plugin。
 - log 的時間是 epoch 毫秒、`coding-lab key list` 顯示 UTC；hub 的「今天」用第一個連上的瀏覽器的時區，跨夏令時間要重開 hub。
+- Windows 上 `CODING_LAB_HOME` 用反斜線（`C:\…`）時，自動下載與背景更新會因為「sha256 不符」失敗；改用正斜線（`C:/…`），或不設、用預設的資料目錄就沒問題。下一版修正。
 - macOS 還沒有在實機上逐項驗證，可能遇到的狀況整理在 [macOS 注意事項](docs/macos-warnings.md)。

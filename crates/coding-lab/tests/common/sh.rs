@@ -87,7 +87,7 @@ pub fn to_sh(p: &Path) -> String {
 }
 
 /// 跑 wrapper 時的 PATH：`dirs`（假的 uname、curl…）在前，再來是基本工具——Unix 的 /usr/bin、/bin，
-/// Windows 是 Git 的 usr\bin。Windows 用 Windows 的格式（`;` 分隔），Git Bash 啟動時自己轉成 POSIX 的。
+/// Windows 是 Git 的 mingw64\bin、usr\bin，最後是 System32。Windows 用 Windows 的格式（`;` 分隔），Git Bash 啟動時自己轉成 POSIX 的。
 pub fn path_env(sh: &Path, dirs: &[&Path]) -> OsString {
     let mut all: Vec<PathBuf> = dirs.iter().map(|d| d.to_path_buf()).collect();
     if cfg!(windows) {
@@ -99,6 +99,15 @@ pub fn path_env(sh: &Path, dirs: &[&Path]) -> OsString {
             .map(|g| g.join("mingw64").join("bin"));
         all.extend(mingw.filter(|m| m.is_dir()));
         all.push(tools);
+        // 最後退到系統的 System32：Windows 內建的 curl.exe、tar.exe 與 PowerShell 在這裡（wrapper 解 zip 的退路也是）。
+        // GitHub 的 windows runner 上光靠 Git 的目錄找不到 curl（check.yml 的 6 條 download::* 紅，實機是綠的）。
+        // 放最後：System32 也有 find.exe、sort.exe 這類和 coreutils 同名的程式，不能蓋掉 Git 的
+        let system = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"));
+        all.extend(
+            system
+                .map(|r| PathBuf::from(r).join("System32"))
+                .filter(|d| d.is_dir()),
+        );
     } else {
         all.push("/usr/bin".into());
         all.push("/bin".into());

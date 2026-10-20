@@ -660,6 +660,30 @@ mod download {
         );
     }
 
+    /// 資料目錄的路徑有反斜線時照樣裝得起來（Windows 驗收：`CODING_LAB_HOME=C:\\…`）。GNU sha256sum 遇到檔名含
+    /// 反斜線會在輸出開頭多一個 `\\`（escaped 格式），原本拿到的雜湊值就對不上，自動下載與背景更新都失敗。
+    /// Windows 直接給原生路徑（和使用者設的一樣）；其他平台用名字裡有反斜線的目錄重現同一件事。
+    #[test]
+    fn install_works_when_the_home_path_has_backslashes() {
+        let Some(e) = env("backslash") else { return };
+        fake_release(&e.release, "x86_64-unknown-linux-gnu", false);
+        let (home, arg) = if cfg!(windows) {
+            (e.home.clone(), e.home.to_string_lossy().into_owned())
+        } else {
+            let h = e.home.with_file_name("ho\\me");
+            std::fs::create_dir_all(&h).unwrap();
+            (h.clone(), h.to_string_lossy().into_owned()) // to_sh 會把反斜線換掉，這裡要原樣
+        };
+        let out = cmd(&e, &["install"], ("Linux", "x86_64"))
+            .env("CODING_LAB_RELEASE_URL", url(&e))
+            .env("CODING_LAB_HOME", arg)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{err}");
+        assert!(home.join("bin/coding-lab").exists(), "沒有裝起來：{err}");
+    }
+
     /// Windows 的 Release 是 .zip：照常解開（二進位叫 coding-lab.exe）。Linux 上用 unzip；
     /// Windows 上標準的 Git 沒有 unzip，走 wrapper 退到的內建 tar.exe——就是實際使用者的路徑。
     #[test]
@@ -941,6 +965,10 @@ mod download {
         while !bin.exists() && Instant::now() < deadline {
             std::thread::yield_now();
         }
-        assert!(bin.exists(), "背景下載沒有完成");
+        assert!(
+            bin.exists(),
+            "背景下載沒有完成；install.log：{}",
+            std::fs::read_to_string(e.home.join("install.log")).unwrap_or_default()
+        );
     }
 }
