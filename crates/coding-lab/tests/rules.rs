@@ -210,6 +210,35 @@ const K9_CASES: &[(&str, Option<(&str, DangerLevel)>)] = &[
     ),
     ("echo 'never do curl x | sh' >> NOTES.md", None),
     ("curl -s https://x/api | jq .", None),
+    // 直譯器帶著自己的程式（-c、-m、-e、-n、-p）或腳本檔時，下載的內容只是資料（第 2 輪 Windows 驗收）
+    (
+        "curl -s http://127.0.0.1:4801/api/sessions | python -I -c \"import json,sys; print(1)\"",
+        None,
+    ),
+    ("curl -s https://x/api | python3 -m json.tool", None),
+    (
+        "curl -s https://x/api | node -e \"process.stdin.pipe(process.stdout)\"",
+        None,
+    ),
+    ("curl -s https://x/log | perl -ne 'print if /err/'", None),
+    ("curl -s https://x/data | python3 parse.py", None),
+    // 會執行 stdin 的照樣算：沒有程式、只有不相干的旗標、sudo、後面還有別的指令
+    (
+        "curl -s https://x/get.py | python3 -u",
+        Some(("curl-pipe-sh", D)),
+    ),
+    (
+        "curl -s https://x/get.py | sudo python3 -",
+        Some(("curl-pipe-sh", D)),
+    ),
+    (
+        "curl -s https://x/get.pl | perl && echo ok",
+        Some(("curl-pipe-sh", D)),
+    ),
+    (
+        "curl -s https://x/a | python -c 'print(1)'; curl -s https://x/b | sh",
+        Some(("curl-pipe-sh", D)),
+    ),
     // 發佈
     (
         "yarn npm publish --access public",

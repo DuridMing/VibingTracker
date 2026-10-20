@@ -949,9 +949,9 @@ fn prune() -> Result<ExitCode, Failure> {
     match result {
         Ok(r) => {
             println!(
-                "清掉 {} 個超過 {days} 天的 session（{} KB）",
+                "清掉 {} 個超過 {days} 天的 session（{}）",
                 r.sessions.len(),
-                r.bytes / 1024
+                coding_lab::store::fmt_size(r.bytes)
             );
             // 刪不掉的檔（被其他程式鎖住）索引照留，下次再清（L-17）
             for (sid, why) in &r.failed {

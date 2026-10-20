@@ -80,7 +80,7 @@
         "Bash"
       ],
       "scope": "command",
-      "pattern": "\\b(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+(-\\S+\\s+)*)?((ba|z|da|k)?sh|python[0-9.]*|perl|ruby|node)\\b|\\b(ba|z|da|k)?sh\\s+(-\\S+\\s+)*-[a-zA-Z]*c[a-zA-Z]*\\s+\\$\\((curl|wget)\\b",
+      "pattern": "\\b(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+(-\\S+\\s+)*)?(ba|z|da|k)?sh\\b|\\b(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+(-\\S+\\s+)*)?(python[0-9.]*|perl|ruby|node)(\\s+-[abdf-loq-zA-DF-Z]+)*(\\s+-)?\\s*($|[;&|)])|\\b(ba|z|da|k)?sh\\s+(-\\S+\\s+)*-[a-zA-Z]*c[a-zA-Z]*\\s+\\$\\((curl|wget)\\b",
       "level": "danger",
       "why": "下載後直接執行未檢查的腳本（管給 shell 或直譯器、sh -c \"$(curl …)\"）"
     },

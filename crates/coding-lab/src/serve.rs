@@ -713,10 +713,10 @@ fn prune_store(store: &mut Store) -> Vec<String> {
         Ok(r) => {
             if !r.sessions.is_empty() {
                 log(&format!(
-                    "清掉 {} 個超過 {} 天的 session（{} KB）",
+                    "清掉 {} 個超過 {} 天的 session（{}）",
                     r.sessions.len(),
                     crate::store::RETENTION_DAYS,
-                    r.bytes / 1024
+                    crate::store::fmt_size(r.bytes)
                 ));
             }
             // 刪不掉的檔（被其他程式鎖住）索引照留，下次再清（L-17）

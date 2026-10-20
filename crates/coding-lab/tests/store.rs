@@ -1900,3 +1900,15 @@ fn acl_is_tightened_for_new_homes_and_homes_outside_the_profile() {
         "不知道 profile 時收緊"
     );
 }
+
+/// 第 2 輪 Windows 驗收 §6：prune 清掉 932 bytes 時印「0 KB」。不到 1 KB 印 bytes，大的印 KB、MB。
+#[test]
+fn prune_sizes_are_printed_readably() {
+    use coding_lab::store::fmt_size;
+    assert_eq!(fmt_size(0), "0 bytes");
+    assert_eq!(fmt_size(932), "932 bytes");
+    assert_eq!(fmt_size(1024), "1 KB");
+    assert_eq!(fmt_size(1536), "2 KB");
+    assert_eq!(fmt_size(5 * 1024 * 1024), "5.0 MB");
+    assert_eq!(fmt_size(1_572_864), "1.5 MB");
+}

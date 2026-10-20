@@ -84,6 +84,18 @@ pub struct TailRow {
     pub line_no: u64,
 }
 
+/// prune 等訊息裡的大小：不到 1 KB 印 bytes（932 bytes 不要變成「0 KB」），不到 1 MB 印四捨五入的 KB，再大印 MB。
+pub fn fmt_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    if bytes < KB {
+        format!("{bytes} bytes")
+    } else if bytes < KB * KB {
+        format!("{} KB", (bytes + KB / 2) / KB)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (KB * KB) as f64)
+    }
+}
+
 /// [`Store::prune`] 清掉了什麼。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PruneReport {
