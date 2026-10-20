@@ -7,7 +7,7 @@
 //! （否則使用者瀏覽器裡任何網頁都能連 `ws://127.0.0.1:4801` 讀走 transcript；沒帶 `Origin` 的 wscat、curl 放行）。
 //! 遠端或 `auth = "always"` 的連線每個請求都要金鑰（[`crate::auth`]）：Bearer 或登入 cookie。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -31,7 +31,7 @@ use crate::auth::{self, Auth, Denied, Identity};
 use crate::config::{AuthMode, RemoteThinking};
 use crate::event::Event;
 use crate::live::{Channel, Frame, Live};
-use crate::store::{ProjectKey, SessionRow, Store};
+use crate::store::{SessionRow, Store};
 
 pub const PROTOCOL: u64 = 1;
 pub const FLUSH_EVERY: Duration = Duration::from_millis(50);
@@ -56,6 +56,27 @@ pub struct WebState {
     remote_thinking: Mutex<RemoteThinking>,
     /// 測試用：把 loopback 連線當成遠端（真的非 loopback 來源在單機測不到）
     force_remote: std::sync::atomic::AtomicBool,
+    /// /api/files 最近的結果（E-H2）：(cwd, base) → (算好的時間, 回應)，約 1 秒內共用
+    files_memo: Mutex<HashMap<(String, String), (Instant, Value)>>,
+    /// 進行中的回放請求數與上限（#742 B-N1）
+    replays: std::sync::atomic::AtomicUsize,
+    max_replays: std::sync::atomic::AtomicUsize,
+}
+
+/// 同一個 collector 同時最多幾個回放請求（#742 B-N1）：回放要讀整段 JSONL、重放、佔記憶體，
+/// 連續拖動滑桿或遠端送大範圍不能把 collector 拖垮。
+pub const MAX_REPLAYS: usize = 2;
+
+/// /api/files 的結果共用多久（E-H2）：前端每 3 秒輪詢一次，晚 1 秒內可以接受
+const FILES_MEMO: Duration = Duration::from_secs(1);
+
+/// 一個回放名額；drop 時還回去。
+pub(crate) struct ReplaySlot(Arc<WebState>);
+
+impl Drop for ReplaySlot {
+    fn drop(&mut self) {
+        self.0.replays.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 同一毫秒建立兩個 [`WebState`]（測試）也要不同
@@ -104,6 +125,9 @@ impl WebState {
             auth,
             remote_thinking: Mutex::new(RemoteThinking::OnDemand),
             force_remote: std::sync::atomic::AtomicBool::new(false),
+            files_memo: Mutex::new(HashMap::new()),
+            replays: std::sync::atomic::AtomicUsize::new(0),
+            max_replays: std::sync::atomic::AtomicUsize::new(MAX_REPLAYS),
         })
     }
 
@@ -124,6 +148,43 @@ impl WebState {
             .remote_thinking
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 約 [`FILES_MEMO`] 內算過的 /api/files 結果（E-H2）。
+    pub(crate) fn recent_files(&self, key: &(String, String)) -> Option<Value> {
+        let memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.get(key)
+            .filter(|(at, _)| at.elapsed() < FILES_MEMO)
+            .map(|(_, v)| v.clone())
+    }
+
+    pub(crate) fn remember_files(&self, key: (String, String), body: Value) {
+        let mut memo = self.files_memo.lock().unwrap_or_else(|e| e.into_inner());
+        memo.retain(|_, (at, _)| at.elapsed() < FILES_MEMO);
+        memo.insert(key, (Instant::now(), body));
+    }
+
+    /// 同時進行的回放請求上限（預設 [`MAX_REPLAYS`]）；測試用。
+    pub fn set_max_replays(&self, n: usize) {
+        self.max_replays.store(n, Ordering::Relaxed);
+    }
+
+    /// 佔一個回放名額；滿了回 None（呼叫端回 429）。名額在 [`ReplaySlot`] drop 時還回去。
+    pub(crate) fn replay_slot(self: &Arc<Self>) -> Option<ReplaySlot> {
+        let max = self.max_replays.load(Ordering::Relaxed);
+        let mut n = self.replays.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match self
+                .replays
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(ReplaySlot(self.clone())),
+                Err(now) => n = now,
+            }
+        }
     }
 
     /// 測試用：所有連線都當成遠端（剝除敏感輸出與 thinking）。
@@ -251,7 +312,6 @@ pub async fn serve_web(
         .route("/api/sessions", get(crate::api::sessions))
         .route("/api/sessions/{id}/events", get(crate::api::events))
         .route("/api/files", get(crate::api::files))
-        .route("/api/projects/events", get(crate::api::project_events))
         .route("/api/projects/replay", get(crate::api::project_replay))
         .route("/api/branches", get(crate::api::branches))
         .route("/api/branch-diff", get(crate::api::branch_diff))
@@ -272,6 +332,7 @@ pub async fn serve_web(
         .route("/auth/logout", post(auth_logout))
         .fallback(get(static_file))
         .layer(middleware::from_fn_with_state(state.clone(), gate))
+        .layer(middleware::map_response(no_framing))
         .with_state(state);
     let task = tokio::spawn(async move {
         // 連線來源位址：遠端連線送出前剝除敏感輸出（#654）
@@ -286,7 +347,7 @@ pub async fn serve_web(
 /// 每個請求的門口：決定這條連線是「本機免金鑰」還是要驗金鑰，並把 [`Identity`] 放進 request extensions。
 ///
 /// - `/healthz` 與 `/auth/*` 不驗（登入頁本身要能開）。
-/// - 本機免金鑰（loopback 來源且 `auth = "local-open"`）：`Host` 必須是 loopback 名稱——DNS rebinding 時攻擊者的
+/// - 本機免金鑰（loopback 來源、沒有轉發標頭，且 `auth = "local-open"`）：`Host` 必須是 loopback 名稱——DNS rebinding 時攻擊者的
 ///   網域解析到 127.0.0.1，瀏覽器送出的 `Origin` 與 `Host` 都是攻擊者網域、彼此相同，只比 Origin 擋不住。
 ///   `/api` 與 `/ws` 另外要 `Origin == Host`。
 /// - 要金鑰的連線：Bearer 或 cookie（cookie 要配 `Origin`）。沒有或不對：API 與 WS 回 401／403，網頁導去登入頁。
@@ -300,11 +361,15 @@ async fn gate(
     let path = req.uri().path().to_string();
     let open = path == "/healthz" || path.starts_with("/auth/");
     let guarded = path.starts_with("/api/") || path == "/ws";
-    if !state.auth.needs_auth(peer) {
+    // 反向代理轉來的：來源與 Host 都可能是 loopback（nginx 預設改寫 Host），只有轉發標頭看得出來（S-1）
+    let proxied = proxied(req.headers());
+    req.extensions_mut()
+        .insert(Remote(proxied || state.remote_peer(peer)));
+    if !proxied && !state.auth.needs_auth(peer) {
         if !host_is_loopback(req.headers()) {
             return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
         }
-        if guarded && !same_origin(req.headers()) {
+        if guarded && !auth::same_origin(req.headers()) {
             return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
         }
         req.extensions_mut().insert(Identity::Local);
@@ -476,6 +541,39 @@ async fn auth_logout(headers: HeaderMap) -> Response {
         .into_response()
 }
 
+/// gate 判定的「這條連線算不算遠端」：來源不是 loopback、測試強制，或經過反向代理（[`proxied`]）。
+/// handler 一律讀這個，不再各自看來源位址——代理轉來的連線來源是 127.0.0.1，只看位址會當成本機（S-1）。
+#[derive(Clone, Copy, Debug)]
+pub struct Remote(pub bool);
+
+/// 帶任何一個轉發標頭就是反向代理轉來的。代理一定會加其中之一（nginx 的 `proxy_set_header`、Caddy 預設、
+/// RFC 7239 `Forwarded`）；Claude Code 與瀏覽器直連都不會帶。標頭本身不可信，所以只拿來「升級成遠端」，不拿來放行。
+pub fn proxied(headers: &HeaderMap) -> bool {
+    [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ]
+    .iter()
+    .any(|h| headers.contains_key(*h))
+}
+
+/// 每個回應（含 gate 拒絕的）都禁止被嵌進 iframe（F-7）：local-open 時任何網站都能把這頁放進 iframe、
+/// 誘導使用者點「全部確認」清掉危險警示。hub 的 web 入口也用。
+pub(crate) async fn no_framing(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    h.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        header::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
+}
+
 /// `Host` 是 loopback 名稱（hub 的 web 入口也用，#663）。
 pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
@@ -491,16 +589,11 @@ pub(crate) fn host_is_loopback(headers: &HeaderMap) -> bool {
 
 /// `/api/*`：同 `/ws`，使用者瀏覽器裡別的網頁不能讀走 session 資料。
 async fn require_same_origin(req: Request, next: Next) -> Response {
-    if same_origin(req.headers()) {
+    if auth::same_origin(req.headers()) {
         next.run(req).await
     } else {
         (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response()
     }
-}
-
-/// `Origin` 必須和 `Host` 相同（沒帶 `Origin` 的非瀏覽器程式放行）。
-fn same_origin(headers: &HeaderMap) -> bool {
-    auth::same_origin(headers)
 }
 
 pub fn thinking_str(mode: RemoteThinking) -> &'static str {
@@ -518,12 +611,11 @@ pub fn is_remote(peer: SocketAddr) -> bool {
 
 async fn ws_handler(
     State(state): State<Arc<WebState>>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(Remote(remote)): Extension<Remote>,
     Extension(identity): Extension<Identity>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Origin 與金鑰都在 gate 驗過了
-    let remote = state.remote_peer(peer);
+    // Origin 與金鑰都在 gate 驗過了，遠端與否也是 gate 判定的
     ws.on_upgrade(move |socket| connection(socket, state, remote, identity))
 }
 
@@ -533,7 +625,7 @@ struct Conn {
     offset: i32,
     /// hello 帶的 frame 編號與收到 hello 的時間
     resume: Option<(u64, Instant)>,
-    /// 從別台連進來（[`is_remote`]）
+    /// 遠端連線（gate 判定的 [`Remote`]）
     remote: bool,
     /// 本機或哪一把金鑰（決定 `welcome.scope` 與能不能 ack）
     identity: Identity,
@@ -544,13 +636,7 @@ struct Conn {
 /// 送一則訊息；遠端連線先剝除敏感輸出（#654）與 thinking 全文（#668，依 `remote_thinking`）。
 async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
     let text = if conn.remote {
-        let mut v = v.clone();
-        crate::sensitive::redact_remote(&mut v);
-        crate::sensitive::redact_keys(&mut v);
-        if conn.thinking != RemoteThinking::Show {
-            defer_thinking(&mut v);
-        }
-        v.to_string()
+        redact_remote_copy(v, conn.thinking).to_string()
     } else {
         v.to_string()
     };
@@ -559,47 +645,109 @@ async fn send(socket: &mut WebSocket, conn: &Conn, v: &Value) -> bool {
 
 impl WebState {
     /// HTTP API 回應送給遠端前的剝除：敏感輸出（#654）＋依 `remote_thinking` 的 thinking（#668）。
-    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。
-    pub fn redact_for_peer(&self, peer: SocketAddr, body: &mut Value) {
-        if !self.remote_peer(peer) {
-            return;
-        }
-        crate::sensitive::redact_remote(body);
-        crate::sensitive::redact_keys(body);
-        if self.remote_thinking() != RemoteThinking::Show {
-            defer_thinking(body);
+    /// WS 的 [`send`] 做同一件事；兩邊共用這個判斷，REST 不能繞過 WS 的佔位。`remote` 是 gate 判定的 [`Remote`]。
+    pub fn redact_for(&self, remote: bool, body: &mut Value) {
+        if remote {
+            *body = redact_remote_copy(body, self.remote_thinking());
         }
     }
 }
 
-/// 把送出副本裡所有 `assistant.thinking` 的 `text` 換成空字串，加 `deferred: true` 與 `chars`（佔位要顯示長度）。
-/// frame、snapshot、載入更多的形狀不同，所以整個走一遍；只改送出的副本，JSONL 與 store 不變。
-pub fn defer_thinking(v: &mut Value) {
+/// 送給遠端連線的副本（不變式 6、7，contracts §4）：WS、每個 API、回放、hub 轉送都走這一個，一次走訪產出：
+/// - 命中敏感規則（`payload.sensitive`）的 Event 剝內容並加 `redacted: true`：`tool.result.output` 換 `""`；
+///   `tool.called.input` 只留路徑類欄位；`file.write.content` 換 `""`；`file.edit.hunk.lines` 換 `[]`（行號與計數保留，C8）。
+/// - `thinking` 不是 `Show` 時：`assistant.thinking` 的 `text` 換 `""`、加 `deferred` 與 `chars`（#668）；
+///   sessions 列裡來源是 thinking 的 `doing` 換 null（C2）。
+/// - 所有字串裡的 `clk_<id>_<secret>` 只留 `clk_<id>_…`（#720）。
+///
+/// frame、snapshot、載入更多、API 回應的形狀不同，所以整個走一遍；原值不動（JSONL、store、本機連線照舊）。
+pub fn redact_remote_copy(v: &Value, thinking: RemoteThinking) -> Value {
+    copy_for_remote(v, thinking != RemoteThinking::Show)
+}
+
+/// `tool.called.input` 剝除後留下的欄位：畫面要顯示是哪個檔或哪個指令。
+const KEEP_INPUT: [&str; 4] = ["file_path", "notebook_path", "path", "command"];
+
+fn copy_for_remote(v: &Value, defer: bool) -> Value {
     match v {
+        Value::String(s) if s.contains("clk_") => {
+            let mut masked = Value::String(s.clone());
+            crate::sensitive::redact_keys(&mut masked);
+            masked
+        }
         Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("assistant.thinking")
-                && let Some(Value::Object(p)) = map.get_mut("payload")
-            {
-                let chars = p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map_or(0, |t| t.chars().count());
-                p.insert("text".into(), Value::String(String::new()));
-                p.insert("deferred".into(), Value::Bool(true));
-                p.insert("chars".into(), json!(chars));
-                return;
+            let mut out: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, child)| (k.clone(), copy_for_remote(child, defer)))
+                .collect();
+            redact_event(map, &mut out, defer);
+            if defer && map.get("doingSource").and_then(Value::as_str) == Some("thinking") {
+                out.insert("doing".into(), Value::Null);
             }
-            for child in map.values_mut() {
-                defer_thinking(child);
-            }
+            Value::Object(out)
         }
-        Value::Array(items) => {
-            for child in items {
-                defer_thinking(child);
-            }
-        }
-        _ => {}
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|child| copy_for_remote(child, defer))
+                .collect(),
+        ),
+        other => other.clone(),
     }
+}
+
+/// `out` 是 `orig` 已複製（字串已遮金鑰）的副本；是 Event 時依種類剝內容。
+fn redact_event(
+    orig: &serde_json::Map<String, Value>,
+    out: &mut serde_json::Map<String, Value>,
+    defer: bool,
+) {
+    let Some(kind) = orig.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(Value::Object(p)) = out.get_mut("payload") else {
+        return;
+    };
+    if kind == "assistant.thinking" {
+        if defer {
+            let chars = orig["payload"]["text"]
+                .as_str()
+                .map_or(0, |t| t.chars().count());
+            p.insert("text".into(), Value::String(String::new()));
+            p.insert("deferred".into(), Value::Bool(true));
+            p.insert("chars".into(), json!(chars));
+        }
+        return;
+    }
+    if p.get("sensitive").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    match kind {
+        "tool.result" => {
+            p.insert("output".into(), Value::String(String::new()));
+        }
+        "tool.called" => {
+            let kept = match p.get("input") {
+                Some(Value::Object(input)) => input
+                    .iter()
+                    .filter(|(k, _)| KEEP_INPUT.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                _ => serde_json::Map::new(),
+            };
+            p.insert("input".into(), Value::Object(kept));
+        }
+        "file.write" => {
+            p.insert("content".into(), Value::String(String::new()));
+        }
+        "file.edit" => {
+            if let Some(Value::Object(hunk)) = p.get_mut("hunk") {
+                hunk.insert("lines".into(), Value::Array(Vec::new()));
+            }
+        }
+        _ => return,
+    }
+    p.insert("redacted".into(), Value::Bool(true));
 }
 
 async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, identity: Identity) {
@@ -631,8 +779,14 @@ async fn connection(mut socket: WebSocket, state: Arc<WebState>, remote: bool, i
                             continue;
                         }
                         conn.subs.insert(ch.clone(), f.no);
-                        if let Some(j) = f.to_json(&ch, conn.offset)
-                            && !send(&mut socket, &conn, &j).await
+                        // 同一個 frame 每種（頻道、offset、模式）只序列化一次，其他連線拿快取（E-L4）
+                        let wire = if conn.remote {
+                            crate::live::Wire::Remote(conn.thinking)
+                        } else {
+                            crate::live::Wire::Local
+                        };
+                        if let Some(text) = f.text_for(&ch, conn.offset, wire)
+                            && socket.send(Message::Text(text)).await.is_err()
                         {
                             return;
                         }
@@ -691,6 +845,8 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 "version": env!("CARGO_PKG_VERSION"), "remote": conn.remote,
                 "thinking": if conn.remote { thinking_str(conn.thinking) } else { "full" },
                 "scope": conn.identity.scope_str(),
+                // store 寫不進去的狀態（W-M10）；之後的改變走 snapshot 與 frame
+                "storeError": state.live().store_error(),
             });
             send(socket, conn, &welcome).await
         }
@@ -747,9 +903,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
                 msg["kind"].as_str().unwrap_or_default(),
                 msg["ref"].as_str().unwrap_or_default(),
             );
-            if let Some(store) = &state.store {
-                let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(e) = store.ack(s, k, r, crate::now_ms()) {
+            if let Some(store) = state.store.clone() {
+                // SQLite 寫入會阻塞，不在 async worker 上拿 store 鎖（L-7）
+                let (s2, k2, r2) = (s.to_string(), k.to_string(), r.to_string());
+                let res = tokio::task::spawn_blocking(move || {
+                    store.lock().unwrap_or_else(|e| e.into_inner()).ack(
+                        &s2,
+                        &k2,
+                        &r2,
+                        crate::now_ms(),
+                    )
+                })
+                .await;
+                if let Ok(Err(e)) = res {
                     crate::logging::log(&format!("web：ack 寫入失敗：{e}"));
                 }
             }
@@ -761,13 +927,19 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
             let session = msg["session"].as_str().unwrap_or_default().to_string();
             let before = msg["beforePos"].as_u64();
             let limit = msg["limit"].as_u64().unwrap_or(200).min(MORE_LIMIT) as usize;
-            let events = match &state.store {
+            let events = match state.store.clone() {
                 Some(store) => {
-                    let store = store.lock().unwrap_or_else(|e| e.into_inner());
-                    more_events(&store, &session, before, limit).unwrap_or_else(|e| {
-                        crate::logging::log(&format!("web：載入更多失敗：{e}"));
-                        Vec::new()
-                    })
+                    // 讀 JSONL 會阻塞，不在 async worker 上做（L-7）
+                    let sid = session.clone();
+                    tokio::task::spawn_blocking(move || more_events(&store, &sid, before, limit))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(crate::store::StoreError::Io(std::io::Error::other(e)))
+                        })
+                        .unwrap_or_else(|e| {
+                            crate::logging::log(&format!("web：載入更多失敗：{e}"));
+                            Vec::new()
+                        })
                 }
                 None => Vec::new(),
             };
@@ -790,57 +962,43 @@ async fn on_message(socket: &mut WebSocket, state: &WebState, conn: &mut Conn, t
 /// 伴隨 Event 從窗口第一個 seq 往前、最後一個 seq 往後各 [`COMPANION_LOOKBACK`] 個找：平行工具的結果
 /// 常在下一張卡片進串流之後才到；伴隨 Event 依 toolUseId 過濾，不會混進窗口外的卡片。
 /// 狀態行仍以下一個帶 pos 的 Event 的時間為上限。
+///
+/// 鎖內只查 offset、放掉鎖再讀 JSONL（L-7、X1）：讀檔期間主迴圈的寫入與別的請求不用等。會阻塞，呼叫端放進 blocking 執行緒。
 pub(crate) fn more_events(
-    store: &Store,
+    store: &Mutex<Store>,
     session: &str,
     before: Option<u64>,
     limit: usize,
 ) -> Result<Vec<Event>, crate::store::StoreError> {
-    let window = store.stream_before(session, before, limit)?;
+    let lock = || store.lock().unwrap_or_else(|e| e.into_inner());
+    let (reads, reader) = {
+        let s = lock();
+        (s.stream_before_reads(session, before, limit)?, s.reader())
+    };
+    let window = reader.read(&reads)?;
     let (Some(first), Some(last)) = (window.first(), window.last()) else {
         return Ok(window);
     };
-    let next = store.next_pos_after(session, last.pos.unwrap_or(0))?;
     let from = first.seq.saturating_sub(COMPANION_LOOKBACK);
-    let pool = store.events_by_seq(session, from, last.seq + COMPANION_LOOKBACK)?;
+    // 只讀伴隨 Event 與狀態行；帶 pos 的窗口已經讀過（E-L9）
+    let (next, pool_reads) = {
+        let s = lock();
+        (
+            s.next_pos_after(session, last.pos.unwrap_or(0))?,
+            s.unplaced_by_seq_reads(
+                session,
+                from,
+                last.seq + COMPANION_LOOKBACK,
+                crate::live::pool_kinds(),
+            )?,
+        )
+    };
+    let pool = reader.read(&pool_reads)?;
     Ok(crate::live::assemble_stream(
         window,
         pool,
         next.map(|(_, ts)| ts),
     ))
-}
-
-/// 全專案回放（#702）的一頁：先依跨 session 順序鍵挑出 `limit` 個串流位置，再把每個 session 的那一段
-/// 照「載入更多」組回來（卡片的呼叫、狀態、結果一起帶）。回傳 (Event, 下一頁的游標)；沒有更舊的時游標是 None。
-pub(crate) fn project_events(
-    store: &Store,
-    root: &str,
-    from: u64,
-    to: u64,
-    before: Option<&ProjectKey>,
-    limit: usize,
-) -> Result<(Vec<Event>, Option<ProjectKey>), crate::store::StoreError> {
-    let window = store.project_window(root, from, to, before, limit)?;
-    // 同一個 session 在這一頁的 pos 範圍；pos 在 session 內連續，用範圍取不受 ts_seen 偶爾倒退影響
-    let mut spans: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-    for k in &window {
-        let e = spans.entry(&k.session).or_insert((k.pos, k.pos));
-        e.0 = e.0.min(k.pos);
-        e.1 = e.1.max(k.pos);
-    }
-    let mut out = Vec::new();
-    for (session, (lo, hi)) in spans {
-        out.extend(more_events(
-            store,
-            session,
-            Some(hi + 1),
-            (hi - lo + 1) as usize,
-        )?);
-    }
-    let next = (window.len() == limit)
-        .then(|| window.last().cloned())
-        .flatten();
-    Ok((out, next))
 }
 
 async fn healthz(State(state): State<Arc<WebState>>) -> Response {

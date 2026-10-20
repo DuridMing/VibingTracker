@@ -81,6 +81,67 @@ fn home_comes_from_cli_then_env() {
     );
 }
 
+/// W-M6（#739）：home 結尾的分隔符號拿掉。Windows 的 `"C:\x\"` 在命令列上會把結尾的引號跳脫掉，
+/// 工作排程器的 `<Arguments>` 因此壞掉；collector.json 的位址、log 的路徑也跟著一致。
+/// （`PathBuf` 的 `==` 不看結尾的分隔符號，所以另外檢查字串的結尾；分隔符號在 Windows 上會重組成 `\`，不比寫法）
+#[test]
+fn home_has_no_trailing_separator() {
+    fn no_trailing(home: &std::path::Path, want: &str) {
+        let s = home.to_str().unwrap();
+        assert!(
+            !s.ends_with('/') && !s.ends_with('\\'),
+            "結尾還有分隔符號：{s}"
+        );
+        assert_eq!(home, std::path::Path::new(want));
+    }
+    let c = resolve(
+        Overrides::default(),
+        &[("CODING_LAB_HOME", "/tmp/x/")],
+        None,
+    )
+    .unwrap();
+    no_trailing(&c.home, "/tmp/x");
+    let cli = Overrides {
+        home: Some("/tmp/y//".into()),
+        ..Overrides::default()
+    };
+    no_trailing(&resolve(cli, &[], None).unwrap().home, "/tmp/y");
+    let root = Overrides {
+        home: Some("/".into()),
+        ..Overrides::default()
+    };
+    assert_eq!(
+        resolve(root, &[], None).unwrap().home,
+        std::path::Path::new("/")
+    );
+}
+
+/// W-L10-4（#739）：家目錄在 Windows 先看 USERPROFILE、其他平台先看 HOME。Git Bash 會設 HOME，
+/// 和 PowerShell、工作排程器（只有 USERPROFILE）拉起的 collector 會用到不同的資料目錄。空字串當作沒設。
+#[test]
+fn user_home_prefers_userprofile_on_windows_and_home_elsewhere() {
+    use coding_lab::config::user_home_from;
+    let pick = |vars: &[(&str, &str)], windows: bool| {
+        let m: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        user_home_from(&|k: &str| m.get(k).cloned(), windows)
+    };
+    let both = [("HOME", "/c/Users/u"), ("USERPROFILE", r"C:\Users\u")];
+    assert_eq!(pick(&both, true), Some(PathBuf::from(r"C:\Users\u")));
+    assert_eq!(pick(&both, false), Some(PathBuf::from("/c/Users/u")));
+    assert_eq!(
+        pick(&[("HOME", "/home/u")], true),
+        Some(PathBuf::from("/home/u"))
+    );
+    assert_eq!(
+        pick(&[("HOME", "/home/u"), ("USERPROFILE", "")], true),
+        Some(PathBuf::from("/home/u"))
+    );
+    assert_eq!(pick(&[("HOME", "")], false), None);
+}
+
 #[test]
 fn web_auth_keys_parse_with_defaults() {
     use coding_lab::config::{AuthMode, RemoteThinking};
@@ -290,7 +351,7 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
     let many = resolve(
         Overrides::default(),
         &[],
-        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.77.241:4801\"]\n"),
+        Some("[web]\nbind = [\"127.0.0.1:4801\", \"192.168.1.5:4801\"]\n"),
     )
     .unwrap();
     assert_eq!(
@@ -303,7 +364,7 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
             .iter()
             .map(|a| a.to_string())
             .collect::<Vec<_>>(),
-        ["127.0.0.1:4801", "192.168.77.241:4801"]
+        ["127.0.0.1:4801", "192.168.1.5:4801"]
     );
 
     let env = resolve(
@@ -338,4 +399,76 @@ fn web_bind_accepts_a_list_and_keeps_the_first_as_primary() {
     )
     .unwrap_err();
     assert!(err.contains("allow_insecure"), "{err}");
+}
+
+/// L-16（#750）：打錯的鍵（`bnd`、`[colector]`、upstream 的 `kye`）原本被 serde 默默略過、用預設值；
+/// 改成照樣啟動（打錯一個字不該讓 collector 起不來、hook 全丟）但每個都列成警告。
+#[test]
+fn unknown_keys_in_config_toml_are_warned() {
+    let file = r#"
+        unknown_top = 1
+        [web]
+        bnd = "127.0.0.1:4801"
+        [colector]
+        idle_exit_seconds = 5
+        [[hub.upstream]]
+        name = "a"
+        url = "http://127.0.0.1:4801"
+        kye = "clk_x"
+    "#;
+    let c = resolve(Overrides::default(), &[], Some(file)).unwrap();
+    let w = c.warnings.join("\n");
+    for key in [
+        "unknown_top",
+        "[web].bnd",
+        "[colector]",
+        "[[hub.upstream]].kye",
+    ] {
+        assert!(w.contains(key), "沒警告 {key}：{w}");
+    }
+    assert_eq!(c.idle_exit_seconds, 600, "打錯的段落不生效");
+
+    let known = r#"
+        [hook]
+        bind = "127.0.0.1:4800"
+        [web]
+        bind = ["127.0.0.1:4801"]
+        root = "/srv/web"
+        auth = "local-open"
+        remote_thinking = "hide"
+        allow_insecure = false
+        [collector]
+        idle_exit_seconds = 5
+        store_flush_ms = 100
+        wait_guess_seconds = 60
+        [hub]
+        bind = "127.0.0.1:4802"
+        [[hub.upstream]]
+        name = "a"
+        url = "http://127.0.0.1:4801"
+        key = "clk_x"
+    "#;
+    let c = resolve(Overrides::default(), &[], Some(known)).unwrap();
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+}
+
+/// B-S1（#739）：`serve --log-file` 或 `CODING_LAB_LOG_FILE=1` 讓 collector 一律寫 collector.log。
+#[test]
+fn log_file_comes_from_the_flag_or_the_environment() {
+    assert!(!resolve(Overrides::default(), &[], None).unwrap().log_file);
+    let cli = Overrides {
+        log_file: true,
+        ..Overrides::default()
+    };
+    assert!(resolve(cli, &[], None).unwrap().log_file);
+    assert!(
+        resolve(Overrides::default(), &[("CODING_LAB_LOG_FILE", "1")], None)
+            .unwrap()
+            .log_file
+    );
+    assert!(
+        !resolve(Overrides::default(), &[("CODING_LAB_LOG_FILE", "0")], None)
+            .unwrap()
+            .log_file
+    );
 }

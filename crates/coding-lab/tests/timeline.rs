@@ -275,3 +275,300 @@ fn sessions_ended_more_than_two_hours_before_t_are_gone() {
     let r = replay(&l.events, &[], 2 * 3_600_000 + 6000, 0, 100, 0, true);
     assert_eq!(ids(&r["snapshot"], "sessions"), ["new"]);
 }
+
+// ── C9（#742）：同 session 內一律依 seq 套用，ts_seen 倒退也不對調（不變式 1） ──────────────
+
+fn raw(s: &str, seq: u64, kind: &str, pos: Option<u64>, ts: u64, payload: Value) -> Event {
+    Event::from_json_line(
+        &json!({"v": 1, "session": s, "seq": seq, "type": kind, "agent": "main", "line": null,
+                "pos": pos, "ts_model": null, "ts_exec": null, "ts_seen": ts, "host": "local",
+                "payload": payload})
+        .to_string(),
+    )
+    .unwrap()
+}
+
+fn started_raw(s: &str, ts: u64) -> Event {
+    raw(
+        s,
+        1,
+        "session.started",
+        None,
+        ts,
+        json!({"cwd": "/p", "source": "startup", "model": null, "transcriptPath": null, "branch": null}),
+    )
+}
+
+fn row_of<'a>(snap: &'a Value, id: &str) -> &'a Value {
+    snap["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == id)
+        .unwrap()
+}
+
+/// seq3 wait、seq4 run（最後是 run），但 seq4 的 ts_seen 比 seq3 早 1 ms：即時依 seq 是 run，回放也要是 run。
+#[test]
+fn replay_applies_a_sessions_events_in_seq_order_even_when_ts_goes_back() {
+    let events = vec![
+        started_raw("s1", 1000),
+        raw(
+            "s1",
+            2,
+            "assistant.text",
+            Some(1),
+            1500,
+            json!({"text": "t", "messageId": "m", "model": null}),
+        ),
+        raw(
+            "s1",
+            3,
+            "session.status",
+            None,
+            2000,
+            json!({"status": "wait", "since": 2000, "score": 0}),
+        ),
+        raw(
+            "s1",
+            4,
+            "session.status",
+            None,
+            1999,
+            json!({"status": "run", "since": 1999, "score": 0}),
+        ),
+    ];
+    // 不論傳進來的順序（依 ts 排好的也一樣）
+    let mut by_ts = events.clone();
+    by_ts.sort_by_key(|e| (e.ts_seen, e.seq));
+    for input in [events, by_ts] {
+        let body = replay(&input, &[], 3000, 3000, 2000, 0, true);
+        assert_eq!(row_of(&body["snapshot"], "s1")["status"], "run");
+    }
+}
+
+#[test]
+fn replay_does_not_resurrect_an_attention_cleared_with_an_earlier_ts() {
+    let mut events = vec![
+        started_raw("s1", 1000),
+        raw(
+            "s1",
+            2,
+            "attention.raised",
+            None,
+            2000,
+            json!({"kind": "wait", "ref": "t1", "reason": "等你"}),
+        ),
+        raw(
+            "s1",
+            3,
+            "attention.cleared",
+            None,
+            1999,
+            json!({"kind": "wait", "ref": "t1", "reason": null}),
+        ),
+    ];
+    events.sort_by_key(|e| (e.ts_seen, e.seq));
+    let body = replay(&events, &[], 3000, 3000, 2000, 0, true);
+    assert_eq!(
+        body["snapshot"]["attention"],
+        json!([]),
+        "{}",
+        body["snapshot"]
+    );
+}
+
+/// ts 倒退時 frame 的時間點仍然單調（前端的時鐘只往前走），倒退的那筆跟著前一個時間點。
+#[test]
+fn replay_frames_stay_in_time_order_when_ts_goes_back() {
+    let events = vec![
+        started_raw("s1", 1000),
+        raw(
+            "s1",
+            2,
+            "assistant.text",
+            Some(1),
+            2000,
+            json!({"text": "a", "messageId": "m1", "model": null}),
+        ),
+        raw(
+            "s1",
+            3,
+            "assistant.text",
+            Some(2),
+            1990,
+            json!({"text": "b", "messageId": "m2", "model": null}),
+        ),
+        raw(
+            "s1",
+            4,
+            "assistant.text",
+            Some(3),
+            3000,
+            json!({"text": "c", "messageId": "m3", "model": null}),
+        ),
+        started_raw("s2", 2500),
+    ];
+    let body = replay(&events, &[], 1000, 5000, 2000, 0, false);
+    let ts: Vec<u64> = body["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["ts"].as_u64().unwrap())
+        .collect();
+    assert!(ts.windows(2).all(|w| w[0] < w[1]), "{ts:?}");
+    let text: Vec<String> = body["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["events"].as_array().unwrap().clone())
+        .filter(|e| e["type"] == "assistant.text")
+        .map(|e| e["payload"]["text"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(text, ["a", "b", "c"], "同 session 依 seq");
+}
+
+/// E-L1（#742）：store 只讀到本頁的截止時間，不再每頁讀到整個範圍的尾；一頁一頁接下去不漏不重。
+#[test]
+fn store_reads_only_this_page_and_pages_cover_everything_once() {
+    use coding_lab::store::Store;
+    use coding_lab::timeline::{Page, replay_page};
+    let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("timeline-page-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let mut store = Store::open(&home).unwrap();
+    store.append(started_raw("s1", 1000));
+    store.append(started_raw("s2", 1000));
+    // 兩個 session 交錯，每 10 ms 一行，各 500 行
+    for i in 0..500u64 {
+        for (k, s) in ["s1", "s2"].iter().enumerate() {
+            let ts = 2000 + i * 10 + k as u64;
+            store.append(raw(
+                s,
+                i + 2,
+                "assistant.text",
+                Some(i + 1),
+                ts,
+                json!({"text": format!("{s}-{i}"), "messageId": format!("m{i}"), "model": null}),
+            ));
+        }
+    }
+    store.flush().unwrap();
+    let until = 100_000;
+    let (events, _, cut) = store.timeline("/p", 0, 1000, until, 100).unwrap();
+    assert!(cut.is_some(), "1000 行、limit 100：要截");
+    assert!(
+        events.len() <= 2 + 101 + 2,
+        "只讀到本頁：{} 筆",
+        events.len()
+    );
+
+    let mut at = 1000;
+    let mut seen: Vec<String> = Vec::new();
+    let mut first = true;
+    loop {
+        let (events, acks, cut) = store.timeline("/p", 0, at, until, 100).unwrap();
+        let page = Page {
+            at,
+            until,
+            cut,
+            limit: 100,
+            offset_min: 0,
+            with_snapshot: first,
+        };
+        first = false;
+        let body = replay_page(&events, &acks, &page);
+        for f in body["frames"].as_array().unwrap() {
+            for e in f["events"].as_array().unwrap() {
+                if e["type"] == "assistant.text" {
+                    seen.push(e["payload"]["text"].as_str().unwrap().to_string());
+                }
+            }
+        }
+        match body["next"].as_u64() {
+            Some(n) => {
+                assert!(n > at, "next 要往前推：{n} ≤ {at}");
+                at = n;
+            }
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 1000, "不漏不重");
+    let mut uniq = seen.clone();
+    uniq.sort();
+    uniq.dedup();
+    assert_eq!(uniq.len(), 1000);
+}
+
+/// C3（#742，X1）：回放讀 JSONL 時不握 store 鎖，主迴圈（sink、hook 後的 flush）不用等。
+/// 負載測試：16 個 session × 約 1500 行；release 跑：`cargo test --release --test timeline c3_ -- --ignored`。
+#[test]
+#[ignore]
+fn c3_replay_does_not_hold_the_store_lock_while_reading_jsonl() {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("timeline-c3-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let mut s = coding_lab::store::Store::open(&home).unwrap();
+    let filler = "回放負載測試的文字內容。".repeat(24);
+    for i in 0..16u64 {
+        let sid = format!("s{i:02}");
+        s.append(raw(&sid, 1, "session.started", None, 1000 + i,
+            json!({"cwd": "/p", "source": "startup", "model": null, "transcriptPath": null, "branch": null})));
+        for k in 0..1500u64 {
+            s.append(raw(
+                &sid,
+                k + 2,
+                "assistant.text",
+                Some(k + 1),
+                2000 + k * 1200 + i,
+                json!({"text": filler, "messageId": format!("m{k}"), "model": null}),
+            ));
+        }
+    }
+    s.flush().unwrap();
+    let store = Arc::new(Mutex::new(s));
+    let state = coding_lab::ws::WebState::new(Some(store.clone()), None, 8);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let addr = rt.block_on(async {
+        coding_lab::ws::serve_web("127.0.0.1:0".parse().unwrap(), state)
+            .await
+            .unwrap()
+            .0
+    });
+    // 主迴圈的替身：不停地拿 store 鎖，記下最久等了多久
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (st2, stop2) = (store.clone(), stop.clone());
+    let waiter = std::thread::spawn(move || {
+        let mut worst = Duration::ZERO;
+        while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+            let t = Instant::now();
+            drop(st2.lock().unwrap());
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worst
+    });
+    let at = 2000 + 1500 * 1200;
+    let resp = rt.block_on(async {
+        let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut c,
+            format!("GET /api/projects/replay?cwd=%2Fp&at={at}&until={at} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut c, &mut out).await.unwrap();
+        out
+    });
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let worst = waiter.join().unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "{}",
+        &resp[..200.min(resp.len())]
+    );
+    eprintln!("C3：回放期間主迴圈最久等 store 鎖 {worst:?}");
+    assert!(
+        worst < Duration::from_millis(100),
+        "回放讓主迴圈等 store 鎖 {worst:?}"
+    );
+}

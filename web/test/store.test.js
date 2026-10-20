@@ -96,3 +96,17 @@ test("offline 列只標既有的 session，不為沒看過的 id 建空列（#72
   assert.equal(st.sessions.get("a").offline, undefined);
   assert.deepEqual([...st.sessions.keys()], ["a"]);
 });
+
+test("storeError：snapshot 一定帶；frame 只在改變時帶這個鍵（null 是恢復）；沒帶就維持原狀（#781 W-M10、contracts §6）", () => {
+  const st = createStore();
+  applySnapshot(st, { sessions: [], agents: [], attention: [], kpi: {}, storeError: { message: "disk full", since: 1, pending: 3, dropped: 0 } });
+  assert.equal(st.storeError.message, "disk full");
+  applyFrame(st, { rows: { sessions: [] } });
+  assert.equal(st.storeError.pending, 3, "沒帶這個鍵：維持");
+  applyFrame(st, { storeError: { message: "disk full", since: 1, pending: 9, dropped: 0 } });
+  assert.equal(st.storeError.pending, 9, "沒有 rows 的 frame 也要套");
+  applyFrame(st, { rows: {}, storeError: null });
+  assert.equal(st.storeError, null, "恢復");
+  applySnapshot(st, { sessions: [], agents: [], attention: [], kpi: {} });
+  assert.equal(st.storeError, null, "舊的 collector 沒有這個欄位：當成正常");
+});

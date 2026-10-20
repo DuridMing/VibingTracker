@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use coding_lab::service::{self, Ctx, Plan, Platform, Step};
+use coding_lab::service::{self, Ctx, Plan, Platform};
 
 fn ctx(home: &Path) -> Ctx {
     Ctx {
@@ -26,7 +26,8 @@ fn tmp(name: &str) -> PathBuf {
 fn file_of<'a>(plan: &'a Plan, suffix: &str) -> &'a str {
     plan.files
         .iter()
-        .find(|(p, _)| p.to_string_lossy().ends_with(suffix))
+        // Windows 上 Path::join 產生 `\`，比對前統一成 `/`
+        .find(|(p, _)| p.to_string_lossy().replace('\\', "/").ends_with(suffix))
         .map(|(_, c)| c.as_str())
         .unwrap_or_else(|| panic!("plan 裡沒有 {suffix}：{:?}", plan.files))
 }
@@ -42,6 +43,12 @@ fn linux_writes_a_systemd_user_unit_that_keeps_the_collector_resident() {
         "ExecStop 的 stop 沒有 --home，要靠環境變數：{unit}"
     );
     assert!(unit.contains("WantedBy=default.target"), "{unit}");
+    // R-7（#739）：開機時 bind 失敗（網路還沒好、埠被佔）要一直重試，不撞 systemd 預設的 5 次／10 秒上限
+    let unit_section = unit.split("[Service]").next().unwrap();
+    assert!(
+        unit_section.contains("StartLimitIntervalSec=0"),
+        "要在 [Unit]：{unit}"
+    );
     let cmds: Vec<String> = plan.commands.iter().map(|c| c.join(" ")).collect();
     assert!(
         cmds.iter().any(|c| c == "systemctl --user daemon-reload"),
@@ -89,6 +96,83 @@ fn macos_writes_a_launch_agent_and_bootstraps_it_for_the_users_gui_domain() {
     );
 }
 
+/// R-15（#739）：systemd 會展開 `%` 指定符，Exec 行還會展開 `$` 變數：路徑裡的要寫成 `%%`、`$$`
+/// （Environment= 只展開 `%`）。有空白、引號、反斜線的路徑加引號、裡面的 `\` 與 `"` 跳脫。
+#[test]
+fn systemd_unit_escapes_specifiers_variables_and_quotes() {
+    let mut c = ctx(Path::new("/home/u/100%/$x/.coding-lab"));
+    c.exe = PathBuf::from("/opt/my apps/coding-lab");
+    let plan = service::plan_install(Platform::Linux, &c);
+    let unit = file_of(&plan, "coding-lab.service");
+    assert!(
+        unit.contains(
+            "ExecStart=\"/opt/my apps/coding-lab\" serve --home /home/u/100%%/$$x/.coding-lab --idle-exit-seconds 0 --log-file\n"
+        ),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("ExecStop=\"/opt/my apps/coding-lab\" stop\n"),
+        "{unit}"
+    );
+    assert!(
+        unit.contains("Environment=CODING_LAB_HOME=/home/u/100%%/$x/.coding-lab\n"),
+        "{unit}"
+    );
+    let mut c = ctx(Path::new(r#"/home/u/a"b\c"#));
+    c.exe = PathBuf::from("/opt/coding-lab/bin/coding-lab");
+    let unit = file_of(
+        &service::plan_install(Platform::Linux, &c),
+        "coding-lab.service",
+    )
+    .to_string();
+    assert!(unit.contains(r#"--home "/home/u/a\"b\\c" "#), "{unit}");
+}
+
+/// W-M6（#739）：`<Arguments>` 照 Windows 的命令列規則加引號；結尾的 `\` 在引號前要加倍，
+/// 否則 `"C:\x\"` 的引號被跳脫、後面的參數全黏進 home。
+#[test]
+fn windows_task_arguments_survive_a_trailing_backslash() {
+    let c = Ctx {
+        exe: PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe"),
+        home: PathBuf::from(r"D:\data\"),
+        config_home: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
+        user_home: PathBuf::from(r"C:\Users\u"),
+        uid: None,
+        user: None,
+    };
+    let xml = file_of(
+        &service::plan_install(Platform::Windows, &c),
+        "coding-lab-task.xml",
+    )
+    .to_string();
+    assert!(
+        xml.contains(
+            r#"<Arguments>--headless &quot;C:\Program Files\coding-lab\coding-lab.exe&quot; serve --home &quot;D:\data\\&quot; --idle-exit-seconds 0 --log-file</Arguments>"#
+        ),
+        "{xml}"
+    );
+}
+
+/// R-6（#739）：`coding-lab stop` 停掉的是常駐服務本身，三個平台都不會自己再起來（正常結束不算失敗）；
+/// stop 之後提示用服務管理員的指令把它叫回來。
+#[test]
+fn start_command_brings_the_resident_collector_back() {
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    let j = |p| service::start_command(p, &c).join(" ");
+    assert_eq!(
+        j(Platform::Linux),
+        "systemctl --user start coding-lab.service"
+    );
+    assert_eq!(
+        j(Platform::Macos),
+        "launchctl kickstart gui/1000/io.coding-lab.collector"
+    );
+    assert_eq!(
+        j(Platform::Windows),
+        r"schtasks /Run /TN \CodingLab\default"
+    );
+}
+
 #[test]
 fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     let c = Ctx {
@@ -102,13 +186,15 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     let plan = service::plan_install(Platform::Windows, &c);
     let xml = file_of(&plan, "coding-lab-task.xml");
     assert!(xml.contains("<LogonTrigger>"), "{xml}");
+    // L-12（#739）：console 程式直接當 Exec 會在登入時開出主控台視窗、關掉就殺掉 collector；
+    // 經 `conhost.exe --headless` 跑就沒有視窗（`<Hidden>` 只是在工作排程器的清單裡隱藏）
     assert!(
-        xml.contains(r"<Command>C:\Users\u\AppData\Local\coding-lab\coding-lab.exe</Command>"),
+        xml.contains(r"<Command>%SystemRoot%\System32\conhost.exe</Command>"),
         "{xml}"
     );
     assert!(
         xml.contains(
-            r#"<Arguments>serve --home "C:\Users\u\.coding-lab" --idle-exit-seconds 0</Arguments>"#
+            r#"<Arguments>--headless &quot;C:\Users\u\AppData\Local\coding-lab\coding-lab.exe&quot; serve --home &quot;C:\Users\u\.coding-lab&quot; --idle-exit-seconds 0 --log-file</Arguments>"#
         ),
         "{xml}"
     );
@@ -127,12 +213,13 @@ fn windows_writes_a_scheduled_task_xml_that_runs_at_logon_and_registers_it() {
     );
     let cmds: Vec<String> = plan.commands.iter().map(|c| c.join(" ")).collect();
     assert!(
-        cmds.iter()
-            .any(|c| c.starts_with("schtasks /Create /TN CodingLab /XML ") && c.ends_with(" /F")),
+        cmds.iter().any(
+            |c| c.starts_with(r"schtasks /Create /TN \CodingLab\u /XML ") && c.ends_with(" /F")
+        ),
         "{cmds:?}"
     );
     assert!(
-        cmds.iter().any(|c| c == "schtasks /Run /TN CodingLab"),
+        cmds.iter().any(|c| c == r"schtasks /Run /TN \CodingLab\u"),
         "{cmds:?}"
     );
 }
@@ -184,7 +271,7 @@ fn uninstall_removes_exactly_what_install_wrote_on_every_platform() {
             &ctx(Path::new(r"C:\Users\u\.coding-lab"))
         )
         .iter()
-        .any(|c| c == "schtasks /Delete /TN CodingLab /F")
+        .any(|c| c == r"schtasks /Delete /TN \CodingLab\default /F")
     );
 }
 
@@ -200,9 +287,9 @@ fn apply_writes_files_then_runs_commands_and_uninstall_leaves_nothing_behind() {
         user: None,
     };
     let install = service::plan_install(Platform::Linux, &c);
-    let mut ran: Vec<Step> = Vec::new();
+    let mut ran: Vec<Vec<String>> = Vec::new();
     service::apply(&install, &mut |cmd| {
-        ran.push(Step::Command(cmd.to_vec()));
+        ran.push(cmd.to_vec());
         Ok(())
     })
     .unwrap();
@@ -260,7 +347,10 @@ fn status_asks_the_service_manager_not_just_the_file() {
         cmds(Platform::Macos),
         "launchctl print gui/1000/io.coding-lab.collector"
     );
-    assert_eq!(cmds(Platform::Windows), "schtasks /Query /TN CodingLab");
+    assert_eq!(
+        cmds(Platform::Windows),
+        r"schtasks /Query /TN \CodingLab\default"
+    );
     for p in [Platform::Linux, Platform::Macos, Platform::Windows] {
         assert!(
             service::query_installed(p, &c, &mut |_| Ok("enabled\n".into())),
@@ -326,13 +416,17 @@ fn install_restores_the_collector_when_registration_fails() {
 fn non_utf8_command_output_is_flagged_instead_of_shown_as_garbage() {
     let (text, lossy) = service::decode_output(b"ERROR: Access is denied.\r\n");
     assert_eq!((text.as_str(), lossy), ("ERROR: Access is denied.", false));
-    // cp950 的「錯誤: 存取被拒。」不是合法 UTF-8
-    let (text, lossy) = service::decode_output(b"\xbf\xf9\xbb~: \xa6s\xa8\xfa\xb3Q\xa9\xda\xa1C");
+    // cp950 的「錯誤: 存取被拒。」不是合法 UTF-8；沒有可用的 code page 時只能 lossy。
+    // code page 用注入的：在 OEM code page 950 的 Windows 上 decode_output 會解碼成功（#724），斷言就不成立（#732）
+    let (text, lossy) =
+        service::decode_output_with(b"\xbf\xf9\xbb~: \xa6s\xa8\xfa\xb3Q\xa9\xda\xa1C", None);
     assert!(lossy);
     assert!(!text.is_empty());
 }
 
-/// #724：Windows 的 schtasks 用 OEM code page 輸出，要解成可讀文字（實機拿到的 cp950 位元組）
+/// #724：Windows 的 schtasks 用 OEM code page 輸出，要解成可讀文字（實機拿到的 cp950 位元組）。
+/// encoding_rs 只在 Windows 編（#758），這個測試由 Windows 的 check.sh／CI 跑
+#[cfg(windows)]
 #[test]
 fn oem_code_page_bytes_decode_to_readable_text() {
     // 「錯誤: 存取被拒。\r\n」的 cp950 位元組（#715 Windows 側實機紀錄）
@@ -364,6 +458,19 @@ fn oem_code_page_bytes_decode_to_readable_text() {
     );
 }
 
+/// 非 Windows 不帶 encoding_rs：code page 對照表照常，解碼一律交給 UTF-8／lossy（#758 E-B9）
+#[cfg(not(windows))]
+#[test]
+fn code_page_decoding_is_windows_only() {
+    assert_eq!(service::code_page_label(950), Some("big5"));
+    assert_eq!(service::code_page_label(12345), None);
+    assert!(service::decode_with_code_page(&[0xbf, 0xf9], 950).is_none());
+    assert_eq!(
+        service::decode_output("ok\n".as_bytes()),
+        ("ok".to_string(), false)
+    );
+}
+
 /// #724：查詢「沒裝」是預期結果，quiet 版不寫 log 也不印十六進位，但錯誤訊息照樣帶回
 #[cfg(unix)]
 #[test]
@@ -386,4 +493,229 @@ fn quiet_capture_returns_the_error_text_without_decorating_it() {
         &c,
         &mut |_| Err("not found".into())
     ));
+}
+
+/// W-L11（#781）：同一個帳號用兩個 home 各 install 一次，第二次被拒並說出原本服務的 home；`--force` 才換。
+#[test]
+fn a_second_install_with_another_home_is_refused() {
+    let dir = tmp("two-homes");
+    let mk = |home: &str| Ctx {
+        exe: PathBuf::from("/opt/coding-lab/bin/coding-lab"),
+        home: dir.join(home),
+        config_home: dir.join("config"),
+        user_home: dir.join("user"),
+        uid: Some(1000),
+        user: None,
+    };
+    let (a, b) = (mk("home a"), mk("home-b"));
+    let mut ok = |_: &[String]| -> Result<String, String> { Ok(String::new()) };
+    assert_eq!(service::existing_home(Platform::Linux, &a, &mut ok), None);
+    service::apply(&service::plan_install(Platform::Linux, &a), &mut |_| Ok(())).unwrap();
+    let existing = service::existing_home(Platform::Linux, &b, &mut ok);
+    assert_eq!(existing.as_deref(), Some(a.home.as_path()));
+    let err = service::check_existing(existing.as_deref(), &b.home, false).unwrap_err();
+    assert!(
+        err.contains(&a.home.display().to_string()) && err.contains("--force"),
+        "{err}"
+    );
+    assert!(service::check_existing(existing.as_deref(), &b.home, true).is_ok());
+    assert!(
+        service::check_existing(existing.as_deref(), &a.home, false).is_ok(),
+        "同一個 home 重裝照常"
+    );
+}
+
+/// W-L11：三個平台寫出去的設定都讀得回原本的 home（含空白、引號、%、$、結尾的反斜線）。
+#[test]
+fn the_home_is_read_back_from_what_install_wrote() {
+    for home in [
+        "/home/u/.coding-lab",
+        "/home/u/a b/100%/$x",
+        r#"/home/u/q"uote"#,
+    ] {
+        let c = ctx(Path::new(home));
+        let unit = file_of(
+            &service::plan_install(Platform::Linux, &c),
+            "coding-lab.service",
+        )
+        .to_string();
+        assert_eq!(
+            service::home_from_unit(&unit).as_deref(),
+            Some(Path::new(home)),
+            "{unit}"
+        );
+        let plist = file_of(&service::plan_install(Platform::Macos, &c), ".plist").to_string();
+        assert_eq!(
+            service::home_from_plist(&plist).as_deref(),
+            Some(Path::new(home)),
+            "{plist}"
+        );
+    }
+    for home in [
+        r"C:\Users\u\.coding-lab",
+        r"D:\data\",
+        r#"C:\a "b"\c"#,
+        r"C:\x y\z",
+    ] {
+        let c = Ctx {
+            exe: PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe"),
+            home: PathBuf::from(home),
+            config_home: PathBuf::from(r"C:\Users\u\AppData\Roaming"),
+            user_home: PathBuf::from(r"C:\Users\u"),
+            uid: None,
+            user: Some(r"DESKTOP-1\u".into()),
+        };
+        let xml = file_of(
+            &service::plan_install(Platform::Windows, &c),
+            "coding-lab-task.xml",
+        )
+        .to_string();
+        assert_eq!(
+            service::home_from_task_xml(&xml).as_deref(),
+            Some(Path::new(home)),
+            "{xml}"
+        );
+    }
+}
+
+/// W-L11：Windows 的工作放在 `\CodingLab\<使用者>`：根目錄的名稱整台機器共用，別的帳號會裝不起來或被蓋掉。
+#[test]
+fn windows_task_is_named_after_the_user() {
+    let mut c = ctx(Path::new(r"C:\Users\u\.coding-lab"));
+    c.user = Some(r"DESKTOP-1\Alice".into());
+    assert_eq!(service::windows_task(&c), r"\CodingLab\Alice");
+    let cmds: Vec<String> = service::plan_install(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    assert!(
+        cmds.iter()
+            .any(|c| c.starts_with(r"schtasks /Create /TN \CodingLab\Alice /XML ")),
+        "{cmds:?}"
+    );
+    let un: Vec<String> = service::plan_uninstall(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    assert!(
+        un.iter()
+            .any(|c| c == r"schtasks /Delete /TN \CodingLab\Alice /F"),
+        "{un:?}"
+    );
+    c.user = Some("we/ird:name".into());
+    assert_eq!(service::windows_task(&c), r"\CodingLab\we_ird_name");
+}
+
+/// B-S1（#739，Windows 驗收）：常駐服務的 collector 一律寫 collector.log（`--log-file`）：Windows 的工作經
+/// `conhost --headless` 跑，stderr 是看不到的主控台，只看終端機判斷時一行 log 都沒有。三個平台一致。
+#[test]
+fn every_platform_runs_serve_with_log_file() {
+    let c = ctx(Path::new("/home/u/.coding-lab"));
+    let unit = file_of(
+        &service::plan_install(Platform::Linux, &c),
+        "coding-lab.service",
+    )
+    .to_string();
+    let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+    assert!(
+        exec.contains(" serve ") && exec.contains("--log-file"),
+        "{exec}"
+    );
+    let plist = file_of(&service::plan_install(Platform::Macos, &c), ".plist").to_string();
+    assert!(plist.contains("<string>--log-file</string>"), "{plist}");
+    let xml = file_of(
+        &service::plan_install(Platform::Windows, &c),
+        "coding-lab-task.xml",
+    )
+    .to_string();
+    let args = xml
+        .split_once("<Arguments>")
+        .unwrap()
+        .1
+        .split_once("</Arguments>")
+        .unwrap()
+        .0;
+    assert!(
+        args.contains(" serve ") && args.contains("--log-file"),
+        "{args}"
+    );
+    // 讀回 home 的解析不受多一個旗標影響
+    assert_eq!(
+        service::home_from_task_xml(&xml).as_deref(),
+        Some(Path::new("/home/u/.coding-lab"))
+    );
+}
+
+/// B-S2（#739）：Windows 的 `schtasks /End` 只結束 conhost，idle-exit 0 的 collector 子程序留下來繼續聽 hook 埠。
+/// uninstall 先 `coding-lab stop`（帶 stopToken、正常結束），再 /End、/Delete。
+#[test]
+fn windows_uninstall_stops_the_collector_before_ending_the_task() {
+    let mut c = ctx(Path::new(r"C:\Users\u\.coding-lab"));
+    c.exe = PathBuf::from(r"C:\Program Files\coding-lab\coding-lab.exe");
+    c.user = Some(r"PC\u".into());
+    let cmds: Vec<String> = service::plan_uninstall(Platform::Windows, &c)
+        .commands
+        .iter()
+        .map(|c| c.join(" "))
+        .collect();
+    let stop = cmds
+        .iter()
+        .position(|c| c == r"C:\Program Files\coding-lab\coding-lab.exe stop");
+    let end = cmds.iter().position(|c| c.starts_with("schtasks /End "));
+    assert!(stop.is_some() && end.is_some() && stop < end, "{cmds:?}");
+}
+
+/// 第 1 輪 Windows 驗收 §8.4：從別的 home 跑 `service status` 時，括號裡的檔要是服務真正用的那個
+/// （Windows 的工作 XML 放在服務的 home），不是目前 home 底下不存在的檔。Linux、macOS 的檔位置和 home 無關。
+#[test]
+fn status_shows_the_file_the_installed_service_uses() {
+    let c = ctx(Path::new("C:/cl-test/l11"));
+    let service_home = Path::new("C:/Users/u/.coding-lab");
+    assert_eq!(
+        service::status_file(Platform::Windows, &c, Some(service_home)),
+        service_home.join(service::WINDOWS_XML)
+    );
+    // 查不到服務的 home（沒裝）：照舊是目前 home 底下的
+    assert_eq!(
+        service::status_file(Platform::Windows, &c, None),
+        service::files_for(Platform::Windows, &c)[0]
+    );
+    for p in [Platform::Linux, Platform::Macos] {
+        assert_eq!(
+            service::status_file(p, &c, Some(service_home)),
+            service::files_for(p, &c)[0],
+            "{p:?}"
+        );
+    }
+}
+
+/// 第 2 輪 Windows 驗收 §2.4：唯讀的 `service status`、`--dry-run` 不能把還不存在的資料目錄建出來
+/// （B-S3 之後 service 子命令一律先建 home 收緊權限、開 collector.log；只有真的會改東西的才要）。
+/// HOME、XDG_CONFIG_HOME 也指到暫存目錄，不碰使用者真的 unit 檔。
+#[test]
+fn read_only_service_commands_do_not_create_the_home() {
+    let dir = tmp("readonly-home");
+    for args in [
+        &["service", "status"][..],
+        &["service", "install", "--dry-run"],
+        &["service", "uninstall", "--dry-run"],
+    ] {
+        let home = dir.join(format!("home-{}", args.join("-")));
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+            .args(args)
+            .env("CODING_LAB_HOME", &home)
+            .env("HOME", dir.join("user"))
+            .env("USERPROFILE", dir.join("user"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            !home.exists(),
+            "{args:?} 不能建出資料目錄：{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

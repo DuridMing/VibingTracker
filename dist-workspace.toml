@@ -1,10 +1,14 @@
 # cargo-dist 的發佈設定（#656）：出五個平台的壓縮檔＋sha256，plugin 的 wrapper 依同樣的檔名下載。
-# 還沒有 GitHub repo，所以沒有設 `ci`；要發佈時執行 `dist init` 產生 CI workflow，再用 `dist plan` 檢查。
+# CI：GitHub Actions（`.github/workflows/release.yml` 由 `dist generate` 產生，不手改；改這裡後重跑 `dist generate`）。
+# 推 `v*` tag 時建五個平台、上傳到 GitHub Release；plugin 的 wrapper 預設從那裡下載（#733）。
 [workspace]
 members = ["cargo:."]
 
 [dist]
 cargo-dist-version = "0.28.0"
+ci = "github"
+# PR 時只跑 plan，不浪費 runner 建五個平台
+pr-run-mode = "plan"
 # 不用 dist 的 shell／powershell installer：plugin 的 wrapper（plugin/bin/coding-lab）自己下載與校驗
 installers = []
 # 改這裡要一起改 wrapper 的 platform()（tests/plugin.rs 會比對）

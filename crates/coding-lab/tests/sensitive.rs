@@ -1,7 +1,7 @@
 //! 敏感輸出（#654）：每條規則都有命中與不命中的案例。
 
-use coding_lab::sensitive::{is_sensitive, redact_keys, redact_remote};
-use serde_json::{Value, json};
+use coding_lab::sensitive::{is_sensitive, redact_keys};
+use serde_json::json;
 
 fn read(path: &str) -> bool {
     is_sensitive("Read", &json!({ "file_path": path }))
@@ -114,36 +114,11 @@ fn bash_reading_secrets_or_dumping_the_environment_hits() {
     }
 }
 
-#[test]
-fn redact_remote_blanks_sensitive_results_anywhere_in_a_frame() {
-    let ev = |sensitive: bool| {
-        json!({"type": "tool.result", "payload": {"toolUseId": "t", "ok": true, "output": "A=secret",
-               "truncated": false, "sensitive": sensitive}})
-    };
-    let mut frame = json!({"t": "frame", "events": [ev(true), ev(false)],
-                           "stream": [ev(true)], "nested": {"events": [ev(true)]}});
-    redact_remote(&mut frame);
-    let out = |v: &Value| {
-        (
-            v["payload"]["output"].clone(),
-            v["payload"]["redacted"].clone(),
-        )
-    };
-    assert_eq!(out(&frame["events"][0]), (json!(""), json!(true)));
-    assert_eq!(
-        out(&frame["events"][1]),
-        (json!("A=secret"), Value::Null),
-        "沒命中的不動"
-    );
-    assert_eq!(out(&frame["stream"][0]), (json!(""), json!(true)));
-    assert_eq!(out(&frame["nested"]["events"][0]), (json!(""), json!(true)));
-}
-
 /// #720：遠端送出的副本裡，這個系統自己發的金鑰（`clk_<8 碼>_<43 碼>`）不論出現在哪個字串欄位都只留 id。
 #[test]
 fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
-    let k1 = "clk_HWYrRkbl_ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8";
-    let k2 = "clk_xka2cp5X_BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD";
+    let k1 = "clk_TestKey1_FakeSecretForTestsOnly000000000000000000000";
+    let k2 = "clk_TestKey2_AnotherFakeSecretForTests111111111111111111";
     let mut v = json!({
         "events": [
             {"type": "assistant.text", "payload": {"text": format!("金鑰是 {k1}，另一把 {k2}。")}},
@@ -159,23 +134,23 @@ fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
     redact_keys(&mut v);
     let text = v.to_string();
     assert!(
-        !text.contains("ff4bBW3FbFRndyOYvtsLRB8ryusCZcbbE2dGf1co9j8"),
+        !text.contains("FakeSecretForTestsOnly000000000000000000000"),
         "{text}"
     );
     assert!(
-        !text.contains("BJyrLdbquLsdOu9hCgLDzqp5d0A4ElLQ5Kktgh1TjLD"),
+        !text.contains("AnotherFakeSecretForTests111111111111111111"),
         "{text}"
     );
     assert_eq!(
         v["events"][0]["payload"]["text"],
-        "金鑰是 clk_HWYrRkbl_…，另一把 clk_xka2cp5X_…。"
+        "金鑰是 clk_TestKey1_…，另一把 clk_TestKey2_…。"
     );
     assert_eq!(
         v["events"][1]["payload"]["input"]["command"],
-        "curl -H 'Authorization: Bearer clk_HWYrRkbl_…' http://x"
+        "curl -H 'Authorization: Bearer clk_TestKey1_…' http://x"
     );
-    assert_eq!(v["rows"]["agents"][0]["current"], "clk_xka2cp5X_…");
-    assert_eq!(v["rows"]["sessions"][0]["doing"], "正在貼 clk_HWYrRkbl_…");
+    assert_eq!(v["rows"]["agents"][0]["current"], "clk_TestKey2_…");
+    assert_eq!(v["rows"]["sessions"][0]["doing"], "正在貼 clk_TestKey1_…");
     assert_eq!(
         v["keep"][0],
         "clk_abc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
@@ -189,4 +164,57 @@ fn redact_keys_masks_the_secret_half_of_every_clk_token_anywhere() {
     let again = v.clone();
     redact_keys(&mut v);
     assert_eq!(v, again);
+}
+
+// ── PowerShell（W-H3）：欄位名假設和 Bash 一樣是 `command`，尚未經實機確認（排在第 1 輪 Windows 驗收）
+
+fn ps(cmd: &str) -> bool {
+    is_sensitive("PowerShell", &json!({ "command": cmd }))
+}
+
+#[test]
+fn powershell_reading_secrets_or_listing_the_environment_hits() {
+    for c in [
+        "Get-Content .env",
+        "gc .env.local",
+        "type .env",
+        "cat .env",
+        "Get-Content -Path C:\\proj\\.env",
+        "Get-Content -Raw 'C:\\Users\\me\\.aws\\credentials'",
+        "Set-Location app; Get-Content config\\.env.production",
+        "Get-Content .e`nv",
+        "gc `\n  .env",
+        "Get-ChildItem env:",
+        "gci Env:",
+        "dir env:",
+        "ls env:*",
+        "Get-Item env:GITHUB_TOKEN",
+        "Get-Content env:AWS_SECRET_ACCESS_KEY",
+        "$env:GITHUB_TOKEN",
+        "[Environment]::GetEnvironmentVariables()",
+        "[System.Environment]::GetEnvironmentVariables() | Format-List",
+    ] {
+        assert!(ps(c), "{c}");
+    }
+    for c in [
+        "Get-Content README.md",
+        "Get-Content .env.example",
+        "Get-ChildItem src",
+        "$env:RUST_LOG = 'debug'; cargo test",
+        "Write-Output 'env:'",
+        "cargo test",
+        "git status",
+        "Get-Content src\\env.rs",
+    ] {
+        assert!(!ps(c), "{c}");
+    }
+}
+
+#[test]
+fn powershell_without_a_command_field_is_not_sensitive() {
+    assert!(!is_sensitive("PowerShell", &json!({})));
+    assert!(!is_sensitive(
+        "PowerShell",
+        &json!({ "script": "Get-Content .env" })
+    ));
 }

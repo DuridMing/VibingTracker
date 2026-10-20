@@ -5,7 +5,7 @@
 // ▶ 回放按鍵（#690）：只給已結束的 session；進行中的直接看即時串流
 export const canReplay = (s) => s?.status === "ended";
 
-const under = (p, base) => p === base || p.startsWith(base.endsWith("/") ? base : `${base}/`);
+import { norm, under } from "./paths.js";
 
 // 同一個 id：WS 的列為準；WS 還沒有模型時用 API 查到的（SQLite 從 usage 補的，#673）。依 startedAt 新到舊
 export function mergeSessions(live, fetched) {
@@ -20,25 +20,19 @@ export function mergeSessions(live, fetched) {
 
 // [{ cwd, sessions: [id], live }]，依 cwd 排序
 export function projectRoots(sessions) {
-  const cwds = [...new Set((sessions ?? []).map((s) => s.cwd).filter(Boolean))];
+  // cwd 先正規化：同一個專案的 e:\ 與 E:\ 歸成一個（#748 L-11）
+  const cwds = [...new Set((sessions ?? []).map((s) => norm(s.cwd)).filter(Boolean))];
   const rootOf = (c) => cwds.filter((o) => under(c, o)).reduce((a, b) => (b.length < a.length ? b : a), c);
   const out = new Map();
   for (const s of sessions ?? []) {
     if (!s.cwd) continue;
-    const r = rootOf(s.cwd);
+    const r = rootOf(norm(s.cwd));
     let p = out.get(r);
     if (!p) out.set(r, (p = { cwd: r, sessions: [], live: 0 }));
     p.sessions.push(s.id);
     if (s.status !== "ended") p.live++;
   }
   return [...out.values()].sort((a, b) => (a.cwd < b.cwd ? -1 : a.cwd > b.cwd ? 1 : 0));
-}
-
-// 使用者選過、而且還在就用它；否則選進行中 session 最多的
-export function pickProject(roots, prev) {
-  if (!roots.length) return null;
-  if (prev && roots.some((r) => r.cwd === prev)) return prev;
-  return roots.reduce((a, b) => (b.live > a.live ? b : a)).cwd;
 }
 
 // session tab 列放不下時（#704）：widths 是每個 tab 的寬（含間距），avail 是可用寬，moreW 是「+N」按鈕的寬。

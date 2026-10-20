@@ -5,13 +5,9 @@
 
 export const LAZY_THRESHOLD = 5000;
 
-const norm = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+import { norm, relUnder as under } from "./paths.js";
+
 const isAbs = (p) => p.startsWith("/") || /^[A-Za-z]:\//.test(p);
-// p 在 base 底下時回傳相對的部分（等於 base 是 ""），否則 null
-function under(p, base) {
-  if (p === base) return "";
-  return p.startsWith(base + "/") ? p.slice(base.length + 1) : null;
-}
 const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 function ancestors(path) {
@@ -91,8 +87,9 @@ export function gitMarks(changes) {
 }
 
 // 基準 → GET /api/files 的網址。「本次開啟以來」不在 collector（前端累積），仍要 tree，用 base=main 抓
-export function filesUrl(cwd, base) {
-  const q = (c, b) => `/api/files?cwd=${encodeURIComponent(c)}&base=${encodeURIComponent(b)}`;
+// have：上次回應的 treeHash，相同時伺服器省略 tree（樹只在新增或刪除檔案時才變，#766 F-6）
+export function filesUrl(cwd, base, have = null) {
+  const q = (c, b) => `/api/files?cwd=${encodeURIComponent(c)}&base=${encodeURIComponent(b)}${have ? `&have=${encodeURIComponent(have)}` : ""}`;
   switch (base?.kind) {
     case "session":
       return q(cwd, `session:${base.id}`);
@@ -111,6 +108,17 @@ export function sinceChanges(t) {
 }
 
 const PENDING_MAX = 2000;
+// 去重（session:seq）與卡片對照（toolUseId）的上限：超過就丟最舊的四分之一（Set／Map 依插入順序）。
+// snapshot、重連重送的只有最近的視窗，早就丟掉的鍵不會再出現，計數不會重複（#766 F-5）
+const SEEN_MAX = 100_000;
+function cap(coll, max = SEEN_MAX) {
+  if (coll.size <= max) return;
+  let n = coll.size - Math.floor(max * 0.75);
+  for (const k of coll.keys()) {
+    if (n-- <= 0) break;
+    coll.delete(k);
+  }
+}
 
 export function createFileTree() {
   const t = {
@@ -211,6 +219,7 @@ export function createFileTree() {
   function countFail(id, hits) {
     const tp = toolPath.get(id);
     countedFail.add(id);
+    cap(countedFail);
     pendingFail.delete(id);
     count(tp.path).x++;
     hits.push({ path: tp.path, kind: "x", session: tp.session });
@@ -221,6 +230,7 @@ export function createFileTree() {
     const tp = toolPath.get(id);
     if (!tp || tp.kind === "r" || revoked.has(id)) return;
     revoked.add(id);
+    cap(revoked);
     const c = count(tp.path);
     c[tp.kind] = Math.max(0, c[tp.kind] - 1);
     if (tp.kind === "w" && c.w === 0) c.isNew = false;
@@ -278,11 +288,13 @@ export function createFileTree() {
       const key = `${e.session}:${e.seq}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      cap(seen);
       const pl = e.payload ?? {};
       const id = pl.toolUseId;
       if (isFail) {
         if (!id) continue;
-        const interrupted = !!pl.interrupted;
+        // Esc 中斷與使用者拒絕（denied）都不算失敗，但改動一樣收回（contracts §4「失敗」的計數，#745 D6）
+        const interrupted = !!pl.interrupted || !!pl.denied;
         if (toolPath.has(id)) failCard(id, interrupted, hits);
         else {
           pendingFail.set(id, interrupted);
@@ -309,6 +321,7 @@ export function createFileTree() {
       hits.push({ path, kind, session: e.session });
       if (id) {
         toolPath.set(id, { path, session: e.session, kind });
+        cap(toolPath);
         if (pendingFail.has(id)) failCard(id, pendingFail.get(id), hits);
       }
     }
@@ -317,6 +330,8 @@ export function createFileTree() {
 
   // session 的 cwd 加 file.* 的 path → 相對專案根（不在專案裡回 null）
   t.pathOf = (cwd, path) => projectPath({ root: t.root, cwd, path, hasDir, worktrees });
+
+  t.sizes = () => ({ seen: seen.size, toolPath: toolPath.size, revoked: revoked.size, countedFail: countedFail.size });
 
   t.counts = (path) => ({ ...(counts.get(path) ?? { r: 0, e: 0, w: 0, x: 0, isNew: false }) });
 
@@ -353,10 +368,7 @@ export function createFileTree() {
   t.mark = (path) => git.get(path) ?? null;
 
   const isOpen = (dir) => (user.has(dir) ? user.get(dir) : activeDirs.has(dir) || gitDirs.has(dir));
-  t.isOpen = isOpen;
   t.toggle = (dir) => user.set(dir, !isOpen(dir));
-
-  t.isDir = hasDir;
 
   t.materialized = () => memo.size;
 

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use coding_lab::derive::{edit_hunk, git_op_from, relative_path};
+use coding_lab::derive::{edit_hunk, git_op_from, relative_path, shell_segments};
 use coding_lab::event::{Event, HunkSource};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{DangerRules, Input, Merger, SESSION_IDLE_EVICT_MS};
@@ -214,6 +214,75 @@ fn git_subcommands_and_non_git() {
         git_op_from("echo 'git commit'", None, true).is_none(),
         "字串裡的 git 不算"
     );
+}
+
+fn segs(cmd: &str) -> Vec<Vec<String>> {
+    shell_segments(cmd)
+}
+
+fn v(words: &[&str]) -> Vec<String> {
+    words.iter().map(|w| w.to_string()).collect()
+}
+
+/// 分詞（#745 K-9）：反斜線跳脫與續行、雙引號內的跳脫、heredoc 本文、註解、重導向、命令替換。
+#[test]
+fn shell_segments_follow_shell_quoting() {
+    assert_eq!(
+        segs("git push \\\n  --force origin"),
+        [v(&["git", "push", "--force", "origin"])],
+        "續行接回同一段"
+    );
+    assert_eq!(segs("\\rm -rf x"), [v(&["rm", "-rf", "x"])]);
+    assert_eq!(
+        segs("echo \"a \\\"b\\\" ; c\" ; ls"),
+        [v(&["echo", "a \"b\" ; c"]), v(&["ls"])],
+        "雙引號內的 \\\" 不結束引號"
+    );
+    assert_eq!(segs("echo 'a\\b'"), [v(&["echo", "a\\b"])], "單引號內原樣");
+    assert_eq!(segs("ls # rm -rf /\npwd"), [v(&["ls"]), v(&["pwd"])]);
+    assert_eq!(
+        segs("echo a#b"),
+        [v(&["echo", "a#b"])],
+        "詞中間的 # 不是註解"
+    );
+    assert_eq!(
+        segs("grep KEY <.env 2>&1"),
+        [v(&["grep", "KEY", "<", ".env", "2", ">&", "1"])],
+        "重導向是自己的詞，2>&1 的 & 不切段"
+    );
+    assert_eq!(
+        segs("docker rm $(docker ps -aq -f status=exited)"),
+        [v(&["docker", "rm", "$(docker…)"])],
+        "命令替換在段裡只留第一個詞"
+    );
+}
+
+#[test]
+fn heredoc_body_is_one_word_of_its_command() {
+    assert_eq!(
+        segs("cat > x.sh <<'EOF'\nrm -rf /\necho hi\nEOF\nls"),
+        [
+            v(&["cat", ">", "x.sh", "<<", "rm -rf / echo hi"]),
+            v(&["ls"])
+        ]
+    );
+    assert_eq!(
+        segs("cat <<-END\n\tgit push -f\n\tEND"),
+        [v(&["cat", "<<", "git push -f"])],
+        "<<- 去掉行首的 tab"
+    );
+    assert_eq!(
+        segs("cat <<< 'rm -rf /'"),
+        [v(&["cat", "<<<", "rm -rf /"])],
+        "here-string 不是 heredoc"
+    );
+}
+
+#[test]
+fn commit_message_heredoc_is_not_a_git_op_of_its_own() {
+    let cmd =
+        "git add -A && git commit -m \"$(cat <<'EOF'\nfix: x\n\ngit push --force is gone\nEOF\n)\"";
+    assert_eq!(git_op_from(cmd, None, true).unwrap().op, "commit");
 }
 
 #[test]
@@ -483,6 +552,60 @@ fn usage_once_per_message_and_model_change_line() {
     assert!(mc.pos < text_ev.pos, "狀態行在該行之前");
 }
 
+/// 同一則訊息拆成多行、collector 在行與行之間重啟（K-13）：重啟後接著讀的行不再算一次 usage，
+/// 新的訊息照算。上一輪最後的 usage 由 store 的最近 Event 交回（`resume_staged`）。
+#[test]
+fn usage_is_not_counted_again_after_a_restart_mid_message() {
+    let think = json!({"type": "thinking", "thinking": "…", "signature": "s"});
+    let text = json!({"type": "text", "text": "好"});
+    let mut a = Merger::new(Box::new(NoDanger));
+    let before = line(&mut a, 1, assistant("u1", "m1", "claude-opus-5-5", think));
+    assert_eq!(of(&before, "usage").len(), 1);
+
+    let mut b = Merger::new(Box::new(NoDanger));
+    let last = before.last().unwrap();
+    b.resume("s1", last.seq, 0, "");
+    b.resume_staged(&before, 100);
+    let after = line(
+        &mut b,
+        2,
+        assistant("u2", "m1", "claude-opus-5-5", text.clone()),
+    );
+    assert!(of(&after, "usage").is_empty(), "m1 重啟前已經算過");
+    let next = line(&mut b, 3, assistant("u3", "m2", "claude-opus-5-5", text));
+    assert_eq!(of(&next, "usage").len(), 1, "新的訊息照算");
+}
+
+/// 「同一則訊息的行一定連在一起」是以檔為單位：subagent 的行夾在 main 的同一則訊息中間，
+/// main 那則訊息不算第二次（K-13 改成每個檔記最後一則）。
+#[test]
+fn usage_once_per_message_with_subagent_lines_in_between() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let text = json!({"type": "text", "text": "好"});
+    let mut all = line(
+        &mut m,
+        1,
+        assistant("u1", "m1", "claude-opus-5-5", text.clone()),
+    );
+    all.extend(m.handle(Input::Line {
+        session: "s1".into(),
+        file: "agent-a1".into(),
+        no: 1,
+        value: assistant("u9", "m9", "claude-opus-5-5", text.clone()),
+        ts_seen: 2,
+    }));
+    all.extend(line(
+        &mut m,
+        2,
+        assistant("u2", "m1", "claude-opus-5-5", text),
+    ));
+    let ids: Vec<&str> = of(&all, "usage")
+        .iter()
+        .map(|e| e.payload["messageId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["m1", "m9"]);
+}
+
 #[test]
 fn synthetic_model_is_ignored() {
     let mut m = Merger::new(Box::new(NoDanger));
@@ -632,4 +755,170 @@ fn write_carries_the_full_line_count() {
     let p = &of(&w, "file.write")[0].payload;
     assert_eq!(p["truncated"], true);
     assert_eq!(p["lines"], 5000);
+}
+
+/// C7（#744）：Edit 的 new_string 很大時，file.edit.hunk.lines 合計也不超過 8 KB：放不下的行丟掉，
+/// 最後一行截在字元邊界，標 truncated；oldLines／newLines 保留原值，+N／−M 照算。
+#[test]
+fn edit_hunk_is_bounded_in_bytes() {
+    let dir = tmpdir();
+    let f = dir.join("a.txt");
+    std::fs::write(&f, "a\nOLD\nb\n").unwrap();
+    let path = f.to_str().unwrap();
+    let mut m = Merger::new(Box::new(NoDanger));
+    let edit = |new: String, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
+               "tool_input": {"file_path": path, "old_string": "OLD", "new_string": new}, "tool_use_id": id})
+    };
+    // 一行 1.5 MB
+    let evs = handle(&mut m, edit("中".repeat(500_000), "e1"), 1);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    let lines: Vec<&str> = fe["hunk"]["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect();
+    assert!(lines.iter().map(|l| l.len()).sum::<usize>() <= 8 * 1024);
+    assert_eq!(fe["truncated"], true);
+    assert_eq!(fe["hunk"]["newLines"], 3, "a、新行、b");
+    // 很多行
+    let many: Vec<String> = (0..5000).map(|i| format!("line {i}")).collect();
+    let evs = handle(&mut m, edit(many.join("\n"), "e2"), 2);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    let n = fe["hunk"]["lines"].as_array().unwrap().len();
+    assert!(n < 5000, "{n}");
+    assert_eq!(fe["truncated"], true);
+    assert_eq!(fe["hunk"]["newLines"], 5002);
+    // 小改動照舊，不輸出 truncated
+    let evs = handle(&mut m, edit("NEW".into(), "e3"), 3);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert!(fe.get("truncated").is_none());
+    assert_eq!(
+        fe["hunk"]["lines"].as_array().unwrap().len(),
+        4,
+        "a、-OLD、+NEW、b"
+    );
+}
+
+/// D7（#745 C19）：replace_all 的 Edit 不畫第一處：`hunk` 為 null、`hunkSource: none`、`replaceAll: true`，
+/// 畫面標「多處取代」；一般的 Edit 不輸出 `replaceAll`。
+#[test]
+fn replace_all_edit_has_no_hunk() {
+    let dir = tmpdir();
+    let f = dir.join("a.rs");
+    std::fs::write(&f, "let foo = 1;\n// x\nprint(foo);\n").unwrap();
+    let path = f.to_str().unwrap();
+    let mut m = Merger::new(Box::new(NoDanger));
+    let edit = |all: bool, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
+               "tool_input": {"file_path": path, "old_string": "foo", "new_string": "bar", "replace_all": all},
+               "tool_use_id": id})
+    };
+    let evs = handle(&mut m, edit(true, "e1"), 1);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["hunk"], &fe["hunkSource"], &fe["replaceAll"]),
+        (&Value::Null, &json!("none"), &json!(true))
+    );
+    let evs = handle(&mut m, edit(false, "e2"), 2);
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert!(fe["hunk"].is_object());
+    assert!(fe.get("replaceAll").is_none());
+}
+
+/// D8（#745 K-10）：lastMessage 截 500 個字元（不是 500 bytes）：440 個中文字整段留著，600 個截成 500。
+#[test]
+fn last_message_is_cut_at_500_chars() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let stop = |msg: String, ts: u64| json!({"session_id": "s1", "hook_event_name": "Stop", "last_assistant_message": msg, "_ts": ts});
+    let short = "這是一段很長的中文訊息".repeat(40);
+    let evs = handle(&mut m, stop(short.clone(), 1), 1);
+    assert_eq!(
+        of(&evs, "turn.stopped")[0].payload["lastMessage"],
+        json!(short)
+    );
+    let evs = handle(&mut m, stop("字".repeat(600), 2), 2);
+    let kept = of(&evs, "turn.stopped")[0].payload["lastMessage"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert_eq!(kept, 500);
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "SubagentStop", "agent_id": "a1",
+               "agent_type": "Explore", "last_assistant_message": "字".repeat(600)}),
+        3,
+    );
+    let kept = of(&evs, "agent.finished")[0].payload["lastMessage"]
+        .as_str()
+        .unwrap()
+        .chars()
+        .count();
+    assert_eq!(kept, 500, "subagent 的也一樣");
+}
+
+/// W-M1（#746）：Windows 上 git 預設 autocrlf，檔案是 CRLF、Claude 給的 old_string 是 LF。
+/// 比對與 hunk 一律以 `\n` 計：多行的 Edit 也找得到，hunk 的行尾不帶 `\r`，行號不變。
+#[test]
+fn crlf_files_get_hunks_without_carriage_returns() {
+    let text = "a\r\nb\r\nc\r\nd\r\n";
+    let h = edit_hunk(text, "b\nc", "B\nC").expect("多行的 old_string 要找得到");
+    assert!(h.lines.iter().all(|l| !l.ends_with('\r')), "{:?}", h.lines);
+    assert_eq!(h.lines, [" a", "-b", "-c", "+B", "+C", " d"]);
+    assert_eq!((h.start, h.old_lines, h.new_lines), (1, 4, 4));
+    let one = edit_hunk(text, "c", "C").unwrap();
+    assert_eq!(one.lines, [" a", " b", "-c", "+C", " d"]);
+    let crlf_old = edit_hunk(text, "b\r\nc", "B\r\nC").unwrap();
+    assert_eq!(crlf_old.lines, h.lines, "old_string 也是 CRLF 時結果相同");
+}
+
+/// W-L9（#746）：NotebookEdit 與 MultiEdit 也產生 file.edit（hunk 為 null），改動紀錄與檔案樹看得到。
+#[test]
+fn notebook_and_multi_edit_derive_file_edit() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    handle(&mut m, session_start("s1", "/repo", "startup"), 1);
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "NotebookEdit", "cwd": "/repo",
+               "tool_input": {"notebook_path": "/repo/nb/a.ipynb", "new_source": "x = 1", "cell_id": "c1"},
+               "tool_use_id": "n1"}),
+        2,
+    );
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["path"], &fe["hunk"], &fe["hunkSource"]),
+        (&json!("nb/a.ipynb"), &Value::Null, &json!("none"))
+    );
+    let evs = handle(
+        &mut m,
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "MultiEdit", "cwd": "/repo",
+               "tool_input": {"file_path": "/repo/src/b.rs",
+                              "edits": [{"old_string": "a", "new_string": "b"}, {"old_string": "c", "new_string": "d"}]},
+               "tool_use_id": "m1"}),
+        3,
+    );
+    let fe = &of(&evs, "file.edit")[0].payload;
+    assert_eq!(
+        (&fe["path"], &fe["hunk"]),
+        (&json!("src/b.rs"), &Value::Null)
+    );
+}
+
+/// L-11（#748）：VS Code 的終端機給小寫的磁碟機代號。session 的 cwd 存成 `E:/repo`，
+/// 檔案路徑不論大小寫怎麼給都算得出相對路徑；不在底下的存正規化後的絕對路徑。
+#[test]
+fn lowercase_drive_letters_are_normalized_for_cwd_and_paths() {
+    let mut m = Merger::new(Box::new(NoDanger));
+    let evs = handle(&mut m, session_start("s1", "e:\\repo", "startup"), 1);
+    assert_eq!(of(&evs, "session.started")[0].payload["cwd"], "E:/repo");
+    let read = |path: &str, id: &str| {
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Read", "cwd": "e:\\repo",
+               "tool_input": {"file_path": path}, "tool_use_id": id})
+    };
+    let evs = handle(&mut m, read("e:\\repo\\src\\a.rs", "r1"), 2);
+    assert_eq!(of(&evs, "file.read")[0].payload["path"], "src/a.rs");
+    let evs = handle(&mut m, read("d:\\other\\b.rs", "r2"), 3);
+    assert_eq!(of(&evs, "file.read")[0].payload["path"], "D:/other/b.rs");
 }

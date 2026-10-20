@@ -13,6 +13,9 @@ const firstLine = (s) => String(s ?? "").split("\n", 1)[0];
 const LONG = 160; // 超過這個長度就可以展開看全文
 
 
+/** 計數欄位：不是有限數字就當 0。 */
+const num = (n) => (Number.isFinite(Number(n)) ? Number(n) : 0);
+
 function duration(ms) {
   if (ms == null) return "";
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
@@ -32,12 +35,15 @@ function statusSuffix(c) {
   }
 }
 
+// 指令型工具（contracts §4、collector 的 event::COMMAND_TOOLS）：Windows 上的 Claude Code 用 PowerShell（#763）
+export const COMMAND_TOOLS = new Set(["Bash", "PowerShell"]);
+
 function toolBody(c) {
   // 載入更多或 snapshot 時伴隨的 tool.called 缺了（contracts.md §6），只知道 toolUseId
   if (c.tool == null) return '<span class="o">（內容不可用）</span>';
   const i = c.input ?? {};
   const path = c.edit?.path ?? c.write?.path ?? c.read?.path ?? i.file_path ?? i.notebook_path ?? i.path ?? "";
-  switch (c.tool) {
+  switch (COMMAND_TOOLS.has(c.tool) ? "Bash" : c.tool) {
     case "Bash": {
       const git = c.git ? ` <span class="ok">⎇ ${esc(c.git.op)}${c.git.hash ? ` ${esc(c.git.hash)}` : ""}</span>` : "";
       return `<span class="p">$</span> <span class="c">${esc(firstLine(i.command))}</span>${git}`;
@@ -51,11 +57,12 @@ function toolBody(c) {
     case "Edit":
     case "MultiEdit":
     case "NotebookEdit": {
-      const n = c.edit ? `  <span class="ok">+${c.edit.added}</span> <span class="bad">−${c.edit.removed}</span>` : "";
+      // 計數一律當數字：hub 原樣轉送上游的 JSON，字串不能進 HTML（F-8）
+      const n = !c.edit ? "" : c.edit.countLabel ? `  <span class="o">（${esc(c.edit.countLabel)}）</span>` : `  <span class="ok">+${num(c.edit.added)}</span> <span class="bad">−${num(c.edit.removed)}</span>`;
       return `<span class="ed">edit</span>  ${esc(path)}${n}`;
     }
     case "Write": {
-      const n = c.write ? `  <span class="o">（${c.write.isNew ? "新檔案 · " : ""}${c.write.lines} 行）</span>` : "";
+      const n = c.write ? `  <span class="o">（${c.write.isNew ? "新檔案 · " : ""}${num(c.write.lines)} 行）</span>` : "";
       return `<span class="wr">write</span> ${esc(path)}${n}`;
     }
     case "Task":
@@ -80,7 +87,7 @@ function outputText(r) {
 }
 
 function toolDetail(c) {
-  const cmd = c.tool === "Bash" ? String(c.input?.command ?? "") : "";
+  const cmd = COMMAND_TOOLS.has(c.tool) ? String(c.input?.command ?? "") : "";
   const out = c.result?.output ?? "";
   const parts = [];
   if (cmd && (cmd.includes("\n") || cmd.length > LONG || out || c.error)) parts.push(`$ ${cmd}`);

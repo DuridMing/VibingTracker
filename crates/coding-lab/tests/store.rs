@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use coding_lab::event::Event;
-use coding_lab::store::{ProjectKey, SCHEMA_VERSION, Store};
+use coding_lab::store::{SCHEMA_VERSION, Store};
 use serde_json::{Value, json};
 
 static N: AtomicU32 = AtomicU32::new(0);
@@ -158,11 +158,11 @@ fn session_row_summarises_events() {
     s.append(ev(
         "s1",
         8,
-        "tool.result",
+        "tool.updated",
         None,
         1600,
         json!({
-            "toolUseId": "t2", "ok": false, "exitCode": 1, "output": "", "truncated": false,
+            "toolUseId": "t2", "status": "failed", "durationMs": 5, "error": "exit 1", "interrupted": null,
         }),
     ));
     s.append(ev(
@@ -234,11 +234,9 @@ fn who_touched_a_file() {
     s.append(file_ev("s1", 3, "file.read", "r2", "src/a.rs", 2100));
     s.append(file_ev("s2", 2, "file.edit", "e1", "src/a.rs", 2200));
     s.append(file_ev("s2", 3, "file.edit", "e2", "src/b.rs", 2300));
-    // 失敗的 Edit 計入 fail
+    // 失敗的 Edit 計入 fail、不算 edit
     s.append(file_ev("s1", 4, "file.edit", "e3", "src/a.rs", 2400));
-    s.append(ev("s1", 5, "tool.result", None, 2410, json!({
-        "toolUseId": "e3", "ok": false, "exitCode": null, "output": "old_string not found", "truncated": false,
-    })));
+    s.append(failed("s1", 5, "e3", 2410));
     s.flush().unwrap();
 
     let mut t = s.touches("/p", "src/a.rs").unwrap();
@@ -249,12 +247,7 @@ fn who_touched_a_file() {
         .collect();
     assert_eq!(
         got,
-        [
-            ("s1", "edit", 1),
-            ("s1", "fail", 1),
-            ("s1", "read", 2),
-            ("s2", "edit", 1)
-        ]
+        [("s1", "fail", 1), ("s1", "read", 2), ("s2", "edit", 1)]
     );
     assert!(
         s.touches("/other", "src/a.rs").unwrap().is_empty(),
@@ -671,6 +664,38 @@ fn failed_flush_keeps_events_for_the_next_one() {
     );
 }
 
+/// C15（#741）：JSONL 寫入失敗、Event 放回 pending 時，tail 讀到的行號不能照樣 commit：
+/// 下次成功之前當掉的話，重啟從那個行號之後接著讀，那些行就永遠不會再進來。
+#[test]
+#[cfg(unix)]
+fn failed_flush_does_not_advance_the_tail_line() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.flush().unwrap();
+        s.append(at_line("s1", 2, "main", 5));
+        s.saw_line("s1", "main", 5);
+        let file = h.join("events/s1.jsonl");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let r = s.flush();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(r.is_err(), "前提：寫不進去");
+    } // 下次 flush 成功之前就當掉
+    let s = Store::open(&h).unwrap();
+    let lines: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| t.line_no)
+        .collect();
+    assert!(
+        !lines.contains(&5),
+        "沒寫進 JSONL 的行，行號不能先記：{lines:?}"
+    );
+}
+
 /// 同一個 (session, seq) 再索引一次時不重複累加。
 #[test]
 fn duplicate_seq_is_not_counted_twice() {
@@ -761,6 +786,45 @@ fn failed_edit_and_write_are_not_changes() {
     assert_eq!(kinds("b.rs"), [("fail".to_string(), 1)]);
 }
 
+/// 「失敗」只算 tool.updated 的 failed、不是 Esc（interrupted）也不是 PermissionDenied（denied）；
+/// tool.result 的 ok=false 不另外算（D6、contracts §4）。檔案工具失敗時那個檔記一次 fail。
+#[test]
+fn only_real_failures_are_counted() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    let upd = |seq, id: &str, extra: Value| {
+        let mut p = json!({"toolUseId": id, "status": "failed", "durationMs": null, "error": "x", "interrupted": null});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        ev("s1", seq, "tool.updated", None, 2000 + seq, p)
+    };
+    s.append(file_ev("s1", 2, "file.read", "r1", "a.rs", 2000));
+    s.append(upd(3, "r1", json!({})));
+    s.append(ev("s1", 4, "tool.result", None, 2004, json!({
+        "toolUseId": "r1", "ok": false, "exitCode": null, "output": "no such file", "truncated": false,
+    })));
+    s.append(file_ev("s1", 5, "file.read", "r2", "b.rs", 2005));
+    s.append(upd(6, "r2", json!({"interrupted": true})));
+    s.append(file_ev("s1", 7, "file.read", "r3", "c.rs", 2007));
+    s.append(upd(8, "r3", json!({"denied": true})));
+    s.append(ev("s1", 9, "tool.result", None, 2009, json!({
+        "toolUseId": "b9", "ok": false, "exitCode": null, "output": "[Request interrupted by user]", "truncated": false,
+    })));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().failures, 1);
+    let fails = |p: &str| {
+        s.touches("/p", p)
+            .unwrap()
+            .into_iter()
+            .filter(|t| t.kind == "fail")
+            .map(|t| t.count)
+            .sum::<u64>()
+    };
+    assert_eq!((fails("a.rs"), fails("b.rs"), fails("c.rs")), (1, 0, 0));
+}
+
 /// file.write 帶全文行數 `lines` 時，改動紀錄用它而不是 200 行的預覽（contracts §4）。
 #[test]
 fn write_line_count_uses_full_length() {
@@ -773,6 +837,28 @@ fn write_line_count_uses_full_length() {
     })));
     s.flush().unwrap();
     assert_eq!(s.recent_changes("/p", 10).unwrap()[0].added, Some(5000));
+}
+
+/// /compact 的 session.started 不能把 done 改成 run：狀態由 merge 的 `session.status` 決定（不變式 8，K-5）。
+#[test]
+fn only_session_status_changes_the_status() {
+    let mut s = Store::open(&home()).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(ev(
+        "s1",
+        2,
+        "session.status",
+        None,
+        1500,
+        json!({"status": "done", "since": 1500, "score": 1.0}),
+    ));
+    let mut compact = started("s1", 3, "/p");
+    compact.payload["source"] = json!("compact");
+    compact.ts_seen = 2000;
+    s.append(compact);
+    s.flush().unwrap();
+    let row = s.session("s1").unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.status_since), ("done", 1500));
 }
 
 /// 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）：sessions 列的結束時間與原因清掉，
@@ -1072,139 +1158,63 @@ fn tool_paths_are_forgotten_when_the_session_ends() {
     assert_eq!(s.cached_tool_paths(), 0);
 }
 
-fn key(ts: u64, session: &str, pos: u64) -> ProjectKey {
-    ProjectKey {
-        ts,
-        session: session.into(),
-        pos,
-    }
-}
-
-/// 專案 /p 的兩個 session（一個在 worktree 裡）、別的專案 /other，以及名字只是前綴相同的 /p2。
-fn project_fixture() -> Store {
-    let mut s = Store::open(&home()).unwrap();
-    s.append(started("s1", 1, "/p"));
-    s.append(started("s2", 1, "/p/worktrees/feature/x"));
-    s.append(started("s3", 1, "/other"));
-    s.append(started("s4", 1, "/p2"));
-    let at = |session: &str, seq: u64, pos: u64, ts: u64| {
-        ev(
-            session,
-            seq,
-            "assistant.text",
-            Some(pos),
-            ts,
-            json!({ "text": "x", "messageId": "m" }),
-        )
-    };
-    s.append(at("s1", 2, 1, 100));
-    s.append(at("s2", 2, 1, 200));
-    s.append(at("s1", 3, 2, 300));
-    s.append(at("s1", 4, 3, 300));
-    s.append(at("s2", 3, 2, 300));
-    s.append(at("s3", 2, 1, 250));
-    s.append(at("s4", 2, 1, 300));
-    // 沒有 pos 的（staged 卡片、usage）不是串流位置
-    s.append(ev("s1", 5, "usage", None, 300, json!({})));
-    s.flush().unwrap();
-    s
-}
-
-/// 全專案回放（#702）：依 (ts_seen, session, pos) 由新到舊；同一毫秒依 session、pos 決定；只含專案根底下的 session。
-#[test]
-fn project_window_orders_across_sessions_newest_first() {
-    let s = project_fixture();
-    let all = s.project_window("/p", 0, u64::MAX, None, 100).unwrap();
-    assert_eq!(
-        all,
-        vec![
-            key(300, "s2", 2),
-            key(300, "s1", 3),
-            key(300, "s1", 2),
-            key(200, "s2", 1),
-            key(100, "s1", 1),
-        ],
-        "worktree 裡的 s2 算同一個專案，/other 與 /p2 不算"
-    );
-    // 專案根帶結尾的 / 也一樣
-    assert_eq!(
-        s.project_window("/p/", 0, u64::MAX, None, 100).unwrap(),
-        all
-    );
-}
-
-#[test]
-fn project_window_pages_with_the_last_key_as_cursor() {
-    let s = project_fixture();
-    let mut got = Vec::new();
-    let mut before = None;
-    loop {
-        let page = s
-            .project_window("/p", 0, u64::MAX, before.as_ref(), 2)
-            .unwrap();
-        if page.is_empty() {
-            break;
-        }
-        before = page.last().cloned();
-        got.extend(page);
-    }
-    assert_eq!(got.len(), 5, "三頁：2＋2＋1");
-    assert_eq!(
-        got,
-        s.project_window("/p", 0, u64::MAX, None, 100).unwrap(),
-        "分頁接起來不重複不漏"
-    );
-}
-
-#[test]
-fn project_window_respects_the_time_range() {
-    let s = project_fixture();
-    assert_eq!(
-        s.project_window("/p", 150, 250, None, 100).unwrap(),
-        vec![key(200, "s2", 1)]
-    );
-    assert_eq!(
-        s.project_window("/p", 100, 200, None, 100).unwrap(),
-        vec![key(200, "s2", 1), key(100, "s1", 1)],
-        "兩端都包含"
-    );
-}
-
-/// v3 升 v4：加上 events 依 ts_seen 的索引，全專案回放不用掃全表（不變式 9）。
-#[test]
-fn v3_database_gets_the_ts_index() {
-    let h = home();
-    {
-        let mut s = Store::open(&h).unwrap();
-        s.append(started("s1", 1, "/p"));
-        s.append(text("s1", 2, 1));
-        s.flush().unwrap();
-    }
+fn index_names(h: &std::path::Path) -> Vec<String> {
     let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
-    db.execute_batch(
-        "DROP INDEX IF EXISTS events_by_ts;
-         UPDATE meta SET value = '3' WHERE key = 'schema_version';",
-    )
-    .unwrap();
-    drop(db);
-
-    let s = Store::open(&h).unwrap();
-    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
-    assert_eq!(
-        s.project_window("/p", 0, u64::MAX, None, 10).unwrap(),
-        vec![key(1002, "s1", 1)],
-        "升級前的資料查得到"
-    );
-    drop(s);
-    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
-    let n: i64 = db
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'events_by_ts'",
-            [],
-            |r| r.get(0),
-        )
+    let mut stmt = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         .unwrap();
-    assert_eq!(n, 1, "v4 有 events_by_ts 索引");
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// v5 升 v6（#755、#756、#742 D5、#750 L-17）：拿掉 events_by_ts，加 usage 的費用基準、依種類找 Event、
+/// file_touch 依 session 刪的索引；資料不動（不變式 9）。從 v3 一路升上來也一樣。
+#[test]
+fn v5_database_is_upgraded_to_v6() {
+    for from in ["3", "5"] {
+        let h = home();
+        {
+            let mut s = Store::open(&h).unwrap();
+            s.append(started("s1", 1, "/p"));
+            s.append(text("s1", 2, 1));
+            s.flush().unwrap();
+        }
+        let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+        db.execute_batch(&format!(
+            "DROP INDEX IF EXISTS events_usage_ts; DROP INDEX IF EXISTS events_by_type;
+             DROP INDEX IF EXISTS file_touch_by_session;
+             CREATE INDEX IF NOT EXISTS events_by_ts ON events (ts_seen, session, pos) WHERE pos IS NOT NULL;
+             UPDATE meta SET value = '{from}' WHERE key = 'schema_version';"
+        ))
+        .unwrap();
+        drop(db);
+
+        let s = Store::open(&h).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 6);
+        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(
+            s.timeline("/p", 0, 0, u64::MAX, 10).unwrap().0.len(),
+            2,
+            "升級前的資料查得到（從 v{from}）"
+        );
+        drop(s);
+        let names = index_names(&h);
+        for want in ["events_usage_ts", "events_by_type", "file_touch_by_session"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "從 v{from} 升級後缺 {want}：{names:?}"
+            );
+        }
+        assert!(!names.iter().any(|n| n == "events_by_ts"), "{names:?}");
+    }
+    // 新建的也一樣
+    let h = home();
+    drop(Store::open(&h).unwrap());
+    let names = index_names(&h);
+    assert!(names.iter().any(|n| n == "events_by_type"));
+    assert!(!names.iter().any(|n| n == "events_by_ts"));
 }
 
 // ── #713：tails 的「不知道」（NULL，從檔尾）和「從頭、還沒讀」（0，重啟從第 1 行）分開
@@ -1230,8 +1240,8 @@ fn raw_tail_line_no(h: &std::path::Path, session: &str) -> Option<Option<i64>> {
     .ok()
 }
 
-/// startup／clear／late 的 session.started 是從檔頭讀的檔：還沒有行產生 Event 時記 0，重啟從第 1 行讀；
-/// resume／compact 接的是從檔尾 tail 的檔：記 NULL，重啟照舊從檔尾，不整份重讀。
+/// startup／clear 的 session.started 是從檔頭讀的檔：還沒有行產生 Event 時記 0，重啟從第 1 行讀；
+/// resume／compact／late 接的是從檔尾 tail 的檔：記 NULL，重啟照舊從檔尾，不整份重讀（late：#741 D4）。
 #[test]
 fn tails_of_a_fresh_file_start_at_zero_and_of_a_resumed_file_are_unknown() {
     let h = home();
@@ -1251,15 +1261,16 @@ fn tails_of_a_fresh_file_start_at_zero_and_of_a_resumed_file_are_unknown() {
     rows.sort();
     assert_eq!(
         rows,
-        [
-            ("cleared".to_string(), 0),
-            ("fresh".to_string(), 0),
-            ("late".to_string(), 0)
-        ],
-        "從頭讀的檔記 0 並交給 TailPlanner；resume／compact 的不交（NULL）"
+        [("cleared".to_string(), 0), ("fresh".to_string(), 0)],
+        "從頭讀的檔記 0 並交給 TailPlanner；resume／compact／late 的不交（NULL）"
     );
     assert_eq!(raw_tail_line_no(&h, "resumed"), Some(None), "NULL＝不知道");
     assert_eq!(raw_tail_line_no(&h, "compacted"), Some(None));
+    assert_eq!(
+        raw_tail_line_no(&h, "late"),
+        Some(None),
+        "late 的 tail 從檔尾開始，不是從頭"
+    );
 
     // 之後讀到的行照常更新；resume 的檔讀到行之後也會接著讀
     s.append(at_line("resumed", 2, "main", 7));
@@ -1331,4 +1342,573 @@ fn tails_advance_to_the_last_line_read_even_without_events() {
         .collect();
     rows.sort();
     assert_eq!(rows, [("agent-a1".to_string(), 2), ("main".to_string(), 3)]);
+}
+
+// ── 起不來的情況（#738 L-10、L-14）：壞掉的一個檔或做到一半的建表不能讓 collector 永遠起不來
+
+/// L-14：新建資料庫的 v0→v1 原本沒有交易，建表做到一半當掉後，下次再建就撞上已經在的表。
+#[test]
+fn half_created_v1_schema_still_opens() {
+    let h = home();
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE sessions (id TEXT PRIMARY KEY, host TEXT NOT NULL DEFAULT 'local', cwd TEXT NOT NULL,
+           transcript_path TEXT, model TEXT, branch TEXT, first_prompt TEXT, started_at INTEGER NOT NULL,
+           ended_at INTEGER, end_reason TEXT, status TEXT NOT NULL DEFAULT 'run', status_since INTEGER NOT NULL,
+           commits INTEGER NOT NULL DEFAULT 0, dangers INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+           cost_usd REAL NOT NULL DEFAULT 0, thinking_tokens INTEGER NOT NULL DEFAULT 0, last_seq INTEGER NOT NULL DEFAULT 0,
+           summary TEXT);",
+    )
+    .unwrap();
+    drop(db);
+    let mut s = Store::open(&h).expect("做到一半的建表要能補完");
+    assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+    s.append(started("s1", 1, "/p"));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p");
+}
+
+/// L-10：JSONL 第一行斷在多位元組字元中間（寫到一半當掉、或檔案被截壞），不能讓整個 store 開不了；
+/// 後面完整的行照樣進索引。
+#[test]
+fn a_broken_first_line_does_not_stop_the_store() {
+    let h = home();
+    std::fs::create_dir_all(h.join("events")).unwrap();
+    let good = serde_json::to_string(&started("s1", 2, "/p")).unwrap();
+    let mut bytes = "{\"v\":1,\"session\":\"s1\",\"seq\":1,\"type\":\"prompt.submitted\",\"payload\":{\"text\":\"中"
+        .as_bytes()
+        .to_vec();
+    bytes.truncate(bytes.len() - 1); // 「中」只留兩個 byte
+    bytes.push(b'\n');
+    bytes.extend_from_slice(good.as_bytes());
+    bytes.push(b'\n');
+    std::fs::write(h.join("events/s1.jsonl"), &bytes).unwrap();
+    let s = Store::open(&h).expect("壞掉的首行不能擋住啟動");
+    assert_eq!(
+        s.session("s1").unwrap().unwrap().cwd,
+        "/p",
+        "後面完整的行照樣索引"
+    );
+}
+
+/// L-10：只有一個沒寫完的半行（合法 UTF-8、沒有換行）時要截掉，不然新的寫入會黏在它後面。
+#[test]
+fn a_lone_partial_line_is_cut_before_new_writes() {
+    let h = home();
+    std::fs::create_dir_all(h.join("events")).unwrap();
+    let path = h.join("events/s1.jsonl");
+    std::fs::write(&path, "{\"v\":1,\"session\":\"s1\",\"seq\":1,\"ty").unwrap();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("s1", 1, "/p"));
+        s.flush().unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    for l in text.lines() {
+        assert!(
+            Event::from_json_line(l).is_ok(),
+            "每一行都要是完整的 Event：{l}"
+        );
+    }
+    let s = Store::open(&h).unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().cwd, "/p");
+}
+
+/// W-L8：一個 JSONL 讀不到（例如被防毒鎖住）時跳過它，其他 session 照常。
+#[cfg(unix)]
+#[test]
+fn an_unreadable_jsonl_is_skipped() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started("a1", 1, "/a"));
+        s.append(started("b1", 1, "/b"));
+        s.flush().unwrap();
+    }
+    for f in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        let _ = std::fs::remove_file(h.join(f));
+    }
+    let locked = h.join("events/a1.jsonl");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let opened = Store::open(&h);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let s = opened.expect("一個檔讀不到不能讓 store 開不了");
+    assert_eq!(s.session("b1").unwrap().unwrap().cwd, "/b");
+}
+
+/// L-14：v2 升級時的 tails 回填遇到非 UTF-8 的行不能失敗（失敗的話版本已經升上去、之後永遠不再回填）；
+/// 那一行略過，其他行照樣回填。
+#[test]
+fn tails_backfill_skips_lines_that_are_not_utf8() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.append(at_line("s1", 2, "main", 4));
+        s.flush().unwrap();
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(h.join("events/s1.jsonl"))
+        .unwrap();
+    f.write_all(b"\xff\xfe not json\n").unwrap();
+    drop(f);
+    let db = rusqlite::Connection::open(h.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TABLE IF EXISTS tails; UPDATE meta SET value = '2' WHERE key = 'schema_version';",
+    )
+    .unwrap();
+    drop(db);
+    let s = Store::open(&h).expect("回填遇到非 UTF-8 不能失敗");
+    let rows: Vec<_> = s
+        .tail_lines()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.file, t.line_no))
+        .collect();
+    assert_eq!(rows, [("main".to_string(), 4)]);
+}
+
+/// S-6（#762、contracts §5）：資料目錄 0700、底下的檔 0600（Claude Code 自己的 transcript 也是 0600）。
+/// 原本照預設的 umask（0755／0644），同一台機器的其他使用者讀得到 transcript 的內容。
+#[cfg(unix)]
+#[test]
+fn data_dir_and_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home().join(".coding-lab");
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.flush().unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&h), 0o700, "資料目錄");
+    assert_eq!(mode(&h.join("events")), 0o700);
+    assert_eq!(mode(&h.join("events/s1.jsonl")), 0o600);
+    assert_eq!(mode(&h.join("index.sqlite")), 0o600);
+    // 舊版建的目錄也收緊
+    drop(s);
+    std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _s = Store::open(&h).unwrap();
+    assert_eq!(mode(&h), 0o700, "重新開啟時收緊舊版的權限");
+}
+
+// ── X1（#740）：web 的讀取鎖內只查 offset、鎖外讀 JSONL（EventsReader）。JSONL 只會 append，
+// 索引裡的 offset 一定指向已經寫完的行，所以不拿 store 的鎖也能讀；主迴圈的寫入不必等 web 讀完
+
+fn prompt_ev(session: &str, seq: u64, pos: Option<u64>, text: &str) -> Event {
+    ev(
+        session,
+        seq,
+        "prompt.submitted",
+        pos,
+        1000 + seq,
+        json!({"text": text, "promptId": format!("p{seq}")}),
+    )
+}
+
+#[test]
+fn events_reader_reads_outside_the_store_lock() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    for seq in 2..=40 {
+        s.append(prompt_ev("s1", seq, Some(seq), &format!("第 {seq}")));
+    }
+    s.flush().unwrap();
+    // 鎖內：只查 offset
+    let reads = s.stream_before_reads("s1", Some(30), 5).unwrap();
+    let reader = s.reader();
+    // 主迴圈照常寫（新的行接在後面），已查好的 offset 照樣讀得到
+    s.append(prompt_ev("s1", 41, Some(41), "之後寫的"));
+    s.flush().unwrap();
+    let got: Vec<u64> = reader.read(&reads).unwrap().iter().map(|e| e.seq).collect();
+    assert_eq!(got, [25, 26, 27, 28, 29]);
+    assert_eq!(
+        got,
+        s.stream_before("s1", Some(30), 5)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        "和原本的 stream_before 一樣"
+    );
+}
+
+/// E-S3：offset 接續時不 seek、跳著的也讀得對；不同 session 的依查詢的順序接起來。
+#[test]
+fn events_reader_reads_contiguous_and_scattered_offsets() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    for sid in ["a", "b"] {
+        s.append(started(sid, 1, "/p"));
+        for seq in 2..=20 {
+            s.append(prompt_ev(sid, seq, None, &"字".repeat(seq as usize * 50)));
+        }
+    }
+    s.flush().unwrap();
+    let all = s.events_by_seq("a", 1, 20).unwrap();
+    assert_eq!(all.len(), 20);
+    assert!(all.windows(2).all(|w| w[0].seq + 1 == w[1].seq));
+    let some = s.events_by_seq("b", 5, 7).unwrap();
+    assert_eq!(some.iter().map(|e| e.seq).collect::<Vec<_>>(), [5, 6, 7]);
+    let types = s
+        .events_of_types("a", &["session.started", "prompt.submitted"])
+        .unwrap();
+    assert_eq!(types.len(), 20);
+    let mut last = s.last_prompt_and_pos(&["a".into(), "b".into()]).unwrap();
+    let text_b = last.remove("b").unwrap().0.unwrap();
+    assert_eq!(text_b, "字".repeat(20 * 50));
+    // recent_events（E-S4：依主鍵順序讀、每個檔只開一次）回傳仍依 (ts_seen, session, seq)
+    let recent = s.recent_events(0).unwrap();
+    assert_eq!(recent.len(), 40);
+    assert!(recent.windows(2).all(
+        |w| (w[0].ts_seen, &w[0].session, w[0].seq) <= (w[1].ts_seen, &w[1].session, w[1].seq)
+    ));
+}
+
+/// E-S5（#755）：每小時的費用基準走 v6 的 usage 索引，不再全表掃。
+#[test]
+fn usage_since_uses_the_usage_index() {
+    let s = Store::open(&home()).unwrap();
+    let plan = s.usage_since_plan().unwrap();
+    assert!(plan.contains("events_usage_ts"), "{plan}");
+}
+
+/// E-S8（#755）：sessions 列只在第一次看到 session 時建、last_seq 每次 flush 更新一次；
+/// prune 掉的 session 之後又有 Event（同一個 id 回來）時列要重建，last_seq 照樣是最大的 seq。
+#[test]
+fn session_rows_come_back_after_prune_and_last_seq_is_the_max() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    for seq in 2..6 {
+        s.append(text("s1", seq, seq - 1));
+    }
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 5);
+    s.append(text("s1", 6, 5));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 6);
+    assert_eq!(s.prune(u64::MAX).unwrap().sessions, ["s1"]);
+    assert!(s.session("s1").unwrap().is_none());
+    s.append(text("s1", 7, 6));
+    s.flush().unwrap();
+    let row = s
+        .session("s1")
+        .unwrap()
+        .expect("prune 後回來的 session 要有列");
+    assert_eq!(row.last_seq, 7);
+    // 重開之後也認得已有的 session
+    drop(s);
+    let mut s = Store::open(&h).unwrap();
+    s.append(text("s1", 8, 7));
+    s.flush().unwrap();
+    assert_eq!(s.session("s1").unwrap().unwrap().last_seq, 8);
+}
+
+/// E-S12（#755）：「工具卡片碰的檔」收到 tool.result 就放掉（同一張卡片不會有第二個 tool.result，K-3），
+/// 不用等 session 結束；之前的失敗照樣記 fail（tool.updated 一定在 tool.result 之前）。
+#[test]
+fn tool_paths_are_forgotten_when_the_result_arrives() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(file_ev("s1", 2, "file.read", "r1", "a.rs", 2000));
+    s.append(file_ev("s1", 3, "file.read", "r2", "b.rs", 2001));
+    s.append(failed("s1", 4, "r2", 2002));
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 1, "前提：r1 還在等結果");
+    for (seq, id, ok) in [(5, "r1", true), (6, "r2", false)] {
+        s.append(ev(
+            "s1",
+            seq,
+            "tool.result",
+            None,
+            2003,
+            json!({
+                "toolUseId": id, "ok": ok, "exitCode": null, "output": "", "truncated": false,
+            }),
+        ));
+    }
+    s.flush().unwrap();
+    assert_eq!(s.cached_tool_paths(), 0);
+    let fails: u64 = s
+        .touches("/p", "b.rs")
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.kind == "fail")
+        .map(|t| t.count)
+        .sum();
+    assert_eq!(fails, 1);
+}
+
+/// L-17（含 W-L8，#750）：prune 先刪 JSONL、刪成功才刪索引。刪不掉（Windows 上被防毒或備份鎖住）的 session
+/// 索引照留、這次不回報（merge 也就不 forget），下次再清；不能先刪了索引、留下孤兒檔在重啟時被 recover 重新索引。
+#[cfg(unix)]
+#[test]
+fn prune_keeps_the_index_when_the_file_cannot_be_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started("s1", 1, "/p"));
+    s.append(text("s1", 2, 1));
+    s.flush().unwrap();
+    let events = h.join("events");
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = s.prune(u64::MAX);
+    std::fs::set_permissions(&events, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let first = first.expect("刪不掉的檔不是整個 prune 失敗");
+    assert!(first.sessions.is_empty(), "{:?}", first.sessions);
+    assert_eq!(first.failed.len(), 1);
+    assert_eq!(first.failed[0].0, "s1");
+    assert!(s.session("s1").unwrap().is_some(), "索引留著");
+    // 重開（recover）不會多出東西，下次 prune 清得掉
+    drop(s);
+    let mut s = Store::open(&h).unwrap();
+    let second = s.prune(u64::MAX).unwrap();
+    assert_eq!(second.sessions, ["s1"]);
+    assert!(second.failed.is_empty());
+    assert!(s.session("s1").unwrap().is_none());
+    assert!(!events.join("s1.jsonl").exists());
+}
+
+// ---------- W-M10（#781）：store 一直寫不進去 ----------
+
+/// 寫不進去時退避（1 秒起、加倍到 30 秒），log 只在開始失敗、每 5 分鐘、恢復時各一行；
+/// storeError 帶訊息、開始時間、待寫與丟掉的筆數，恢復後是 None。時間注入，不 sleep。
+#[test]
+fn failing_flushes_back_off_and_log_only_at_the_edges() {
+    use coding_lab::store::FlushGate;
+    let mut g = FlushGate::default();
+    let mut logs = Vec::new();
+    let mut tries = 0;
+    // 40 秒、每 100 ms 一個 tick（和 serve 的 flush 間隔一樣），只在 ready 時才真的試
+    for t in (0..40_000).step_by(100) {
+        if g.ready(t) {
+            tries += 1;
+            logs.extend(g.record(Err("disk full".into()), t, 600, 0));
+        }
+    }
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(
+        logs[0].contains("disk full") && logs[0].contains("600"),
+        "{logs:?}"
+    );
+    // 1、2、4、8、16 秒後各一次，之後每 30 秒：0、1、3、7、15、31 秒
+    assert!(tries <= 7, "退避後只試了 {tries} 次");
+    let e = g.error(600, 2).unwrap();
+    assert_eq!(e["message"], "disk full");
+    assert_eq!(e["since"], 0);
+    assert_eq!(e["pending"], 600);
+    assert_eq!(e["dropped"], 2);
+
+    // 5 分鐘後再報一次（附待寫筆數）
+    let mut later = Vec::new();
+    for t in (40_000..331_000).step_by(100) {
+        if g.ready(t) {
+            later.extend(g.record(Err("disk full".into()), t, 900, 0));
+        }
+    }
+    assert_eq!(later.len(), 1, "{later:?}");
+    assert!(
+        later[0].contains("仍然") && later[0].contains("900"),
+        "{later:?}"
+    );
+
+    let back = g.record(Ok(()), 331_000, 0, 0);
+    assert!(back.is_some_and(|l| l.contains("恢復")));
+    assert!(g.error(0, 0).is_none());
+    assert!(g.ready(331_001), "恢復後不再退避");
+    assert!(
+        g.record(Ok(()), 331_100, 0, 0).is_none(),
+        "平常成功不寫 log"
+    );
+}
+
+#[cfg(unix)]
+fn lock_events_file(h: &std::path::Path, sid: &str, locked: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if locked { 0o400 } else { 0o600 };
+    std::fs::set_permissions(
+        h.join(format!("events/{sid}.jsonl")),
+        std::fs::Permissions::from_mode(mode),
+    )
+    .unwrap();
+}
+
+/// pending 設上限：一直寫不進去時超過的丟最舊的、計數，記憶體不會無限長。
+#[test]
+#[cfg(unix)]
+fn pending_is_capped_and_drops_the_oldest() {
+    let h = home();
+    let mut s = Store::open(&h).unwrap();
+    s.append(started_at("s1", "/t/s1.jsonl"));
+    s.flush().unwrap();
+    s.set_pending_limit(2_000);
+    lock_events_file(&h, "s1", true);
+    for seq in 2..100 {
+        s.append(ev(
+            "s1",
+            seq,
+            "tool.called",
+            None,
+            seq,
+            json!({"toolUseId": format!("t{seq}"), "tool": "Bash", "input": {}}),
+        ));
+    }
+    let r = s.flush();
+    lock_events_file(&h, "s1", false);
+    assert!(r.is_err(), "前提：寫不進去");
+    assert!(s.pending_len() < 98, "要丟掉一些：還有 {}", s.pending_len());
+    assert_eq!(s.pending_len() as u64 + s.dropped(), 98);
+    s.flush().unwrap();
+    let text = std::fs::read_to_string(h.join("events/s1.jsonl")).unwrap();
+    assert!(text.contains("\"t99\""), "最新的留著");
+    assert!(!text.contains("\"t2\""), "最舊的丟掉");
+}
+
+/// 結束時還寫不進去：hook 來的 Event（`line` 是 null）寫進 `<home>/pending-<時間>.jsonl`，下次開 store 補回並刪檔；
+/// transcript 來的不寫（C15 之後它們的行號沒 commit，重啟時 tail 會重讀，寫進去會變兩份）。
+#[test]
+#[cfg(unix)]
+fn pending_hook_events_survive_a_shutdown_while_the_store_is_unwritable() {
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_at("s1", "/t/s1.jsonl"));
+        s.flush().unwrap();
+        lock_events_file(&h, "s1", true);
+        s.append(ev(
+            "s1",
+            2,
+            "tool.called",
+            None,
+            2,
+            json!({"toolUseId": "hook-1", "tool": "Bash", "input": {}}),
+        ));
+        s.append(at_line("s1", 3, "main", 7));
+        s.saw_line("s1", "main", 7);
+        assert!(s.flush().is_err(), "前提：寫不進去");
+        let (saved, skipped) = s.dump_pending(&h).unwrap();
+        assert_eq!((saved, skipped), (1, 1));
+        lock_events_file(&h, "s1", false);
+    }
+    let dumps: Vec<_> = std::fs::read_dir(&h)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("pending-"))
+        .collect();
+    assert_eq!(dumps.len(), 1);
+    let s = Store::open(&h).unwrap();
+    let text = std::fs::read_to_string(h.join("events/s1.jsonl")).unwrap();
+    assert!(text.contains("hook-1"), "hook 的 Event 補回來了：{text}");
+    assert!(!text.contains("\"no\":7"), "transcript 的不寫（會重讀）");
+    assert!(s.events_by_seq("s1", 2, 1).is_ok());
+    assert!(!dumps[0].path().exists(), "補完就刪");
+}
+
+/// #741 D4：late session（沒收到 SessionStart）的 tail 從檔尾開始；讀到新行之前 collector 重啟，
+/// 重啟後也要從檔尾接，不能把整份歷史重讀進串流與費用。走 serve 的同一條路：store 的 `tail_lines`
+/// 交給 `TailPlanner::seed`，再來一個 hook。startup 的對照組從第 1 行讀（當掉前沒 flush 的行補得回來）。
+#[test]
+fn late_session_restarted_before_reading_a_line_resumes_from_the_end() {
+    use coding_lab::hook::HookInput;
+    use coding_lab::transcript::{Start, TailAction, TailPlanner};
+    let h = home();
+    {
+        let mut s = Store::open(&h).unwrap();
+        s.append(started_from("late", "/t/late.jsonl", "late"));
+        s.append(started_from("fresh", "/t/fresh.jsonl", "startup"));
+        s.flush().unwrap();
+    }
+    // 重啟
+    let s = Store::open(&h).unwrap();
+    let mut planner = TailPlanner::default();
+    for t in s.tail_lines().unwrap() {
+        planner.seed(&t.session, &t.file, t.path.as_deref(), t.line_no);
+    }
+    let start_of = |planner: &mut TailPlanner, sid: &str, path: &str| {
+        let hook = HookInput::from_json(
+            json!({"session_id": sid, "hook_event_name": "PreToolUse", "transcript_path": path,
+                   "tool_name": "Bash", "tool_use_id": "t1", "tool_input": {"command": "ls"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        match planner.on_hook(&hook).as_slice() {
+            [TailAction::Start { start, .. }] => *start,
+            other => panic!("{sid}：要開 tail：{other:?}"),
+        }
+    };
+    assert_eq!(
+        start_of(&mut planner, "late", "/t/late.jsonl"),
+        Start::End,
+        "late：重啟前一行都還沒讀到，照舊從檔尾"
+    );
+    assert_eq!(
+        start_of(&mut planner, "fresh", "/t/fresh.jsonl"),
+        Start::After(0),
+        "startup：從第 1 行讀"
+    );
+}
+
+/// E-H3（#756）：/api/sessions 每列的「最後一個 prompt」走 v6 的 `events_by_type`（依 session 找 MAX(seq)），
+/// 不是沿主鍵把 session 的每筆 Event 看過一遍；「最後一個 pos」走 `events_by_pos` 的 MAX。
+#[test]
+fn last_prompt_and_pos_use_the_indexes() {
+    let s = Store::open(&home()).unwrap();
+    let (prompt, pos) = s.last_prompt_and_pos_plans().unwrap();
+    assert!(prompt.contains("events_by_type"), "{prompt}");
+    assert!(pos.contains("events_by_pos"), "{pos}");
+}
+
+/// B-S3（#762，Windows 驗收）：資料目錄的 ACL 什麼時候要收緊。剛建立的一律收緊；已經存在的（使用者先手動建好、
+/// 或舊版的子命令用一般的 create_dir_all 建的）只有不在 %USERPROFILE% 底下時才要——那裡預設只有自己能讀，
+/// `C:\` 根目錄底下則繼承 Users:(RX)、Authenticated Users:(M)，collector.json 的 stopToken、config.toml 的上游金鑰都露出去。
+#[test]
+fn acl_is_tightened_for_new_homes_and_homes_outside_the_profile() {
+    use coding_lab::store::acl_restrict_needed;
+    use std::path::Path;
+    let profile = Some(Path::new(r"C:\Users\u"));
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\Users\u\.coding-lab"), profile, true),
+        "剛建立的一律收緊"
+    );
+    assert!(
+        !acl_restrict_needed(Path::new(r"C:\Users\u\.coding-lab"), profile, false),
+        "在 profile 底下"
+    );
+    assert!(
+        !acl_restrict_needed(Path::new(r"c:\users\U\.coding-lab"), profile, false),
+        "Windows 不分大小寫"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\cl-test\k5"), profile, false),
+        "C:\\ 根目錄底下"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"D:\data"), profile, false),
+        "別的磁碟"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\Users\u2\.coding-lab"), profile, false),
+        "前綴相同不算在底下"
+    );
+    assert!(
+        acl_restrict_needed(Path::new(r"C:\x"), None, false),
+        "不知道 profile 時收緊"
+    );
+}
+
+/// 第 2 輪 Windows 驗收 §6：prune 清掉 932 bytes 時印「0 KB」。不到 1 KB 印 bytes，大的印 KB、MB。
+#[test]
+fn prune_sizes_are_printed_readably() {
+    use coding_lab::store::fmt_size;
+    assert_eq!(fmt_size(0), "0 bytes");
+    assert_eq!(fmt_size(932), "932 bytes");
+    assert_eq!(fmt_size(1024), "1 KB");
+    assert_eq!(fmt_size(1536), "2 KB");
+    assert_eq!(fmt_size(5 * 1024 * 1024), "5.0 MB");
+    assert_eq!(fmt_size(1_572_864), "1.5 MB");
 }

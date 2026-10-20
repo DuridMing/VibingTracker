@@ -2,7 +2,7 @@
 
 這份手冊帶你從零裝好 coding-lab：編譯 collector、裝 Claude Code plugin、確認追蹤有在跑。目前還沒有發佈好的二進位，要從原始碼編譯，大約 10 分鐘（大部分是第一次編譯）。
 
-裝好之後，每次開 Claude Code session 都會自動被追蹤，打開 <http://127.0.0.1:4801> 就能看到所有 session 合在一起的串流。追蹤不花 token，也不會攔截或改變 Claude Code 的行為。
+裝好之後，每次開 Claude Code session 都會自動被追蹤，打開 <http://127.0.0.1:4801> 就能看到所有 session 合在一起的串流。追蹤不花 token，也不會攔截或改變 Claude Code 的行為。網頁各區塊怎麼用見[使用手冊](usage.md)；macOS 使用者先看 [macOS 注意事項](macos-warnings.md)。
 
 ## 目錄
 
@@ -95,7 +95,9 @@ Windows 在 PowerShell 或 Git Bash 都可以，路徑例如 `C:\src\VibingTrack
 ~/.coding-lab/bin/coding-lab healthz
 ```
 
-會印出版本、`open`（還開著的 session 數）、`sessions`（記憶體裡的 session 數，含 2 小時內結束的）等資訊。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
+會印出版本、`user`（這個 collector 是哪個帳號的）、`open`（還開著的 session 數）、`sessions`（記憶體裡的 session 數，含 2 小時內結束的）等資訊。
+
+同一台機器上另一個帳號已經在用 coding-lab 時，4800 被它的 collector 佔著：你這個帳號的 hook 會被它丟掉，這個帳號不會被追蹤，`healthz` 印出「沒在跑」，`~/.coding-lab/collector.log` 有一行說明。目前一台機器只能有一個帳號使用（見 README「多人共用的伺服器」）。Windows 與它的 WSL2 也算同一台：兩邊共用 4800，只在其中一邊裝 plugin。Windows 在 Git Bash 用同一行，或在 PowerShell 用 `& "$env:USERPROFILE\.coding-lab\bin\coding-lab.exe" healthz`。
 
 collector 不用自己啟動：每個 session 開始時，plugin 會在它沒在跑時把它拉起來；所有 session 都結束、再閒置 10 分鐘後它會自己退出。
 
@@ -111,8 +113,16 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 
 1. 在伺服器的 `~/.coding-lab/config.toml` 設 `[web] bind = "100.x.x.x:4801"`（這台的 tailnet IP）。SSH 通道也要繼續用的話寫成陣列：`bind = ["127.0.0.1:4801", "100.x.x.x:4801"]`，通道進來的仍免金鑰、直連的要金鑰。
 2. 建一把金鑰：`~/.coding-lab/bin/coding-lab key create --name laptop --scope view --expires 90d`。印出來的 `clk_…` 只會出現這一次，先複製。
-3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。
+3. `~/.coding-lab/bin/coding-lab stop`，下一個 session 開始時 collector 會用新設定重新拉起。裝了常駐服務（見下一節）的話，stop 也會停掉服務、而且它不會自己回來，改用服務的重啟：`systemctl --user restart coding-lab.service`（Linux）、`launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`（macOS）；Windows 先 `stop` 再 `schtasks /Run /TN \CodingLab\%USERNAME%`（PowerShell 寫成 `\CodingLab\$env:USERNAME`）。
 4. 本機或手機開 `http://100.x.x.x:4801`，在登入頁貼上金鑰。之後 30 天不必再貼。手機不好打字的話，在伺服器終端機執行 `coding-lab key login-link`，用手機掃或打開它印出的網址（5 分鐘內、只能用一次）。
+
+伺服器是 Windows 時，防火牆預設擋下其他機器連進來的連線：綁 tailnet 或區網 IP 之後，在系統管理員的 PowerShell 開放 4801，只開給 tailnet 的網段：
+
+```powershell
+New-NetFirewallRule -DisplayName "coding-lab web" -Direction Inbound -Protocol TCP -LocalPort 4801 -RemoteAddress 100.64.0.0/10 -Action Allow
+```
+
+區網直連時把 `-RemoteAddress` 改成區網的網段，例如 `192.168.1.0/24`。不要開給 `Any`。4800（hook 入口）永遠只綁 127.0.0.1，不用開。
 
 遠端看不到命中敏感規則的工具輸出，thinking 預設點開才載入。撤銷金鑰：`coding-lab key revoke <id>`（`key list` 看 id）。綁公開 IP 會被拒絕啟動，除非自己前置 TLS 並設 `allow_insecure = true`——明文 http 上的金鑰會被同網段竊聽。
 
@@ -128,16 +138,24 @@ ssh -N -L 4801:127.0.0.1:4801 <伺服器>
 | --- | --- | --- |
 | Linux | `~/.config/systemd/user/coding-lab.service` | `systemctl --user enable --now`；沒人登入也要跑的話再執行一次 `loginctl enable-linger $USER` |
 | macOS | `~/Library/LaunchAgents/io.coding-lab.collector.plist` | `launchctl bootstrap gui/<uid>`；第一次會跳「允許在背景執行」，允許即可 |
-| Windows | `%USERPROFILE%\.coding-lab\coding-lab-task.xml` | 工作排程器的 `CodingLab` 工作，登入時啟動、隱藏視窗（要在沒人登入時跑，在工作排程器裡改成「不論使用者登入與否均執行」） |
+| Windows | `%USERPROFILE%\.coding-lab\coding-lab-task.xml` | 工作排程器 `\CodingLab\` 資料夾裡以使用者命名的工作（例如 `\CodingLab\alice`），登入時啟動、隱藏視窗（要在沒人登入時跑，在工作排程器裡改成「不論使用者登入與否均執行」） |
 
-安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0` 跑，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows `schtasks /End /TN CodingLab` 再 `schtasks /Run /TN CodingLab`）。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
+安裝時會先請正在跑的 collector 結束（服務要接手同一個埠），服務用 `serve --home ~/.coding-lab --idle-exit-seconds 0 --log-file` 跑，log 一律寫 `~/.coding-lab/collector.log`，設定一樣讀 `~/.coding-lab/config.toml`（改了 `[web].bind` 等設定後重啟服務：Linux `systemctl --user restart coding-lab`、macOS `launchctl kickstart -k gui/$(id -u)/io.coding-lab.collector`、Windows 先 `coding-lab stop` 再 `schtasks /Run /TN \CodingLab\%USERNAME%`；`schtasks /End` 只結束外層的 conhost，collector 會留著佔住埠）。`schtasks` 請在 cmd 或 PowerShell 執行；在 Git Bash 裡，`/TN` 這類參數會被當成路徑改寫，要在前面加 `MSYS_NO_PATHCONV=1`，工作名稱寫成 `'\CodingLab\'"$USERNAME"`。plugin 的 `ensure` 看到埠有人就不會再拉第二個。
 
-- `service status`：有沒有裝、collector 現在有沒有在跑。
+- `service status`：有沒有裝、服務用的資料目錄（和目前的是否相同）、collector 現在有沒有在跑。
+- 已經有服務、但用的是別的資料目錄（例如拿 `CODING_LAB_HOME=<測試目錄>` 試服務）時，`service install`／`uninstall` 會拒絕並印出原本的資料目錄，不會換掉或移除正式的服務；確定要換加 `--force`。
 - `service install --dry-run`：只印會寫的檔與會跑的指令。
 - `service uninstall`：停掉、取消註冊、刪掉上面那個檔；之後又回到由 session 拉起的模式。
 - 更新執行檔時先 `service uninstall` 或停掉服務再覆蓋，覆蓋完再 `service install`（Windows 不能覆蓋執行中的 .exe）。
 
 https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801，或走 tailnet、SSH 通道（見上一節）。
+
+架反向代理時：
+
+- 在 `config.toml` 的 `[web]` 設 `auth = "always"`。
+- 請求帶了 `X-Forwarded-For`、`X-Forwarded-Host`、`X-Forwarded-Proto` 或 `Forwarded`，collector 就把它當成遠端連線：一律要金鑰，敏感輸出與 thinking 照遠端的規則遮蔽。nginx、Caddy 預設都會帶其中幾個。
+- 登入失敗的限流（每個來源每分鐘 10 次）在反代後面是以反代的 IP 計算，所有人共用同一個額度。用 `Authorization: Bearer` 帶金鑰不限流，因為 256 位元的亂數猜不到。
+- hub 沒有金鑰驗證，不要放在反代後面：帶轉發標頭的連線一律回 403。
 
 ## 一次看多台伺服器（hub）
 
@@ -149,13 +167,13 @@ https 不內建：需要時前置 Caddy／nginx 反向代理到 127.0.0.1:4801�
 ~/.coding-lab/bin/coding-lab hub
 ```
 
-打開 <http://127.0.0.1:4802>：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
+打開 `coding-lab hub` 印出的網址（`http://127.0.0.1:4802/?token=…`）：和單機的頁面一樣，只是每行前面多一個 `[主機名]`，Sessions 與 Agents 也標主機，連線狀態列顯示 `hub`。
 
 - 某台斷線（網路斷、重開機）：它的 session 標「離線」、分頁變淡，其他台照常；hub 每 1～30 秒重連，連回來會整頁重載那台的內容。
 - 「載入更多」、thinking 點開、檔案樹、分支視窗、回放、「已確認」都由 hub 轉給對應的那台；那台給 hub 的金鑰是 `view` 時按「已確認」會提示要 `operate` 金鑰。
-- hub 自己不存資料、只綁本機、不需要金鑰；要從別台看 hub，請對 hub 這台開 SSH 通道。
+- hub 自己不存資料、只綁本機。127.0.0.1 是整台機器共用的（同一台的其他帳號、其他程式都連得到），hub 又拿著上游的金鑰，所以每次啟動都產生新的 token、只印在執行它的終端機；第一次用網址開會換成 cookie，之後網址列不再帶 token。沒有 token 的 `/api`、`/ws` 回 401。hub 重新啟動後要用新印出的網址；頁面出現「需要 hub 的網址」就是這個原因。要從別台看 hub，請對 hub 這台開 SSH 通道。
 - 上游寫在 `~/.coding-lab/config.toml`（`[[hub.upstream]]`，含金鑰，檔案權限 600）；改埠用 `[hub] bind = "127.0.0.1:4802"` 或 `coding-lab hub --bind …`。上游網址只接受 `http://`：遠端一律走 tailnet（WireGuard 加密）或 SSH 通道。
-- `curl 127.0.0.1:4802/healthz` 看每台連上了沒。
+- `curl -H "Authorization: Bearer <token>" 127.0.0.1:4802/healthz` 看每台連上了沒（不帶 token 只回版本）。
 
 ## 同一台機器上有好幾個專案
 
@@ -187,6 +205,8 @@ collector 收這台機器上所有 Claude Code 的事件，不分專案。頁面
 紀錄保留 30 天，超過的會自動清掉。
 
 ## 更新
+
+由 plugin 自動下載的二進位（`~/.coding-lab/bin/` 旁邊有 `coding-lab.version`）不用手動更新：plugin 更新後，下一個 session 開始時 wrapper 發現二進位比 plugin 舊，會在背景下載同版的 Release，再下一個 session 開始用新版。下面是從原始碼安裝時的做法。
 
 在 clone 下來的資料夾拉新的程式碼、重新編譯，再把執行檔與網頁蓋過去：
 
@@ -232,6 +252,7 @@ plugin 的版本號還沒跟著每次改動調整，`update` 可能判斷成「�
 - `coding-lab key list` 的狀態是不是「已撤銷」或「已到期」。
 - 連續失敗 10 次會被擋一分鐘（每個來源 IP 各算）。
 - 伺服器的 `~/.coding-lab/collector.log` 會寫被拒的原因；`keys.json` 權限不是 600 時所有金鑰都會失效，照 log 裡的 `chmod 600` 修。
+- 每次 `key create`／`key revoke` 寫入前，原本的內容會留在 `keys.json.bak`。`keys.json` 壞掉（log 寫「格式錯誤」）時，確認 `.bak` 的內容後把它改名回 `keys.json` 就能還原；`.bak` 是上一版，之後建的那一把要重建。
 
 **SSH 通道進來也被要求登入**
 

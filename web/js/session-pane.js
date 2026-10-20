@@ -29,11 +29,15 @@ export function createSessionPane(session = null) {
   // 碰過的檔案（不受改動紀錄的筆數上限影響）：每筆 file.edit／file.write 一個紀錄，files() 時才彙總，
   // 這樣之後以 failed 結束的卡片（被拒或失敗的改動，contracts §4，#682）可以排除
   const touches = [];
+  // files() 的結果依版本快取：touches 或 toolStatus 真的變了才重算、重排（單 session 畫面每次重繪都會叫，#757 E-F12）
+  let ver = 0;
+  let cached = null;
 
   function touchFile(e) {
     const key = `${e.session}:${e.seq}`;
     if (seen.has(key)) return;
     seen.add(key);
+    ver++;
     const pl = e.payload ?? {};
     const { added, removed } = countHunk(pl.hunk?.lines);
     touches.push({ path: pl.path ?? "", edit: e.type === "file.edit", isNew: e.type === "file.write" && !!pl.isNew, added, removed, agent: e.agent, ts: e.ts_seen, seq: e.seq, toolUseId: pl.toolUseId ?? null });
@@ -87,7 +91,12 @@ export function createSessionPane(session = null) {
         thinking = { text: thinkingText(e.payload, p.thinkingMode?.(p.session)), agent: e.agent, summarized: !!e.payload?.summarized };
       }
     }
-    for (const [id, st] of status) if (!older || !toolStatus.has(id)) toolStatus.set(id, st);
+    for (const [id, st] of status) {
+      if ((!older || !toolStatus.has(id)) && toolStatus.get(id) !== st) {
+        toolStatus.set(id, st);
+        ver++;
+      }
+    }
     if (older) {
       p.git.commits.unshift(...commits);
       p.git.last ??= commits.at(-1) ?? null;
@@ -106,6 +115,7 @@ export function createSessionPane(session = null) {
     seen.clear();
     toolStatus.clear();
     touches.length = 0;
+    ver++;
     const mine = (list) => list.filter((e) => e.session === p.session);
     const ops = p.stream.load({ staged: mine(staged), stream: mine(stream) });
     p.changes.load(mine(stream).filter((e) => e.type === "file.edit" || e.type === "file.write" || (e.type === "tool.updated" && e.payload?.status === "failed")));
@@ -133,9 +143,12 @@ export function createSessionPane(session = null) {
   // 換到另一個 session（同一個 pane 重用，畫面那層只建一次）；等新的 snapshot 再填內容
   // 這個 session 碰過的檔案：正在改（工具還沒結束）的在前，其餘依最近一次改動由新到舊
   p.files = () => {
+    if (cached?.ver === ver) return cached.list;
     const live = (id) => ["pending", "running"].includes(toolStatus.get(id));
     const list = [...fileMap().values()].map((f) => ({ ...f, running: f.toolUseIds.some(live) }));
-    return list.sort((a, b) => Number(b.running) - Number(a.running) || b.lastTs - a.lastTs || b.lastSeq - a.lastSeq);
+    list.sort((a, b) => Number(b.running) - Number(a.running) || b.lastTs - a.lastTs || b.lastSeq - a.lastSeq);
+    cached = { ver, list };
+    return list;
   };
   p.open = (id) => {
     p.session = id;

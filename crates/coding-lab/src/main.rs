@@ -31,11 +31,11 @@ enum Command {
     Healthz,
     /// 請執行中的 collector 正常結束（放掉埠、寫完紀錄）；沒在跑也 exit 0
     Stop,
-    /// 常駐服務（#662）：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
+    /// 常駐服務：install／uninstall／status；Linux 用 systemd user unit、macOS 用 LaunchAgent、Windows 用工作排程器
     Service(ServiceArgs),
-    /// 遠端查看用的金鑰：create／list／revoke（存 <home>/keys.json）
+    /// 遠端查看用的金鑰：create／list／revoke／login-link（存 <home>/keys.json）
     Key(KeyArgs),
-    /// 多機總覽（#663）：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
+    /// 多機總覽：對 config.toml 的每個 [[hub.upstream]] 開 WS 合流，在本機開 web；`hub add` 新增一台
     Hub(HubArgs),
 }
 
@@ -75,11 +75,17 @@ enum ServiceCommand {
         /// 只印出會寫的檔與會跑的指令，不執行
         #[arg(long)]
         dry_run: bool,
+        /// 已經有服務、但用的是別的資料目錄時，照樣換成目前的
+        #[arg(long)]
+        force: bool,
     },
     /// 停掉並移除常駐服務（只刪 install 寫的檔）
     Uninstall {
         #[arg(long)]
         dry_run: bool,
+        /// 服務用的是別的資料目錄時，照樣移除
+        #[arg(long)]
+        force: bool,
     },
     /// 有沒有裝、collector 現在有沒有在跑
     Status,
@@ -135,6 +141,9 @@ struct ServeArgs {
     /// 所有 session 都結束後，閒置多久就自動結束（秒，0＝不結束）
     #[arg(long)]
     idle_exit_seconds: Option<u64>,
+    /// 一律寫 <home>/collector.log（常駐服務用；沒帶時 stderr 是終端機就印到畫面）
+    #[arg(long)]
+    log_file: bool,
 }
 
 impl ServeArgs {
@@ -145,13 +154,14 @@ impl ServeArgs {
             web_bind: self.web_bind.clone(),
             web_root: self.web_root.clone(),
             idle_exit_seconds: self.idle_exit_seconds,
+            log_file: self.log_file,
         }
     }
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Serve(args) => run_serve(&args.overrides()),
+        Command::Serve(args) => run(|| run_serve(&args.overrides())),
         // 不變式 4：ensure 失敗也不能讓 Claude Code 看到錯誤，stdout 也不能有任何輸出
         Command::Ensure => {
             if let Err(e) = ensure() {
@@ -159,38 +169,72 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Command::Config(args) => match Config::load(&args.overrides()) {
-            Ok(c) => {
-                println!("{c:#?}");
-                ExitCode::SUCCESS
+        Command::Config(args) => run(|| {
+            let c = config(&args.overrides())?;
+            for w in &c.warnings {
+                eprintln!("coding-lab：{w}");
             }
-            Err(e) => {
-                eprintln!("coding-lab：{e}");
-                ExitCode::from(2)
-            }
-        },
-        Command::Healthz => healthz(),
-        Command::Stop => stop(),
-        Command::Prune => prune(),
+            println!("{c:#?}");
+            Ok(ExitCode::SUCCESS)
+        }),
+        Command::Healthz => run(healthz),
+        Command::Stop => run(stop),
+        Command::Prune => run(prune),
         Command::Service(args) => service(args.command),
         Command::Key(args) => key(args.command),
         Command::Hub(args) => hub(args),
     }
 }
 
-/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
-fn hub(args: HubArgs) -> ExitCode {
-    match hub_inner(args) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
+/// 子命令失敗的原因（E-D7）：設定錯誤一律 exit 2，其他失敗 exit 1。
+enum Failure {
+    Config(String),
+    Other(String),
+}
+
+impl From<String> for Failure {
+    fn from(e: String) -> Failure {
+        Failure::Other(e)
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(e: &str) -> Failure {
+        Failure::Other(e.to_string())
+    }
+}
+
+/// 讀設定；讀不了算設定錯誤。
+fn config(overrides: &Overrides) -> Result<Config, Failure> {
+    Config::load(overrides).map_err(Failure::Config)
+}
+
+/// 跑一個子命令：錯誤印到 stderr，退出碼見 [`Failure`]。
+fn run(f: impl FnOnce() -> Result<ExitCode, Failure>) -> ExitCode {
+    match f() {
+        Ok(code) => code,
+        // serve 也走這裡：服務的主控台不在時 `eprintln!` 會 panic（#739 B-S2），寫不出去就算了
+        Err(Failure::Config(e)) => {
+            let _ = writeln!(std::io::stderr(), "coding-lab：{e}");
+            ExitCode::from(2)
+        }
+        Err(Failure::Other(e)) => {
+            let _ = writeln!(std::io::stderr(), "coding-lab：{e}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn hub_inner(args: HubArgs) -> Result<(), String> {
-    let cfg = Config::load(&Overrides::default())?;
+/// `coding-lab hub [--bind]`／`hub add <name> <url>`（#663）
+fn hub(args: HubArgs) -> ExitCode {
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        hub_inner(cfg, args)?;
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+fn hub_inner(cfg: Config, args: HubArgs) -> Result<(), String> {
     match args.command {
         Some(HubCommand::Add { name, url, no_key }) => {
             let key = if no_key {
@@ -229,19 +273,26 @@ fn hub_inner(args: HubArgs) -> Result<(), String> {
                 None => cfg.hub_bind,
             };
             if !bind.ip().is_loopback() {
-                return Err(format!("hub 的 web 免金鑰，只能綁本機位址，收到 {bind}"));
+                return Err(format!("hub 的 web 只能綁本機位址，收到 {bind}"));
             }
             let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads())
                 .enable_all()
                 .build()
                 .map_err(|e| format!("無法建立 runtime：{e}"))?;
+            // 127.0.0.1 是整台機器共用的：每次啟動產生新的 token，只印在這個終端機（W-M8）
+            let token = coding_lab::hub::new_token(&mut coding_lab::keys::SystemRng);
             rt.block_on(async {
-                let (addr, task) =
-                    coding_lab::hub::serve(bind, cfg.hub_upstreams.clone(), cfg.web_root.clone())
-                        .await
-                        .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
+                let (addr, task) = coding_lab::hub::serve(
+                    bind,
+                    cfg.hub_upstreams.clone(),
+                    cfg.web_root_or_bundled(),
+                    token.clone(),
+                )
+                .await
+                .map_err(|e| format!("hub 綁不到 {bind}：{e}"))?;
                 eprintln!(
-                    "coding-lab hub：http://{addr}（上游：{}）；Ctrl-C 結束",
+                    "coding-lab hub：http://{addr}/?token={token}（上游：{}）\n用這個網址開；hub 重新啟動後要用新印出的網址。Ctrl-C 結束",
                     cfg.hub_upstreams
                         .iter()
                         .map(|u| format!("{} {}", u.name, u.url))
@@ -263,43 +314,29 @@ fn read_secret(prompt: &str) -> Result<String, String> {
     let stdin = std::io::stdin();
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
-    let tty = stdin.is_terminal();
-    #[cfg(unix)]
-    let echo_off = tty
-        && std::process::Command::new("stty")
-            .arg("-echo")
-            .status()
-            .is_ok_and(|s| s.success());
-    #[cfg(not(unix))]
-    let echo_off = false;
-    if tty && !echo_off {
-        eprintln!("（輸入會顯示在畫面上）");
+    // 終端機：不回顯（三個平台都是，#743 W-L2）。rpassword 讀的是終端機本身，所以管線輸入（腳本、測試）照舊讀 stdin
+    if stdin.is_terminal() {
+        return rpassword::read_password().map_err(|e| format!("讀不到輸入：{e}"));
     }
     let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
-    #[cfg(unix)]
-    if echo_off {
-        let _ = std::process::Command::new("stty").arg("echo").status();
-        eprintln!();
-    }
-    read.map_err(|e| format!("讀不到輸入：{e}"))?;
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(|e| format!("讀不到輸入：{e}"))?;
     Ok(line)
 }
 
 /// `coding-lab service …`（#662）：Plan 由 service.rs 算，這裡只負責環境、印出與執行。
 fn service(cmd: ServiceCommand) -> ExitCode {
-    match service_inner(cmd) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
-        }
-    }
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        service_inner(cfg, cmd)?;
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
-fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
+fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
     use coding_lab::service::{self, Platform};
-    let cfg = Config::load(&Overrides::default())?;
     let platform = Platform::current().ok_or_else(|| {
         format!(
             "{} 沒有常駐服務的做法；請自己用系統的方式跑 coding-lab serve --idle-exit-seconds 0",
@@ -307,9 +344,18 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
         )
     })?;
     let ctx = service::Ctx::detect(&cfg.home)?;
-    // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）
-    let _ = std::fs::create_dir_all(&cfg.home);
-    let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
+    // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）。
+    // 唯讀的 status、--dry-run 不建資料目錄（第 2 輪 Windows 驗收：status 把不存在的 home 建出來了）
+    let writes = match &cmd {
+        ServiceCommand::Install { dry_run, .. } | ServiceCommand::Uninstall { dry_run, .. } => {
+            !dry_run
+        }
+        ServiceCommand::Status => false,
+    };
+    if writes {
+        let _ = coding_lab::store::create_private_dir(&cfg.home);
+        let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
+    }
     let describe = |plan: &service::Plan| {
         for (p, _) in &plan.files {
             println!("寫入 {}", p.display());
@@ -322,9 +368,18 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
         }
     };
     match cmd {
-        ServiceCommand::Install { dry_run } => {
+        ServiceCommand::Install { dry_run, force } => {
             if let Some(w) = cfg.plugin_warning() {
                 eprintln!("coding-lab：{w}");
+            }
+            // 已經有服務、但 home 不同：不換掉（W-L11）
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            if let Err(e) = service::check_existing(existing.as_deref(), &cfg.home, force) {
+                if !dry_run {
+                    return Err(e);
+                }
+                eprintln!("coding-lab：（實際執行時會被拒）{e}");
             }
             let plan = service::plan_install(platform, &ctx);
             describe(&plan);
@@ -335,7 +390,10 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 return Ok(());
             }
             // 已經有 ensure 拉起的 collector 在跑時，服務會搶不到埠：先請它結束；登記失敗再把它拉回（#719）
-            let was_running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
+            let was_running = matches!(
+                coding_lab::serve::state(&cfg.home),
+                coding_lab::serve::State::Up(_)
+            );
             if was_running
                 && std::process::Command::new(&ctx.exe)
                     .arg("stop")
@@ -347,6 +405,13 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                 eprintln!(
                     "coding-lab：舊的 collector 沒有停下來，服務可能綁不到埠；稍後用 service status 確認"
                 );
+            }
+            // 舊版放在工作排程器根目錄的 CodingLab：是自己這個 home 的才刪（W-L11）
+            if platform == Platform::Windows
+                && let Some(cmd) =
+                    service::legacy_windows_task(&ctx, &mut service::run_command_capture_quiet)
+            {
+                let _ = service::run_command_capture_quiet(&cmd);
             }
             if platform == Platform::Macos && service::installed(platform, &ctx) {
                 // 重裝：先卸掉舊的（沒裝過時 bootout 會失敗，所以只在檔案在時做）
@@ -385,7 +450,15 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
             }
             Ok(())
         }
-        ServiceCommand::Uninstall { dry_run } => {
+        ServiceCommand::Uninstall { dry_run, force } => {
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            if let Err(e) = service::check_existing(existing.as_deref(), &cfg.home, force) {
+                if !dry_run {
+                    return Err(e);
+                }
+                eprintln!("coding-lab：（實際執行時會被拒）{e}");
+            }
             let plan = service::plan_uninstall(platform, &ctx);
             describe(&plan);
             if dry_run {
@@ -420,11 +493,14 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
             Ok(())
         }
         ServiceCommand::Status => {
-            let files = service::files_for(platform, &ctx);
             // 以系統的登記為準（#719）：install 失敗後 unit／XML 檔可能還在
             let registered =
                 service::query_installed(platform, &ctx, &mut service::run_command_capture_quiet);
             let file = service::installed(platform, &ctx);
+            // 服務用的 home 和目前的不一定一樣（W-L11）；括號裡的檔跟著服務的 home（§8.4）
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            let shown = service::status_file(platform, &ctx, existing.as_deref());
             println!(
                 "常駐服務：{}（{}：{}）",
                 if registered {
@@ -435,14 +511,25 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
                     "未安裝"
                 },
                 service::status_command(platform, &ctx).join(" "),
-                files[0].display()
+                shown.display()
             );
-            let running = TcpStream::connect_timeout(&cfg.hook_bind, PROBE_TIMEOUT).is_ok();
-            println!(
-                "collector：{}（hook 入口 {}）",
-                if running { "執行中" } else { "沒有在跑" },
-                cfg.hook_bind
-            );
+            if let Some(h) = existing {
+                let same = service::check_existing(Some(&h), &cfg.home, false).is_ok();
+                println!(
+                    "服務的資料目錄：{}（{}）",
+                    h.display(),
+                    if same {
+                        "和目前的相同".to_string()
+                    } else {
+                        format!("和目前的 {} 不同", cfg.home.display())
+                    }
+                );
+            }
+            let running = running_info(&cfg, Duration::ZERO);
+            match running.as_ref().and_then(|i| i.hook) {
+                Some(hook) => println!("collector：執行中（hook 入口 {hook}）"),
+                None => println!("collector：沒有在跑"),
+            }
             Ok(())
         }
     }
@@ -450,20 +537,18 @@ fn service_inner(cmd: ServiceCommand) -> Result<(), String> {
 
 /// `coding-lab key …`（#666）。collector 每次驗證都重讀 keys.json，所以這裡直接改檔就生效，不必重啟。
 fn key(cmd: KeyCommand) -> ExitCode {
-    match key_inner(cmd) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
-        }
-    }
+    run(|| {
+        let cfg = config(&Overrides::default())?;
+        key_inner(cfg, cmd)?;
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
-fn key_inner(cmd: KeyCommand) -> Result<(), String> {
-    let cfg = Config::load(&Overrides::default())?;
+fn key_inner(cfg: Config, cmd: KeyCommand) -> Result<(), String> {
     let now = coding_lab::now_ms();
     let mut rng = SystemRng;
-    let mut store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
+    // 只讀的子命令用這份；create／revoke 在鎖裡重讀（KeyStore::update，W-L13）
+    let store = KeyStore::load(&cfg.home)?.unwrap_or_else(|| KeyStore::new(&mut rng));
     match cmd {
         KeyCommand::Create {
             name,
@@ -471,9 +556,15 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             expires,
         } => {
             let expires_ms = coding_lab::keys::parse_expires(&expires, now)?;
-            let token = store.create(&name, scope, expires_ms, now, &mut rng);
-            store.save(&cfg.home)?;
-            let id = store.list().last().map(|k| k.id.as_str()).unwrap_or("");
+            let (token, id) = KeyStore::update(&cfg.home, &mut rng, |store, rng| {
+                let token = store.create(&name, scope, expires_ms, now, rng);
+                let id = store
+                    .list()
+                    .last()
+                    .map(|k| k.id.clone())
+                    .unwrap_or_default();
+                Ok(((token, id), true))
+            })?;
             println!("金鑰（只顯示這一次，請現在複製）：\n\n    {token}\n");
             println!(
                 "id {id}　name {name}　scope {}　到期 {}",
@@ -577,13 +668,16 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
             Ok(())
         }
         KeyCommand::Revoke { id } => {
-            if store.get(&id).is_none() {
-                return Err(format!(
-                    "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
-                ));
-            }
-            if store.revoke(&id, now) {
-                store.save(&cfg.home)?;
+            let revoked = KeyStore::update(&cfg.home, &mut rng, |store, _| {
+                if store.get(&id).is_none() {
+                    return Err(format!(
+                        "沒有 id 是 {id} 的金鑰；coding-lab key list 看現有的"
+                    ));
+                }
+                let revoked = store.revoke(&id, now);
+                Ok((revoked, revoked))
+            })?;
+            if revoked {
                 println!("已撤銷 {id}，持有這把金鑰的連線下一次請求起失效");
             } else {
                 println!("{id} 先前已撤銷");
@@ -593,44 +687,45 @@ fn key_inner(cmd: KeyCommand) -> Result<(), String> {
     }
 }
 
-fn run_serve(overrides: &Overrides) -> ExitCode {
-    let cfg = match Config::load(overrides) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+fn run_serve(overrides: &Overrides) -> Result<ExitCode, Failure> {
+    let cfg = config(overrides)?;
     let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads())
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("coding-lab：無法建立 runtime：{e}");
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
     };
     match rt.block_on(serve::run(cfg)) {
-        Ok(Outcome::Stopped) => ExitCode::SUCCESS,
+        Ok(Outcome::Stopped) => Ok(ExitCode::SUCCESS),
         Ok(Outcome::AlreadyRunning) => {
             eprintln!("coding-lab：已經有 collector 在跑");
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }
 
-const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// 連本機的 collector：它在跑（拿著鎖）時連線不到 1 ms；沒在聽的埠在 Windows 要約 2 秒才回拒絕，不能等那麼久（EW2）
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 /// ensure 整體最多花多久（plugin 的 SessionStart hook timeout 是 5 秒）
 const ENSURE_BUDGET: Duration = Duration::from_secs(4);
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// SessionStart command hook：確保 collector 在跑，再把 stdin 的 payload 轉送給它。
+///
+/// 在不在跑看 store 鎖、位址看 collector.json、起不來看 collector.failed（contracts §5），不靠 TCP 探測猜。
+/// 轉送拿到 503 或連線斷掉，表示舊的 collector 正在結束（#685）：拉起新的，新的看到 closing 會等舊的放掉 hook 埠、
+/// 綁上之後先收 hook，所以照樣送到同一個位址就好。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout。
 fn ensure() -> Result<(), String> {
+    use coding_lab::serve::{self, State};
     let cfg = Config::load(&Overrides::default())?;
     let mut body = Vec::new();
     let stdin = std::io::stdin();
@@ -640,32 +735,64 @@ fn ensure() -> Result<(), String> {
             .read_to_end(&mut body)
             .map_err(|e| e.to_string())?;
     }
-    // 轉送拿到 503，或 probe 之後埠就被放掉（連線被拒、還沒回應就被 RST），表示舊的 collector 正在閒置結束
-    // （#685）：等它放掉埠，拉起新的再送一次。每一步的 timeout 都用剩下的預算夾住，整體不超過 hook timeout
+    let home = &cfg.home;
+    // L-1：最近起不來過就不再拉起，不讓每個 SessionStart 都等滿預算
+    let fresh = coding_lab::now_ms().saturating_sub(serve::FAILED_FRESH_MS);
+    if let Some(e) = serve::failed_since(home, fresh) {
+        return Err(format!(
+            "collector 最近起不來，{} 秒內不再拉起：{e}",
+            serve::FAILED_FRESH_MS / 1000
+        ));
+    }
     let deadline = Instant::now() + ENSURE_BUDGET;
-    let mut spawned = false;
+    // 拉起 collector 的時間（epoch ms）：之後寫的 collector.failed 就是它的
+    let mut spawned: Option<u64> = None;
+    let spawn = |spawned: &mut Option<u64>| -> Result<(), String> {
+        if spawned.is_none() {
+            *spawned = Some(coding_lab::now_ms());
+            spawn_collector(&cfg)?;
+        }
+        Ok(())
+    };
+    // 我們拉起的 collector 用這份設定，位址就是 cfg.hook_bind
+    let mut target = cfg.hook_bind;
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             return Err(format!(
                 "collector {} 秒內沒有起來",
                 ENSURE_BUDGET.as_secs()
             ));
         }
-        if probe(cfg.hook_bind, left) {
-            if body.is_empty() {
+        if let Some(e) = spawned.and_then(|t| serve::failed_since(home, t)) {
+            return Err(format!("collector 起不來：{e}"));
+        }
+        match serve::state(home) {
+            State::Up(Some(info)) => {
+                if let Some(a) = info.hook {
+                    target = a;
+                }
+                if info.closing {
+                    spawn(&mut spawned)?;
+                } else if body.is_empty() {
+                    return Ok(());
+                }
+            }
+            // 啟動中（綁好 hook 埠、還沒寫 collector.json）或結束中（刪了 collector.json、還沒放鎖）：
+            // 多拉起一個沒關係，在跑的那個會讓它以「已經有 collector」結束
+            State::Up(None) | State::Down => spawn(&mut spawned)?,
+        }
+        if body.is_empty() {
+            if spawned.is_some() && matches!(serve::state(home), State::Up(_)) {
                 return Ok(());
             }
+        } else {
             let left = deadline.saturating_duration_since(Instant::now());
-            match forward(cfg.hook_bind, &body, left)? {
+            match forward(target, &body, left)? {
                 Forwarded::Accepted => return Ok(()),
                 Forwarded::Exiting => {}
             }
-        } else if !spawned {
-            spawn_collector(&cfg)?;
-            spawned = true;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -676,20 +803,15 @@ enum Forwarded {
     Exiting,
 }
 
-fn probe(addr: SocketAddr, left: Duration) -> bool {
-    !left.is_zero() && TcpStream::connect_timeout(&addr, PROBE_TIMEOUT.min(left)).is_ok()
-}
-
 fn spawn_collector(cfg: &Config) -> Result<(), String> {
-    std::fs::create_dir_all(&cfg.home).map_err(|e| e.to_string())?;
+    coding_lab::store::create_private_dir(&cfg.home).map_err(|e| e.to_string())?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(cfg.home.join("collector.log"))
+    let log = coding_lab::store::open_private_append(&cfg.home.join("collector.log"))
         .map_err(|e| e.to_string())?;
     let mut cmd = std::process::Command::new(exe);
+    // 工作目錄用 home，不沿用第一個 session 的專案目錄：Windows 上程序的 cwd 會鎖住那個資料夾（L-9）
     cmd.arg("serve")
+        .current_dir(&cfg.home)
         .env("CODING_LAB_HOME", &cfg.home)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -750,15 +872,20 @@ fn no_inherit_std_handles() {
 fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, String> {
     use std::io::ErrorKind;
     let step = |d: Duration| d.min(left).max(Duration::from_millis(1));
-    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(PROBE_TIMEOUT)) else {
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, step(CONNECT_TIMEOUT)) else {
         return Ok(Forwarded::Exiting);
     };
     s.set_write_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
     s.set_read_timeout(Some(step(FORWARD_TIMEOUT)))
         .map_err(|e| e.to_string())?;
+    // 和 plugin 的 http hook 一樣帶使用者：4800 被別的帳號的 collector 佔著時它會丟掉（#777）
+    let user = coding_lab::hooks::current_user()
+        .filter(|u| !u.contains(['\r', '\n']))
+        .map(|u| format!("{}: {u}\r\n", coding_lab::hooks::USER_HEADER))
+        .unwrap_or_default();
     let head = format!(
-        "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\n{user}Content-Length: {}\r\nConnection: close\r\n\r\n",
         coding_lab::hooks::HOOK_PATH,
         body.len()
     );
@@ -784,22 +911,15 @@ fn forward(addr: SocketAddr, body: &[u8], left: Duration) -> Result<Forwarded, S
 }
 
 fn append_log(msg: &str) {
-    let home = Config::load(&Overrides::default())
-        .map(|c| c.home)
-        .unwrap_or_else(|_| coding_lab::config::default_home());
-    let _ = std::fs::create_dir_all(&home);
+    // 不讀 config.toml：設定壞掉正是常見的原因，那時也要寫進 CODING_LAB_HOME 而不是預設的 home
+    let home = coding_lab::config::resolve_home(&Overrides::default());
+    let _ = coding_lab::store::create_private_dir(&home);
     coding_lab::logging::append(&home.join("collector.log"), msg);
 }
 
 /// 清掉超過保留期限的 session。collector 在跑時不動（它啟動時與每天會自己清），避免兩個程序同時寫 store。
-fn prune() -> ExitCode {
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
-        }
-    };
+fn prune() -> Result<ExitCode, Failure> {
+    let cfg = config(&Overrides::default())?;
     let days = coding_lab::store::RETENTION_DAYS;
     let _lock = match serve::try_lock_store(&cfg.home) {
         Ok(Some(lock)) => lock,
@@ -807,119 +927,168 @@ fn prune() -> ExitCode {
             eprintln!(
                 "coding-lab：collector 正在執行，它啟動時與每天會自動清掉 {days} 天前的資料；要立刻清請先結束 collector"
             );
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            return ExitCode::FAILURE;
+            return Ok(ExitCode::FAILURE);
         }
     };
+    // 拿著鎖的期間留標記：這時被拉起的 collector 等鎖時說得出是 prune（W-L15）
+    let marker = cfg.home.join(serve::PRUNE_MARKER);
+    let _ = coding_lab::store::write_private(&marker, std::process::id().to_string().as_bytes());
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _marker = RemoveOnDrop(marker);
     let before = coding_lab::now_ms().saturating_sub(days * 24 * 60 * 60 * 1000);
     let result = coding_lab::store::Store::open(&cfg.home).and_then(|mut s| s.prune(before));
     match result {
         Ok(r) => {
             println!(
-                "清掉 {} 個超過 {days} 天的 session（{} KB）",
+                "清掉 {} 個超過 {days} 天的 session（{}）",
                 r.sessions.len(),
-                r.bytes / 1024
+                coding_lab::store::fmt_size(r.bytes)
             );
-            ExitCode::SUCCESS
+            // 刪不掉的檔（被其他程式鎖住）索引照留，下次再清（L-17）
+            for (sid, why) in &r.failed {
+                eprintln!("coding-lab：{sid} 的事件檔刪不掉（{why}），下次再清");
+            }
+            Ok(if r.failed.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
         }
         Err(e) => {
             eprintln!("coding-lab：{e}");
-            ExitCode::FAILURE
+            Ok(ExitCode::FAILURE)
         }
     }
 }
 
-/// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 放掉埠、刪掉 collector.json 才回。
-/// 背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），這是三平台都通、不丟資料的停法；
-/// 沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
-fn stop() -> ExitCode {
-    const STOP_WAIT: Duration = Duration::from_secs(15);
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
+/// 一次 HTTP 請求（`Connection: close`），回傳整個回應。只連 collector.json 寫的位址（R-11）。
+fn http_once(addr: SocketAddr, request: &str) -> std::io::Result<Vec<u8>> {
+    let mut s = TcpStream::connect_timeout(&addr, FORWARD_TIMEOUT)?;
+    s.set_read_timeout(Some(FORWARD_TIMEOUT))?;
+    s.set_write_timeout(Some(FORWARD_TIMEOUT))?;
+    s.write_all(request.as_bytes())?;
+    let mut out = Vec::new();
+    s.read_to_end(&mut out)?;
+    Ok(out)
+}
+
+/// 執行中 collector 的位址（contracts §5）：拿著鎖、collector.json 有寫才算；啟動或結束到一半時等 `wait`。
+/// 沒有 collector.json 時不退回設定裡的預設埠：那可能是別的資料目錄的 collector（R-11）。
+/// serve 與 hub 的 tokio worker 數：核心數，最多 4（EW9）。預設等於邏輯核心數（24 核的機器閒置 29 條執行緒），
+/// collector 用不到；hook 入口另有自己的執行緒（L-7）。
+fn worker_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().min(4))
+}
+
+fn running_info(cfg: &Config, wait: Duration) -> Option<coding_lab::serve::Info> {
+    use coding_lab::serve::State;
+    let deadline = Instant::now() + wait;
+    loop {
+        match coding_lab::serve::state(&cfg.home) {
+            State::Down => return None,
+            State::Up(Some(info)) => return Some(info),
+            State::Up(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            State::Up(None) => return None,
         }
+    }
+}
+
+/// `coding-lab stop`（#700）：對 hook 埠 `POST /stop`，等 collector 關好 SQLite、刪掉 collector.json、放掉 store 鎖才回
+/// （L-13：回報結束時新的 collector 馬上就能開 store）。背景 collector 沒有 console（Windows 用 CREATE_NO_WINDOW），
+/// 這是三平台都通、不丟資料的停法；沒在跑時 exit 0 只印一句，手冊的更新與卸載步驟可以無條件先跑它。
+fn stop() -> Result<ExitCode, Failure> {
+    const STOP_WAIT: Duration = Duration::from_secs(15);
+    let cfg = config(&Overrides::default())?;
+    let Some((pid, hook, token)) = running_info(&cfg, STOP_WAIT).and_then(|i| {
+        i.hook
+            .map(|h| (i.pid, h, i.stop_token.unwrap_or_else(|| "1".into())))
+    }) else {
+        eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
+        return Ok(ExitCode::SUCCESS);
     };
-    let info = cfg.home.join("collector.json");
-    let hook = std::fs::read_to_string(&info)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| {
-            v["hook"]
-                .as_str()
-                .and_then(|w| w.parse::<SocketAddr>().ok())
-        })
-        .unwrap_or(cfg.hook_bind);
-    let Ok(mut s) = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT) else {
-        eprintln!("coding-lab：collector 沒有在跑（{hook}）");
-        return ExitCode::SUCCESS;
-    };
-    let _ = s.set_read_timeout(Some(FORWARD_TIMEOUT));
-    let _ = s.set_write_timeout(Some(FORWARD_TIMEOUT));
     let req = format!(
-        "POST {} HTTP/1.1\r\nHost: {hook}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        coding_lab::hooks::STOP_PATH
+        "POST {} HTTP/1.1\r\nHost: {hook}\r\n{}: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH,
+        coding_lab::hooks::STOP_HEADER
     );
-    let mut resp = [0u8; 64];
-    let accepted = s.write_all(req.as_bytes()).is_ok()
-        && matches!(s.read(&mut resp), Ok(n) if resp[..n].starts_with(b"HTTP/1.1 200"));
-    drop(s);
-    if !accepted {
+    if !http_once(hook, &req).is_ok_and(|r| r.starts_with(b"HTTP/1.1 200")) {
         eprintln!(
             "coding-lab：collector 沒有接受 stop（{hook}）；請直接結束 coding-lab serve 這個程序"
         );
-        return ExitCode::FAILURE;
+        return Ok(ExitCode::FAILURE);
     }
-    // 埠放掉之後它還在停 tail、flush：等 collector.json 被刪掉（它是最後一步）
+    // 它刪 collector.json 時 SQLite 已經關好，緊接著放鎖。鎖一放掉可能馬上被新的 collector 拿走，
+    // 所以 collector.json 不見之後鎖還被拿著一陣子、或換成別的 pid 寫的，也算它結束了
+    const HANDED_OVER: Duration = Duration::from_secs(1);
     let deadline = Instant::now() + STOP_WAIT;
+    let mut gone_at: Option<Instant> = None;
     while Instant::now() < deadline {
-        let port_free = TcpStream::connect_timeout(&hook, PROBE_TIMEOUT).is_err();
-        let info_gone = !info.exists();
-        if port_free && info_gone {
+        use coding_lab::serve::State;
+        let done = match coding_lab::serve::state(&cfg.home) {
+            State::Down => true,
+            State::Up(Some(i)) => i.pid != pid,
+            State::Up(None) => gone_at.get_or_insert_with(Instant::now).elapsed() >= HANDED_OVER,
+        };
+        if done {
             eprintln!("coding-lab：collector 已結束");
-            return ExitCode::SUCCESS;
+            service_start_hint(&cfg.home);
+            return Ok(ExitCode::SUCCESS);
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     eprintln!(
         "coding-lab：collector 收到 stop 但 {} 秒內還沒結束；看 {}",
         STOP_WAIT.as_secs(),
         cfg.home.join("collector.log").display()
     );
-    ExitCode::FAILURE
+    Ok(ExitCode::FAILURE)
 }
 
-fn healthz() -> ExitCode {
-    let cfg = match Config::load(&Overrides::default()) {
-        Ok(c) => c,
+/// 裝了常駐服務時，stop 停掉的就是它，而且不會自己回來（R-6）：提示怎麼叫回來。服務管理員自己呼叫
+/// （systemd 的 ExecStop）時 stderr 不是終端機，不印。
+fn service_start_hint(home: &std::path::Path) {
+    use coding_lab::service::{self, Platform};
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    let (Some(platform), Ok(ctx)) = (Platform::current(), service::Ctx::detect(home)) else {
+        return;
+    };
+    if service::installed(platform, &ctx) {
+        eprintln!(
+            "coding-lab：常駐服務也跟著停了，不會自己回來；要叫回來：{}（之後的 session 也會照常拉起一個閒置會結束的 collector）",
+            service::start_command(platform, &ctx).join(" ")
+        );
+    }
+}
+
+fn healthz() -> Result<ExitCode, Failure> {
+    let cfg = config(&Overrides::default())?;
+    let Some(web) = running_info(&cfg, Duration::from_secs(2)).and_then(|i| i.web) else {
+        eprintln!("coding-lab：collector 沒有在跑（{}）", cfg.home.display());
+        return Ok(ExitCode::FAILURE);
+    };
+    let req = format!("GET /healthz HTTP/1.1\r\nHost: {web}\r\nConnection: close\r\n\r\n");
+    match http_once(web, &req) {
+        Ok(out) => {
+            let out = String::from_utf8_lossy(&out);
+            println!("{}", out.split("\r\n\r\n").nth(1).unwrap_or(&out));
+            Ok(ExitCode::SUCCESS)
+        }
         Err(e) => {
-            eprintln!("coding-lab：{e}");
-            return ExitCode::from(2);
+            eprintln!("coding-lab：連不上 collector（{web}）：{e}");
+            Ok(ExitCode::FAILURE)
         }
-    };
-    let web = std::fs::read_to_string(cfg.home.join("collector.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v["web"].as_str().and_then(|w| w.parse::<SocketAddr>().ok()))
-        .unwrap_or(cfg.web_bind);
-    let mut s = match TcpStream::connect_timeout(&web, PROBE_TIMEOUT) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("coding-lab：collector 沒有在跑（{web}）");
-            return ExitCode::FAILURE;
-        }
-    };
-    let _ = s.set_read_timeout(Some(FORWARD_TIMEOUT));
-    let _ = write!(
-        s,
-        "GET /healthz HTTP/1.1\r\nHost: {web}\r\nConnection: close\r\n\r\n"
-    );
-    let mut out = String::new();
-    let _ = s.read_to_string(&mut out);
-    println!("{}", out.split("\r\n\r\n").nth(1).unwrap_or(&out));
-    ExitCode::SUCCESS
+    }
 }

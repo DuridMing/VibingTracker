@@ -9,6 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+#[path = "common/sh.rs"]
+mod sh;
+
 static N: AtomicU32 = AtomicU32::new(0);
 
 struct Env {
@@ -116,13 +119,15 @@ fn http(port: u16, method: &str, path: &str, body: &str) -> String {
     out
 }
 
+/// 子程序先交給 Kill 再等：等不到 collector.json 而 panic 時也會收掉它。
+/// 不然 idle_exit_seconds = 0 的 collector 會一直跑下去（Windows 驗收第 1 輪看到一個跑了一小時多）。
 fn start_serve(e: &Env) -> Kill {
-    let child = cmd(e, &["serve"]).spawn().unwrap();
-    let pid = child.id();
+    let child = Kill(cmd(e, &["serve"]).spawn().unwrap());
+    let pid = child.0.id();
     wait_for("collector.json", || {
         collector(e).is_some_and(|c| c["pid"] == pid)
     });
-    Kill(child)
+    child
 }
 
 #[test]
@@ -353,11 +358,49 @@ fn ensure_twice_starts_one_collector_and_forwards_session_start() {
     kill_pid(pid);
 }
 
+/// L-9（#739）：ensure 拉起的 collector 的工作目錄是 home，不是第一個 session 的專案目錄
+/// （Windows 上程序的 cwd 會鎖住那個資料夾，刪不掉也改不了名）。用 /proc 看，只在 Linux 跑。
+#[cfg(target_os = "linux")]
+#[test]
+fn ensure_starts_the_collector_in_its_home() {
+    let e = env(5);
+    let project = e.home.with_extension("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut c = cmd(&e, &["ensure"]);
+    c.current_dir(&project).stdin(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    assert!(child.wait().unwrap().success());
+    wait_for("collector.json", || collector(&e).is_some());
+    let pid = collector(&e).unwrap()["pid"].as_u64().unwrap();
+    let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap();
+    kill_pid(pid);
+    assert_eq!(cwd, e.home.canonicalize().unwrap());
+}
+
+/// EW9（#760）：主 runtime 的 worker 最多 4 條。預設是邏輯核心數（Windows 實機 24 核閒置 29 條執行緒），
+/// collector 的工作量用不到；hook 入口另有自己的執行緒（L-7）。用 /proc 數，只在 Linux 跑。
+#[cfg(target_os = "linux")]
+#[test]
+fn serve_uses_at_most_four_runtime_workers() {
+    let e = env(0);
+    let _c = start_serve(&e);
+    let pid = collector(&e).unwrap()["pid"].as_u64().unwrap();
+    let workers = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|c| c.trim() == "tokio-rt-worker")
+        .count();
+    assert!((1..=4).contains(&workers), "worker {workers} 條");
+}
+
 #[test]
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
     // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走
     let squatter = TcpListener::bind("127.0.0.1:0").unwrap(); // 接受連線但從不回應
-    let e = env_on(0, squatter.local_addr().unwrap().port());
+    // 閒置 1 秒就結束（不是 0＝永遠不結束）：ensure 在背景拉起的 collector 不歸測試管，squatter 一放開
+    // 它就可能綁上同一個埠；idle 0 的話會一直跑下去（Windows 第 2 輪驗收與 Linux 都看到留下來的 collector）
+    let e = env_on(1, squatter.local_addr().unwrap().port());
     let t = Instant::now();
     let out = ensure(&e, r#"{"session_id":"s","hook_event_name":"SessionStart"}"#);
     assert!(out.status.success() && out.stdout.is_empty());
@@ -735,6 +778,24 @@ fn idle_from_before_a_restart_returns_to_run_on_the_next_prompt() {
         .unwrap();
         wait_for("Esc 後是 idle", || status() == "idle");
         wait_for("idle 寫進 store", || stored_status() == "idle");
+        // flush 先寫 JSONL、再在 SQLite 的交易裡記 tail 讀到的行號：只看 JSONL 就殺掉的話，可能殺在兩者之間，
+        // 重啟後從舊的行號重讀那行中斷，狀態在新的 prompt 之後又回到 idle（負載高時偶發，T-4）
+        let tail_line = || {
+            rusqlite::Connection::open_with_flags(
+                e.home.join("index.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .and_then(|db| {
+                db.query_row(
+                    "SELECT line_no FROM tails WHERE session = 'si' AND file = 'main'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+            })
+            .ok()
+            .flatten()
+        };
+        wait_for("讀到的行號寫進索引", || tail_line() == Some(1));
     }
     let _second = start_serve(&e);
     assert_eq!(status(), "idle", "前提：重啟後重放出 idle");
@@ -765,40 +826,275 @@ fn serve_waits_for_the_store_lock_before_opening_the_store() {
     });
 }
 
-/// #685：ensure 轉送時拿到 503（舊的 collector 正在閒置結束），要等埠放掉後拉起新的再轉送一次。
-#[test]
-fn ensure_retries_on_a_new_collector_when_the_old_one_is_exiting() {
-    let (old, port) = bound_free_port();
-    let e = env_on(5, port);
-    let exiting = std::thread::spawn(move || {
-        // probe 只連線不送資料；轉送的那一條回 503，然後放掉埠（模擬舊 collector 結束）
-        for conn in old.incoming() {
-            let Ok(mut c) = conn else { continue };
+/// 模擬 #685 閒置結束中的舊 collector：拿著 store 鎖、collector.json 標 `closing`；hook 埠上 ensure 的轉送回 503
+/// （`reset` 時改成接了就斷線，像埠剛被放掉時 backlog 裡的連線被 RST），然後放掉埠；過一會刪 collector.json、放鎖，
+/// 和真正的結束順序一樣（contracts §5）。
+fn old_collector_closing(e: &Env, old: TcpListener, reset: bool) -> std::thread::JoinHandle<()> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.home.join("collector.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let info = e.home.join("collector.json");
+    std::fs::write(
+        &info,
+        json!({"pid": 999_998, "hook": format!("127.0.0.1:{}", e.hook), "web": format!("127.0.0.1:{}", e.web),
+               "closing": true}).to_string(),
+    )
+    .unwrap();
+    std::thread::spawn(move || {
+        // reset 時接了連線就丟掉（不回應），像埠剛被放掉時 backlog 裡的連線被 RST
+        if let Some(Ok(mut c)) = old.incoming().next()
+            && !reset
+        {
             c.set_read_timeout(Some(Duration::from_millis(500)))
                 .unwrap();
             let mut buf = [0u8; 4096];
-            if matches!(c.read(&mut buf), Ok(n) if n > 0) {
-                let _ =
-                    c.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n");
-                return;
-            }
+            let _ = c.read(&mut buf);
+            let _ = c.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n");
         }
-    });
-    let start = json!({"session_id": "s7", "hook_event_name": "SessionStart", "source": "startup",
-                       "transcript_path": e.home.join("t7.jsonl"), "cwd": "/p"})
-    .to_string();
-    let t = Instant::now();
-    let out = ensure(&e, &start);
-    assert!(out.status.success() && out.stdout.is_empty());
-    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
-    exiting.join().unwrap();
-    let jsonl = e.home.join("events/s7.jsonl");
-    wait_for("SessionStart 轉送到新的 collector", || {
-        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
-    });
-    if let Some(c) = collector(&e) {
-        kill_pid(c["pid"].as_u64().unwrap());
+        drop(old);
+        // 放掉埠之後還在 flush、關 SQLite
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = std::fs::remove_file(&info);
+        drop(lock);
+    })
+}
+
+/// #685：ensure 轉送時拿到 503（舊的 collector 正在閒置結束）：拉起新的，新的等舊的放掉 hook 埠就先綁上收 hook、
+/// 等舊的放鎖才開 store；SessionStart 轉送到新的那一個。
+#[test]
+fn ensure_hands_over_to_a_new_collector_when_the_old_one_is_exiting() {
+    for reset in [false, true] {
+        let (old, port) = bound_free_port();
+        let e = env_on(5, port);
+        let exiting = old_collector_closing(&e, old, reset);
+        let start =
+            json!({"session_id": "s7", "hook_event_name": "SessionStart", "source": "startup",
+                           "transcript_path": e.home.join("t7.jsonl"), "cwd": "/p"})
+            .to_string();
+        let t = Instant::now();
+        let out = ensure(&e, &start);
+        assert!(out.status.success() && out.stdout.is_empty());
+        assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
+        exiting.join().unwrap();
+        let jsonl = e.home.join("events/s7.jsonl");
+        wait_for("SessionStart 轉送到新的 collector", || {
+            std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+        });
+        if let Some(c) = collector(&e) {
+            kill_pid(c["pid"].as_u64().unwrap());
+        }
     }
+}
+
+// ── collector 在不在跑（contracts §5，#738）：鎖＝在跑、collector.json＝位址、collector.failed＝起不來
+
+fn failed(e: &Env) -> Option<Value> {
+    serde_json::from_str(&std::fs::read_to_string(e.home.join("collector.failed")).ok()?).ok()
+}
+
+/// 背景的 collector 寫好 collector.failed：ensure 可能比它先回來（例如佔著埠的程式接了連線不回應，
+/// ensure 轉送逾時就結束），負載高時 collector 判斷「埠被別的程式佔用」也要更久（T-4）
+fn wait_failed(e: &Env) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(f) = failed(e) {
+            return f;
+        }
+        assert!(Instant::now() < deadline, "要寫 collector.failed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+const SESSION_START: &str =
+    r#"{"session_id":"s","hook_event_name":"SessionStart","source":"startup","cwd":"/p"}"#;
+
+/// L-1：最近 60 秒內起不來過，ensure 不再拉起、立刻結束（不讓每個 SessionStart 都卡 4 秒）。
+#[test]
+fn ensure_does_not_respawn_right_after_a_failed_start() {
+    let e = env(5);
+    std::fs::write(
+        e.home.join("collector.failed"),
+        json!({"ts": now_ms(), "error": "測試：起不來"}).to_string(),
+    )
+    .unwrap();
+    let t = Instant::now();
+    let out = ensure(&e, SESSION_START);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(
+        t.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t.elapsed()
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(collector(&e).is_none(), "不能再拉起 collector");
+    assert!(
+        TcpStream::connect(("127.0.0.1", e.hook)).is_err(),
+        "不能再拉起 collector"
+    );
+    // 超過 60 秒就照常再試
+    std::fs::write(
+        e.home.join("collector.failed"),
+        json!({"ts": now_ms() - 61_000, "error": "很久以前"}).to_string(),
+    )
+    .unwrap();
+    let out = ensure(&e, SESSION_START);
+    assert!(out.status.success());
+    wait_for("照常拉起", || collector(&e).is_some());
+    kill_pid(collector(&e).unwrap()["pid"].as_u64().unwrap());
+}
+
+/// L-1：store 比支援的新（降版之後），collector 起不來：ensure 很快結束、不等滿 4 秒，
+/// collector.failed 寫清楚是哪個檔；hook 埠也不綁（綁了就會回 200、把 hook 丟掉）。
+#[test]
+fn ensure_gives_up_fast_when_the_store_is_from_a_newer_version() {
+    let e = env(5);
+    let db = rusqlite::Connection::open(e.home.join("index.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO meta VALUES ('schema_version', '99');",
+    )
+    .unwrap();
+    drop(db);
+    let t = Instant::now();
+    let out = ensure(&e, SESSION_START);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let f = wait_failed(&e);
+    assert!(
+        f["file"]
+            .as_str()
+            .is_some_and(|p| p.contains("index.sqlite")),
+        "{f}"
+    );
+    assert!(f["error"].as_str().is_some_and(|m| m.contains("99")), "{f}");
+    assert!(
+        TcpStream::connect(("127.0.0.1", e.hook)).is_err(),
+        "沒有 collector 綁著 hook 埠"
+    );
+    // 接下來的 SessionStart 不再等
+    let t = Instant::now();
+    let _ = ensure(&e, SESSION_START);
+    assert!(t.elapsed() < Duration::from_millis(500));
+}
+
+/// L-1：hook 埠被別的程式佔著（Windows 的保留埠也是）：很快結束，collector.failed 帶位址。
+#[test]
+fn ensure_gives_up_fast_when_the_hook_port_belongs_to_another_program() {
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let e = env_on(1, squatter.local_addr().unwrap().port()); // 閒置 1 秒：理由同上一條
+    let t = Instant::now();
+    let out = ensure(&e, SESSION_START);
+    assert!(out.status.success() && out.stdout.is_empty());
+    assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+    let f = wait_failed(&e);
+    assert_eq!(f["addr"], format!("127.0.0.1:{}", e.hook), "{f}");
+    drop(squatter);
+}
+
+/// L-4：web 埠綁不到時 hook 照收、照寫 store；之後定期重試，埠空出來就開始服務。
+#[test]
+fn hooks_are_kept_while_the_web_port_is_taken() {
+    let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+    let web = squatter.local_addr().unwrap().port();
+    let e = env(0);
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "[hook]\nbind = \"127.0.0.1:{}\"\n[web]\nbind = \"127.0.0.1:{web}\"\n",
+            e.hook
+        ),
+    )
+    .unwrap();
+    let mut s = Kill(cmd(&e, &["serve"]).spawn().unwrap());
+    wait_for("collector.json（web 還沒綁上）", || {
+        collector(&e).is_some()
+    });
+    let start = json!({"session_id": "w1", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("tw.jsonl"), "cwd": "/p"});
+    assert!(http(e.hook, "POST", "/hook", &start.to_string()).starts_with("HTTP/1.1 200"));
+    wait_for("hook 進 store", || {
+        std::fs::read_to_string(e.home.join("events/w1.jsonl"))
+            .is_ok_and(|t| t.contains("session.started"))
+    });
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "collector 不能因為 web 埠就結束"
+    );
+    drop(squatter);
+    wait_for("web 埠空出來後開始服務", || {
+        TcpStream::connect(("127.0.0.1", web))
+            .is_ok_and(|_| http(web, "GET", "/healthz", "").starts_with("HTTP/1.1 200"))
+    });
+    wait_for("collector.json 補上 web", || {
+        collector(&e).is_some_and(|c| c["web"] == format!("127.0.0.1:{web}"))
+    });
+}
+
+/// R-11：沒有 collector.json（也沒有人拿著鎖）時，stop 與 healthz 不能去碰設定裡的預設埠：
+/// 那可能是別的資料目錄的 collector（2026-10-18 審查時就這樣停掉了自我追蹤的 collector）。
+#[test]
+fn stop_and_healthz_never_touch_a_port_without_collector_json() {
+    let hook = TcpListener::bind("127.0.0.1:0").unwrap();
+    let web = TcpListener::bind("127.0.0.1:0").unwrap();
+    let e = env(0);
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "[hook]\nbind = \"{}\"\n[web]\nbind = \"{}\"\n",
+            hook.local_addr().unwrap(),
+            web.local_addr().unwrap()
+        ),
+    )
+    .unwrap();
+    hook.set_nonblocking(true).unwrap();
+    web.set_nonblocking(true).unwrap();
+    let out = cmd(&e, &["stop"]).stderr(Stdio::piped()).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("沒有在跑"));
+    let out = cmd(&e, &["healthz"])
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("沒有在跑"));
+    assert!(hook.accept().is_err(), "stop 連了設定裡的 hook 埠");
+    assert!(web.accept().is_err(), "healthz 連了設定裡的 web 埠");
+}
+
+/// L-13：stop 回報結束時，SQLite 已經關了、鎖也放了（新的 collector 馬上就能開 store）。
+#[test]
+fn stop_reports_only_after_the_store_lock_is_released() {
+    let e = env(0);
+    let mut s = start_serve(&e);
+    let out = cmd(&e, &["stop"]).output().unwrap();
+    assert!(out.status.success());
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.home.join("collector.lock"))
+        .unwrap();
+    assert!(
+        lock.try_lock().is_ok(),
+        "stop 回來時 collector.lock 要已經放掉"
+    );
+    assert!(collector(&e).is_none());
+    assert!(
+        !e.home.join("index.sqlite-wal").exists(),
+        "SQLite 要已經關閉"
+    );
+    let _ = s.0.wait();
 }
 
 fn old_event(session: &str, seq: u64, kind: &str, ts: u64) -> coding_lab::event::Event {
@@ -873,33 +1169,6 @@ fn detached_serve_writes_its_own_log() {
 
 /// #685（驗證找到的缺口）：probe 連上之後、轉送之前舊的 collector 就放掉了埠——轉送被拒或被 RST，
 /// ensure 要在預算內改拉新的 collector，不能直接放棄（SessionStart 會掉）。
-#[test]
-fn ensure_retries_when_the_port_closes_between_probe_and_forward() {
-    let (old, port) = bound_free_port();
-    let e = env_on(5, port);
-    let exiting = std::thread::spawn(move || {
-        // 只接 probe 那一條，接著放掉埠（還在 backlog 的轉送連線會被 RST）
-        let probe = old.accept();
-        drop(old);
-        drop(probe);
-    });
-    let start = json!({"session_id": "s8", "hook_event_name": "SessionStart", "source": "startup",
-                       "transcript_path": e.home.join("t8.jsonl"), "cwd": "/p"})
-    .to_string();
-    let t = Instant::now();
-    let out = ensure(&e, &start);
-    assert!(out.status.success() && out.stdout.is_empty());
-    assert!(t.elapsed() < Duration::from_secs(5), "不能卡住 Claude Code");
-    exiting.join().unwrap();
-    let jsonl = e.home.join("events/s8.jsonl");
-    wait_for("SessionStart 轉送到新的 collector", || {
-        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
-    });
-    if let Some(c) = collector(&e) {
-        kill_pid(c["pid"].as_u64().unwrap());
-    }
-}
-
 /// #685：進入「結束中」（ensure 轉送回 503）之後有一般 hook 進來，取消結束、繼續服務。
 #[test]
 fn a_hook_during_closing_cancels_the_idle_exit() {
@@ -908,7 +1177,7 @@ fn a_hook_during_closing_cancels_the_idle_exit() {
     let via_ensure = |body: &str| {
         let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        write!(c, "POST /hook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nX-Coding-Lab-Via: ensure\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
         let mut out = String::new();
         let _ = c.read_to_string(&mut out);
         out
@@ -1236,22 +1505,20 @@ fn ensure_returns_before_the_collector_has_written_its_info() {
 }
 
 /// 同一件事經過 plugin 的 wrapper（Claude Code 實際的呼叫路徑）：wrapper 自己也不能把 pipe 交給 ensure。
-/// 沒有 `sh` 的機器（沒裝 Git Bash 的 Windows）跳過。
+/// Windows 用 Git Bash 的 sh（不一定在 PATH 上，#783）；找不到時印出原因後略過，CODING_LAB_REQUIRE_SH=1 時失敗。
 #[test]
 fn wrapper_ensure_releases_the_callers_std_pipes_too() {
-    if Command::new("sh").arg("-c").arg("true").status().is_err() {
-        eprintln!("沒有 sh，跳過");
+    let Some(sh) = sh::sh_or_skip("wrapper_ensure_releases_the_callers_std_pipes_too") else {
         return;
-    }
+    };
     let e = env(30);
     let start =
         json!({"session_id": "s713", "hook_event_name": "SessionStart", "source": "startup",
                        "transcript_path": e.home.join("t713.jsonl"), "cwd": "/p"})
         .to_string();
-    let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/bin/coding-lab");
-    let mut c = Command::new("sh");
-    c.arg(&wrapper)
-        .arg("ensure")
+    // 真的 coding-lab.exe 是 Windows 原生程式：它讀的路徑照原樣給，不換成 MSYS 的
+    let mut c = sh::wrapper_cmd(&sh);
+    c.arg("ensure")
         .env("CODING_LAB_BIN", env!("CARGO_BIN_EXE_coding-lab"))
         .env("CODING_LAB_HOME", &e.home);
     let (status, out, err) = run_piped(c, &start);
@@ -1262,15 +1529,17 @@ fn wrapper_ensure_releases_the_callers_std_pipes_too() {
 
 /// 像 `start_serve`，但 store 的批次 flush 調成 60 秒：測試裡「還沒 flush 就當掉」的時序由此控制，不靠 sleep。
 fn start_serve_slow_flush(e: &Env) -> Kill {
-    let child = cmd(e, &["serve"])
-        .env("CODING_LAB_STORE_FLUSH_MS", "60000")
-        .spawn()
-        .unwrap();
-    let pid = child.id();
+    let child = Kill(
+        cmd(e, &["serve"])
+            .env("CODING_LAB_STORE_FLUSH_MS", "60000")
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
     wait_for("collector.json", || {
         collector(e).is_some_and(|c| c["pid"] == pid)
     });
-    Kill(child)
+    child
 }
 
 /// live 裡的 session 列（WS `hello` 後 `subscribe *` 的 snapshot）：`/api/sessions` 讀的是 store，
@@ -1456,4 +1725,252 @@ fn web_bind_list_serves_every_address() {
             format!("127.0.0.1:{second}")
         ])
     );
+}
+
+/// S-6：collector 自己寫的 collector.json、collector.log 也是 0600。
+#[cfg(unix)]
+#[test]
+fn collector_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env(0);
+    let mut c = cmd(&e, &["serve"]);
+    // 背景執行才會寫 collector.log（stderr 不是終端機）
+    let _s = Kill(c.spawn().unwrap());
+    wait_for("collector.json", || collector(&e).is_some());
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&e.home), 0o700);
+    assert_eq!(mode(&e.home.join("collector.json")), 0o600);
+    assert_eq!(mode(&e.home.join("collector.log")), 0o600);
+}
+
+/// L-6（#740）：tail 補讀大量行時塞滿輸入佇列，hook 原本被 try_send 丟掉（實測 100 個丟 32 個）。
+/// hook 走自己的 channel、主迴圈先處理 hook：另一個 session 的 hook 一個都不丟；/healthz 有 dropped。
+#[test]
+fn hooks_are_not_dropped_while_a_tail_catches_up() {
+    let e = env(0);
+    let transcript = e.home.join("big.jsonl");
+    let mut text = String::new();
+    for i in 0..60_000 {
+        text.push_str(&text_line(&format!("u{i}"), &format!("m{i}"), "補讀"));
+    }
+    std::fs::write(&transcript, text).unwrap();
+    let _s = start_serve(&e);
+    let start = json!({"session_id": "big", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": transcript, "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    for i in 0..100 {
+        let p = json!({"session_id": "other", "hook_event_name": "UserPromptSubmit",
+                       "prompt": format!("p{i}"), "cwd": "/q"});
+        assert!(http(e.hook, "POST", "/hook", &p.to_string()).starts_with("HTTP/1.1 200"));
+    }
+    let jsonl = e.home.join("events/other.jsonl");
+    let prompts = || {
+        std::fs::read_to_string(&jsonl)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("prompt.submitted"))
+            .count()
+    };
+    wait_for("100 個 prompt 都進 store", || prompts() == 100);
+    let h = http(e.web, "GET", "/healthz", "");
+    let v: Value = serde_json::from_str(h.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap();
+    assert_eq!(v["dropped"], 0, "{v}");
+}
+
+/// L-7（#740）：回放與 events 請求並行、web 的 worker 很忙時，hook 仍然很快回 200（不變式 4）。
+/// hook 入口在自己的執行緒上，不和 web 搶 worker。
+#[test]
+fn hooks_stay_fast_while_web_requests_pile_up() {
+    let e = env(0);
+    let _s = start_serve(&e);
+    let start = json!({"session_id": "busy", "hook_event_name": "SessionStart", "source": "startup",
+                       "transcript_path": e.home.join("tb.jsonl"), "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    for i in 0..200 {
+        let p = json!({"session_id": "busy", "hook_event_name": "UserPromptSubmit", "prompt": format!("p{i}"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &p.to_string());
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let web = e.web;
+    let load: Vec<_> = (0..16)
+        .map(|i| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let path = if i % 2 == 0 {
+                    "/api/projects/replay?cwd=/p&at=0&until=99999999999999"
+                } else {
+                    "/api/sessions/busy/events?limit=500"
+                };
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = http(web, "GET", path, "");
+                }
+            })
+        })
+        .collect();
+    let mut worst = Duration::ZERO;
+    for i in 0..30 {
+        let body = json!({"session_id": "other", "hook_event_name": "UserPromptSubmit", "prompt": format!("q{i}"), "cwd": "/q"});
+        let t = Instant::now();
+        assert!(http(e.hook, "POST", "/hook", &body.to_string()).starts_with("HTTP/1.1 200"));
+        worst = worst.max(t.elapsed());
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in load {
+        let _ = t.join();
+    }
+    // 預算是 100 ms；check.sh 並行跑時機器很忙，留一點餘裕，測的是「不會被 web 卡住幾秒」
+    assert!(
+        worst < Duration::from_millis(500),
+        "最慢一個 hook 花了 {worst:?}"
+    );
+}
+
+/// #777：/stop 要帶 collector.json 的 stopToken；別人（另一個帳號讀不到這個檔）送的被拒、collector 照常。
+/// healthz 帶 user，看得出是誰的 collector。
+#[test]
+fn stop_needs_the_token_from_collector_json() {
+    let e = env(0);
+    let mut s = start_serve(&e);
+    let info = collector(&e).unwrap();
+    let token = info["stopToken"]
+        .as_str()
+        .expect("collector.json 要有 stopToken")
+        .to_string();
+    assert!(token.len() >= 32);
+    let mut c = TcpStream::connect(("127.0.0.1", e.hook)).unwrap();
+    write!(c, "POST /stop HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Coding-Lab-Stop: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+    let mut out = String::new();
+    let _ = c.read_to_string(&mut out);
+    assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        s.0.try_wait().unwrap().is_none(),
+        "錯的 token 不能停掉 collector"
+    );
+    let h = http(e.web, "GET", "/healthz", "");
+    let v: Value = serde_json::from_str(h.split_once("\r\n\r\n").map_or("", |(_, b)| b)).unwrap();
+    assert!(v["user"].as_str().is_some_and(|u| !u.is_empty()), "{v}");
+    // coding-lab stop 讀自己的 collector.json 帶上
+    assert!(cmd(&e, &["stop"]).output().unwrap().status.success());
+    wait_for("stop 之後結束", || s.0.try_wait().unwrap().is_some());
+}
+
+fn log_text(e: &Env) -> String {
+    std::fs::read_to_string(e.home.join("collector.log")).unwrap_or_default()
+}
+
+/// W-L15（#781）：store 鎖被一個正常在跑的 collector 拿著時，等鎖的 log 說「另一個 collector 已經在用」，
+/// 不是「上一個 collector 還在結束」。同一個 home、別的埠再起一個 serve。
+#[test]
+fn waiting_for_the_store_lock_names_the_running_collector() {
+    let e = env(0);
+    let _a = start_serve(&e);
+    let b = Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+        .args([
+            "serve",
+            "--hook-bind",
+            &format!("127.0.0.1:{}", free_port()),
+        ])
+        .args(["--web-bind", &format!("127.0.0.1:{}", free_port())])
+        .env("CODING_LAB_HOME", &e.home)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _b = Kill(b);
+    wait_for("第二個 serve 寫等鎖的原因", || {
+        log_text(&e).contains("另一個 collector 已經在用這個資料目錄")
+    });
+    assert!(
+        !log_text(&e).contains("上一個 collector 還在結束"),
+        "{}",
+        log_text(&e)
+    );
+}
+
+/// W-L15：`coding-lab prune` 拿著鎖時留標記檔，等鎖的 serve 說「prune 正在執行」。
+#[test]
+fn waiting_for_the_store_lock_names_a_running_prune() {
+    let e = env(0);
+    let lock = coding_lab::serve::try_lock_store(&e.home).unwrap().unwrap();
+    std::fs::write(
+        e.home.join(coding_lab::serve::PRUNE_MARKER),
+        format!("{}", std::process::id()),
+    )
+    .unwrap();
+    let child = cmd(&e, &["serve"]).spawn().unwrap();
+    let _c = Kill(child);
+    wait_for("serve 寫等鎖的原因", || {
+        log_text(&e).contains("prune 正在執行")
+    });
+    drop(lock);
+}
+
+#[cfg(unix)]
+fn healthz(e: &Env) -> Value {
+    let r = http(e.web, "GET", "/healthz", "");
+    serde_json::from_str(r.split("\r\n\r\n").nth(1).unwrap_or("{}")).unwrap_or(Value::Null)
+}
+
+/// W-M10（#781）：store 一直寫不進去（這裡把 session 的 JSONL 改成唯讀）時，`/healthz` 有 storeError、log 不會每個 hook
+/// 一行；結束時沒寫進去的 hook 事件存進 `pending-*.jsonl`，下次啟動補回。
+#[cfg(unix)]
+#[test]
+fn an_unwritable_store_is_reported_and_its_hooks_survive_a_stop() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = env(0);
+    let child = cmd(&e, &["serve"]).spawn().unwrap();
+    let pid = child.id();
+    let mut serve = Kill(child);
+    wait_for("collector.json", || {
+        collector(&e).is_some_and(|c| c["pid"] == pid)
+    });
+    assert!(
+        healthz(&e)["storeError"].is_null(),
+        "正常時是 null：{}",
+        healthz(&e)
+    );
+    let start = json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "cwd": "/p"});
+    http(e.hook, "POST", "/hook", &start.to_string());
+    let jsonl = e.home.join("events/s1.jsonl");
+    wait_for("session.started 進 store", || {
+        std::fs::read_to_string(&jsonl).is_ok_and(|t| t.contains("session.started"))
+    });
+    std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o400)).unwrap();
+    for i in 0..50 {
+        let pre = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                         "tool_input": {"command": "ls"}, "tool_use_id": format!("locked-{i}"), "cwd": "/p"});
+        http(e.hook, "POST", "/hook", &pre.to_string());
+    }
+    wait_for("healthz 的 storeError", || {
+        healthz(&e)["storeError"]["pending"]
+            .as_u64()
+            .is_some_and(|n| n > 0)
+    });
+    let err = healthz(&e)["storeError"].clone();
+    assert!(
+        err["message"].is_string() && err["since"].is_u64() && err["dropped"] == 0,
+        "{err}"
+    );
+    let failures = log_text(&e).matches("store 寫不進去").count();
+    assert_eq!(failures, 1, "只在開始失敗時寫一行：{}", log_text(&e));
+
+    let out = cmd(&e, &["stop"]).output().unwrap();
+    assert!(out.status.success());
+    let _ = serve.0.wait();
+    std::fs::set_permissions(&jsonl, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dumps: Vec<_> = std::fs::read_dir(&e.home)
+        .unwrap()
+        .flatten()
+        .filter(|f| f.file_name().to_string_lossy().starts_with("pending-"))
+        .collect();
+    assert_eq!(dumps.len(), 1, "{}", log_text(&e));
+
+    let _again = start_serve(&e);
+    let text = std::fs::read_to_string(&jsonl).unwrap();
+    assert!(
+        text.contains("locked-0") && text.contains("locked-49"),
+        "補回來了"
+    );
+    assert!(!dumps[0].path().exists(), "補完就刪");
 }

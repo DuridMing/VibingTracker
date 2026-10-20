@@ -1,7 +1,6 @@
 import { createClient } from "./client.js";
 import { createStore, applySnapshot, applyFrame } from "./store.js";
 import { sessionColor, shortId } from "./color.js";
-import { installMock } from "./mock-feed.js";
 import { createStream } from "./stream.js";
 import { createStreamView } from "./stream-view.js";
 import { formatRow, esc } from "./format.js";
@@ -19,6 +18,7 @@ import { createFileTree, filesUrl, sinceChanges } from "./tree.js";
 import { mergeSessions, projectRoots, canReplay, fitTabs } from "./sessions.js";
 import { projectColors, projectColor, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "./projects.js";
 import { degradedNotice } from "./degraded.js";
+import { norm as normPath } from "./paths.js";
 import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices, layoutGraph, withWip } from "./branches.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -62,6 +62,14 @@ function renderConn() {
     text.append(" ", h("b", {}, `${ui.welcome.host} · v${ui.welcome.version}`));
   }
   document.body.classList.toggle("stale", ui.conn !== "open");
+  // 資料寫不進磁碟（磁碟滿、檔案被鎖，#781 W-M10）：畫面照常更新，但沒存下來，要讓人看得到
+  const se = store.storeError;
+  const seText = se ? `⚠ 資料沒有寫進磁碟（${fmtClock(se.since ?? Date.now())} 起，待寫 ${se.pending ?? 0} 筆${se.dropped ? `，已丟 ${se.dropped} 筆` : ""}）` : "";
+  if (changed("storeErr", seText)) {
+    $("#storeErr").hidden = !se;
+    $("#storeErr").textContent = seText;
+    $("#storeErr").title = se?.message ?? "";
+  }
 }
 
 function renderKpis() {
@@ -162,14 +170,20 @@ function renderProjectSwitch() {
   sel.title = proj.cur ? `只看 ${proj.cur}\n其他專案的 session 只是隱藏，切回「全部專案」就回來` : "專案：全部（串流每行標專案、檔案樹與改動紀錄依專案分組）或只看一個";
 }
 
+function tabTitle(s) {
+  const host = hostTag(s.id);
+  return `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`;
+}
+
 function sessionTab(s, extra = {}) {
   const host = hostTag(s.id);
-  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: `${host ? `[${host}]${s.offline ? "（離線）" : ""}\n` : ""}${sessionTitle(s)}`, onclick: () => selectTab(s.id), ...extra },
+  return h("button", { class: `stab ${s.status}${s.offline ? " offline" : ""}${ui.tab === s.id ? " on" : ""}`, title: tabTitle(s), "aria-keyshortcuts": "M", onkeydown: (e) => { if (e.key === "m" || e.key === "M") { e.preventDefault(); openMonitor(s.id); } }, onclick: () => selectTab(s.id), ...extra },
     h("span", { class: "sw", style: `background:${sessionColor(s.id)}` }),
     h("span", { class: "dot" }),
     host ? h("small", { class: "hst" }, host) : null,
     sessTag(s),
-    h("span", { class: "pop", role: "button", tabindex: "0", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
+    // ⧉ 在 button 裡面，不能再是一個可聚焦的按鈕（巢狀互動元素鍵盤到不了）：滑鼠點 ⧉，鍵盤在 tab 上按 M（#747 F-12）
+    h("span", { class: "pop", "aria-hidden": "true", title: "開成監視器視窗（可拖到第二螢幕，關掉主視窗也能繼續看；鍵盤在 tab 上按 M）", onclick: (e) => { e.stopPropagation(); openMonitor(s.id); } }, "⧉"));
 }
 
 // 放不下的 session tab 收進「+N」（#704）：先全部畫出來量寬，再依 fitTabs 收起來；寬度變了重算
@@ -177,7 +191,15 @@ let tabsHidden = [];
 function renderTabs() {
   const box = $("#stabs");
   const live = liveSessions().filter((s) => inProject(s.id));
-  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.lastPrompt ?? ""}:${s.doing ?? ""}`).join("|"))) return;
+  // 簽章只放結構欄位；lastPrompt、doing 只用在 tooltip，變了就地改 title，不重建整列、不重跑 fitTabRow 的強制排版（#757 E-F4）
+  if (!changed("tabs", ui.tab + "|" + proj.cur + "|" + (ui.welcome?.host ?? "") + "|" + live.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}`).join("|"))) {
+    for (const s of live) {
+      const b = box.querySelector(`[data-sid="${s.id}"]`);
+      const t = tabTitle(s);
+      if (b && b.title !== t) b.title = t;
+    }
+    return;
+  }
   box.replaceChildren(
     h("button", { class: `stab${ui.tab === "all" ? " on" : ""}`, onclick: () => selectTab("all") }, "全部串流 ", h("small", {}, String(live.length))),
     ...live.map((s) => sessionTab(s, { "data-sid": s.id })),
@@ -290,8 +312,10 @@ function renderLive() {
 const SESS_SHOWN = 200;
 function renderSessions() {
   const all = allSessions().filter((s) => inProject(s.id));
-  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sessCount").textContent = all.length ? String(all.length) : "";
+  // 列表藏著（預設在檔案樹分頁）時不重建：doing 幾乎每次工具呼叫都會變（#757 E-F3）；切回來時 showLeftTab 清掉簽章
+  if (left.tab !== "sess") return;
+  if (!changed("sess", `${ui.tab}|${proj.cur}|${proj.many}|${ui.welcome?.host ?? ""}|` + all.map((s) => `${s.id}:${s.status}:${s.offline ? "off" : ""}:${s.host}:${s.firstPrompt}:${s.branch}:${s.commits}:${s.dangers}:${s.model}:${s.doing ?? ""}`).join("|"))) return;
   $("#sess").replaceChildren(
     ...(all.length
       ? all.slice(0, SESS_SHOWN).map((s) =>
@@ -420,6 +444,10 @@ function render(urgent = false) {
   requestAnimationFrame(() => {
     rafPending = false;
     lastPanelRender = performance.now();
+    if (proj.dirty) {
+      proj.dirty = false;
+      syncProjects();
+    }
     renderOnce = stream.rows.length >= 3000;
     renderConn();
     renderDegraded();
@@ -459,7 +487,7 @@ function renderAttention() {
   const elsewhere = allRows.length - rows.length; // 單一專案時其他專案的件數，只提示不列
   const now = viewNow();
   const canAck = ui.welcome?.scope !== "view" && !tl.active; // 回放中不能確認（#730）
-  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${scoreOf(r.session) ?? 0}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(",");
+  const sig = `${Math.floor(now / 30_000)}|${canAck}|${ui.tab}|${proj.cur}|${elsewhere}|${ui.ackError ?? ""}|` + rows.map((r) => `${r.id}:${ackPending.has(r.id)}:${r.reason}:${r.clearedAt ?? ""}`).join(","); // 分數不在簽章裡：#728 之後只剩 tooltip 用，collector 每 10 秒重算就重建佇列太浪費（#757 E-F9）
   if (!changed("att", sig)) return;
   const todo = canAck ? ackAllTargets(rows, ackPending) : [];
   $("#ackAll").hidden = !todo.length;
@@ -493,10 +521,24 @@ function renderAttention() {
   }), other ?? "");
 }
 
+// 送出 ack：沒連上就直接說，不讓那一列卡在「確認中…」；送出後 10 秒還沒被刪掉（斷線、hub 的上游離線）就解除（#747 F-2）
+const ACK_TIMEOUT_MS = 10_000;
+function sendAck(r) {
+  if (!client.ack({ session: r.session, kind: r.kind, ref: r.ref })) {
+    ui.ackError = "沒有連上 collector，連上之後再按";
+    return;
+  }
+  ackPending.add(r.id);
+  setTimeout(() => {
+    if (!ackPending.delete(r.id) || !store.attention.has(r.id)) return;
+    ui.ackError = "確認沒有回應（collector 或 hub 的上游沒有回覆），請再按一次";
+    render(true);
+  }, ACK_TIMEOUT_MS);
+}
+
 function ackRow(r) {
   ui.ackError = null;
-  ackPending.add(r.id);
-  client.ack({ session: r.session, kind: r.kind, ref: r.ref });
+  sendAck(r);
   render(true);
 }
 
@@ -510,10 +552,7 @@ function onServerError(m) {
 // 全部確認（#697）：每列各送一次既有的 ack，不改 WS 協定
 $("#ackAll").addEventListener("click", () => {
   ui.ackError = null;
-  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) {
-    ackPending.add(r.id);
-    client.ack({ session: r.session, kind: r.kind, ref: r.ref });
-  }
+  for (const r of ackAllTargets([...store.attention.values()].filter((r) => inProject(r.session)), ackPending)) sendAck(r);
   render(true);
 });
 
@@ -592,8 +631,10 @@ const leader = createLeader({
   now: () => Date.now(),
   setInterval: (fn, ms) => window.setInterval(fn, ms),
   clearInterval: (t) => window.clearInterval(t),
+  visible: () => !document.hidden,
 });
 addEventListener("pagehide", () => leader.stop());
+document.addEventListener("visibilitychange", () => leader.beat());
 
 const notifier = createNotifier({
   now: () => Date.now(),
@@ -673,6 +714,7 @@ const left = {
   hashCwd: null, // 從單 session 的 git 列點 commit 時，用那個 session 的 worktree
   trees: new Map(), // 專案 cwd → { tree, loading, error, info, req }
   fileEvents: [],
+  bodies: new Map(), // cwd → { url, body }：最後一次 /api/files 的回應（回放 reset 時重建用，#766 E-F5）
   dirty: true,
   rows: [],
   els: new Map(), // `${cwd}|${path}`（專案標題列是 `#${cwd}`）→ { el, sig }
@@ -681,15 +723,14 @@ const left = {
   refetch: 0,
 };
 // 專案切換（#669）：cur 是單一專案的根 cwd，null＝全部專案（預設）；roots 來自 sessions.js 的 projectRoots
-const proj = { cur: pref.get("project") || null, roots: [], rootCwds: [], colors: new Map(), labels: new Map(), many: false, collapsed: new Set(), sig: "" };
+const proj = { cur: pref.get("project") || null, roots: [], rootCwds: [], colors: new Map(), labels: new Map(), many: false, collapsed: new Set(), sig: "", dirty: false };
 const activeRoots = () => (proj.cur ? [proj.cur] : proj.rootCwds);
 const fetchedById = () => new Map(left.fetched.map((s) => [s.id, s]));
 let fetchedIndex = new Map();
 const cwdOf = (id) => store.sessions.get(id)?.cwd ?? fetchedIndex.get(id)?.cwd ?? null;
 // 401：cookie 過期或金鑰被撤銷（#667），整頁導去登入
 const toLogin = (r) => { if (r.status === 401) location.assign("/auth/login"); return r; };
-const apiFetch = (url) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin" }).then(toLogin));
-const normRoot = (p) => String(p ?? "").replace(/\\/g, "/").replace(/\/+$/, "");
+const apiFetch = (url, { signal } = {}) => (mock ? mock.fetch(url) : fetch(url, { credentials: "same-origin", signal }).then(toLogin));
 
 function allSessions() {
   return mergeSessions([...store.sessions.values()], left.fetched);
@@ -726,6 +767,12 @@ function syncProjects() {
 }
 
 function setProject(cwd) {
+  // 回放中（#730）畫面固定在回放的專案：選的專案存成偏好、離開回放時還原成它，畫面與存檔才一致（#765 C23）
+  if (tl.active) {
+    tlProjBefore = cwd || null;
+    pref.set("project", tlProjBefore ?? "");
+    return;
+  }
   proj.cur = cwd || null;
   pref.set("project", proj.cur ?? "");
   br.cwd = null;
@@ -743,7 +790,11 @@ function feedFiles(events) {
   const mine = (events ?? []).filter((e) => e.type?.startsWith("file.") || (e.type === "tool.updated" && e.payload?.status === "failed"));
   const gitOp = (events ?? []).some((e) => e.type === "git.op");
   if (!mine.length && !gitOp) return;
-  left.fileEvents.push(...mine);
+  // 只存檔案樹用得到的欄位：write 的 content、edit 的 hunk 不留（開幾天會累積數十 MB，#766 F-5）
+  for (const e of mine) {
+    const p = e.payload ?? {};
+    left.fileEvents.push({ type: e.type, session: e.session, seq: e.seq, payload: { path: p.path, isNew: p.isNew, toolUseId: p.toolUseId, status: p.status, interrupted: p.interrupted, denied: p.denied } });
+  }
   if (left.fileEvents.length > FILE_EVENTS_MAX) left.fileEvents.splice(0, left.fileEvents.length - FILE_EVENTS_MAX);
   let changedFiles = gitOp;
   for (const [cwd, ent] of left.trees) {
@@ -763,7 +814,7 @@ function feedFiles(events) {
       const ent = left.trees.get(cwd);
       if (ent?.tree.root != null) setSince(ent);
     }
-  } else scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）
+  } else if (!tl.active) scheduleFiles(3000); // git 狀態跟著改動與 commit 變，等一下再抓（合併連續的改動）；回放中的歷史改動不必（#766 E-F5）
 }
 
 function setSince(ent) {
@@ -803,9 +854,17 @@ async function loadFiles(cwd = null) {
   const ent = treeFor(cwd);
   const base = currentBase();
   // 樹還沒載入時，commit 基準先用專案的 cwd（另一個 worktree 的根不同，樹要以專案為準）
-  const url = base && filesUrl(cwd, ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const fbase = base && (ent.tree.root == null && base.kind === "commit" ? { ...base, cwd: undefined } : base);
+  const url = base && filesUrl(cwd, fbase);
   if (!url) {
     ent.error = base ? "commit hash 要 4–64 位十六進位" : "這個專案沒有 session";
+    render(true);
+    return;
+  }
+  // 回放中（#730）：檔案清單是 git 現況、和回放的時刻無關，reset 後用上次抓到的重建，不再打 /api/files（#766 E-F5）
+  const cached = left.bodies.get(cwd);
+  if (tl.active && cached?.url === url) {
+    applyFiles(ent, cwd, base, cached.body);
     render(true);
     return;
   }
@@ -813,30 +872,16 @@ async function loadFiles(cwd = null) {
   ent.loading = true;
   render(true);
   try {
-    const res = await apiFetch(url);
-    const body = await res.json().catch(() => ({}));
+    // 樹已經在手上就帶 treeHash：沒變時回應省略 tree（2 萬筆路徑不必每 3 秒重送，#766 F-6）
+    const have = cached?.url === url && ent.tree.root != null ? cached.body.treeHash : null;
+    const res = await apiFetch(have ? filesUrl(cwd, fbase, have) : url);
+    let body = await res.json().catch(() => ({}));
     if (req !== ent.req) return;
     if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
-    // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
-    if (ent.tree.root == null || normRoot(body.root) === ent.tree.root) ent.tree.setFiles(body);
-    const n = body.changes?.length ?? 0;
-    const cf = (body.changes ?? []).filter((c) => c.conflict).length;
-    const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";
-    if (base.kind === "since") setSince(ent);
-    else if (base.kind === "session") {
-      ent.tree.setGit(body.changes, (p) => ent.tree.pathOf(cwdOf(base.id), p));
-      ent.info = `session ${shortId(base.id)} · ${n} 個檔有改動`;
-    } else {
-      ent.tree.setGit(body.changes);
-      const wts = new Set((body.changes ?? []).flatMap((c) => c.by.map((b) => b.worktree)));
-      ent.info = base.kind === "commit"
-        ? `相對 ${String(body.baseRef ?? base.hash).slice(0, 7)} · ${n} 個檔有改動`
-        : `相對 ${body.baseRef ?? "main"} · ${n} 個檔有改動${wts.size > 1 ? `（${wts.size} 個 worktree）` : ""}${cf ? ` · ⚠ ${cf} 個衝突候選` : ""}`;
-    }
-    ent.info += trunc;
-    ent.error = null;
-    left.dirty = true;
-    if (cwd === brTarget()) loadBranches();
+    // 省略 tree 的回應：補上手上那份，快取（回放 reset 時重建用）與 applyFiles 都拿完整的
+    if (body.tree == null && cached?.body?.tree) body = { ...body, tree: cached.body.tree, treeTruncated: cached.body.treeTruncated };
+    left.bodies.set(cwd, { url, body });
+    applyFiles(ent, cwd, base, body);
   } catch (e) {
     if (req !== ent.req) return;
     ent.error = `檔案樹載入失敗：${e.message}`;
@@ -846,6 +891,30 @@ async function loadFiles(cwd = null) {
       render(true);
     }
   }
+}
+
+// /api/files 的回應套到一棵樹（新抓的或回放 reset 時快取的）
+function applyFiles(ent, cwd, base, body) {
+  // 專案的根以第一次為準；另一個 worktree 的 commit 基準只拿它的 changes（路徑一樣相對 repo 根）
+  if (ent.tree.root == null || normPath(body.root) === ent.tree.root) ent.tree.setFiles(body);
+  const n = body.changes?.length ?? 0;
+  const cf = (body.changes ?? []).filter((c) => c.conflict).length;
+  const trunc = body.treeTruncated ? " · 檔案太多，樹只列前 20000 個" : "";
+  if (base.kind === "since") setSince(ent);
+  else if (base.kind === "session") {
+    ent.tree.setGit(body.changes, (p) => ent.tree.pathOf(cwdOf(base.id), p));
+    ent.info = `session ${shortId(base.id)} · ${n} 個檔有改動`;
+  } else {
+    ent.tree.setGit(body.changes);
+    const wts = new Set((body.changes ?? []).flatMap((c) => c.by.map((b) => b.worktree)));
+    ent.info = base.kind === "commit"
+      ? `相對 ${String(body.baseRef ?? base.hash).slice(0, 7)} · ${n} 個檔有改動`
+      : `相對 ${body.baseRef ?? "main"} · ${n} 個檔有改動${wts.size > 1 ? `（${wts.size} 個 worktree）` : ""}${cf ? ` · ⚠ ${cf} 個衝突候選` : ""}`;
+  }
+  ent.info += trunc;
+  ent.error = null;
+  left.dirty = true;
+  if (cwd === brTarget()) loadBranches();
 }
 setInterval(() => { if (left.tab === "tree" && !document.hidden && left.base !== "since") loadFiles(); }, 60_000);
 
@@ -1059,6 +1128,7 @@ function renderDetail() {
   pane.replaceChildren(head, h("div", { class: "bdb" }, files, br.file ? diffCols(br.file.diffs) : null));
 }
 
+let brSig = null; // 分支視窗上次畫的參照（E-F7）
 function renderBranches() {
   const n = changedBranches(br.body);
   const target = brTarget();
@@ -1068,8 +1138,10 @@ function renderBranches() {
     btn.textContent = `${proj.many ? `${proj.labels.get(target) ?? ""} ` : ""}${br.body ? `⎇ 分支（${n}）` : "⎇ 分支"}`;
   }
   if (!brWin.isOpen) return;
-  const sig = JSON.stringify([br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)]);
-  if (!changed("brList", sig)) return;
+  // 比參照不比內容：這幾個欄位每次更新都整個換掉（新的 fetch 結果），不必每次重繪都 JSON.stringify 整張圖與 diff（#757 E-F7）
+  const sig = [br.error, br.body, br.graph, br.sel?.key, br.detail, br.file, Math.floor(Date.now() / 60_000)];
+  if (brSig && sig.every((v, i) => v === brSig[i])) return;
+  brSig = sig;
   const body = br.body;
   $("#brWinSub").textContent = body?.integration ? `相對 ${body.integration}・點一列看檔案・拖標題列移動、右下角縮放` : "拖標題列移動、右下角縮放";
   $("#brWinTitle").textContent = `${proj.rootCwds.length > 1 && br.cwd ? `${proj.labels.get(br.cwd) ?? br.cwd} · ` : ""}${body ? `分支（${body.branches.length}）` : "分支"}`;
@@ -1184,7 +1256,11 @@ function showLeftTab(name) {
   $("#tbar").hidden = name !== "tree";
   $("#treeLeg").hidden = name !== "tree";
   $("#sess").hidden = name !== "sess";
-  if (name === "sess") loadSessions();
+  if (name === "sess") {
+    lastSig.delete("sess");
+    loadSessions();
+    renderSessions();
+  }
   else left.dirty = true;
   render(true);
 }
@@ -1232,6 +1308,7 @@ function renderTree() {
   const to = Math.min(rows.length, Math.ceil((top + height) / ROW_H) + 10);
   const running = new Set([...store.sessions.values()].filter((s) => s.status === "run").map((s) => s.id));
   const keep = new Set();
+  const fx = []; // 這次要閃或點亮的列：最後一起重新觸發動畫
   for (let i = from; i < to; i++) {
     const x = rows[i];
     const key = x.hdr ? `#${x.cwd}` : `${x.cwd}|${x.path}`;
@@ -1260,12 +1337,15 @@ function renderTree() {
       left.els.set(key, row);
     }
     const fl = left.flash.get(key);
-    if (fl || left.lit.has(key)) {
-      const el = row.el;
-      el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
-      void el.offsetWidth; // 重新觸發動畫
+    if (fl || left.lit.has(key)) fx.push({ el: row.el, fl, lit: left.lit.has(key) });
+  }
+  // 重新觸發動畫要「移除 class → 強制排版 → 加回」：分兩趟做，N 列只排版一次（#757 E-F8）
+  if (fx.length) {
+    for (const { el } of fx) el.classList.remove("flash", "flash-e", "flash-w", "flash-x", "lit");
+    void inner.offsetWidth;
+    for (const { el, fl, lit } of fx) {
       if (fl) el.classList.add(fl);
-      if (left.lit.has(key)) el.classList.add("lit");
+      if (lit) el.classList.add("lit");
     }
   }
   for (const [p, row] of left.els) {
@@ -1286,7 +1366,7 @@ function projectHeader(x, pr, ent, i) {
     title: `${x.cwd}\n${ent?.error ?? ent?.info ?? ""}`.trim(),
   },
   h("span", { class: "lbl" }, h("span", { class: "pre" }, x.open ? "▾ " : "▸ "), h("i", { class: "psw", style: `background:${color}` }), h("span", { class: "nm", style: `color:${color}` }, proj.labels.get(x.cwd) ?? x.cwd), h("small", {}, ` ${pr?.live ?? 0}/${pr?.sessions.length ?? 0}${ent?.error ? " · 載入失敗" : ""}`)),
-  h("span", { class: "mk" }, h("span", { class: "pbr", role: "button", tabindex: "0", title: "這個專案的分支", onclick: (e) => { e.stopPropagation(); openBranches(x.cwd); } }, "⎇")));
+  h("span", { class: "mk" }, h("span", { class: "pbr", role: "button", tabindex: "0", title: "這個專案的分支", onclick: (e) => { e.stopPropagation(); openBranches(x.cwd); }, onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); openBranches(x.cwd); } } }, "⎇")));
   const toggle = () => {
     if (proj.collapsed.has(x.cwd)) proj.collapsed.delete(x.cwd);
     else proj.collapsed.add(x.cwd);
@@ -1352,20 +1432,29 @@ const pane = createSessionPane();
 const thinkingModeOf = (sessionId) => store.sessions.get(sessionId)?.thinking ?? ui.welcome?.thinking ?? null;
 pane.thinkingMode = thinkingModeOf;
 let paneMoreReq = null;
+// 逾時之後才到的回覆：對得上最後一次請求就照樣套用，不丟（#747 F-10）
+let paneMoreLate = null;
 const NOW_TEXT = { run: "執行中", wait: "等你", done: "完成", fail: "失敗", danger: "危險", idle: "閒置", ended: "結束" };
-const LANE_TEXT = { run: "執行中", idle: "閒置", done: "完成", fail: "失敗", danger: "注意" };
+const LANE_TEXT = AGENT_STATUS_TEXT; // 同一份對照（#757 E-D9）
 
 // replay：session 已不在 live（#653），從最新的往前讀（beforePos 不帶）
 function paneMore(replay = false) {
   if (paneMoreReq || !isSessionTab(ui.tab)) return;
   const beforePos = replay ? null : pane.stream.minPos().get(pane.session);
   if (!replay && !(beforePos > 1)) return;
-  paneMoreReq = { session: pane.session, beforePos, timer: setTimeout(() => { paneMoreReq = null; }, 3000) };
+  paneMoreLate = null;
+  paneMoreReq = {
+    session: pane.session,
+    beforePos,
+    // 逾時：放開「載入更多」讓使用者可以再按，晚到的回覆仍接受
+    timer: setTimeout(() => { paneMoreLate = paneMoreReq; paneMoreReq = null; paneHasMore(); }, MORE_TIMEOUT_MS),
+  };
   client.more({ session: pane.session, beforePos, limit: 200 });
 }
 function onPaneMore(m) {
-  clearTimeout(paneMoreReq.timer);
+  if (paneMoreReq) clearTimeout(paneMoreReq.timer);
   paneMoreReq = null;
+  paneMoreLate = null;
   paneView.prepended(pane.prepend(m.events));
   paneHasMore();
 }
@@ -1452,12 +1541,17 @@ function renderPane() {
 }
 
 // 危險指令提示框：這個 session 還沒確認的危險列；工具已結束（clearedAt）的變淡
+const dzAnnounced = new Set(); // 已朗讀過的危險列
 function renderPaneDanger(id) {
   const rows = sessionDangers([...store.attention.values()], id);
   const canAck = ui.welcome?.scope !== "view";
   if (!changed("spDz", `${Math.floor(Date.now() / 30_000)}|${canAck}|` + rows.map((r) => `${r.id}:${r.clearedAt ?? ""}:${ackPending.has(r.id)}`).join(","))) return;
   $("#spDz").hidden = !rows.length;
   $("#spDzN").textContent = rows.length ? `${rows.length} 筆待確認` : "";
+  // 框本身不是 role=alert（每 30 秒更新「幾分前」會被重唸）：只有出現新的危險列時朗讀一次（#747 F-12）
+  const fresh = rows.filter((r) => !dzAnnounced.has(r.id));
+  for (const r of fresh) dzAnnounced.add(r.id);
+  if (fresh.length) $("#spDzLive").textContent = `危險指令：${fresh.map((r) => r.reason ?? "").join("；")}`;
   const now = Date.now();
   $("#spDzList").replaceChildren(...rows.map((r) => {
     const pend = ackPending.has(r.id);
@@ -1497,7 +1591,7 @@ function renderPaneFiles(id) {
   h("span", { class: "ag" }, f.agents.map(who).join("、")))) : [h("div", { class: "none" }, "尚無改動")]));
   $("#spFb").hidden = !sel;
   if (sel) {
-    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT −${sel.removed} +${sel.added} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
+    $("#spFbKind").textContent = sel.kind === "edit" ? `EDIT ${sel.countLabel ?? `−${sel.removed} +${sel.added}`} · ${who(sel.agent)}` : `WRITE${sel.isNew ? "（新檔案）" : ""} · ${who(sel.agent)}`;
     $("#spFbPath").textContent = sel.path;
     $("#spFbBody").innerHTML = diffHtml(sel);
   }
@@ -1516,7 +1610,9 @@ function renderChanges() {
     return;
   }
   const row = (c) => {
-    const n = c.kind === "edit" ? h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`)) : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
+    const n = c.kind === "edit"
+      ? c.countLabel ? h("span", { class: "n" }, c.countLabel) : h("span", { class: "n" }, h("span", { class: "a" }, `+${c.added}`), " ", h("span", { class: "d" }, `−${c.removed}`))
+      : h("span", { class: "n" }, c.isNew ? "新檔案" : "覆寫");
     return h("button", { class: c.key === changes.selectedKey ? "sel" : "", title: `${c.path}\n${c.session}`, "aria-pressed": String(c.key === changes.selectedKey), onclick: () => selectChange(c.key) },
       h("span", { class: "ss", style: `color:${sessionColor(c.session)}` }, shortId(c.session)),
       h("span", { class: `k ${c.kind === "edit" ? "e" : "w"}` }, c.kind === "edit" ? "改" : "寫"),
@@ -1543,7 +1639,7 @@ function renderDiff() {
   $("#gfbNone").hidden = !!c;
   if (!c) return;
   const who = `${shortId(c.session)} · ${agentWho(c.session, c.agent, agentName)}`;
-  $("#fbKind").textContent = c.kind === "edit" ? `EDIT −${c.removed} +${c.added} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
+  $("#fbKind").textContent = c.kind === "edit" ? `EDIT ${c.countLabel ?? `−${c.removed} +${c.added}`} · ${who}` : `WRITE${c.isNew ? "（新檔案）" : ""} · ${who}`;
   $("#fbPath").textContent = c.path;
   $("#fbPath").title = c.path;
   $("#fbBody").innerHTML = diffHtml(c);
@@ -1552,7 +1648,7 @@ function renderDiff() {
 
 // 修改情形的內容（全部串流的右欄與單 session 的檔案變更共用）
 function diffHtml(c) {
-  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource) : writeRows(c.content, c.truncated);
+  const rows = c.kind === "edit" ? diffRows(c.hunk, c.hunkSource, c) : writeRows(c.content, c.truncated, c.redacted);
   const no = (v) => (v == null ? "" : String(v));
   return rows.map((r) => {
     if (r.type === "hunk") return `<div class="hunk">${esc(r.text)}</div>`;
@@ -1672,7 +1768,7 @@ const brWin = makeFloating($("#brWin"), {
   },
   onToggle: (open) => {
     $("#brToggle").setAttribute("aria-expanded", String(open));
-    lastSig.delete("brList");
+    brSig = null;
     if (open) loadBranches();
     render(true);
   },
@@ -1682,11 +1778,13 @@ $("#brWinClose").addEventListener("click", () => brWin.close());
 
 // 載入更多：每個 session 各要一段（contracts.md §6 的 more），全部回來後依順序鍵合併放在最上面
 const MORE_LIMIT = 200;
-const MORE_TIMEOUT_MS = 3000;
+// 回放或大量讀取時 collector 可能要好幾秒才回（C3），3 秒就丟太早（#747 F-10）
+const MORE_TIMEOUT_MS = 15_000;
 let moreReq = null;
 
 function requestMore() {
-  if (moreReq) return;
+  // 回放中（#730）串流是回放的時刻，WS 的 more 問的是即時 collector，會帶出 t 之後的結果（#765 C24）
+  if (moreReq || tl.active) return;
   const wanted = [...stream.minPos()].filter(([, p]) => p > 1);
   if (!wanted.length) return;
   moreReq = { waiting: new Set(wanted.map(([s]) => s)), got: [], timer: setTimeout(finishMore, MORE_TIMEOUT_MS) };
@@ -1711,7 +1809,7 @@ function finishMore() {
 function onStreamSnapshot(m) {
   stream.load({ staged: m.staged, stream: m.stream });
   moreReq = null;
-  view.reset();
+  view.reset({ keep: true });
   updateHasMore();
 }
 
@@ -1767,6 +1865,15 @@ const utcOffset = () => -new Date().getTimezoneOffset();
 // 「幾分鐘前」：回放中以回放的時刻算
 const viewNow = () => (tl.active ? tl.t : Date.now());
 let tlProjBefore = null; // 進回放前選的專案，離開時還原
+// 回放的請求一次只留一組：換範圍、拖動、離開時取消還在跑的（collector 同時最多處理 2 個，#765 B-N1）
+let tlAbort = null;
+function tlSignal() {
+  tlAbort?.abort();
+  tlAbort = new AbortController();
+  return tlAbort.signal;
+}
+const tlHttpError = (res, body) =>
+  res.status === 429 ? "collector 正在處理其他回放，稍等一下再試" : body?.error ?? `讀取失敗（HTTP ${res.status}）`;
 
 function fillReplayProjects() {
   const roots = projectRoots(allSessions());
@@ -1800,7 +1907,7 @@ function applyMainFrame(m) {
   applyFrame(store, m);
   onStreamFrame(m);
   changes.apply(m.events);
-  if (m.rows?.sessions?.length) syncProjects();
+  if (m.rows?.sessions?.length) proj.dirty = true; // 在 render 裡做一次（#757 E-F2）
   feedFiles(m.events);
 }
 
@@ -1808,7 +1915,7 @@ function startTimeline() {
   const cwd = $("#rpProj").value;
   if (!cwd) return;
   const choice = $("#rpRange").value;
-  let { from, to } = rangeFor(choice, Date.now(), utcOffset());
+  let { from, to } = rangeFor(choice, Date.now(), (ms) => -new Date(ms).getTimezoneOffset());
   if (choice === "custom") {
     // datetime-local 沒有時區，Date.parse 當成本地時間
     from = Date.parse($("#rpFrom").value);
@@ -1831,9 +1938,9 @@ async function seekTimeline(at) {
   const req = tl.seek(at);
   render(true);
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.t, until: tl.to, offset: utcOffset() }));
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.t, until: tl.to, offset: utcOffset() }), { signal: tlSignal() });
     const body = await res.json();
-    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    if (!res.ok) return tl.failed(req, tlHttpError(res, body));
     const snap = tl.loaded(req, body);
     if (!snap) return;
     resetMain();
@@ -1848,9 +1955,11 @@ async function seekTimeline(at) {
 async function moreTimeline() {
   const req = tl.loadingMore();
   try {
-    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false }));
+    const res = await apiFetch(timelineUrl({ cwd: tl.cwd, at: tl.next, until: tl.to, offset: utcOffset(), snapshot: false, from: tl.lower }), {
+      signal: tlSignal(),
+    });
     const body = await res.json();
-    if (!res.ok) return tl.failed(req, body?.error ?? `讀取失敗（HTTP ${res.status}）`);
+    if (!res.ok) return tl.failed(req, tlHttpError(res, body));
     tl.appended(req, body);
   } catch {
     tl.failed(req, "讀取下一段失敗");
@@ -1860,6 +1969,7 @@ async function moreTimeline() {
 // 離開回放：主頁換回現況（重訂 `*`，collector 送新的 snapshot）
 function exitTimeline() {
   if (!tl.active) return;
+  tlAbort?.abort();
   tl.stop();
   document.body.classList.remove("replaying");
   proj.cur = tlProjBefore;
@@ -1868,16 +1978,23 @@ function exitTimeline() {
   client.subscribe("*");
 }
 
-let tlLast = performance.now();
-setInterval(() => {
-  const now = performance.now();
-  const dt = now - tlLast;
-  tlLast = now;
-  if (!tl.active || !tl.playing) return;
-  for (const f of tl.tick(dt)) applyMainFrame(f);
-  if (tl.needsMore()) moreTimeline();
-  render();
-}, TICK_MS);
+// 只在播放中掛計時器（#757 E-F12）：暫停、播到結尾、離開回放時拿掉
+let tlLast = 0;
+let tlTimer = null;
+tl.onPlayingChange = (on) => {
+  clearInterval(tlTimer);
+  tlTimer = null;
+  if (!on) return;
+  tlLast = performance.now();
+  tlTimer = setInterval(() => {
+    const now = performance.now();
+    const dt = now - tlLast;
+    tlLast = now;
+    for (const f of tl.tick(dt)) applyMainFrame(f);
+    if (tl.needsMore()) moreTimeline();
+    render();
+  }, TICK_MS);
+};
 
 function renderReplay() {
   fillReplayProjects();
@@ -1888,6 +2005,8 @@ function renderReplay() {
   }
   const slider = $("#tlSlider");
   slider.disabled = !tl.active;
+  // 回放中專案由回放的選單決定：頂端的專案選單停用，離開時還原的才會和存下來的偏好一致（#765 C23）
+  $("#gProj").disabled = tl.active;
   $("#tlPlay").disabled = !tl.active || tl.loading && !tl.queue.length;
   $("#tlPlay").textContent = tl.playing ? "⏸" : "▶";
   $("#tlPlay").setAttribute("aria-label", tl.playing ? "暫停" : "播放");
@@ -1897,7 +2016,7 @@ function renderReplay() {
     slider.value = String(tl.t);
   }
   $("#tlTime").textContent = tl.active ? fmtClock(tl.t) : "";
-  const info = tl.error ?? (tl.active ? `${fmtTime(tl.from)} – ${fmtTime(tl.to)} · ${store.sessions.size} 個 session${tl.loading ? " · 載入中…" : tl.ended ? " · 已播到範圍結尾" : ""} · 回放中「已確認」與通知停用；檔案樹的檔案清單是 git 現況，只有活動標記跟著時間軸` : "選專案與範圍後按「載入」");
+  const info = tl.error ?? (tl.active ? `${fmtTime(tl.from)} – ${fmtTime(tl.to)} · ${store.sessions.size} 個 session${tl.loading ? " · 載入中…" : tl.ended ? " · 已播到範圍結尾" : ""} · 回放中「已確認」停用，即時的通知照常；檔案樹的檔案清單是 git 現況，只有活動標記跟著時間軸` : "選專案與範圍後按「載入」");
   if (changed("rpInfo", info)) $("#rpInfo").textContent = info;
 }
 $("#rpGo").addEventListener("click", startTimeline);
@@ -1915,11 +2034,18 @@ $("#tlPlay").addEventListener("click", () => {
   render(true);
 });
 $("#tlSpeed").addEventListener("change", () => { tl.speed = Number($("#tlSpeed").value) || tl.speed; });
-// 拖動時只更新時刻的字；放開才重新取那個時刻的畫面
+// 拖動時只更新時刻的字；放開才重新取那個時刻的畫面。用鍵盤連按方向鍵時每下都是 change：停 250 ms 才取（#765 B-N1）
 $("#tlSlider").addEventListener("input", () => { $("#tlTime").textContent = fmtClock(Number($("#tlSlider").value)); });
+let tlSeekTimer = null;
 $("#tlSlider").addEventListener("change", () => {
-  const playing = tl.playing;
-  seekTimeline(Number($("#tlSlider").value)).then(() => { if (playing) tl.play(); });
+  const playing = tl.playing || tlSeekTimer != null;
+  tl.pause();
+  clearTimeout(tlSeekTimer);
+  tlSeekTimer = setTimeout(() => {
+    tlSeekTimer = null;
+    // 讀取失敗時 play 不會開始（timeline.js，#765 C14）
+    seekTimeline(Number($("#tlSlider").value)).then(() => { if (playing) tl.play(); });
+  }, 250);
 });
 
 // ---------- 互動 ----------
@@ -1968,7 +2094,8 @@ bench.on = mockN > 0 && params.has("bench");
 bench.isolate = bench.on && params.has("isolate");
 // &prefill：mock 先產生一段歷史（每個 session 約 220 個 pos），用來試「載入更多」與 3000 行上限
 // &bigtree：檔案樹超過懶載入門檻（#642）
-const mock = mockN ? installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
+// mock 只在 ?mock 時才載入（38 KB，正式環境用不到，#757 E-F11）
+const mock = mockN ? (await import("./mock-feed.js")).installMock(mockN, { bench: bench.on, prefill: params.has("prefill"), bigtree: params.has("bigtree") }) : null;
 if (mock) {
   $("#mockDrop").hidden = false;
   $("#mockDrop").addEventListener("click", () => mock.restart(3000));
@@ -1982,7 +2109,8 @@ const client = createClient({
   clearTimeout: (t) => window.clearTimeout(t),
   utcOffsetMin: -new Date().getTimezoneOffset(),
   handlers: {
-    welcome: (m) => { ui.welcome = m; notifier.connected(); loadSessions(); render(true); },
+    // 重連：斷線前送出的 ack 不知道有沒有到，待確認的全部解除，由新的 snapshot 決定哪些還在（#747 F-2）
+    welcome: (m) => { ui.welcome = m; ackPending.clear(); notifier.connected(); loadSessions(); render(true); },
     snapshot: (m) => {
       // 監視器沒有 `*`：彙總列（這個 session 的一列、agents、attention）也從 session 頻道來
       if (isMonitor && m.ch === `session:${monitorId}`) applySnapshot(store, m);
@@ -2004,8 +2132,11 @@ const client = createClient({
       render(true);
     },
     frame: (m) => {
-      if (m.ch === "*" && tl.blocksLive()) return;
-      applyFrame(store, m);
+      // 回放中（#730）即時的 `*` 不碰主頁，但通知照常：回放期間真的發生的危險、等你不能因為在看回放就漏掉，
+      // 離開時的 snapshot 會把它們當成已知、永遠不再通知（#765 C5）
+      if (m.ch === "*" && tl.blocksLive()) return void notifier.frame(m.rows?.attention);
+      // session 分頁同時訂了 `*` 與 session:<id>，兩邊帶同樣的列：只套 `*` 的（監視器只有自己的頻道，#757 E-F10）
+      if (m.ch === "*" || isMonitor) applyFrame(store, m);
       if (m.ch === "*") notifier.frame(m.rows?.attention);
       // 單 session 畫面只吃自己的頻道（`*` 也帶同樣的 Event，兩邊都吃會重複算）
       if (isSessionTab(ui.tab) && m.ch === `session:${pane.session}`) paneView.update(pane.apply(m.events));
@@ -2014,12 +2145,16 @@ const client = createClient({
         if (bench.on) benchFrame(m);
         else onStreamFrame(m);
         changes.apply(m.events);
-        if (m.rows?.sessions?.length) syncProjects();
+        // 專案清單在 render 裡同步一次：每則 frame 都全量合併、排序 sessions 太浪費，回放一個 tick 可能套上百個 frame（#757 E-F2）
+        if (m.rows?.sessions?.length) proj.dirty = true;
         feedFiles(m.events);
       }
       render();
     },
-    more: (m) => (paneMoreReq && m.session === paneMoreReq.session && m.beforePos === paneMoreReq.beforePos ? onPaneMore(m) : onMore(m)),
+    more: (m) => {
+      const req = paneMoreReq ?? paneMoreLate;
+      return req && m.session === req.session && m.beforePos === req.beforePos && pane.session === req.session ? onPaneMore(m) : onMore(m);
+    },
     onStatus: (s) => {
       if (ui.conn !== "incompatible") ui.conn = s;
       // WS 握手被 401 拒絕（cookie 過期、金鑰被撤銷）在瀏覽器只看得到斷線：用一個 API 請求確認，是就導去登入

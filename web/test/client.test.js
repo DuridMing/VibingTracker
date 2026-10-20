@@ -245,3 +245,12 @@ test("server 的 error 訊息交給 handlers.error（#721）", () => {
   assert.equal(got.serverError[0].message, "linux 的金鑰只能看（view）");
   assert.equal(got.error.length, 0, "不是解析錯誤");
 });
+
+test("ack 回報有沒有送出：沒連上時是 false，呼叫端才不會卡在「確認中…」（#747 F-2）", () => {
+  const { at, client } = harness();
+  client.connect();
+  assert.equal(client.ack({ session: "s", kind: "danger", ref: "t" }), false);
+  at(0).open();
+  assert.equal(client.ack({ session: "s", kind: "danger", ref: "t" }), true);
+  assert.deepEqual(at(0).sent.at(-1), { op: "ack", session: "s", kind: "danger", ref: "t" });
+});

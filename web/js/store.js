@@ -4,7 +4,7 @@
 const KINDS = ["sessions", "agents", "attention"];
 
 export function createStore() {
-  return { sessions: new Map(), agents: new Map(), attention: new Map(), kpi: {} };
+  return { sessions: new Map(), agents: new Map(), attention: new Map(), kpi: {}, storeError: null };
 }
 
 function upsert(map, rows) {
@@ -24,9 +24,13 @@ export function applySnapshot(st, msg) {
     upsert(st[k], msg[k]);
   }
   st.kpi = { ...msg.kpi };
+  // 資料寫不進磁碟（#781 W-M10）：snapshot 一定帶，舊的 collector 沒有這個欄位就當正常
+  st.storeError = msg.storeError ?? null;
 }
 
 export function applyFrame(st, msg) {
+  // frame 只在 storeError 改變時帶這個鍵（null＝恢復），沒帶就維持
+  if ("storeError" in msg) st.storeError = msg.storeError ?? null;
   const rows = msg.rows;
   if (rows == null) return;
   for (const k of KINDS) upsert(st[k], rows[k]);

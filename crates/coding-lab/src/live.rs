@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 
 use crate::derive::relative_path;
-use crate::doing::Doing;
+use crate::doing::{Doing, Source};
 use crate::event::{DangerLevel, Event, Payload};
 use crate::status::task_failed;
 use crate::store::SessionRow;
@@ -48,6 +48,11 @@ const STATUS_LINES: &[&str] = &[
     "agent.finished",
     "session.started",
 ];
+
+/// 「載入更多」組串流時會用到的不帶 pos 的 Event 種類：卡片的伴隨 Event 與狀態行（E-L9：store 只讀這些）。
+pub fn pool_kinds() -> impl Iterator<Item = &'static str> {
+    COMPANIONS.iter().chain(STATUS_LINES).copied()
+}
 
 /// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact）才算。startup 與 clear
 /// 都是新 session 的第一行，不標（`/clear` 換 session id、舊 session 收到 SessionEnd reason clear，#688 實測）。
@@ -107,14 +112,12 @@ pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u
         list.sort_by_key(|e| e.seq);
         keep_latest_update(list);
     }
-    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）
+    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）。同 session 內 pos 與 seq 都由 merge 依序發、一起單調，
+    // 所以依 pos 排好的窗口 seq 也遞增，可以二分搜尋（E-L6）
     lines.sort_by_key(|e| e.seq);
     let mut after: Vec<Vec<Event>> = vec![Vec::new(); window.len() + 1];
     for l in lines {
-        let at = window
-            .iter()
-            .rposition(|e| e.seq < l.seq)
-            .map_or(0, |i| i + 1);
+        let at = window.partition_point(|e| e.seq < l.seq);
         after[at].push(l);
     }
     let mut after = after.into_iter();
@@ -229,9 +232,102 @@ pub struct Frame {
     agents: Vec<(String, Value)>,
     attention: Vec<(String, Value)>,
     kpi: BTreeMap<i32, Value>,
+    /// storeError 改變了（W-M10）：Some(null) 是恢復；None 是這個 frame 不帶
+    store_error: Option<Value>,
+    /// 序列化好的結果（E-L4）：(頻道, offset, 模式) → 送出的文字；None＝這種連線沒有內容
+    texts: std::sync::Mutex<HashMap<(String, i32, u8), Option<axum::extract::ws::Utf8Bytes>>>,
+    serialized: std::sync::atomic::AtomicUsize,
+}
+
+/// 本機版本直接序列化借用的 Event，不經過中間的 Value（E-L4）。
+#[derive(serde::Serialize)]
+struct FrameOut<'a> {
+    t: &'static str,
+    frame: u64,
+    ch: String,
+    events: Vec<&'a Event>,
+    rows: Value,
+    #[serde(rename = "storeError", skip_serializing_if = "Option::is_none")]
+    store_error: Option<&'a Value>,
+}
+
+/// frame 送給哪一種連線：本機原樣，遠端依 `remote_thinking` 剝除（[`crate::ws::redact_remote_copy`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Local,
+    Remote(crate::config::RemoteThinking),
 }
 
 impl Frame {
+    /// 這個連線要送的文字（[`Frame::to_json`] 序列化後；遠端先剝除）。同一個 frame 每種（頻道、offset、模式）只序列化
+    /// 一次，之後的連線拿快取（E-L4）。遠端模式各自一份，本機的全文不會送給遠端（X9）；session 頻道不帶 kpi，不分 offset。
+    pub fn text_for(
+        &self,
+        ch: &Channel,
+        offset_min: i32,
+        wire: Wire,
+    ) -> Option<axum::extract::ws::Utf8Bytes> {
+        use crate::config::RemoteThinking;
+        let offset = if *ch == Channel::All { offset_min } else { 0 };
+        let mode = match wire {
+            Wire::Local => 0,
+            Wire::Remote(RemoteThinking::OnDemand) => 1,
+            Wire::Remote(RemoteThinking::Hide) => 2,
+            Wire::Remote(RemoteThinking::Show) => 3,
+        };
+        let key = (ch.name(), offset, mode);
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = texts.get(&key) {
+            return t.clone();
+        }
+        self.serialized
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = match wire {
+            Wire::Local => self.local_text(ch, offset),
+            Wire::Remote(thinking) => self
+                .to_json(ch, offset)
+                .map(|v| crate::ws::redact_remote_copy(&v, thinking).to_string()),
+        }
+        .map(axum::extract::ws::Utf8Bytes::from);
+        texts.insert(key, text.clone());
+        text
+    }
+
+    /// [`Frame::text_for`] 實際序列化了幾次（測試用）。
+    pub fn serializations(&self) -> usize {
+        self.serialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn local_text(&self, ch: &Channel, offset_min: i32) -> Option<String> {
+        let events: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|e| ch.wants(&e.session))
+            .collect();
+        let mut rows = self.rows_for(ch);
+        if *ch == Channel::All
+            && let Some(k) = self.kpi_for(offset_min)
+            && let Some(obj) = rows.as_object_mut()
+        {
+            obj.insert("kpi".into(), k);
+        }
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
+            return None;
+        }
+        serde_json::to_string(&FrameOut {
+            t: "frame",
+            frame: self.no,
+            ch: ch.name(),
+            events,
+            rows,
+            store_error: self.store_error.as_ref(),
+        })
+        .ok()
+    }
+
     pub fn events_for(&self, ch: &Channel) -> Vec<Event> {
         self.events
             .iter()
@@ -273,12 +369,17 @@ impl Frame {
         {
             obj.insert("kpi".into(), k);
         }
-        if events.is_empty() && rows.as_object().is_none_or(|o| o.is_empty()) {
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
             return None;
         }
-        Some(
-            json!({ "t": "frame", "frame": self.no, "ch": ch.name(), "events": events, "rows": rows }),
-        )
+        let mut v = json!({ "t": "frame", "frame": self.no, "ch": ch.name(), "events": events, "rows": rows });
+        if let Some(e) = &self.store_error {
+            v["storeError"] = e.clone();
+        }
+        Some(v)
     }
 }
 
@@ -355,6 +456,9 @@ struct AttentionLive {
 
 #[derive(Default)]
 pub struct Live {
+    /// store 寫不進去的狀態（W-M10，contracts §6）：snapshot 一定帶，frame 只在改變時帶
+    store_error: Option<Value>,
+    store_error_dirty: bool,
     sessions: BTreeMap<String, SessionLive>,
     agents: BTreeMap<String, AgentLive>,
     attention: BTreeMap<String, AttentionLive>,
@@ -381,11 +485,22 @@ pub struct Live {
     kpi_dirty: bool,
     kpi_slot: u64,
     kpi_computes: u64,
+    /// （每個 session 的串流筆數, 留幾個 frame 給斷線接續）；None＝即時用的預設
+    limits: Option<(usize, usize)>,
 }
 
 impl Live {
     pub fn new() -> Live {
         Live::default()
+    }
+
+    /// 回放這類不用「載入更多」也沒有人斷線接續的用途（E-L8）：串流每個 session 只留 `stream_cap` 筆
+    /// （`*` 的 snapshot 只送 [`ALL_STREAM_PER_SESSION`]）、history 留 `history_cap` 個 frame。
+    pub fn with_limits(stream_cap: usize, history_cap: usize) -> Live {
+        Live {
+            limits: Some((stream_cap, history_cap)),
+            ..Live::default()
+        }
     }
 
     pub fn frame_no(&self) -> u64 {
@@ -404,18 +519,31 @@ impl Live {
             .count()
     }
 
+    /// 「已扣回 KPI」記號的數量（測試確認它跟著卡片放掉，K-12）
+    pub fn reverted_count(&self) -> usize {
+        self.reverted.len()
+    }
+
     /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
     pub fn kpi_computations(&self) -> u64 {
         self.kpi_computes
     }
 
-    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）：之後由 /api/sessions 與回放查看。
-    /// 不送 deleted 列：已經開著的頁面可能還有它的串流行，保留那一列比較不會出錯。
+    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）並送 sessions 列 `deleted`：之後由
+    /// /api/sessions 與回放查看。還有佇列列的延後到佇列清空，佇列列不會變成孤兒列（契約 §6、K-7、D3）。
     fn evict_ended(&mut self, now: u64) {
+        let queued: HashSet<&str> = self
+            .attention
+            .values()
+            .map(|a| a.session.as_str())
+            .collect();
         let gone: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now))
+            .filter(|(id, s)| {
+                s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now)
+                    && !queued.contains(id.as_str())
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for sid in gone {
@@ -423,8 +551,9 @@ impl Live {
             self.streams.remove(&sid);
             self.status_lines.remove(&sid);
             self.bg_running.remove(&sid);
-            self.dirty_sessions.remove(&sid);
+            self.dirty_sessions.insert(sid.clone());
             self.card_events.retain(|(s, _), _| *s != sid);
+            self.reverted.retain(|(s, _)| *s != sid);
             self.staged.retain(|(s, _), _| *s != sid);
             self.agents.retain(|_, a| a.session != sid);
         }
@@ -506,14 +635,18 @@ impl Live {
             }
         }
         if let Some(p) = e.pos {
+            let cap = self.limits.map_or(STREAM_PER_SESSION, |(s, _)| s);
             let stream = self.streams.entry(sid.clone()).or_default();
             stream.push_back(e.clone());
-            while stream.len() > STREAM_PER_SESSION {
+            while stream.len() > cap {
                 // 卡片被擠出串流，它的伴隨 Event 也不用留了
                 if let Some(old) = stream.pop_front()
                     && let Some(id) = card_key(&old)
                 {
-                    self.card_events.remove(&(sid.clone(), id));
+                    // 「已扣回」只在伴隨 Event 還在時有用（revert_kpi 找不到就不扣），一起放掉（K-12）
+                    let key = (sid.clone(), id);
+                    self.card_events.remove(&key);
+                    self.reverted.remove(&key);
                 }
             }
             if let Some(s) = self.sessions.get_mut(&sid) {
@@ -528,7 +661,7 @@ impl Live {
             Payload::FileEdit(_) => counts.edits += 1,
             Payload::FileWrite(w) if w.is_new => counts.writes += 1,
             Payload::ToolCalled(c) => {
-                if c.tool == "Bash" {
+                if crate::event::is_command_tool(&c.tool) {
                     counts.commands += 1;
                 }
                 if c.danger
@@ -540,7 +673,10 @@ impl Live {
             }
             Payload::ToolUpdated(u) => {
                 if u.status == crate::event::ToolStatus::Failed {
-                    counts.failures += 1;
+                    // Esc 與 PermissionDenied 不算失敗（D6），但被拒的改動一樣扣回
+                    if u.is_failure() {
+                        counts.failures += 1;
+                    }
                     self.revert_kpi(&sid, &u.tool_use_id);
                 }
                 let counts = self.slots.entry(ts / SLOT_MS).or_default();
@@ -574,15 +710,15 @@ impl Live {
             Payload::SessionStarted(p) => {
                 // 第一次的 cwd 是路徑基準（#672），之後的 session.started 不換
                 if s.cwd.is_empty() {
-                    s.cwd = p.cwd.replace('\\', "/");
+                    s.cwd = crate::paths::normalize(&p.cwd);
                 }
                 s.model = p.model.or(s.model.take());
                 s.branch = p.branch.or(s.branch.take());
                 s.ended_at = None;
-                s.status = "run".into();
-                s.status_since = ts;
+                // 狀態不在這裡改，只認 session.status（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
             }
             Payload::SessionEnded(_) => {
+                // merge 在 session.ended 之後一定發 ended；這裡照設，是給沒有 session.status 的舊 JSONL（不變式 9）
                 s.ended_at = Some(ts);
                 s.status = "ended".into();
                 s.status_since = ts;
@@ -639,7 +775,6 @@ impl Live {
                     s.branch = g.branch;
                 }
             }
-            Payload::ToolResult(r) if !r.ok => s.failures += 1,
             Payload::AttentionRaised(a) => {
                 let kind = enum_str(&a.kind);
                 if kind == "danger" {
@@ -699,6 +834,10 @@ impl Live {
                 }
             }
             Payload::ToolUpdated(u) => {
+                // 和 KPI 同一個判斷（D6）；tool_result 的 ok=false 含 Esc 與拒絕，不另外算
+                if u.is_failure() {
+                    s.failures += 1;
+                }
                 // 被拒或失敗的 Edit／Write 視為沒有發生，不留在改動紀錄（contracts §4，#682）
                 if u.status == crate::event::ToolStatus::Failed {
                     self.changes.retain(|c| {
@@ -787,6 +926,11 @@ impl Live {
         }
     }
 
+    /// live 裡所有 session 的 id。
+    pub fn session_ids(&self) -> HashSet<String> {
+        self.sessions.keys().cloned().collect()
+    }
+
     pub fn has_session(&self, id: &str) -> bool {
         self.sessions.contains_key(id)
     }
@@ -816,7 +960,7 @@ impl Live {
                 ..SessionLive::default()
             });
         if !r.cwd.is_empty() {
-            s.cwd = r.cwd.replace('\\', "/");
+            s.cwd = crate::paths::normalize(&r.cwd);
         }
         if let Some(p) = &r.first_prompt {
             s.first_prompt = Some(clip(p));
@@ -873,6 +1017,15 @@ impl Live {
     }
 
     /// 打包這段時間的變化；沒有任何變化回 None。
+    /// 丟掉還沒送出的變更、不組 frame（E-L2）：啟動時重建、回放追到起點這類大量 apply，
+    /// 沒有人在等那些 frame（重連的 instance 不同、回放只要 snapshot），組出來只會留在 history 佔記憶體。
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.dirty_sessions.clear();
+        self.dirty_agents.clear();
+        self.dirty_attention.clear();
+    }
+
     pub fn flush(&mut self, now: u64) -> Option<Arc<Frame>> {
         self.evict_ended(now);
         let mut kpi = BTreeMap::new();
@@ -894,8 +1047,9 @@ impl Live {
         for off in offsets {
             let current = self.kpi(off, now);
             let day = day_start(off, now);
-            let changed = match self.offsets.get(&off).cloned().flatten() {
-                Some((prev_day, prev)) if prev_day == day => {
+            // 和上次送出的比，借用不拷貝上一份（E-L3）
+            let changed = match self.offsets.get(&off).and_then(Option::as_ref) {
+                Some((prev_day, prev)) if *prev_day == day => {
                     let mut diff = Map::new();
                     if let (Some(c), Some(p)) = (current.as_object(), prev.as_object()) {
                         for (k, v) in c {
@@ -938,7 +1092,13 @@ impl Live {
 
         let sessions: Vec<(String, Value)> = std::mem::take(&mut self.dirty_sessions)
             .into_iter()
-            .filter_map(|id| self.session_row(&id).map(|row| (id, row)))
+            .map(|id| {
+                // 不在 live 裡的是剛移出的（evict_ended）
+                let row = self
+                    .session_row(&id)
+                    .unwrap_or_else(|| json!({ "id": id, "deleted": true }));
+                (id, row)
+            })
             .collect();
         let agents: Vec<(String, Value)> = std::mem::take(&mut self.dirty_agents)
             .into_iter()
@@ -963,11 +1123,14 @@ impl Live {
             })
             .collect();
 
+        let store_error = std::mem::take(&mut self.store_error_dirty)
+            .then(|| self.store_error.clone().unwrap_or(Value::Null));
         if events.is_empty()
             && sessions.is_empty()
             && agents.is_empty()
             && attention.is_empty()
             && kpi.is_empty()
+            && store_error.is_none()
         {
             return None;
         }
@@ -979,9 +1142,13 @@ impl Live {
             agents,
             attention,
             kpi,
+            store_error,
+            texts: Default::default(),
+            serialized: Default::default(),
         });
         self.history.push_back(frame.clone());
-        while self.history.len() > FRAMES_KEPT {
+        let kept = self.limits.map_or(FRAMES_KEPT, |(_, h)| h);
+        while self.history.len() > kept {
             self.history.pop_front();
         }
         Some(frame)
@@ -1000,6 +1167,19 @@ impl Live {
             return None;
         }
         Some(self.history.iter().filter(|f| f.no > no).cloned().collect())
+    }
+
+    /// 目前的 storeError（welcome 用）；正常時 null。
+    pub fn store_error(&self) -> Value {
+        self.store_error.clone().unwrap_or(Value::Null)
+    }
+
+    /// serve 每次試著寫 store 之後呼叫（W-M10）；和上次不同才送。
+    pub fn set_store_error(&mut self, e: Option<Value>) {
+        if e != self.store_error {
+            self.store_error = e;
+            self.store_error_dirty = true;
+        }
     }
 
     pub fn snapshot(&self, ch: &Channel, offset_min: i32, now: u64) -> Value {
@@ -1074,6 +1254,7 @@ impl Live {
             "t": "snapshot", "ch": ch.name(), "frame": self.frame_no,
             "sessions": sessions, "agents": agents, "attention": attention,
             "staged": staged, "stream": stream,
+            "storeError": self.store_error.clone().unwrap_or(Value::Null),
         });
         if *ch == Channel::All {
             snap["kpi"] = self.kpi(offset_min, now);
@@ -1172,32 +1353,35 @@ impl Live {
     }
 
     fn kpi(&self, offset_min: i32, now: u64) -> Value {
+        // 加總時借用時間格裡的字串，不逐格 clone（E-L3：即時每次 flush、回放每個 frame 都算一次）
         let start = day_start(offset_min, now);
-        let mut total = Counts::default();
+        let mut sessions: HashSet<&str> = HashSet::new();
+        let mut agents: HashSet<&str> = HashSet::new();
+        let mut models: BTreeMap<&str, (f64, u64, BTreeSet<&str>)> = BTreeMap::new();
+        let mut sum = Counts::default();
         for c in self.slots.range(start / SLOT_MS..).map(|(_, c)| c) {
-            total.sessions.extend(c.sessions.iter().cloned());
-            total.agents.extend(c.agents.iter().cloned());
-            total.edits += c.edits;
-            total.writes += c.writes;
-            total.commands += c.commands;
-            total.failures += c.failures;
-            total.dangers += c.dangers;
-            total.commits += c.commits;
-            total.thinking += c.thinking;
-            total.cost += c.cost;
+            sessions.extend(c.sessions.iter().map(String::as_str));
+            agents.extend(c.agents.iter().map(String::as_str));
+            sum.edits += c.edits;
+            sum.writes += c.writes;
+            sum.commands += c.commands;
+            sum.failures += c.failures;
+            sum.dangers += c.dangers;
+            sum.commits += c.commits;
+            sum.thinking += c.thinking;
+            sum.cost += c.cost;
             for (name, (cost, thinking, ids)) in &c.models {
-                let m = total.models.entry(name.clone()).or_default();
+                let m = models.entry(name).or_default();
                 m.0 += cost;
                 m.1 += thinking;
-                m.2.extend(ids.iter().cloned());
+                m.2.extend(ids.iter().map(String::as_str));
             }
         }
-        let models: Map<String, Value> = total
-            .models
-            .iter()
+        let models: Map<String, Value> = models
+            .into_iter()
             .map(|(name, (cost, thinking, ids))| {
                 (
-                    name.clone(),
+                    name.to_string(),
                     json!({ "costUsd": cost, "thinkingTokens": thinking, "ids": ids }),
                 )
             })
@@ -1205,16 +1389,16 @@ impl Live {
         json!({
             "live": self.sessions.values().filter(|s| s.status == "run").count(),
             "attention": self.attention.len(),
-            "sessions": total.sessions.len(),
-            "agents": total.agents.len(),
-            "edits": total.edits,
-            "writes": total.writes,
-            "commands": total.commands,
-            "failures": total.failures,
-            "dangers": total.dangers,
-            "commits": total.commits,
-            "thinkingTokens": total.thinking,
-            "costUsd": total.cost,
+            "sessions": sessions.len(),
+            "agents": agents.len(),
+            "edits": sum.edits,
+            "writes": sum.writes,
+            "commands": sum.commands,
+            "failures": sum.failures,
+            "dangers": sum.dangers,
+            "commits": sum.commits,
+            "thinkingTokens": sum.thinking,
+            "costUsd": sum.cost,
             "models": models,
         })
     }
@@ -1232,7 +1416,8 @@ impl Live {
             "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model.as_deref().map(short_model), "modelId": s.model,
             "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
             "startedAt": s.started_at, "endedAt": s.ended_at,
-            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t), "score": s.score,
+            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t),
+            "doingSource": s.doing.local().map(|(src, _)| doing_source(src)), "score": s.score,
             "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
             "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
             "degraded": s.degraded,
@@ -1299,7 +1484,7 @@ fn describe(tool: &str, input: &Value, cwd: &str) -> String {
             .unwrap_or_default()
     };
     match tool {
-        "Bash" => {
+        t if crate::event::is_command_tool(t) => {
             let cmd = input["command"].as_str().unwrap_or_default();
             let first = cmd.lines().next().unwrap_or_default();
             format!("$ {}", first.chars().take(80).collect::<String>())
@@ -1308,5 +1493,15 @@ fn describe(tool: &str, input: &Value, cwd: &str) -> String {
         "Edit" => format!("edit {}", path()),
         "Write" => format!("write {}", path()),
         other => other.to_string(),
+    }
+}
+
+/// sessions 列的 `doingSource`：遠端剝除靠它判斷 `doing` 是不是取自 thinking（C2，contracts §4）。
+fn doing_source(src: Source) -> &'static str {
+    match src {
+        Source::Text => "text",
+        Source::Thinking => "thinking",
+        Source::Tool => "tool",
+        Source::Prompt => "prompt",
     }
 }

@@ -90,3 +90,73 @@ test("快用完時要下一段：有 next、沒在載入、佇列裡剩下的不
   tl.seek(5000);
   assert.equal(tl.appended(more, { frames: [frame(1800)], next: null }), false, "拖動之後才回來的接續段丟掉");
 });
+
+test("下一段還在載入時時鐘停在已載入的範圍，載入後接著播，最後一段也會套到（#765 C4）", () => {
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 600_000 });
+  const req = tl.seek(0);
+  // 第一段放到 500 s（next＝最後放進來的時間點），範圍到 600 s
+  tl.loaded(req, { snapshot: {}, frames: [frame(250_000), frame(500_000)], next: 500_000 });
+  tl.play(600);
+  const got = tl.tick(1000).map((f) => f.ts); // 600× 一秒＝600 s，超過已載入的部分
+  assert.deepEqual(got, [250_000, 500_000]);
+  assert.equal(tl.t, 500_000, "時鐘不能跑到還沒載入的地方");
+  assert.equal(tl.playing, true, "還沒播完，等下一段");
+  assert.equal(tl.ended, false);
+  const more = tl.loadingMore();
+  assert.deepEqual(tl.tick(1000), [], "載入中不前進");
+  assert.equal(tl.t, 500_000);
+  tl.appended(more, { frames: [frame(550_000)], next: null });
+  assert.deepEqual(tl.tick(1000).map((f) => f.ts), [550_000], "晚到的那段照樣套用");
+  assert.equal(tl.t, 600_000);
+  assert.equal(tl.ended, true);
+});
+
+test("讀取失敗之後不開始播放（#765 C14）", () => {
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 10_000 });
+  const req = tl.seek(5000);
+  tl.failed(req, "HTTP 500");
+  tl.play();
+  assert.equal(tl.playing, false, "沒有資料可播，不能假裝在播");
+  // 重新 seek 成功後可以播
+  const again = tl.seek(5000);
+  tl.loaded(again, { snapshot: {}, frames: [], next: null });
+  tl.play();
+  assert.equal(tl.playing, true);
+});
+
+test("續頁帶第一段回應的 from（挑 session 的下界），跨午夜時下半段不少算前一天的 session（#765、#742 C6）", () => {
+  assert.equal(
+    timelineUrl({ cwd: "/p", at: 50, until: 90, offset: 0, snapshot: false, from: 7 }),
+    "/api/projects/replay?cwd=%2Fp&at=50&until=90&offset=0&limit=2000&snapshot=0&from=7",
+  );
+  const tl = createTimeline();
+  tl.start({ cwd: "/p", from: 0, to: 100 });
+  const req = tl.seek(0);
+  tl.loaded(req, { snapshot: {}, frames: [], next: 50, from: -3600 });
+  assert.equal(tl.lower, -3600, "記下伺服器算的下界");
+  tl.seek(20);
+  assert.equal(tl.lower, null, "重新 seek 由伺服器重算");
+});
+
+test("播放狀態改變時通知（主頁只在播放中掛計時器，#757 E-F12）：播放、暫停、播到結尾、讀取失敗、離開回放", () => {
+  const tl = createTimeline();
+  const seen = [];
+  tl.onPlayingChange = (on) => seen.push(on);
+  tl.start({ cwd: "/p", from: 0, to: 1000 });
+  assert.deepEqual(seen, [], "還沒播放：不通知");
+  tl.play(1);
+  tl.play(1);
+  assert.deepEqual(seen, [true], "已經在播：不重複通知");
+  tl.pause();
+  assert.deepEqual(seen, [true, false]);
+  tl.play(1);
+  tl.tick(5000);
+  assert.deepEqual(seen, [true, false, true, false], "播到結尾自己停");
+  tl.seek(0);
+  tl.play(1);
+  tl.stop();
+  assert.deepEqual(seen.slice(-2), [true, false], "離開回放也停");
+  assert.equal(tl.playing, false);
+});

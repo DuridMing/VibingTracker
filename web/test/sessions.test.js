@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeSessions, projectRoots, pickProject, canReplay } from "../js/sessions.js";
+import { mergeSessions, projectRoots, canReplay } from "../js/sessions.js";
 
 const row = (id, extra = {}) => ({ id, cwd: "/repo", status: "run", startedAt: 1000, model: null, ...extra });
 
@@ -33,14 +33,6 @@ test("專案：只有 worktree 的 session 時，它自己就是專案；已結�
   assert.deepEqual(projectRoots(sessions).map((p) => [p.cwd, p.live]), [["/repo/worktrees/feature/x", 0], ["/repo/worktrees/feature/y", 1]]);
 });
 
-test("預設專案：使用者選過且還在就用它，否則選 live 最多的", () => {
-  const roots = [{ cwd: "/a", sessions: ["1"], live: 1 }, { cwd: "/b", sessions: ["2", "3"], live: 2 }];
-  assert.equal(pickProject(roots, null), "/b");
-  assert.equal(pickProject(roots, "/a"), "/a");
-  assert.equal(pickProject(roots, "/gone"), "/b");
-  assert.equal(pickProject([], "/a"), null);
-});
-
 test("▶ 回放按鍵只給已結束的 session（#690）", () => {
   assert.equal(canReplay(row("a", { status: "ended" })), true);
   for (const status of ["run", "wait", "done", "fail", "danger", "idle"]) assert.equal(canReplay(row("a", { status })), false, status);
@@ -61,4 +53,11 @@ test("tab 列：選中的被收起來時換到列上，擠掉最後一個看得�
   assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, 3), { shown: [0, 3], hidden: [1, 2] });
   assert.deepEqual(fitTabs([100, 100, 100, 250], 330, 40, 3), { shown: [3], hidden: [0, 1, 2] });
   assert.deepEqual(fitTabs([100, 100, 100, 100], 330, 40, 1), { shown: [0, 1], hidden: [2, 3] }, "選中的本來就看得到：不動");
+});
+
+test("同一個專案的 cwd 磁碟機代號大小寫不同（e:\\ 與 E:\\）也歸成同一個專案（#748 L-11）", () => {
+  const sessions = [row("a", { cwd: "E:\\repo" }), row("b", { cwd: "e:\\repo\\worktrees\\x" })];
+  const roots = projectRoots(sessions);
+  assert.equal(roots.length, 1);
+  assert.deepEqual(roots[0].sessions.sort(), ["a", "b"]);
 });

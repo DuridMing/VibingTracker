@@ -160,12 +160,16 @@ test(`> ${LAZY_THRESHOLD} 檔懶載入：沒展開的目錄不建子節點`, () 
 test("大樹開頁：20000 檔建樹加第一次 visible 在 50 ms 內", () => {
   const big = [];
   for (let d = 0; d < 200; d++) for (let f = 0; f < 100; f++) big.push(`pkg${d}/src/m${f}.ts`);
-  const t0 = performance.now();
-  const t = tree(big);
-  t.apply([edit(A, "pkg3/src/m1.ts")]);
-  const rows = t.visible();
-  const ms = performance.now() - t0;
-  assert.equal(rows.length, 200 + 1 + 100);
+  // 取 3 次裡最快的：機器忙（check.sh 與其他編譯同時跑）時單次會被排程拖慢，演算法變慢則 3 次都慢（#749 T-4）
+  let ms = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const t0 = performance.now();
+    const t = tree(big);
+    t.apply([edit(A, "pkg3/src/m1.ts")]);
+    const rows = t.visible();
+    ms = Math.min(ms, performance.now() - t0);
+    assert.equal(rows.length, 200 + 1 + 100);
+  }
   assert.ok(ms < 50, `${ms.toFixed(1)} ms`);
 });
 
@@ -249,4 +253,32 @@ test("被拒或失敗的 Edit／Write 不算改：改／新建的方塊收回、
   // 失敗先到、file.* 後到
   t.apply([failed(B, "e3"), edit(B, "src/b.rs", "e3")]);
   assert.deepEqual(t.counts("src/b.rs"), { r: 0, e: 0, w: 0, x: 1, isNew: false });
+});
+
+test("頁面開著幾天：去重與卡片對照的集合有上限，計數照樣正確（#766 F-5）", () => {
+  const t = createFileTree();
+  t.cwdOf = () => "/r";
+  t.setFiles({ root: "/r", tree: ["a.txt"] });
+  const evs = [];
+  for (let i = 0; i < 300_000; i++) evs.push({ session: "s", seq: i + 1, type: "file.read", payload: { toolUseId: `t${i}`, path: "a.txt" } });
+  t.apply(evs);
+  assert.equal(t.counts("a.txt").r, 300_000);
+  const z = t.sizes();
+  assert.ok(z.seen <= 100_000 && z.toolPath <= 100_000, JSON.stringify(z));
+  // 最近的照樣去重
+  t.apply([evs.at(-1)]);
+  assert.equal(t.counts("a.txt").r, 300_000);
+});
+
+test("重抓檔案樹帶上次的 treeHash（have），相同時伺服器省略 tree（#766 F-6、contracts §7）", () => {
+  assert.equal(filesUrl("/repo", { kind: "main" }, "abcd1234abcd1234"), "/api/files?cwd=%2Frepo&base=main&have=abcd1234abcd1234");
+  assert.equal(filesUrl("/repo", { kind: "main" }, null), "/api/files?cwd=%2Frepo&base=main");
+  assert.equal(filesUrl("/repo", { kind: "commit", hash: "zz" }, "abcd"), null, "hash 格式不對照樣是 null");
+});
+
+test("使用者拒絕（PermissionDenied，denied）不算失敗：改動照樣收回，但不記「失敗」（#745 D6、contracts §4）", () => {
+  const t = tree(["src/a.rs"]);
+  t.apply([edit(A, "src/a.rs", "d1"), failed(A, "d1", { denied: true })]);
+  assert.equal(t.counts("src/a.rs").x, 0, "被拒不是工具出錯");
+  assert.equal(t.counts("src/a.rs").e, 0, "被拒的改動沒有發生，照樣收回");
 });

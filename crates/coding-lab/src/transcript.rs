@@ -5,10 +5,13 @@
 //! （notify 會漏事件或合併事件，輪詢是保底），把每一行轉成 merge 的 [`Input::Line`]。
 //! 同一個 uuid 的去重在 merge 做。
 
+use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -156,10 +159,11 @@ impl TailReader {
 
         let mut f = File::open(&self.path)?;
         f.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = Vec::new();
-        f.take(meta.len() - self.offset).read_to_end(&mut buf)?;
-        self.offset += buf.len() as u64;
-        self.pending.extend_from_slice(&buf);
+        // 直接接在半行後面讀，大行不多一份拷貝（E-S9）
+        let want = meta.len() - self.offset;
+        self.pending.reserve(usize::try_from(want).unwrap_or(0));
+        let got = f.take(want).read_to_end(&mut self.pending)?;
+        self.offset += got as u64;
 
         let mut start = 0;
         self.scanned += (self.pending.len() - self.searched) as u64;
@@ -193,6 +197,27 @@ impl TailReader {
     pub fn scanned_bytes(&self) -> u64 {
         self.scanned
     }
+
+    /// 檔案裡還沒讀的 bytes（檔案不見或變短時是 0）。
+    pub fn backlog(&self) -> u64 {
+        fs::metadata(&self.path).map_or(0, |m| m.len().saturating_sub(self.offset))
+    }
+}
+
+/// 讀一次。新增超過 [`BIG_LINE`] 時（Read 大檔整個進一行：實測 release 2 MB 約 20 ms、100 MB 約 1 秒）
+/// 在 blocking 執行緒讀與解析，不佔住 runtime 的 worker（hook 要 100 ms 內回，E-S9）。
+/// blocking 執行緒沒回來（runtime 正在關）時回 None，tail 就此結束。
+async fn poll_reader(mut reader: TailReader) -> Option<(TailReader, io::Result<Poll>)> {
+    if reader.backlog() <= BIG_LINE as u64 {
+        let polled = reader.poll();
+        return Some((reader, polled));
+    }
+    tokio::task::spawn_blocking(move || {
+        let polled = reader.poll();
+        (reader, polled)
+    })
+    .await
+    .ok()
 }
 
 /// 一般的行整個解析；大行用 [`Capped`] 邊解析邊截短長字串，記憶體不隨行長倍數成長（#684 R21）。
@@ -278,6 +303,8 @@ pub struct TailOptions {
     pub use_notify: bool,
     /// 這個 tail 的編號（serve 遞增發號）；Degraded／Recovered 帶著它，merge 用來忽略已被取代的 tail（#684 R20）
     pub tail: u64,
+    /// 共用的 notify watcher（E-S6）；None 時這個 tail 自己開一個
+    pub watcher: Option<Arc<SharedWatcher>>,
 }
 
 impl Default for TailOptions {
@@ -286,6 +313,7 @@ impl Default for TailOptions {
             poll_every: Duration::from_millis(500),
             use_notify: true,
             tail: 0,
+            watcher: None,
         }
     }
 }
@@ -374,12 +402,13 @@ async fn run(
         }
     };
     let wake = Arc::new(Notify::new());
-    // watcher 要活到 task 結束；建立失敗（例如 inotify 上限）就只靠輪詢
-    let _watcher = if opts.use_notify {
-        watch(&path, wake.clone())
-    } else {
-        None
+    // 登記要活到 task 結束（結束時 unwatch）；失敗（例如 inotify 上限）就只靠輪詢
+    let shared = match (opts.use_notify, opts.watcher) {
+        (false, _) => None,
+        (true, Some(w)) => Some(w),
+        (true, None) => Some(Arc::new(SharedWatcher::default())),
     };
+    let _watch = shared.and_then(|w| w.register(&path, wake.clone()));
     let mut out = Sender {
         tx,
         session,
@@ -389,34 +418,164 @@ async fn run(
     };
 
     loop {
-        out.send(reader.poll()).await;
+        let Some((r, polled)) = poll_reader(reader).await else {
+            return;
+        };
+        reader = r;
+        out.send(polled).await;
         tokio::select! {
             _ = &mut stop => break,
             _ = wake.notified() => {}
             _ = tokio::time::sleep(opts.poll_every) => {}
         }
     }
-    out.send(reader.poll()).await;
+    if let Some((_, polled)) = poll_reader(reader).await {
+        out.send(polled).await;
+    }
 }
 
-/// 監看 transcript 所在的資料夾（檔案可能還不存在，或被 rename 替換）。
-fn watch(path: &Path, wake: Arc<Notify>) -> Option<notify::RecommendedWatcher> {
-    use notify::Watcher;
-    let name = path.file_name()?.to_os_string();
-    let dir = path.parent()?.to_path_buf();
-    let mut w = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if let Ok(ev) = res
-            && ev
-                .paths
-                .iter()
-                .any(|p| p.file_name() == Some(name.as_os_str()))
+/// 整個 collector 共用的 notify watcher（E-S6）。每個 tail 各開一個時，每個就是一條 OS 執行緒加一個
+/// inotify instance（Linux 預設上限 128，用完只剩輪詢），而且主 transcript 都在同一個專案資料夾：
+/// 任何一個檔寫入，所有 tail 一起醒。這裡只開一個，資料夾依引用計數 watch／unwatch，事件依檔名分給等它的 tail。
+#[derive(Default)]
+pub struct SharedWatcher {
+    /// 檔名 → 等它的 tail（登記編號、資料夾、叫醒誰）。notify 的 callback 只拿這把鎖
+    routes: Arc<Mutex<HashMap<OsString, Vec<Route>>>>,
+    /// watcher 與每個資料夾的引用數。呼叫 watch／unwatch 時不能拿著 `routes`：inotify 的 watch 要等事件執行緒回應，
+    /// 事件執行緒若正在 callback 裡等 `routes` 就會互相卡住
+    dirs: Mutex<WatchedDirs>,
+    next: AtomicU64,
+}
+
+struct Route {
+    id: u64,
+    dir: PathBuf,
+    wake: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct WatchedDirs {
+    watcher: Option<notify::RecommendedWatcher>,
+    count: HashMap<PathBuf, usize>,
+}
+
+/// [`SharedWatcher::register`] 的登記；drop 時取消，資料夾沒人用了就 unwatch。跟著 tail task 一起結束。
+pub struct WatchGuard {
+    owner: Arc<SharedWatcher>,
+    dir: PathBuf,
+    name: OsString,
+    id: u64,
+}
+
+impl SharedWatcher {
+    /// 監看 `path` 所在的資料夾（檔案可能還不存在，或被 rename 替換），這個檔有事件時叫醒 `wake`。
+    /// 失敗（watcher 開不起來、資料夾不存在）時回 None，tail 只靠輪詢。
+    pub fn register(self: &Arc<Self>, path: &Path, wake: Arc<Notify>) -> Option<WatchGuard> {
+        use notify::Watcher;
+        let name = path.file_name()?.to_os_string();
+        let dir = path.parent()?.to_path_buf();
         {
-            wake.notify_one();
+            let mut d = self.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            let WatchedDirs { watcher, count } = &mut *d;
+            if watcher.is_none() {
+                let routes = self.routes.clone();
+                *watcher =
+                    notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                        let Ok(ev) = res else { return };
+                        let routes = routes.lock().unwrap_or_else(|e| e.into_inner());
+                        for p in &ev.paths {
+                            let Some(waiting) = p.file_name().and_then(|n| routes.get(n)) else {
+                                continue;
+                            };
+                            // 同名的檔在別的資料夾不叫醒；事件路徑的寫法和登記時不同（macOS 的 /private/var 之類）
+                            // 對不上任何一個時，退回同名的全部叫醒（多讀一次無害）
+                            let exact: Vec<&Route> = waiting
+                                .iter()
+                                .filter(|r| p.parent() == Some(r.dir.as_path()))
+                                .collect();
+                            let wake = if exact.is_empty() {
+                                waiting.iter().collect()
+                            } else {
+                                exact
+                            };
+                            for r in wake {
+                                r.wake.notify_one();
+                            }
+                        }
+                    })
+                    .ok();
+            }
+            let w = watcher.as_mut()?;
+            let n = count.get(&dir).copied().unwrap_or(0);
+            if n == 0 && w.watch(&dir, notify::RecursiveMode::NonRecursive).is_err() {
+                return None;
+            }
+            count.insert(dir.clone(), n + 1);
         }
-    })
-    .ok()?;
-    w.watch(&dir, notify::RecursiveMode::NonRecursive).ok()?;
-    Some(w)
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        self.routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name.clone())
+            .or_default()
+            .push(Route {
+                id,
+                dir: dir.clone(),
+                wake,
+            });
+        Some(WatchGuard {
+            owner: self.clone(),
+            dir,
+            name,
+            id,
+        })
+    }
+
+    /// 目前 watch 中的資料夾數。
+    pub fn watched_dirs(&self) -> usize {
+        self.dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count
+            .len()
+    }
+
+    /// 目前登記中的 tail 數。
+    pub fn watched_files(&self) -> usize {
+        self.routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(Vec::len)
+            .sum()
+    }
+}
+
+impl Drop for WatchGuard {
+    fn drop(&mut self) {
+        use notify::Watcher;
+        {
+            let mut routes = self.owner.routes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = routes.get_mut(&self.name) {
+                v.retain(|r| r.id != self.id);
+                if v.is_empty() {
+                    routes.remove(&self.name);
+                }
+            }
+        }
+        let mut d = self.owner.dirs.lock().unwrap_or_else(|e| e.into_inner());
+        let WatchedDirs { watcher, count } = &mut *d;
+        if let Some(n) = count.get_mut(&self.dir) {
+            *n -= 1;
+            if *n == 0 {
+                count.remove(&self.dir);
+                // 資料夾已被刪掉時 watch 早就自己沒了，unwatch 的錯誤不理
+                if let Some(w) = watcher {
+                    let _ = w.unwatch(&self.dir);
+                }
+            }
+        }
+    }
 }
 
 struct Sender {
@@ -579,8 +738,14 @@ pub struct TailPlanner {
     agents: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// 這一輪結束過的 subagent：晚到的 hook 不再重開
     stopped: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    /// (session, file) → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)
-    read: std::collections::HashMap<(String, String), (Option<String>, u64)>,
+    /// session → file → (記錄時的路徑（`/` 分隔，不知道時 None）, 讀到的行號)。分兩層：每行都要找，
+    /// 用 `&str` 就找得到，不必先組 key（E-S10）
+    read:
+        std::collections::HashMap<String, std::collections::HashMap<String, (Option<String>, u64)>>,
+    /// session → file → 現在 tail 的路徑（`/` 分隔），開 tail 時算好，每行不再重組（E-S10）
+    paths: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// 已結束的 session（SessionEnd，或 merge 判定 abandoned）：下一個 SessionStart 之前不再開 tail（C12、L-8）
+    ended: std::collections::HashSet<String>,
 }
 
 fn slash(p: &Path) -> String {
@@ -595,28 +760,42 @@ fn subagent_path(main: &Path, file: &str) -> PathBuf {
 impl TailPlanner {
     /// collector 重啟時交入 store 記的行號（`tails` 表）；`path` 是記錄時的檔案路徑（`/` 分隔，不知道時 None）。
     pub fn seed(&mut self, session: &str, file: &str, path: Option<&str>, line_no: u64) {
-        self.read.insert(
-            (session.to_string(), file.to_string()),
+        self.read.entry(session.to_string()).or_default().insert(
+            file.to_string(),
             (path.map(|p| p.replace('\\', "/")), line_no),
         );
     }
 
     /// tail 讀到第 `no` 行（serve 每收到一行就告訴 planner），之後重開同一個檔時從這裡接著讀。
+    /// 每行都會呼叫：已有記錄時只更新行號（路徑變了才換），不配置字串（E-S10）。
     pub fn saw_line(&mut self, session: &str, file: &str, no: u64) {
-        let path = self.main.get(session).map(|m| {
-            if file == "main" {
-                slash(m)
-            } else {
-                slash(&subagent_path(m, file))
+        let path = self.paths.get(session).and_then(|m| m.get(file));
+        if let Some(entry) = self.read.get_mut(session).and_then(|m| m.get_mut(file)) {
+            entry.1 = no;
+            if entry.0.as_ref() != path {
+                entry.0 = path.cloned();
             }
+            return;
+        }
+        // 不是經過這裡開的 tail（測試直接餵行）：照主檔推出路徑
+        let path = path.cloned().or_else(|| {
+            self.main.get(session).map(|m| {
+                if file == "main" {
+                    slash(m)
+                } else {
+                    slash(&subagent_path(m, file))
+                }
+            })
         });
         self.read
-            .insert((session.to_string(), file.to_string()), (path, no));
+            .entry(session.to_string())
+            .or_default()
+            .insert(file.to_string(), (path, no));
     }
 
     /// 重開 `file` 時從哪裡讀：有這個檔的記錄（路徑相同或記錄沒有路徑）就接著讀，否則用 `default`。
     fn resume_from(&self, session: &str, file: &str, path: &Path, default: Start) -> Start {
-        match self.read.get(&(session.to_string(), file.to_string())) {
+        match self.read.get(session).and_then(|m| m.get(file)) {
             Some((recorded, n)) if recorded.as_deref().is_none_or(|r| r == slash(path)) => {
                 Start::After(*n)
             }
@@ -624,24 +803,73 @@ impl TailPlanner {
         }
     }
 
+    /// merge 判定這個 session 結束了（沒有 SessionEnd、被丟下的 abandoned，L-8）：停掉它的 tail。
+    /// 不停的話 tail 與它的 watcher 會一直留著，常駐服務（不閒置結束）下只增不減。
+    pub fn on_session_ended(&mut self, session: &str) -> Vec<TailAction> {
+        self.ended.insert(session.to_string());
+        self.paths.remove(session);
+        let had_main = self.main.remove(session).is_some();
+        let had_agents = self.agents.remove(session).is_some_and(|a| !a.is_empty());
+        self.stopped.remove(session);
+        if had_main || had_agents {
+            vec![TailAction::StopSession {
+                session: session.to_string(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 這個 session 結束了、還沒有新的 SessionStart。
+    pub fn is_ended(&self, session: &str) -> bool {
+        self.ended.contains(session)
+    }
+
     pub fn on_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
+        let out = self.plan_hook(h);
+        // 開 tail 時把路徑記下，之後每行的 saw_line 直接用（E-S10）
+        for a in &out {
+            if let TailAction::Start {
+                session,
+                file,
+                path,
+                ..
+            } = a
+            {
+                self.paths
+                    .entry(session.clone())
+                    .or_default()
+                    .insert(file.clone(), slash(path));
+            }
+        }
+        out
+    }
+
+    fn plan_hook(&mut self, h: &crate::hook::HookInput) -> Vec<TailAction> {
         let sid = h.session_id().to_string();
         let event = h.event_name();
         let mut out = Vec::new();
 
         if event == "SessionEnd" {
-            let had_main = self.main.remove(&sid).is_some();
-            let had_agents = self.agents.remove(&sid).is_some_and(|a| !a.is_empty());
-            self.stopped.remove(&sid);
-            if had_main || had_agents {
-                out.push(TailAction::StopSession { session: sid });
-            }
+            return self.on_session_ended(&sid);
+        }
+        // 結束之後、下一個 SessionStart 之前的 hook（/clear 後舊 id 晚到的背景 agent 結果）不開 tail（C12）：
+        // 沒有東西會再停掉它，tail 與 watcher 會一直留著。
+        // main 的 UserPromptSubmit／PreToolUse 例外：merge 依同一條規則把 session 重新打開（#679，閒置被補
+        // abandoned 後終端機又用起來，不會有 SessionStart），tail 要跟著回來
+        let main_activity = matches!(event, "UserPromptSubmit" | "PreToolUse")
+            && h.str_field("agent_id").is_none_or(str::is_empty);
+        if event == "SessionStart" || main_activity {
+            self.ended.remove(&sid);
+        } else if self.ended.contains(&sid) {
             return out;
         }
 
+        // UNC 路徑不碰：Windows 會去連那台主機（送出 NTLM 憑證），離線時還會卡住（#762 W-M5）。
+        // 不 tail 的 session 照收 hook，10 秒後依不變式 2 降級進串流
         let transcript = h
             .str_field("transcript_path")
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && !crate::derive::is_unc(p))
             .map(PathBuf::from);
         if let Some(path) = &transcript {
             match self.main.get(&sid) {

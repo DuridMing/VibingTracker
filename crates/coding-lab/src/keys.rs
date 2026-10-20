@@ -13,6 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const FILE_NAME: &str = "keys.json";
+/// 每把金鑰最後一次用到的時間（collector 寫）。和 `keys.json` 分開：`keys.json` 只有 CLI 的 create／revoke 會寫，
+/// collector 寫回 last_used 就不會蓋掉剛撤銷的金鑰（#743 S-3）。
+pub const USED_FILE: &str = "keys-usage.json";
+/// `keys.json` 與 `login-links.json` 讀改寫的跨程序鎖（W-L13）
+pub const LOCK_FILE: &str = "keys.lock";
 pub const TOKEN_PREFIX: &str = "clk_";
 pub const ID_LEN: usize = 8;
 /// 32 bytes 以 base62 表示固定補到 43 個字元（⌈256 / log2 62⌉）。
@@ -112,6 +117,8 @@ pub struct SystemRng;
 impl Rng for SystemRng {
     fn fill(&mut self, buf: &mut [u8]) {
         // getrandom 只在系統亂數來源壞掉時失敗；那時寧可 panic 也不要發出可預測的金鑰
+        // 只有 CLI（`key create`、`key login-link`）用，不在 collector 的執行期路徑上；
+        // 亂數來源不可用時寧可停下，也不發出可預測的金鑰（C21）
         getrandom::fill(buf).expect("系統亂數來源不可用");
     }
 }
@@ -251,8 +258,7 @@ impl KeyStore {
             Err(e) => return Err(format!("讀不到 {}：{e}", path.display())),
         };
         check_mode(&path)?;
-        let f: FileFormat =
-            serde_json::from_str(&text).map_err(|e| format!("{} 格式錯誤：{e}", path.display()))?;
+        let f: FileFormat = serde_json::from_str(&text).map_err(|e| corrupt(&path, e))?;
         if f.version > FILE_VERSION {
             return Err(format!(
                 "{} 是版本 {}，這個 coding-lab 只認得到版本 {FILE_VERSION}；請升級",
@@ -262,15 +268,45 @@ impl KeyStore {
         }
         let server_secret = hex_decode32(&f.server_secret)
             .ok_or_else(|| format!("{} 的 server_secret 不是 32 bytes 十六進位", path.display()))?;
+        let mut keys = f.keys;
+        // last_used 另存在 keys-usage.json；兩邊取較晚的（舊版 collector 寫在 keys.json 裡的也算）
+        let used = read_used(home);
+        for k in &mut keys {
+            if let Some(t) = used.get(&k.id) {
+                k.last_used_ms = Some(k.last_used_ms.map_or(*t, |o| o.max(*t)));
+            }
+        }
         Ok(Some(KeyStore {
             server_secret,
-            keys: f.keys,
+            keys,
         }))
     }
 
-    /// 寫回 `<home>/keys.json`：先寫 `.tmp`（600）再 rename，不會留下半個檔。
+    /// 在 `<home>/keys.lock` 的獨佔鎖裡讀、改、寫 `keys.json`（W-L13）：同時跑的 `key create`／`revoke`
+    /// 不會用舊內容蓋掉彼此。`f` 回 (結果, 有沒有改)；沒有檔案時用 `rng` 建一份新的。
+    pub fn update<T>(
+        home: &Path,
+        rng: &mut dyn Rng,
+        f: impl FnOnce(&mut KeyStore, &mut dyn Rng) -> Result<(T, bool), String>,
+    ) -> Result<T, String> {
+        let _lock = lock_home(home)?;
+        let mut store = match KeyStore::load(home)? {
+            Some(s) => s,
+            None => KeyStore::new(rng),
+        };
+        let (out, changed) = f(&mut store, rng)?;
+        if changed {
+            store.save(home)?;
+        }
+        Ok(out)
+    }
+
+    /// 寫回 `<home>/keys.json`：先寫暫存檔（600）再 rename，不會留下半個檔；原本的內容留在 `keys.json.bak`。
+    /// 和別的程序並行時要在 [`KeyStore::update`] 裡呼叫。
     pub fn save(&self, home: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(home).map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+        // 資料目錄一律走 create_private_dir（#762 B-S3）
+        crate::store::create_private_dir(home)
+            .map_err(|e| format!("建不了 {}：{e}", home.display()))?;
         let path = KeyStore::path(home);
         let f = FileFormat {
             version: FILE_VERSION,
@@ -278,14 +314,113 @@ impl KeyStore {
             keys: self.keys.clone(),
         };
         let text = serde_json::to_string_pretty(&f).map_err(|e| e.to_string())?;
-        save_private_json(&path, &text)
+        save_secret_json_with_backup(&path, &text)
     }
 }
 
-/// 寫一個只有自己能讀的 JSON 檔：先寫 `<path>.tmp`（unix 600）再 rename，不會留下半個檔。
+/// 讀到格式錯誤的檔：有 `.bak` 時說可以從它還原。
+pub(crate) fn corrupt(path: &Path, e: serde_json::Error) -> String {
+    let bak = backup_path(path);
+    let hint = if bak.exists() {
+        format!(
+            "；上一版在 {}，確認內容後把它改名回 {} 就能還原",
+            bak.display(),
+            path.display()
+        )
+    } else {
+        String::new()
+    };
+    format!("{} 格式錯誤：{e}{hint}", path.display())
+}
+
+fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// 拿 `<home>/keys.lock` 的獨佔鎖（跨程序；檔案關掉就放掉）：`keys.json` 與 `login-links.json`
+/// 的讀、改、寫整段拿著（W-L13）。CLI 只拿一下；別的程序拿著時等它放掉。
+pub(crate) fn lock_home(home: &Path) -> Result<std::fs::File, String> {
+    // `key create` 常是第一個建資料目錄的子命令（#762 B-S3）
+    crate::store::create_private_dir(home)
+        .map_err(|e| format!("建不了 {}：{e}", home.display()))?;
+    let path = home.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("開不了 {}：{e}", path.display()))?;
+    file.lock()
+        .map_err(|e| format!("鎖不了 {}：{e}", path.display()))?;
+    Ok(file)
+}
+
+/// 暫存檔名：`<檔名>.<pid>.<亂數>.tmp`。同一個 home 的程序各寫各的，不會 rename 走別人寫到一半的檔（W-L13）。
+fn tmp_path(path: &Path) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut buf = [0u8; 8];
+    // 亂數只是避免撞名；系統亂數來源壞掉時退回時間與序號
+    let r = if getrandom::fill(&mut buf).is_ok() {
+        u64::from_le_bytes(buf)
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        nanos ^ SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    };
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.{r:016x}.tmp", std::process::id()));
+    path.with_file_name(name)
+}
+
+/// 同 [`save_secret_json`]，寫之前把原本的內容（還能解析的才算）留在 `<path>.bak`：寫壞或誤刪時還原得回來。
+/// 原本的檔已經壞了就不碰 `.bak`，免得蓋掉最後一份好的。
+pub(crate) fn save_secret_json_with_backup(path: &Path, text: &str) -> Result<(), String> {
+    if let Ok(old) = std::fs::read_to_string(path)
+        && serde_json::from_str::<serde_json::Value>(&old).is_ok()
+    {
+        save_secret_json(&backup_path(path), &old)?;
+    }
+    save_secret_json(path, text)
+}
+
+fn read_used(home: &Path) -> std::collections::HashMap<String, u64> {
+    std::fs::read_to_string(home.join(USED_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 記下這把金鑰在 `now_ms` 用過（寫 `keys-usage.json`，不碰 `keys.json`）。同一個程序內依序寫，不會互相蓋掉。
+pub fn record_used(home: &Path, id: &str, now_ms: u64) -> Result<(), String> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut used = read_used(home);
+    let t = used.entry(id.to_string()).or_insert(0);
+    *t = (*t).max(now_ms);
+    let text = serde_json::to_string(&used).map_err(|e| e.to_string())?;
+    save_private_json(&home.join(USED_FILE), &text)
+}
+
+/// 寫一個只有自己能讀的 JSON 檔：先寫暫存檔（unix 600）再 rename，不會留下半個檔。
 pub(crate) fn save_private_json(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = tmp_path(path);
     write_private(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("寫不了 {}：{e}", path.display())
+    })
+}
+
+/// 寫一個含秘密的 JSON 檔（`keys.json` 的 server secret、一次性登入連結）：同 [`save_private_json`]，
+/// Windows 上另外把暫存檔的 ACL 收成只有目前使用者（停用繼承），再寫內容、rename（同一磁碟區 rename 保留 ACL）。
+/// 不靠資料目錄的 ACL：目錄只在 collector 第一次建立時收緊，使用者先建好的 home 沒有（#735 S-6／W-L3）。
+pub(crate) fn save_secret_json(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = tmp_path(path);
+    write_secret(&tmp, text.as_bytes()).map_err(|e| format!("寫不了 {}：{e}", tmp.display()))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("寫不了 {}：{e}", path.display())
@@ -330,18 +465,26 @@ pub fn parse_expires(s: &str, now_ms: u64) -> Result<Option<u64>, String> {
         return Ok(None);
     }
     let bad = || format!("--expires 要像 90d、12h、30m 或 never，收到 {s}");
-    let (num, unit) = s.split_at(s.len().checked_sub(1).ok_or_else(bad)?);
+    // 單位是最後一個字元；用字元切，不用位元組（「9天」切在「天」中間會 panic，W-L1）
+    let (num, unit) = s
+        .char_indices()
+        .last()
+        .map(|(i, _)| s.split_at(i))
+        .ok_or_else(bad)?;
     let n: u64 = num.parse().map_err(|_| bad())?;
     if n == 0 {
         return Err(bad());
     }
-    let ms = match unit {
-        "d" => n * 24 * 60 * 60 * 1000,
-        "h" => n * 60 * 60 * 1000,
-        "m" => n * 60 * 1000,
+    let unit_ms: u64 = match unit {
+        "d" => 24 * 60 * 60 * 1000,
+        "h" => 60 * 60 * 1000,
+        "m" => 60 * 1000,
         _ => return Err(bad()),
     };
-    Ok(Some(now_ms + ms))
+    n.checked_mul(unit_ms)
+        .and_then(|ms| now_ms.checked_add(ms))
+        .map(Some)
+        .ok_or_else(|| format!("--expires 太長：{s}"))
 }
 
 /// epoch ms → `YYYY-MM-DD HH:MM UTC`（list 用；不拉日期 crate）。
@@ -445,4 +588,45 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, data)
+}
+
+#[cfg(unix)]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_private(path, data)
+}
+
+/// 先建空檔、收緊 ACL，再寫內容：秘密不會出現在權限寬鬆的檔裡。icacls 失敗時寫 log、照樣寫（退回目錄的 ACL）。
+#[cfg(windows)]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    let restricted = std::env::var("USERNAME").is_ok_and(|user| {
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !restricted {
+        crate::logging::log(&format!(
+            "收緊 {} 的權限失敗（icacls）；沿用資料目錄的 ACL",
+            path.display()
+        ));
+    }
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn write_secret(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    write_private(path, data)
 }

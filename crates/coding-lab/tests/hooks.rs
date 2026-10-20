@@ -1,5 +1,7 @@
 //! hooks 入口（#630）與 TailPlanner。
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -128,7 +130,7 @@ async fn p95_latency_under_50ms() {
 /// samples/hooks 重放（從 #624 的樣本）；沒有 samples/ 時略過。
 #[tokio::test]
 async fn every_sample_hook_replays() {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../samples/hooks");
+    let dir = common::samples_root().join("hooks");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         eprintln!("略過：沒有 samples/hooks");
         return;
@@ -265,7 +267,7 @@ async fn edit_hunk_is_read_before_the_response() {
     let file = dir.join("calc.py");
     std::fs::write(&file, "def sub(a, b):\n    return a + b\n").unwrap();
     let (addr, mut rx) = server(8).await;
-    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": dir,
                       "tool_input": {"file_path": file, "old_string": "a + b", "new_string": "a - b"},
                       "tool_use_id": "e1"});
     post(addr, body.to_string().as_bytes()).await;
@@ -316,8 +318,7 @@ fn every_tail_action_resets_degraded_in_merge() {
     assert_eq!(reset(all), ("s".into(), None, 7));
 }
 
-/// 同步送一個 hook，回傳是否在 `wait` 內收到回應。只有 unix 的測試用到。
-#[cfg(unix)]
+/// 同步送一個 hook，回傳是否在 `wait` 內收到回應。
 fn post_blocking(addr: SocketAddr, body: &str, wait: Duration) -> bool {
     use std::io::{Read, Write};
     let Ok(mut s) = std::net::TcpStream::connect(addr) else {
@@ -622,4 +623,394 @@ fn restart_reads_a_fresh_file_with_no_recorded_line_from_the_start() {
         ),
         "{a:?}"
     );
+}
+
+// ── hook 埠的來源檢查（#762 S-4、D10、contracts §7）：瀏覽器裡任何網頁都能對 127.0.0.1:4800 送 no-cors 的
+// POST（text/plain、不觸發 preflight），偽造 session、危險指令，或 POST /stop 關掉 collector
+
+async fn raw(addr: SocketAddr, req: String) -> String {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    s.read_to_end(&mut resp).await.unwrap();
+    String::from_utf8_lossy(&resp).to_string()
+}
+
+fn hook_req(headers: &str, body: &str) -> String {
+    format!(
+        "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+fn stop_req(headers: &str) -> String {
+    format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n",
+        coding_lab::hooks::STOP_PATH
+    )
+}
+
+#[tokio::test]
+async fn hook_with_an_origin_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    let resp = raw(
+        addr,
+        hook_req(
+            "Origin: https://attacker.example\r\nContent-Type: application/json\r\n",
+            &body,
+        ),
+    )
+    .await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    assert!(rx.try_recv().is_err(), "偽造的 hook 不能進 merge");
+}
+
+#[tokio::test]
+async fn hook_that_is_not_json_is_refused() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "evil", "hook_event_name": "UserPromptSubmit", "prompt": "x"})
+        .to_string();
+    for headers in ["Content-Type: text/plain;charset=UTF-8\r\n", ""] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 415"), "{headers:?}：{resp}");
+    }
+    assert!(rx.try_recv().is_err());
+    // Claude Code 送的是 application/json（帶參數、大小寫不同也算）
+    for headers in [
+        "Content-Type: application/json\r\n",
+        "content-type: Application/JSON; charset=utf-8\r\n",
+    ] {
+        let resp = raw(addr, hook_req(headers, &body)).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{headers:?}：{resp}");
+        assert!(matches!(rx.try_recv(), Ok(Input::Hook { .. })));
+    }
+}
+
+#[tokio::test]
+async fn stop_needs_its_own_header_and_no_origin() {
+    let (tx, _rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    let addr = server.addr;
+    let stop = server.stop_requested();
+    // #777：標頭的值要等於這次啟動的 stopToken（寫在 0600 的 collector.json 裡，只有同一個帳號讀得到）
+    let token = server.stop_token().to_string();
+    assert!(token.len() >= 32, "隨機值：{token}");
+    for headers in [
+        "".to_string(),
+        "Content-Type: text/plain\r\n".to_string(),
+        "X-Coding-Lab-Stop: 1\r\n".to_string(),
+        format!("Origin: https://attacker.example\r\nX-Coding-Lab-Stop: {token}\r\n"),
+    ] {
+        let resp = raw(addr, stop_req(&headers)).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "{headers:?}：{resp}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), stop.notified())
+            .await
+            .is_err(),
+        "被拒的 stop 不能觸發結束"
+    );
+    let resp = raw(addr, stop_req(&format!("X-Coding-Lab-Stop: {token}\r\n"))).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    tokio::time::timeout(Duration::from_secs(2), stop.notified())
+        .await
+        .expect("coding-lab stop 帶的標頭要能結束");
+}
+
+// ── 讀檔探測（#762 W-M5）：UNC 路徑不碰（Windows 會去連那台主機、送出 NTLM 憑證），只讀 cwd 底下的檔，
+// 探測有時限（網路磁碟、OneDrive 隨選檔案、離線 NAS 會讓 hook 卡 21 秒）
+
+fn edit_hook(cwd: &str, path: &str) -> HookInput {
+    h(
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd,
+             "tool_use_id": "t1", "tool_input": {"file_path": path, "old_string": "a", "new_string": "b"}}),
+    )
+}
+
+#[test]
+fn unc_paths_are_never_touched() {
+    for path in [
+        "\\\\10.255.255.1\\share\\x.txt",
+        "//10.255.255.1/share/x.txt",
+        "\\\\?\\UNC\\10.255.255.1\\share\\x.txt",
+        "\\\\localhost\\C$\\Windows\\win.ini",
+    ] {
+        let mut hook = edit_hook("//10.255.255.1/share", path);
+        coding_lab::derive::attach_probe(&mut hook);
+        assert!(hook.probe().is_none(), "{path}");
+    }
+}
+
+#[test]
+fn files_outside_the_cwd_are_not_read() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-cwd-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    std::fs::write(dir.join("secret.txt"), "a\n").unwrap();
+    std::fs::write(dir.join("proj/a.txt"), "a\n").unwrap();
+    let cwd = dir.join("proj");
+    let mut outside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("secret.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut outside);
+    let p = outside.probe().expect("存在與否還是看（不讀內容）");
+    assert!(p.exists);
+    assert!(p.hunk.is_none(), "cwd 外的檔不讀內容");
+    let mut inside = edit_hook(
+        cwd.to_str().unwrap(),
+        dir.join("proj/a.txt").to_str().unwrap(),
+    );
+    coding_lab::derive::attach_probe(&mut inside);
+    assert!(
+        inside.probe().is_some_and(|p| p.hunk.is_some()),
+        "cwd 底下照常算 hunk"
+    );
+}
+
+#[tokio::test]
+async fn probe_has_a_time_limit_and_the_hook_still_goes_through() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("probe-limit-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let (tx, mut rx) = mpsc::channel(8);
+    let server = serve_hooks("127.0.0.1:0".parse().unwrap(), tx)
+        .await
+        .unwrap();
+    // 時限設 0：探測一定逾時（不 sleep，等同探測卡住）
+    server.set_probe_limit(Duration::ZERO);
+    let body = json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit",
+                      "cwd": dir, "tool_use_id": "t1",
+                      "tool_input": {"file_path": dir.join("a.txt"), "old_string": "a", "new_string": "b"}});
+    let resp = post(server.addr, body.to_string().as_bytes()).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    match rx.try_recv() {
+        Ok(Input::Hook { hook, .. }) => assert!(hook.probe().is_none(), "逾時就不帶探測結果"),
+        _ => panic!("逾時也要照常交給 merge"),
+    }
+}
+
+/// W-M5：transcript_path 是 UNC 時不 tail（hook 照收，10 秒後依不變式 2 降級進串流）。
+#[test]
+fn unc_transcript_is_not_tailed() {
+    for t in ["\\\\nas\\share\\s1.jsonl", "//nas/share/s1.jsonl"] {
+        let mut p = TailPlanner::default();
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SessionStart",
+                                    "source": "startup", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+        let a = p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "SubagentStart",
+                                    "agent_id": "a1", "transcript_path": t}),
+        ));
+        assert!(a.is_empty(), "{t}：{a:?}");
+    }
+}
+
+// ── body 上限（#740 L-2）：axum 預設 2 MB；編輯超過約 2 MB 的檔時 Edit 的 PostToolUse 帶整份 originalFile，
+// 原本回 413（Claude Code 顯示 hook 錯誤，違反不變式 4）。上限 64 MB，超過的也回 200、寫 log
+
+#[tokio::test]
+async fn big_hook_is_answered_200_and_forwarded() {
+    let (addr, mut rx) = server(8).await;
+    let body = json!({"session_id": "s1", "hook_event_name": "PostToolUse", "tool_name": "Edit",
+        "tool_use_id": "e1", "tool_response": {"originalFile": "x".repeat(3_000_000)}})
+    .to_string();
+    let resp = raw(addr, hook_req("Content-Type: application/json\r\n", &body)).await;
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "{}",
+        resp.lines().next().unwrap_or("")
+    );
+    assert!(
+        matches!(rx.try_recv(), Ok(Input::Hook { .. })),
+        "3 MB 的 hook 要交給 merge"
+    );
+}
+
+#[tokio::test]
+async fn hook_over_the_limit_is_still_answered_200() {
+    let (addr, mut rx) = server(8).await;
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    // 只送一點 body：宣告的長度超過上限就不讀，直接回 200
+    s.write_all(
+        format!(
+            "POST {HOOK_PATH} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{{\"session_id\"",
+            65 * 1024 * 1024
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut resp)).await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(rx.try_recv().is_err());
+}
+
+/// L-7（#740）：hook 入口跑在自己的執行緒與 runtime 上。web 的 async handler 鎖 std Mutex<Store> 被卡住、
+/// 主 runtime 的 worker 全被佔住時，hook 照樣立刻回 200（不變式 4）。
+#[test]
+fn hooks_are_answered_while_every_main_worker_is_stuck() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (addr, _rx) = rt.block_on(server(8));
+    // 佔住唯一的 worker（像 handler 在 async 裡等 store 的鎖）
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        started_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    started_rx.recv().unwrap();
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    let t = Instant::now();
+    assert!(
+        post_blocking(addr, &body, Duration::from_secs(5)),
+        "hook 要回 200"
+    );
+    // 不變式 4 的預算是 100 ms；測的是「不用等那 3 秒」，負載高的機器上留一點餘裕
+    assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
+    drop(rt);
+}
+
+// ── 多帳號（#777 W-M7）：4800 是整台機器共用的，第二個帳號的 hook 會送進第一個帳號的 collector。
+// plugin 的 hook 帶 X-Coding-Lab-User（${USER}）與 X-Coding-Lab-Username（${USERNAME}）
+
+async fn server_as(user: &str) -> (SocketAddr, mpsc::Receiver<Input>) {
+    let (tx, rx) = mpsc::channel(32);
+    let server =
+        coding_lab::hooks::serve_hooks_as("127.0.0.1:0".parse().unwrap(), tx, Some(user.into()))
+            .await
+            .unwrap();
+    (server.addr, rx)
+}
+
+#[tokio::test]
+async fn hooks_of_another_account_are_ignored() {
+    let (addr, mut rx) = server_as("alice").await;
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    for headers in [
+        "X-Coding-Lab-User: bob\r\n",
+        "X-Coding-Lab-Username: bob\r\n",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: bob\r\n",
+        "X-Coding-Lab-User: ${USER}\r\nX-Coding-Lab-Username: bob\r\n",
+    ] {
+        let resp = raw(
+            addr,
+            hook_req(
+                &format!("Content-Type: application/json\r\n{headers}"),
+                &body,
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "照樣回 200：{resp}");
+        assert!(
+            rx.try_recv().is_err(),
+            "別的帳號的 hook 要丟掉：{headers:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hooks_of_the_same_account_or_without_a_user_are_kept() {
+    let (addr, mut rx) = server_as("alice").await;
+    let body = json!({"session_id": "s1", "hook_event_name": "Stop"}).to_string();
+    for headers in [
+        "X-Coding-Lab-User: alice\r\n",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: alice\r\n",
+        // 舊版 plugin、設定擋掉環境變數：沒有、空的、原樣留下的 ${…}
+        "",
+        "X-Coding-Lab-User: \r\nX-Coding-Lab-Username: \r\n",
+        "X-Coding-Lab-User: ${USER}\r\nX-Coding-Lab-Username: $USERNAME\r\n",
+    ] {
+        let resp = raw(
+            addr,
+            hook_req(
+                &format!("Content-Type: application/json\r\n{headers}"),
+                &body,
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            matches!(rx.try_recv(), Ok(Input::Hook { .. })),
+            "要照收：{headers:?}"
+        );
+    }
+}
+
+/// C12（#741）：SessionEnd 之後（例如 /clear 換了新 id），同一個舊 id 帶 transcript_path 的 hook（背景 agent 晚到的結果）
+/// 不重開 tail，subagent 的也不開；下一個 SessionStart（resume）才重新開始。
+#[test]
+fn hooks_after_session_end_do_not_reopen_tails_until_the_next_session_start() {
+    let mut p = TailPlanner::default();
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "transcript_path": T})));
+    let end = p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionEnd", "reason": "clear", "transcript_path": T})));
+    assert_eq!(
+        end,
+        [TailAction::StopSession {
+            session: "s1".into()
+        }]
+    );
+    assert!(p.is_ended("s1"));
+    for late in [
+        json!({"session_id": "s1", "hook_event_name": "PostToolUse", "transcript_path": T, "tool_name": "Agent", "tool_use_id": "t"}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "transcript_path": T, "tool_name": "Bash", "tool_use_id": "u",
+               "agent_id": "a1", "agent_type": "Explore"}),
+    ] {
+        assert!(
+            p.on_hook(&h(late)).is_empty(),
+            "結束之後晚到的 hook 不開 tail"
+        );
+    }
+    let resumed = p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "resume", "transcript_path": T})));
+    assert!(
+        matches!(resumed.as_slice(), [TailAction::Start { .. }]),
+        "{resumed:?}"
+    );
+    assert!(!p.is_ended("s1"));
+}
+
+/// L-8（#741）：沒有 SessionEnd、被 merge 判 abandoned 的 session 要停掉它的 tail（含 subagent）；之後晚到的 hook 也不重開。
+#[test]
+fn abandoned_session_stops_its_tails() {
+    let mut p = TailPlanner::default();
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SessionStart", "source": "startup", "transcript_path": T})));
+    p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "SubagentStart", "transcript_path": T, "agent_id": "a1", "agent_type": "Explore"})));
+    assert_eq!(
+        p.on_session_ended("s1"),
+        [TailAction::StopSession {
+            session: "s1".into()
+        }]
+    );
+    assert!(p.on_session_ended("s1").is_empty(), "第二次沒有東西可停");
+    assert!(p.on_session_ended("nobody").is_empty());
+    assert!(
+        p.on_hook(&h(
+            json!({"session_id": "s1", "hook_event_name": "Stop", "transcript_path": T})
+        ))
+        .is_empty()
+    ); // 終端機一直開著、閒置被補 abandoned 後又用起來（merge 依 #679 重新打開，不會有 SessionStart）：
+    // main 的 UserPromptSubmit／PreToolUse 重開 tail，從讀過的行接著讀；subagent 的 hook 不算
+    assert!(
+        p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "PreToolUse", "transcript_path": T,
+                            "agent_id": "a1", "agent_type": "Explore", "tool_name": "Read", "tool_use_id": "t1"})))
+            .is_empty()
+    );
+    assert!(matches!(
+        p.on_hook(&h(json!({"session_id": "s1", "hook_event_name": "UserPromptSubmit", "transcript_path": T, "prompt": "再來"})))
+            .as_slice(),
+        [TailAction::Start { file, start: Start::End, .. }] if file == "main"
+    ));
+    assert!(!p.is_ended("s1"));
 }

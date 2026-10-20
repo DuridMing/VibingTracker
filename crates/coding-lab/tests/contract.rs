@@ -1,5 +1,7 @@
 //! 資料契約測試（docs/plan/contracts.md）。
 
+mod common;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -105,7 +107,7 @@ fn raw_is_omitted_when_absent() {
 }
 
 fn samples_hooks() -> Option<Vec<PathBuf>> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../samples/hooks");
+    let dir = common::samples_root().join("hooks");
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .flatten()

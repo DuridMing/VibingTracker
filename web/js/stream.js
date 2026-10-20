@@ -4,9 +4,11 @@
 // - 超過上限從最舊的丟；往上「載入更多」時暫時保留（holding），回到底部再 trim。
 // - 篩選只影響可見性，不改順序。
 
-import { countHunk } from "./changes.js";
+import { editCounts } from "./changes.js";
 
 export const CAP = 3000;
+// 結束的 session 留在暫存區的卡片最多留幾張（晚到的 tool.placed 還找得回內容），超過丟最舊的（#757 E-F12）
+export const ORPHAN_CAP = 256;
 
 // 串流裡的狀態行：prompt 與 session.status（run 不出現，避免太吵；idle＝使用者按 Esc 中斷，只標示、不通知）
 const STATUS_ROWS = new Set(["idle", "wait", "done", "fail", "danger", "ended"]);
@@ -49,9 +51,15 @@ export function createStream({ cap = CAP } = {}) {
   const cards = new Map(); // toolUseId → card（暫存區與串流共用同一個物件）
   const cardRow = new Map(); // toolUseId → row
   const dropped = new Set(); // 已被上限丟掉的卡片：之後的更新不讓它復活
+  const orphans = new Map(); // 結束的 session 留在暫存區的卡片（toolUseId → card），最多 ORPHAN_CAP 張
 
   function card(id, ev) {
     let c = cards.get(id);
+    if (!c && orphans.has(id)) {
+      c = orphans.get(id);
+      orphans.delete(id);
+      cards.set(id, c);
+    }
     if (!c) {
       c = { toolUseId: id, session: ev.session, agent: ev.agent, tool: null, input: {}, status: "pending", danger: null, fallback: false };
       cards.set(id, c);
@@ -63,6 +71,8 @@ export function createStream({ cap = CAP } = {}) {
     const r = cardRow.get(id);
     if (r) {
       r.v++;
+      // 展開中的行內容變了（例如結果到了）：高度要重量，否則下面的行會疊上來（#747 F-1）
+      if (r.expanded) r.h = 0;
       ops.updated.add(r.key);
     } else if (st.staged.has(id)) {
       ops.stagedChanged = true;
@@ -124,7 +134,7 @@ export function createStream({ cap = CAP } = {}) {
         touch(id, ops);
         break;
       case "file.edit":
-        card(id, ev).edit = { path: p.path, ...countHunk(p.hunk?.lines) };
+        card(id, ev).edit = { path: p.path, ...editCounts(p) };
         touch(id, ops);
         break;
       case "file.write":
@@ -172,12 +182,18 @@ export function createStream({ cap = CAP } = {}) {
         break;
       case "session.ended":
         // 中途結束的 session：還在暫存區的卡片不會再有進展，從「即時」計數拿掉。
-        // 卡片本身留著，萬一 tool.placed 晚到仍照常進串流。
+        // 卡片移到 orphans（有上限，不然結束的 session 越多 cards 越大），萬一 tool.placed 晚到仍照常進串流。
         for (const [tid, c] of st.staged) {
           if (c.session === ev.session) {
             st.staged.delete(tid);
+            cards.delete(tid);
+            orphans.set(tid, c);
             ops.stagedChanged = true;
           }
+        }
+        for (const tid of orphans.keys()) {
+          if (orphans.size <= ORPHAN_CAP) break;
+          orphans.delete(tid);
         }
         break;
       default:
@@ -215,8 +231,10 @@ export function createStream({ cap = CAP } = {}) {
     if (out.stagedChanged) ops.stagedChanged = true;
     st.rows.push(...out);
     ops.appended = out.length;
-    if (!st.holding && st.rows.length > st.cap) {
-      ops.droppedRows = dropFront(st.rows.length - st.cap);
+    // 停在上方（holding，看載入更多的內容）時放寬到 3 倍，但不能沒有上限：開著不動也會一直長（#766 F-4）
+    const limit = st.holding ? st.cap * 3 : st.cap;
+    if (st.rows.length > limit) {
+      ops.droppedRows = dropFront(st.rows.length - limit);
       ops.dropped = ops.droppedRows.length;
     }
     return ops;
@@ -230,6 +248,7 @@ export function createStream({ cap = CAP } = {}) {
     cards.clear();
     cardRow.clear();
     dropped.clear();
+    orphans.clear();
     return st.apply([...staged, ...stream]);
   };
 
@@ -277,6 +296,8 @@ export function createStream({ cap = CAP } = {}) {
   st.setSessionHidden = (id, hidden) => (hidden ? st.hiddenSessions.add(id) : st.hiddenSessions.delete(id));
   st.setKindHidden = (k, hidden) => (hidden ? st.hiddenKinds.add(k) : st.hiddenKinds.delete(k));
   st.setSessionFilter = (fn) => { st.sessionFilter = typeof fn === "function" ? fn : null; };
+  // 記憶體裡的卡片張數（測試用）
+  st.cardCount = () => cards.size;
   st.isVisible = (r) => !st.hiddenSessions.has(r.session) && !st.hiddenKinds.has(kindOf(r)) && (st.sessionFilter == null || st.sessionFilter(r.session));
 
   return st;

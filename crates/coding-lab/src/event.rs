@@ -12,6 +12,18 @@ use serde_json::{Map, Value};
 /// 目前的契約版本（contracts.md §1）。
 pub const CONTRACT_VERSION: u32 = 1;
 
+/// 指令型工具（D12）：`tool_input.command` 是一條 shell 指令的工具。敏感判斷、危險規則、git 操作、
+/// 連續失敗、KPI 的指令數都認這個集合，不寫死 `"Bash"`。cmd 不是工具，只在指令字串裡的 `cmd /c …` 比對。
+/// 危險規則的 `tools` 寫 [`COMMAND_TOOLS_ALIAS`] 等於列出這裡的每一個。
+pub const COMMAND_TOOLS: [&str; 2] = ["Bash", "PowerShell"];
+
+/// 危險規則 `tools` 裡代表「所有指令型工具」的寫法。
+pub const COMMAND_TOOLS_ALIAS: &str = "@command";
+
+pub fn is_command_tool(tool: &str) -> bool {
+    COMMAND_TOOLS.contains(&tool)
+}
+
 #[derive(Debug)]
 pub enum Error {
     Json(serde_json::Error),
@@ -112,7 +124,8 @@ macro_rules! payloads {
         impl Payload {
             pub fn parse(kind: &str, v: &Value) -> Result<Option<Payload>, serde_json::Error> {
                 Ok(Some(match kind {
-                    $($name => Payload::$variant(serde_json::from_value(v.clone())?),)*
+                    // `&Value` 本身就能反序列化，不必先 clone 整棵 payload（E-M6）
+                    $($name => Payload::$variant(<$ty as serde::Deserialize>::deserialize(v)?),)*
                     _ => return Ok(None),
                 }))
             }
@@ -310,6 +323,9 @@ pub struct ToolCalled {
     pub status: ToolStatus,
     pub placement: Placement,
     pub danger: Option<Danger>,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -330,6 +346,17 @@ pub struct ToolUpdated {
     /// transcript 先建卡、PreToolUse 後到時才判斷出的危險；沒有時不輸出。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub danger: Option<Danger>,
+    /// PermissionDenied 衍生的（使用者或自動模式拒絕，不是工具出錯）；false 時不輸出（D6）
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
+}
+
+impl ToolUpdated {
+    /// 算不算「失敗」（contracts §4，D6）：failed，而且不是 Esc（interrupted）也不是 PermissionDenied（denied）。
+    /// KPI、sessions 列、file_touch 的 fail 都用這個；「被拒或失敗的改動」的排除另看所有 failed。
+    pub fn is_failure(&self) -> bool {
+        self.status == ToolStatus::Failed && self.interrupted != Some(true) && !self.denied
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -368,6 +395,15 @@ pub struct FileEdit {
     pub path: String,
     pub hunk: Option<Hunk>,
     pub hunk_source: HunkSource,
+    /// hunk.lines 合計超過 8 KB，放不下的行丟掉、最後一行截在字元邊界（C7、#744）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
+    /// `replace_all` 的 Edit：`hunk` 為 null，畫面標「多處取代」，不畫第一處（D7、#745）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_all: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -381,6 +417,9 @@ pub struct FileWrite {
     /// 全文行數（`content` 只留前 200 行）；舊的 Event 沒有（#682）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lines: Option<u64>,
+    /// 命中敏感規則（同 `tool.result`）：對遠端連線剝除對應欄位（C8、#761）；false 時不輸出
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

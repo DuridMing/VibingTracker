@@ -1,0 +1,9 @@
+{
+  "cwd": "/home/user/fixture-lab",
+  "hook_event_name": "SessionEnd",
+  "prompt_id": "c598ac01-c82f-4a69-b298-3d1e7fb9452c",
+  "reason": "other",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f/scratchpad",
+  "session_id": "9addaaff-fe09-4395-b5e6-86eca2de8c6f",
+  "transcript_path": "/home/user/.claude/projects/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f.jsonl"
+}

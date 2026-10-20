@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +26,8 @@ use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use crate::http_util::{json as json_response, percent_decode, query_param};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc};
@@ -85,12 +87,30 @@ impl Heartbeat {
 }
 
 /// `[[hub.upstream]]`：一台 collector。`key` 省略時只適合本機或 SSH 通道（那台 `auth = "local-open"`）。
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct Upstream {
     pub name: String,
     pub url: String,
     #[serde(default)]
     pub key: Option<String>,
+}
+
+/// `coding-lab config` 用 Debug 印整份設定：金鑰只留 `clk_<id>_…`，疑難排解時整段貼出去也不會外洩（R-5）。
+impl std::fmt::Debug for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = self
+            .key
+            .as_deref()
+            .map(|k| match crate::keys::parse_token(k) {
+                Some((id, _)) => format!("clk_{id}_…"),
+                None => "…".to_string(),
+            });
+        f.debug_struct("Upstream")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("key", &key)
+            .finish()
+    }
 }
 
 /// `http://host:port[/]` → `host:port`。TLS 不內建（只接受 http://）：遠端請走 tailnet 或 SSH 通道。
@@ -260,9 +280,8 @@ impl Hub {
     fn up(&mut self, name: &str) -> &mut UpCache {
         if !self.ups.contains_key(name) {
             self.names.push(name.to_string());
-            self.ups.insert(name.to_string(), UpCache::default());
         }
-        self.ups.get_mut(name).expect("剛放進去")
+        self.ups.entry(name.to_string()).or_default()
     }
 
     fn next_no(&mut self) -> u64 {
@@ -299,16 +318,22 @@ impl Hub {
 
     /// 上游的一則 server → client 訊息
     pub fn on_message(&mut self, up: &str, msg: &Value) -> Vec<Out> {
+        self.on_message_owned(up, msg.clone())
+    }
+
+    /// 同 [`Hub::on_message`]，收下整則訊息（上游迴圈用）：frame 的 events、rows 直接拿走，不再各拷一份（E-H4）
+    pub fn on_message_owned(&mut self, up: &str, mut msg: Value) -> Vec<Out> {
         let ch = msg["ch"].as_str().unwrap_or("*").to_string();
-        match msg["t"].as_str().unwrap_or_default() {
+        let t = msg["t"].as_str().unwrap_or_default().to_string();
+        match t.as_str() {
             "welcome" => {
-                self.on_welcome(up, msg);
+                self.on_welcome(up, &msg);
                 Vec::new()
             }
             "snapshot" if ch == "*" => {
                 // （重）連上：快取裡有、新 snapshot 沒有的 session 先明確送 deleted，已開著的客戶端才不會留著
                 // 只有 offline 旗標的舊列（#723）；然後重送合併的 snapshot
-                let gone = self.on_all_snapshot(up, msg);
+                let gone = self.on_all_snapshot(up, &msg);
                 let mut outs = Vec::new();
                 if !gone.is_empty() {
                     let no = self.next_no();
@@ -324,27 +349,17 @@ impl Hub {
                 outs.push(Out::Resnapshot);
                 outs
             }
-            "snapshot" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
+            "snapshot" | "frame" if ch != "*" => {
+                self.rewrite(up, &mut msg);
                 match ch.strip_prefix("session:") {
-                    Some(id) => vec![Out::Session(id.to_string(), v)],
+                    Some(id) => vec![Out::Session(id.to_string(), msg)],
                     None => Vec::new(),
                 }
             }
-            "frame" if ch == "*" => vec![Out::All(self.on_all_frame(up, msg))],
-            "frame" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
-                match ch.strip_prefix("session:") {
-                    Some(id) => vec![Out::Session(id.to_string(), v)],
-                    None => Vec::new(),
-                }
-            }
+            "frame" => vec![Out::All(self.on_all_frame(up, msg))],
             "more" | "error" => {
-                let mut v = msg.clone();
-                self.rewrite(up, &mut v);
-                vec![Out::Any(v)]
+                self.rewrite(up, &mut msg);
+                vec![Out::Any(msg)]
             }
             _ => Vec::new(),
         }
@@ -431,12 +446,17 @@ impl Hub {
             .collect()
     }
 
-    fn on_all_frame(&mut self, up: &str, frame: &Value) -> Value {
-        let mut v = frame.clone();
+    fn on_all_frame(&mut self, up: &str, mut v: Value) -> Value {
         self.rewrite(up, &mut v);
         let no = self.next_no();
-        let events = v["events"].as_array().cloned().unwrap_or_default();
-        let rows = v["rows"].as_object().cloned().unwrap_or_default();
+        let events = match v["events"].take() {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        let rows = match v["rows"].take() {
+            Value::Object(o) => o,
+            _ => Map::new(),
+        };
         let had_kpi = rows.contains_key("kpi");
         {
             let cache = self.up(up);
@@ -505,9 +525,10 @@ impl Hub {
 
     /// `cwd` 等於某台某個 session 的 cwd、在它底下（worktree、子目錄）或是它的上層：那台；多台符合取最長的
     pub fn owner_of_cwd(&self, cwd: &str) -> Option<String> {
-        let want = cwd.replace('\\', "/");
+        // 比對依 crate::paths：磁碟機代號的大小寫、Windows 路徑的大小寫都不算差別（L-11）
+        let want = crate::paths::normalize(cwd);
         let want = want.trim_end_matches('/');
-        let under = |p: &str, base: &str| p == base || p.starts_with(&format!("{base}/"));
+        let under = |p: &str, base: &str| crate::paths::within(base, p);
         let mut best: Option<(usize, &str)> = None;
         for n in &self.names {
             let Some(u) = self.ups.get(n) else { continue };
@@ -606,7 +627,14 @@ pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
     let body = if chunked {
         let mut out = Vec::new();
         let mut p = 0;
-        while let Some(nl) = rest[p..].windows(2).position(|w| w == b"\r\n") {
+        // 每一步都檢查邊界、加法都 checked：上游走區網的 http，殘缺或惡意的回應只能回 Err，
+        // 不能 panic（release 是 panic=abort，整個 hub 會結束，W-L5）
+        while let Some(nl) = rest
+            .get(p..)
+            .ok_or("chunk 不完整")?
+            .windows(2)
+            .position(|w| w == b"\r\n")
+        {
             let size = usize::from_str_radix(
                 String::from_utf8_lossy(&rest[p..p + nl])
                     .split(';')
@@ -620,8 +648,9 @@ pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
             if size == 0 {
                 break;
             }
-            out.extend_from_slice(rest.get(p..p + size).ok_or("chunk 不完整")?);
-            p += size + 2;
+            let end = p.checked_add(size).ok_or("chunk 長度太大")?;
+            out.extend_from_slice(rest.get(p..end).ok_or("chunk 不完整")?);
+            p = end.checked_add(2).ok_or("chunk 長度太大")?;
         }
         out
     } else {
@@ -682,10 +711,11 @@ pub fn append_upstream(
         return Err(format!("名稱只能用英數字與 . _ -：{name}"));
     }
     ws_url(url)?;
+    // 只收這個系統發的 clk_ 金鑰（W-L4）：其他字元（例如 \）寫進 TOML 會讓 config.toml 解析失敗、所有子命令起不來
     if let Some(k) = key
-        && (k.is_empty() || k.chars().any(|c| c.is_control() || c == '"'))
+        && crate::keys::parse_token(k).is_none()
     {
-        return Err("金鑰格式不對".into());
+        return Err("金鑰格式不對：要是 `coding-lab key create` 印出的 clk_ 開頭那一串".into());
     }
     let existing = match std::fs::read_to_string(config_path) {
         Ok(t) => t,
@@ -717,8 +747,10 @@ pub fn append_upstream(
     if let Some(k) = key {
         text.push_str(&format!("key = \"{k}\"\n"));
     }
+    // config.toml 會放上游的金鑰：資料目錄走 create_private_dir；只當 hub 的那台可能從來不跑 serve（#762 B-S3）
     if let Some(dir) = config_path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("建不出 {}：{e}", dir.display()))?;
+        crate::store::create_private_dir(dir)
+            .map_err(|e| format!("建不出 {}：{e}", dir.display()))?;
     }
     std::fs::write(config_path, text)
         .map_err(|e| format!("寫不了 {}：{e}", config_path.display()))?;
@@ -744,8 +776,10 @@ struct UpHandle {
 struct HubState {
     hub: Mutex<Hub>,
     ups: Vec<UpHandle>,
-    out: broadcast::Sender<Arc<Out>>,
+    out: broadcast::Sender<Arc<Outgoing>>,
     web_root: Option<PathBuf>,
+    /// 啟動時的 token（W-M8）
+    token: String,
     instance: String,
     /// 上游 KPI「今天」用的時區：第一個明確帶 `utcOffsetMin` 的客戶端決定，之後不再變（#718：不然瀏覽器與
     /// 不帶時區的腳本輪流連就一直讓所有上游斷線重連）
@@ -756,7 +790,15 @@ struct HubState {
     /// snapshot 快取以外的 session 屬於哪台（#726）：`/api/sessions` 合併時與逐台試出來時記下。
     /// 已結束、被移出 live 的 session 只有這裡找得到
     known: Mutex<HashMap<String, String>>,
+    /// 同上，目錄 → 哪台（C13）：live 快取裡沒有 session 的專案，逐台問出來後記下
+    known_cwds: Mutex<HashMap<String, String>>,
 }
+
+/// 記下的 session 對照最多幾筆（E-H11）
+const KNOWN_SESSIONS_MAX: usize = 4096;
+
+/// 記下的目錄對照最多幾筆，超過就整個重來（逐台問一次的成本很低，不用 LRU）
+const KNOWN_CWDS_MAX: usize = 1024;
 
 static INSTANCES: AtomicU64 = AtomicU64::new(0);
 
@@ -773,10 +815,12 @@ impl HubState {
     }
 
     fn remember(&self, sid: &str, up: &str) {
-        self.known
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(sid.to_string(), up.to_string());
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        // 有上限（E-H11）：滿了就整個重來，之後用到再逐台問（成本很低，不用 LRU）
+        if known.len() >= KNOWN_SESSIONS_MAX && !known.contains_key(sid) {
+            known.clear();
+        }
+        known.insert(sid.to_string(), up.to_string());
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -787,19 +831,47 @@ impl HubState {
         self.ups.iter().find(|u| u.up.name == name)
     }
 
+    /// 廣播給客戶端。Resnapshot 在這裡算一次合併的 snapshot（呼叫端已放掉 hub 鎖），
+    /// 不再每條連線各自在 hub 鎖裡算（E-H6）。
     fn emit(&self, outs: Vec<Out>) {
         for o in outs {
-            let _ = self.out.send(Arc::new(o));
+            let o = match o {
+                Out::Resnapshot => Out::All(self.hub().snapshot_all()),
+                o => o,
+            };
+            let _ = self.out.send(Arc::new(Outgoing {
+                out: o,
+                text: std::sync::OnceLock::new(),
+            }));
         }
     }
 }
 
+/// 廣播的一則訊息：第一條連線序列化後，其他連線共用同一份 bytes（E-H6）。
+/// 客戶端都是本機（hub 不收遠端），不用依連線剝除，同一份文字可以給每一條。
+struct Outgoing {
+    out: Out,
+    text: std::sync::OnceLock<axum::extract::ws::Utf8Bytes>,
+}
+
+impl Outgoing {
+    fn text(&self) -> Option<axum::extract::ws::Utf8Bytes> {
+        let v = match &self.out {
+            Out::All(v) | Out::Session(_, v) | Out::Any(v) => v,
+            Out::Resnapshot => return None,
+        };
+        Some(self.text.get_or_init(|| v.to_string().into()).clone())
+    }
+}
+
+/// `token`：啟動時產生、印在網址裡的 token（W-M8），見 [`new_token`]
 pub async fn serve(
     bind: SocketAddr,
     upstreams: Vec<Upstream>,
     web_root: Option<PathBuf>,
+    token: String,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
-    serve_with_backoff(bind, upstreams, web_root, Duration::from_secs(1)).await
+    serve_with_backoff(bind, upstreams, web_root, token, Duration::from_secs(1)).await
 }
 
 /// `backoff`：上游斷線後多久試著重連（之後翻倍到 30 秒；連上就歸零）
@@ -807,6 +879,7 @@ pub async fn serve_with_backoff(
     bind: SocketAddr,
     upstreams: Vec<Upstream>,
     web_root: Option<PathBuf>,
+    token: String,
     backoff: Duration,
 ) -> io::Result<(SocketAddr, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -828,6 +901,7 @@ pub async fn serve_with_backoff(
         ups,
         out,
         web_root,
+        token,
         instance: format!(
             "hub-{}-{}",
             crate::now_ms(),
@@ -837,6 +911,7 @@ pub async fn serve_with_backoff(
         offset_fixed: std::sync::atomic::AtomicBool::new(false),
         subs: Mutex::new(HashMap::new()),
         known: Mutex::new(HashMap::new()),
+        known_cwds: Mutex::new(HashMap::new()),
     });
     let mut tasks = Vec::new();
     for (up, rx) in rxs {
@@ -847,7 +922,8 @@ pub async fn serve_with_backoff(
         .route("/healthz", get(healthz))
         .route("/api/{*rest}", get(api_proxy))
         .fallback(get(static_file))
-        .layer(middleware::from_fn(gate))
+        .layer(middleware::from_fn_with_state(state.clone(), gate))
+        .layer(middleware::map_response(crate::ws::no_framing))
         .with_state(state);
     let task = tokio::spawn(async move {
         let _tasks = tasks;
@@ -858,15 +934,107 @@ pub async fn serve_with_backoff(
     Ok((local, task))
 }
 
-/// hub 只綁本機、免金鑰：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）
-async fn gate(req: Request, next: Next) -> Response {
-    let path = req.uri().path();
+/// hub 的 cookie：和 collector 的名稱不同（cookie 不分埠，同一台的 4801 與 4802 會互相收到）
+pub const HUB_COOKIE: &str = "coding-lab-hub";
+
+/// hub 啟動時的 token（W-M8）：32 bytes 系統亂數的 base62，`coding-lab hub` 印在網址裡。
+pub fn new_token(rng: &mut dyn crate::keys::Rng) -> String {
+    crate::keys::random_base62(rng)
+}
+
+/// `/healthz` 是否帶了 token：沒有時不列上游
+#[derive(Clone, Copy)]
+struct Authed(bool);
+
+/// `/auth/login`：說明怎麼拿到網址。前端遇到 401 會導去這裡。
+const NEED_TOKEN_HTML: &str = "<!doctype html><html lang=\"zh-Hant\"><meta charset=\"utf-8\">\
+<title>coding-lab hub</title><body style=\"font-family:sans-serif;max-width:40em;margin:3em auto;line-height:1.6\">\
+<h1>需要 hub 的網址</h1><p>這個 hub 只接受 <code>coding-lab hub</code> 啟動時印出的網址（帶 <code>?token=</code>）。\
+請回到執行 <code>coding-lab hub</code> 的終端機，複製那個網址開啟；hub 重新啟動後要用新印出的網址。</p></body></html>";
+
+/// hub 只綁本機：`Host` 要是 loopback 名稱，`/api` 與 `/ws` 的 `Origin` 要等於 `Host`（同 collector 的本機規則）。
+/// 反向代理轉來的（帶轉發標頭）一律拒絕：代理後面的人都會變成本機（S-1）。
+///
+/// 127.0.0.1 是整台機器共用的，hub 又拿著上游的金鑰（常是 operate）：`/api` 與 `/ws` 要帶啟動時的 token
+/// （`?token=`、`Authorization: Bearer`）或用它換到的 cookie，否則 401（W-M8）。`/healthz` 沒帶時不列上游。網頁帶 `?token=` 時換成
+/// HttpOnly、SameSite=Strict 的 cookie，再轉回不帶 token 的網址，token 不留在網址列與歷史紀錄。
+async fn gate(State(state): State<Arc<HubState>>, mut req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if crate::ws::proxied(req.headers()) {
+        return (StatusCode::FORBIDDEN, "hub 不接受反向代理轉來的連線").into_response();
+    }
     if !crate::ws::host_is_loopback(req.headers()) {
         return (StatusCode::FORBIDDEN, "Host 不是本機").into_response();
     }
-    if (path.starts_with("/api/") || path == "/ws") && !crate::auth::same_origin(req.headers()) {
+    let api = path.starts_with("/api/") || path == "/ws";
+    if api && !crate::auth::same_origin(req.headers()) {
         return (StatusCode::FORBIDDEN, "Origin 與 Host 不符").into_response();
     }
+    let valid = |t: &str| {
+        !state.token.is_empty() && crate::keys::ct_eq(t.as_bytes(), state.token.as_bytes())
+    };
+    let from_query = req.uri().query().is_some_and(|q| {
+        q.split('&')
+            .any(|kv| kv.strip_prefix("token=").is_some_and(valid))
+    });
+    let authed = from_query
+        || crate::auth::cookie_named(req.headers(), HUB_COOKIE).is_some_and(|t| valid(&t))
+        || req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(valid);
+    if from_query && !api {
+        let rest: Vec<&str> = req
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("token="))
+            .collect();
+        // `//host` 與 `/\host` 會被瀏覽器當成別的網站
+        let base = if path.starts_with("//") || path.starts_with("/\\") {
+            "/"
+        } else {
+            path.as_str()
+        };
+        let location = if rest.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", rest.join("&"))
+        };
+        let cookie = format!(
+            "{HUB_COOKIE}={}; Path=/; HttpOnly; SameSite=Strict",
+            state.token
+        );
+        return (
+            StatusCode::SEE_OTHER,
+            [
+                (axum::http::header::LOCATION, location),
+                (axum::http::header::SET_COOKIE, cookie),
+            ],
+        )
+            .into_response();
+    }
+    if api && !authed {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "要用 coding-lab hub 啟動時印出的網址（帶 token）開啟",
+        )
+            .into_response();
+    }
+    // 前端遇到 401 會導去這裡（collector 的登入頁）；hub 沒有登入，只說明怎麼拿到網址
+    if path == "/auth/login" {
+        return (
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            NEED_TOKEN_HTML,
+        )
+            .into_response();
+    }
+    // 網頁本身（HTML／JS／CSS）沒有資料，不擋：從別的網站點進來時，SameSite=Strict 的 cookie 在
+    // 轉址後的第一個請求不會送，擋了反而要重新整理一次；資料都在 /api 與 /ws
+    req.extensions_mut().insert(Authed(authed));
     next.run(req).await
 }
 
@@ -985,7 +1153,7 @@ async fn run_upstream(
                 Some(Ok(M::Text(t))) => {
                     hb.on_activity(crate::now_ms());
                     let Ok(v) = serde_json::from_str::<Value>(&t) else { continue };
-                    let outs = state.hub().on_message(&up.name, &v);
+                    let outs = state.hub().on_message_owned(&up.name, v);
                     state.emit(outs);
                 }
                 Some(Ok(M::Ping(p))) => { hb.on_activity(crate::now_ms()); let _ = ws.send(M::Pong(p)).await; }
@@ -1052,13 +1220,16 @@ async fn client(mut socket: WebSocket, state: Arc<HubState>) {
             },
             out = rx.recv() => match out {
                 Ok(o) => {
-                    let ok = match &*o {
-                        Out::All(f) => !subs.all || send(&mut socket, f).await,
-                        Out::Session(id, v) => !subs.sessions.contains(id) || send(&mut socket, v).await,
-                        Out::Resnapshot => !subs.all || { let s = state.hub().snapshot_all(); send(&mut socket, &s).await },
-                        Out::Any(v) => send(&mut socket, v).await,
+                    let wanted = match &o.out {
+                        Out::All(_) | Out::Resnapshot => subs.all,
+                        Out::Session(id, _) => subs.sessions.contains(id),
+                        Out::Any(_) => true,
                     };
-                    if !ok { break; }
+                    if wanted && let Some(text) = o.text()
+                        && socket.send(Message::Text(text)).await.is_err()
+                    {
+                        break;
+                    }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     if subs.all { let s = state.hub().snapshot_all(); if !send(&mut socket, &s).await { break; } }
@@ -1092,6 +1263,54 @@ async fn resolve_owner(state: &HubState, sid: &str) -> Option<String> {
             && r.status == 200
         {
             state.remember(sid, &u.up.name);
+            return Some(u.up.name.clone());
+        }
+    }
+    None
+}
+
+/// `/api/sessions` 合併後的預設與最大筆數（同 collector 的 `/api/sessions`）
+const SESSIONS_DEFAULT: usize = 100;
+const SESSIONS_MAX: usize = 1000;
+
+/// 擁有這個目錄的上游（C13）：先看 live 快取與記下的對照；都沒有就逐台問上線的上游
+/// `/api/sessions?cwd=<目錄>&limit=1`，有列的那台就是，記下來。已結束、被移出 live 的專案（回放舊的工作）靠這個找到。
+async fn resolve_cwd_owner(state: &HubState, cwd: &str) -> Option<String> {
+    let cached = state.hub().owner_of_cwd(cwd);
+    if cached.is_some() {
+        return cached;
+    }
+    let key = crate::paths::normalize(cwd)
+        .trim_end_matches('/')
+        .to_string();
+    let remembered = state
+        .known_cwds
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned();
+    if remembered.is_some() {
+        return remembered;
+    }
+    let online = state.hub().online();
+    let path = format!("/api/sessions?cwd={}&limit=1", percent_encode(&key));
+    for u in &state.ups {
+        if !online.iter().any(|(n, on)| *n == u.up.name && *on) {
+            continue;
+        }
+        let Ok(r) = http_get(&u.up.url, &path, u.up.key.as_deref()).await else {
+            continue;
+        };
+        let has = r.status == 200
+            && serde_json::from_slice::<Value>(&r.body)
+                .ok()
+                .is_some_and(|v| v["sessions"].as_array().is_some_and(|a| !a.is_empty()));
+        if has {
+            let mut known = state.known_cwds.lock().unwrap_or_else(|e| e.into_inner());
+            if known.len() >= KNOWN_CWDS_MAX {
+                known.clear();
+            }
+            known.insert(key, u.up.name.clone());
             return Some(u.up.name.clone());
         }
     }
@@ -1243,16 +1462,17 @@ async fn on_client_message(
 
 // ── 本機 web：HTTP ─────────────────────────────────────────────────────────
 
-fn json_response(status: StatusCode, body: &Value) -> Response {
-    (
-        status,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
-    )
-        .into_response()
-}
-
-async fn healthz(State(state): State<Arc<HubState>>) -> Response {
+async fn healthz(
+    State(state): State<Arc<HubState>>,
+    Extension(Authed(authed)): Extension<Authed>,
+) -> Response {
+    // 沒帶 token 只回版本：上游的名稱與網址不給別的本機程序看（W-M8）
+    if !authed {
+        return json_response(
+            StatusCode::OK,
+            &json!({ "version": env!("CARGO_PKG_VERSION"), "protocol": crate::ws::PROTOCOL, "hub": true }),
+        );
+    }
     let online = state.hub().online();
     let ups: Vec<Value> = state
         .ups
@@ -1267,42 +1487,6 @@ async fn healthz(State(state): State<Arc<HubState>>) -> Response {
         StatusCode::OK,
         &json!({ "version": env!("CARGO_PKG_VERSION"), "protocol": crate::ws::PROTOCOL, "hub": true, "upstreams": ups }),
     )
-}
-
-fn query_param(uri: &Uri, name: &str) -> Option<String> {
-    uri.query()?.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == name).then(|| percent_decode(v))
-    })
-}
-
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(b) => {
-                    out.push(b);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn relay(r: HttpResponse) -> Response {
@@ -1330,26 +1514,30 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
     let gateway = |why: String| json_response(StatusCode::BAD_GATEWAY, &json!({ "error": why }));
     if path == "/api/sessions" {
         let cwd = query_param(&uri, "cwd");
-        let owner = cwd.as_deref().map(|c| state.hub().owner_of_cwd(c));
+        // 快取裡找得到這個目錄就只問那台；找不到（已結束、被移出 live 的專案，C13）就每台都問
+        let owner = cwd.as_deref().and_then(|c| state.hub().owner_of_cwd(c));
         let targets: Vec<&UpHandle> = match owner {
-            Some(Some(o)) => state.ups.iter().filter(|u| u.up.name == o).collect(),
-            Some(None) => return not_found("hub 不認得這個目錄（沒有任何一台有它的 session）"),
+            Some(o) => state.ups.iter().filter(|u| u.up.name == o).collect(),
             None => state.ups.iter().collect(),
         };
         let online = state.hub().online();
+        // 並行問各台（E-H7）：某台卡住時不用一台一台等到逾時
+        let pq = pq.as_str();
+        let asks = targets
+            .into_iter()
+            .filter(|u| online.iter().any(|(n, on)| *n == u.up.name && *on))
+            .map(|u| async move { (u, http_get(&u.up.url, pq, u.up.key.as_deref()).await) });
         let mut rows = Vec::new();
-        for u in targets {
-            if !online.iter().any(|(n, on)| *n == u.up.name && *on) {
-                continue;
-            }
-            match http_get(&u.up.url, &pq, u.up.key.as_deref()).await {
+        for (u, res) in futures_util::future::join_all(asks).await {
+            match res {
                 Ok(r) if r.status == 200 => {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&r.body) {
-                        for s in v["sessions"].as_array().into_iter().flatten() {
+                    if let Ok(mut v) = serde_json::from_slice::<Value>(&r.body)
+                        && let Value::Array(list) = v["sessions"].take()
+                    {
+                        for mut s in list {
                             if let Some(id) = s["id"].as_str() {
                                 state.remember(id, &u.up.name);
                             }
-                            let mut s = s.clone();
                             set_host(&mut s, &u.up.name);
                             rows.push(s);
                         }
@@ -1361,7 +1549,20 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
                 }
             }
         }
-        rows.sort_by_key(|s| std::cmp::Reverse(s["startedAt"].as_u64().unwrap_or(0)));
+        // 依開始時間由新到舊（同時間依 host、id，結果穩定），合併後截到 limit：每台各給 limit 筆，合起來會超過
+        let key = |s: &Value| {
+            (
+                std::cmp::Reverse(s["startedAt"].as_u64().unwrap_or(0)),
+                s["host"].as_str().unwrap_or_default().to_string(),
+                s["id"].as_str().unwrap_or_default().to_string(),
+            )
+        };
+        rows.sort_by_cached_key(key);
+        let limit = query_param(&uri, "limit")
+            .and_then(|l| l.parse::<usize>().ok())
+            .unwrap_or(SESSIONS_DEFAULT)
+            .clamp(1, SESSIONS_MAX);
+        rows.truncate(limit);
         return json_response(StatusCode::OK, &json!({ "sessions": rows }));
     }
     let owner = if let Some(rest) = path.strip_prefix("/api/sessions/") {
@@ -1369,7 +1570,7 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
         resolve_owner(&state, &percent_decode(id)).await
     } else {
         match query_param(&uri, "cwd") {
-            Some(c) => state.hub().owner_of_cwd(&c),
+            Some(c) => resolve_cwd_owner(&state, &c).await,
             None => None,
         }
     };
@@ -1379,10 +1580,15 @@ async fn api_proxy(State(state): State<Arc<HubState>>, uri: Uri) -> Response {
     let Some(u) = state.handle(&owner) else {
         return not_found("上游不存在");
     };
+    // 只有帶 Event 或 sessions 列的回應要改寫、標 host（E-H5）；其他（檔案樹、diff、分支、thinking 全文…）
+    // 原封轉送 bytes，不解析也不重新序列化。原封送沒有剝除的顧慮：hub 對上游是遠端，需要剝的上游已經剝過；
+    // hub 自己沒有遠端客戶端（只綁 loopback、帶轉發標頭的一律 403，見 gate）。這個前提一改，這裡要回到
+    // ws::redact_remote_copy。
+    let rewrite = path.ends_with("/events") && path.starts_with("/api/sessions/")
+        || path == "/api/projects/replay";
     match http_get(&u.up.url, &pq, u.up.key.as_deref()).await {
         Ok(mut r) => {
-            // 回應裡的 Event 與 sessions 列也標 host
-            if let Ok(mut v) = serde_json::from_slice::<Value>(&r.body) {
+            if rewrite && let Ok(mut v) = serde_json::from_slice::<Value>(&r.body) {
                 state.hub().rewrite(&owner, &mut v);
                 r.body = v.to_string().into_bytes();
             }

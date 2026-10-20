@@ -357,30 +357,6 @@ function createWorld(n, { bigtree = false } = {}) {
     return { status: 200, body: { root: cwd === R || base === "main" ? R : cwd, base, baseRef: base === "main" ? (R === ROOT2 ? "main" : "develop") : base.startsWith("commit:") ? base.slice(7).padEnd(40, "0") : null, tree: [...(R === ROOT2 ? FILES2 : tree)].sort(), treeTruncated: false, changes, worktrees: [...new Map(mine.map((s) => [s.cwd, { path: s.cwd, branch: s.branch }])).values()] } };
   }
 
-  // 全專案回放（#702）：cwd 底下的 session、範圍內有 pos 的 Event，依 (ts_seen, session, pos) 由新到舊一頁
-  function projectEvents(q) {
-    const cwd = (q.get("cwd") ?? "").replace(/\/$/, "");
-    if (!cwd) return err(400, "缺少 cwd（專案根目錄）");
-    const from = Number(q.get("from") ?? 0);
-    const to = Number(q.get("to") ?? Number.MAX_SAFE_INTEGER);
-    const limit = Math.min(500, Number(q.get("limit") ?? 200));
-    const [bts, bs, bpos] = (q.get("before") ?? "").split(",");
-    const under = new Set(sessions.filter((s) => s.cwd === cwd || s.cwd.startsWith(`${cwd}/`)).map((s) => s.id));
-    const key = (e) => [e.ts_seen, e.session, e.pos];
-    const older = (a, b) => a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) || a[2] - b[2];
-    const win = glog
-      .filter((e) => e.pos != null && under.has(e.session) && e.ts_seen >= from && e.ts_seen <= to && (!bts || older(key(e), [Number(bts), bs, Number(bpos)]) < 0))
-      .sort((a, b) => older(key(b), key(a)))
-      .slice(0, limit);
-    const bySession = new Map();
-    for (const e of [...win].reverse()) {
-      if (!bySession.has(e.session)) bySession.set(e.session, []);
-      bySession.get(e.session).push(...expand(e));
-    }
-    const last = win.length === limit ? win[win.length - 1] : null;
-    return { status: 200, body: { cwd, from, to, events: [...bySession.values()].flat(), next: last && { ts: last.ts_seen, session: last.session, pos: last.pos } } };
-  }
-
   // 主頁時間軸回放（#729）：簡化版——列（sessions、agents、注意佇列、KPI）用現況，串流與改動只取 at 之前的；
   // frame 是 (at, until] 之間進串流的 Event 依 ts_seen 分組，列不變。只用來在前端試時間軸與播放
   function projectReplay(q, snap) {
@@ -511,7 +487,6 @@ function createWorld(n, { bigtree = false } = {}) {
     api(url) {
       const u = new URL(url, "http://mock");
       if (u.pathname === "/api/files") return files(u.searchParams);
-      if (u.pathname === "/api/projects/events") return projectEvents(u.searchParams);
       if (u.pathname === "/api/projects/replay") return projectReplay(u.searchParams, this.snapshot());
       if (u.pathname === "/api/branches") return branches(u.searchParams);
       if (u.pathname === "/api/branch-diff") return branchDiff(u.searchParams);
@@ -567,9 +542,10 @@ function createWorld(n, { bigtree = false } = {}) {
       frame++;
       return { t: "frame", frame, ch: "*", events: [], rows: { attention: [{ id, deleted: true }], kpi: { attention: kpi.attention } } };
     },
+    // 和 collector 一樣照請求帶回 beforePos；null（▶ 回放）是從最新的往前讀（#747 F-9）
     more(session, beforePos, limit) {
-      const mine = glog.filter((e) => e.session === session && e.pos != null && e.pos < beforePos);
-      return { t: "more", session, events: mine.slice(-limit).flatMap(expand) };
+      const mine = glog.filter((e) => e.session === session && e.pos != null && e.pos < (beforePos ?? Infinity));
+      return { t: "more", session, beforePos: beforePos ?? null, events: mine.slice(-limit).flatMap(expand) };
     },
     step({ minEvents = 0 } = {}) {
       frame++;
@@ -670,7 +646,9 @@ export function installMock(n, { bench = false, prefill = false, bigtree = false
           : setInterval(() => this.#frame(world.step()), 400);
       }
       if (msg.op === "unsubscribe" && msg.channel.startsWith("session:")) this.subs.delete(msg.channel.slice(8));
-      if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#emit(f); }, 80);
+      if (msg.op === "unsubscribe" && msg.channel === "*") this.all = false; // 離開回放時前端會先取消再重訂（#747 F-9）
+      // 確認後的 deleted 也送到訂了那個 session 頻道的連線（#747 F-9）
+      if (msg.op === "ack") setTimeout(() => { const f = world.ack(msg); if (f) for (const c of live) c.#frame(f); }, 80);
       if (msg.op === "more") setTimeout(() => this.#emit(world.more(msg.session, msg.beforePos, msg.limit)), 60);
     }
     close() { this.#end(); }

@@ -319,4 +319,156 @@ mod cli {
         assert!(!ok);
         assert!(err.contains("nope0000"), "{err}");
     }
+
+    /// 同時啟動 `args_of(i)` 的 n 個程序，回每個的 (成功, stdout, stderr)。
+    fn run_many(
+        home: &std::path::Path,
+        n: usize,
+        args_of: impl Fn(usize) -> Vec<String>,
+    ) -> Vec<(bool, String, String)> {
+        let children: Vec<_> = (0..n)
+            .map(|i| {
+                coding_lab(home)
+                    .args(args_of(i))
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        children
+            .into_iter()
+            .map(|c| {
+                let out = c.wait_with_output().unwrap();
+                (
+                    out.status.success(),
+                    String::from_utf8_lossy(&out.stdout).into_owned(),
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// W-L13（#782）：同一個 home 同時跑的 create 與 revoke 都不遺失、keys.json 不寫壞。
+    /// 修正前：共用 keys.json.tmp、讀改寫沒有鎖，會少金鑰、偶爾整個檔寫壞（所有金鑰一起失效）。
+    #[test]
+    fn concurrent_creates_and_revokes_lose_nothing_and_keep_valid_json() {
+        for round in 0..3 {
+            let home = tmp(&format!("many-{round}"));
+            for i in 0..5 {
+                let (ok, _, err) = run(&home, &["key", "create", "--name", &format!("old{i}")]);
+                assert!(ok, "{err}");
+            }
+            let old: Vec<String> = KeyStore::load(&home)
+                .unwrap()
+                .unwrap()
+                .list()
+                .iter()
+                .map(|k| k.id.clone())
+                .collect();
+            let results = run_many(&home, 20, |i| {
+                if i < 15 {
+                    ["key", "create", "--name", &format!("new{i}")]
+                        .map(String::from)
+                        .to_vec()
+                } else {
+                    vec!["key".into(), "revoke".into(), old[i - 15].clone()]
+                }
+            });
+            for (i, (ok, _, err)) in results.iter().enumerate() {
+                assert!(ok, "第 {round} 輪第 {i} 個失敗：{err}");
+            }
+            let text = std::fs::read_to_string(KeyStore::path(&home)).unwrap();
+            let store = KeyStore::load(&home)
+                .unwrap_or_else(|e| panic!("第 {round} 輪 keys.json 壞了：{e}\n{text}"))
+                .unwrap();
+            let names: std::collections::BTreeSet<&str> =
+                store.list().iter().map(|k| k.name.as_str()).collect();
+            assert_eq!(store.list().len(), 20, "第 {round} 輪：{names:?}");
+            for i in 0..15 {
+                assert!(
+                    names.contains(format!("new{i}").as_str()),
+                    "第 {round} 輪少了 new{i}"
+                );
+            }
+            for id in &old {
+                assert!(
+                    store.get(id).unwrap().revoked_ms.is_some(),
+                    "第 {round} 輪：{id} 的撤銷被蓋掉了"
+                );
+            }
+        }
+    }
+
+    /// W-L13：寫入前留一份 keys.json.bak；keys.json 寫壞時，錯誤訊息指向它。
+    #[test]
+    fn writes_keep_a_backup_and_a_corrupt_file_points_to_it() {
+        let home = tmp("bak");
+        assert!(run(&home, &["key", "create", "--name", "a"]).0);
+        assert!(run(&home, &["key", "create", "--name", "b"]).0);
+        let bak = home.join("keys.json.bak");
+        let text = std::fs::read_to_string(&bak).expect("要留 keys.json.bak");
+        assert!(
+            text.contains("\"a\"") && !text.contains("\"b\""),
+            "是寫入前的內容：{text}"
+        );
+        std::fs::write(KeyStore::path(&home), "{ 壞掉").unwrap();
+        let (ok, _, err) = run(&home, &["key", "list"]);
+        assert!(!ok);
+        assert!(err.contains("keys.json.bak"), "要說可以從 .bak 還原：{err}");
+        // 壞掉的檔不會蓋掉好的 .bak
+        let (ok, _, _) = run(&home, &["key", "create", "--name", "c"]);
+        assert!(!ok, "keys.json 壞掉時不寫");
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), text);
+    }
+
+    /// W-L13：login-links.json 一樣，同時建的一次性連結都在、都能用。
+    #[test]
+    fn concurrent_login_links_are_all_kept() {
+        let home = tmp("links");
+        assert!(run(&home, &["key", "create", "--name", "a"]).0);
+        let id = KeyStore::load(&home).unwrap().unwrap().list()[0].id.clone();
+        let results = run_many(&home, 20, |_| {
+            ["key", "login-link", "--key", &id]
+                .map(String::from)
+                .to_vec()
+        });
+        let codes: Vec<String> = results
+            .iter()
+            .map(|(ok, out, err)| {
+                assert!(ok, "{err}");
+                out.split("/auth/once/")
+                    .nth(1)
+                    .and_then(|r| r.split_whitespace().next())
+                    .unwrap_or_else(|| panic!("沒有連結：{out}"))
+                    .to_string()
+            })
+            .collect();
+        let now = coding_lab::now_ms();
+        for code in &codes {
+            assert_eq!(
+                coding_lab::auth::consume_once_link(&home, code, now).unwrap(),
+                Some(id.clone()),
+                "連結 {code} 不見了"
+            );
+        }
+    }
+}
+
+/// W-L1：單位不是 ASCII 時回錯誤（原本位元組切片切在「天」的中間而 panic）；乘出來溢位也回錯誤。
+#[test]
+fn parse_expires_rejects_non_ascii_units_and_overflow() {
+    for bad in [
+        "9天",
+        "天",
+        "9d天",
+        "18446744073709551615d",
+        "99999999999999999m",
+    ] {
+        assert!(keys::parse_expires(bad, NOW).is_err(), "{bad}");
+    }
+    assert!(
+        keys::parse_expires("1d", u64::MAX - 1).is_err(),
+        "加上 now 溢位"
+    );
 }

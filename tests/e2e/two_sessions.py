@@ -9,10 +9,12 @@
    - 每張卡片的 tool.placed 都在 tool.called 之後，沒有降級；
    - `session:<id>` 頻道只含自己的事件，而且和 `*` 裡那個 session 的事件完全相同。
 
-hook 的 url 寫死 127.0.0.1:4800，所以用的是正在跑的 collector（例如主工作樹的自我追蹤 collector）；
-web 埠從它的 collector.json 讀。只用標準函式庫（主機沒有 Node／wscat）。
+不碰正在跑的 collector（4800）與 <repo>/.coding-lab（#749 T-7，測試資料不混進自我追蹤）：和 lifecycle.py 一樣在
+target/tmp/e2e-two-sessions/ 建獨立的資料目錄、隨機埠，複製一份 hook 指到那個埠的 plugin；先用 ensure 拉起專屬的
+collector（WS 要在兩個 session 開始前連上），跑完就關掉。模型預設 haiku（`E2E_MODEL` 可改）。
+只用標準函式庫（主機沒有 Node／wscat）。
 
-用法：tests/e2e/two_sessions.py [CODING_LAB_HOME，預設 <repo>/.coding-lab]
+用法：tests/scripts/e2e.sh（先建 release 再執行本檔）
 """
 
 import base64
@@ -30,17 +32,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "target" / "release" / ("coding-lab.exe" if os.name == "nt" else "coding-lab")
 WORK = ROOT / "target" / "tmp" / "e2e-two-sessions"
+MODEL = os.environ.get("E2E_MODEL", "haiku")
 
 
 class WS:
     """最小的 WebSocket 用戶端（RFC 6455，只用文字訊息）。不帶 Origin，就和 wscat 一樣。"""
 
-    def __init__(self, port):
+    def __init__(self, port, headers=None):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=30)
         key = base64.b64encode(os.urandom(16)).decode()
+        extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
         self.s.sendall(
             f"GET /ws HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n".encode()
         )
         head = b""
         while b"\r\n\r\n" not in head:
@@ -103,12 +107,39 @@ def listen(port, channel, out, stop):
 PROMPT = "依序用 Bash 執行 echo {tag}-1、echo {tag}-2、echo {tag}-3（每次一個指令，分三次呼叫），最後只回答 OK"
 
 
-def run_claude(sid, tag, home):
-    env = dict(os.environ, CODING_LAB_BIN=str(BIN), CODING_LAB_HOME=str(home))
+def run_claude(L, sid, tag):
+    env = dict(os.environ, CODING_LAB_BIN=str(BIN), CODING_LAB_HOME=str(L.HOME))
     return subprocess.run(
-        ["claude", "-p", "--plugin-dir", str(ROOT / "plugin"), "--session-id", sid, "--allowedTools", "Bash(echo:*)"],
+        ["claude", "-p", "--plugin-dir", str(L.PLUGIN), "--model", MODEL, "--session-id", sid,
+         "--allowedTools", "Bash(echo:*)"],
         input=PROMPT.format(tag=tag).encode(), env=env, cwd=WORK, capture_output=True, timeout=300,
     )
+
+
+def isolated():
+    """lifecycle.py 的 setup／stop_collector，改用這個腳本自己的目錄（在 main 裡改，hub_sim 只 import WS）。"""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import lifecycle as L
+
+    L.WORK = WORK
+    L.HOME = WORK / "home"
+    L.PLUGIN = WORK / "plugin"
+    return L
+
+
+def start_collector(L):
+    """沒有 SessionStart 的 ensure 也會拉起 collector；等它寫好 collector.json。"""
+    env = dict(os.environ, CODING_LAB_HOME=str(L.HOME))
+    subprocess.run([str(BIN), "ensure"], env=env, stdin=subprocess.DEVNULL, timeout=30, check=True)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            if json.loads((L.HOME / "collector.json").read_text(encoding="utf-8")).get("web"):
+                return
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.1)
+    sys.exit(f"collector 沒有起來：看 {L.HOME / 'collector.log'}")
 
 
 def check_session(name, evs):
@@ -120,7 +151,11 @@ def check_session(name, evs):
     if pos != sorted(set(pos)):
         problems.append(f"{name}: pos 不是嚴格遞增（往前插入）{pos}")
     types = [e["type"] for e in evs]
-    if not types or types[0] != "session.started" or types[-1] != "session.ended":
+    # session.ended 之後 status 會轉成 ended（#645 的狀態機），那一筆 session.status 排在它後面是對的
+    tail = len(types)
+    while tail and evs[tail - 1]["type"] == "session.status" and evs[tail - 1]["payload"].get("status") == "ended":
+        tail -= 1
+    if not types or types[0] != "session.started" or tail == 0 or types[tail - 1] != "session.ended":
         problems.append(f"{name}: 頭尾不是 session.started／session.ended：{types[:2]}…{types[-2:]}")
     called = {}
     for i, e in enumerate(evs):
@@ -136,14 +171,19 @@ def check_session(name, evs):
 
 
 def main():
-    home = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / ".coding-lab"
-    info = json.loads((home / "collector.json").read_text(encoding="utf-8"))
-    web_port = int(info["web"].rsplit(":", 1)[1])
-    WORK.mkdir(parents=True, exist_ok=True)
-    if not (WORK / ".git").exists():  # 自己的 git root，避免讀到上層的 .claude/settings.local.json
-        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}  # 同 lifecycle.git_init（#703）
-        subprocess.run(["git", "init", "-q", str(WORK)], check=True, env=env)
+    if not BIN.exists():
+        sys.exit(f"找不到 {BIN}：請用 tests/scripts/e2e.sh 執行（會先建 release）")
+    L = isolated()
+    _, web_port = L.setup()  # 停掉上次留下的、清資料目錄、隨機埠、plugin 副本、git init
+    print(f"資料目錄 {L.HOME}、web 127.0.0.1:{web_port}、模型 {MODEL}")
+    start_collector(L)
+    try:
+        run(L, web_port)
+    finally:
+        L.stop_collector()
 
+
+def run(L, web_port):
     a, b = str(uuid.uuid4()), str(uuid.uuid4())
     all_events, ch_a, ch_b = [], [], []
     stop = threading.Event()
@@ -158,7 +198,7 @@ def main():
     print(f"session A {a}\nsession B {b}\n同時執行兩個 claude -p …")
     results = {}
     runners = [
-        threading.Thread(target=lambda s=s, tag=tag: results.update({tag: run_claude(s, tag, home)}))
+        threading.Thread(target=lambda s=s, tag=tag: results.update({tag: run_claude(L, s, tag)}))
         for s, tag in ((a, "A"), (b, "B"))
     ]
     for t in runners:

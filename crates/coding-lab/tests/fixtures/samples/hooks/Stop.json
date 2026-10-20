@@ -1,0 +1,21 @@
+{
+  "background_tasks": [
+    {
+      "agent_type": "general-purpose",
+      "description": "計算 test_calc.py 中有幾個 assert",
+      "id": "a2ae31d4a7d83015b",
+      "status": "running",
+      "type": "subagent"
+    }
+  ],
+  "cwd": "/home/user/fixture-lab",
+  "hook_event_name": "Stop",
+  "last_assistant_message": "已派出 subagent 在背景執行，會自動通知結果。我已完成前 5 步：\n1. ✅ 讀 calc.py\n2. ✅ 加入 mul(a, b) 函式\n3. ✅ 建立 notes.md\n4. ✅ 執行測試通過\n5. ✅ 執行失敗命令後繼續\n\n等 agent 回報 assert 數量...",
+  "permission_mode": "default",
+  "prompt_id": "a592e386-96e5-4944-8d2b-4fc1b808cdad",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f/scratchpad",
+  "session_crons": [],
+  "session_id": "9addaaff-fe09-4395-b5e6-86eca2de8c6f",
+  "stop_hook_active": false,
+  "transcript_path": "/home/user/.claude/projects/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f.jsonl"
+}

@@ -298,7 +298,10 @@ fn samples_compact_and_resume_neither_repeat_nor_drop_lines() {
 
 /// 把一個樣本複製到 target/tmp，給測試改動用。
 fn copy_sample(name: &str, to: &Path) -> Option<std::path::PathBuf> {
-    let from = sample_sessions().into_iter().find(|d| d.ends_with(name))?;
+    // 指名的樣本只有真的 samples/ 才有（CODING_LAB_REQUIRE_SAMPLES=1 時沒有就失敗）
+    let from = sessions_in(&common::full_samples()?.join("sessions"))
+        .into_iter()
+        .find(|d| d.ends_with(name))?;
     let dir = to.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;

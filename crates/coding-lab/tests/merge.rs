@@ -10,7 +10,7 @@ use common::{arrivals, read_jsonl, sample_sessions};
 use coding_lab::event::{Danger, DangerLevel, Event};
 use coding_lab::hook::HookInput;
 use coding_lab::merge::{
-    AgentMetaRead, DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger,
+    AgentMetaRead, CARD_KEEP_MS, DangerRules, FALLBACK_AFTER_MS, FALLBACK_WAIT_MS, Input, Merger,
     SESSION_EVICT_AFTER_MS, SESSION_IDLE_EVICT_MS,
 };
 use serde_json::{Value, json};
@@ -331,6 +331,46 @@ fn duplicate_transcript_lines_are_ignored() {
     let mut m = merger();
     assert_eq!(m.handle(line(1, thinking("u1", "m1"), 1000)).len(), 1);
     assert!(m.handle(line(1, thinking("u1", "m1"), 1001)).is_empty());
+}
+
+/// uuid 去重存成數字（E-M5）：標準格式的 uuid 只差一個字也不能當成同一行；不是標準格式的照樣去重。
+#[test]
+fn uuid_dedup_tells_close_uuids_apart_and_keeps_other_formats() {
+    let mut m = merger();
+    let a = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e6f";
+    let b = "0f2d4c1e-7b9a-4e3f-9c8d-1a2b3c4d5e60";
+    assert_eq!(m.handle(line(1, thinking(a, "m1"), 1000)).len(), 1);
+    assert_eq!(m.handle(line(2, thinking(b, "m1"), 1001)).len(), 1);
+    assert!(m.handle(line(1, thinking(a, "m1"), 1002)).is_empty());
+    let upper = a.to_uppercase();
+    assert_eq!(
+        m.handle(line(3, thinking(&upper, "m1"), 1003)).len(),
+        1,
+        "大小寫不同就是不同的字串，和以前一樣"
+    );
+    assert!(m.handle(line(3, thinking(&upper, "m1"), 1004)).is_empty());
+}
+
+/// 完成的卡片（已進串流、已結束、結果已送）留 [`CARD_KEEP_MS`] 給重複的 hook（K-3），之後釋放；
+/// 沒完成的不動（K-12：長開的 session 不再一直累積卡片）。
+#[test]
+fn finished_cards_are_released_after_a_while() {
+    let mut m = merger();
+    m.handle(pre("t1", "Bash", json!({ "command": "ls" }), 1_000));
+    m.handle(post("t1", 1_100));
+    m.handle(line(1, tool_use("u1", "m1", "t1"), 1_200));
+    m.handle(line(2, tool_result("u2", "t1"), 1_300));
+    m.handle(line(3, tool_use("u3", "m2", "t2"), 1_400));
+    assert_eq!(m.card_count(S), 2);
+    m.tick(2_000);
+    assert!(
+        m.handle(post("t1", 2_100)).is_empty(),
+        "保留期間重複的 hook 照樣不處理"
+    );
+    m.tick(2_000 + CARD_KEEP_MS / 2);
+    assert_eq!(m.card_count(S), 2, "還在保留期間");
+    m.tick(2_000 + CARD_KEEP_MS);
+    assert_eq!(m.card_count(S), 1, "t1 釋放，還在跑的 t2 留著");
 }
 
 #[test]
@@ -1568,6 +1608,55 @@ fn reading_secrets_marks_the_result_sensitive() {
     );
 }
 
+/// C8（#761）：敏感的 Write／Edit 在 tool.called、file.write、file.edit 也標 sensitive（hunk 的前後文是從實際檔案
+/// 讀的，會帶出 .env 原有的秘密）；判斷和 tool.result 一樣；沒命中時不輸出這個欄位。
+#[test]
+fn writing_secrets_marks_the_call_and_the_file_event_sensitive() {
+    let mut m = merger();
+    let w = m.handle(pre(
+        "t1",
+        "Write",
+        json!({"file_path": "/p/.env", "content": "TOKEN=abc\n"}),
+        1000,
+    ));
+    let e = m.handle(pre(
+        "t2",
+        "Edit",
+        json!({"file_path": "/p/.env", "old_string": "abc", "new_string": "xyz"}),
+        1100,
+    ));
+    let n = m.handle(pre(
+        "t3",
+        "Write",
+        json!({"file_path": "/p/src/a.rs", "content": "fn a() {}\n"}),
+        1200,
+    ));
+    let of = |evs: &[Event], t: &str| {
+        evs.iter()
+            .find(|e| e.type_name() == t)
+            .unwrap()
+            .payload
+            .clone()
+    };
+    assert_eq!(of(&w, "tool.called")["sensitive"], true);
+    assert_eq!(of(&w, "file.write")["sensitive"], true);
+    assert_eq!(of(&e, "tool.called")["sensitive"], true);
+    assert_eq!(of(&e, "file.edit")["sensitive"], true);
+    assert!(of(&n, "tool.called").get("sensitive").is_none());
+    assert!(of(&n, "file.write").get("sensitive").is_none());
+    // 本機照存
+    assert_eq!(of(&w, "file.write")["content"], "TOKEN=abc\n");
+}
+
+/// C8：讀敏感檔的指令型工具，tool.called 也標（輸入裡的指令本身通常不是秘密，但和 tool.result 一致）。
+#[test]
+fn reading_secrets_with_a_command_marks_the_call_sensitive() {
+    let mut m = merger();
+    let a = m.handle(pre("t1", "Bash", json!({"command": "cat .env"}), 1000));
+    let c = a.iter().find(|e| e.type_name() == "tool.called").unwrap();
+    assert_eq!(c.payload["sensitive"], true);
+}
+
 /// #654（R22）：tool.called 的 input 裡過長的字串截到 8 KB，標 inputTruncated；短的不動。
 #[test]
 fn long_tool_input_strings_are_truncated() {
@@ -1602,4 +1691,226 @@ fn output_truncation_keeps_utf8_intact() {
     assert!(out.len() <= 8 * 1024);
     assert!(out.ends_with('a'), "不留下半個字");
     assert_eq!(r.payload["truncated"], true);
+}
+
+/// K-8：PreToolUse 到了、transcript 的 tool_use 行還沒到時 collector 重啟。重啟前的暫存卡要種回 merge：
+/// tool_use 行到了照常放進串流（不再發第二筆 tool.called，KPI 不重複），等不到就照常降級，不留幽靈卡。
+#[test]
+fn samples_restart_between_pre_tool_use_and_its_line() {
+    let mut tried = 0;
+    for dir in sample_sessions() {
+        let Some(first) = common::sample_inputs(&dir) else {
+            continue;
+        };
+        let sid = first.session.clone();
+        // 重啟點：PreToolUse 剛處理完（它的 tool_use 行一定還沒到）；每個樣本最多 5 個
+        let points: Vec<usize> = first
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, i))| {
+                matches!(i, Input::Hook { hook, .. } if hook.event_name() == "PreToolUse")
+            })
+            .map(|(n, _)| n + 1)
+            .take(5)
+            .collect();
+        for cut in points {
+            let mut it = common::sample_inputs(&dir).unwrap().inputs.into_iter();
+            let mut a = Merger::new(Box::new(common::NoDanger));
+            let (mut before, mut last_ts) = (Vec::new(), 0);
+            for (ts, input) in it.by_ref().take(cut) {
+                before.extend(a.tick(ts));
+                before.extend(a.handle(input));
+                last_ts = ts;
+            }
+            // 重啟：和 serve 一樣，從 store 種回 seq／pos／路徑基準與最近的 Event
+            let mut b = Merger::new(Box::new(common::NoDanger));
+            let seq = before.iter().map(|e| e.seq).max().unwrap_or(0);
+            let pos = before.iter().filter_map(|e| e.pos).max().unwrap_or(0);
+            let cwd = before
+                .iter()
+                .find(|e| e.type_name() == "session.started")
+                .and_then(|e| e.payload["cwd"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            b.resume(&sid, seq, pos, &cwd);
+            b.resume_staged(&before, last_ts);
+            let (mut after, mut end) = (Vec::new(), last_ts);
+            for (ts, input) in it {
+                after.extend(b.tick(ts));
+                after.extend(b.handle(input));
+                end = ts;
+            }
+            after.extend(b.tick(end + 60_000));
+            let all: Vec<&Event> = before.iter().chain(&after).collect();
+            let of = |t: &str, id: &str| {
+                all.iter()
+                    .filter(|e| e.type_name() == t && e.payload["toolUseId"] == id)
+                    .count()
+            };
+            let called: Vec<&Event> = all
+                .iter()
+                .copied()
+                .filter(|e| e.type_name() == "tool.called")
+                .collect();
+            for c in &called {
+                let id = c.payload["toolUseId"].as_str().unwrap();
+                assert_eq!(
+                    of("tool.called", id),
+                    1,
+                    "{} 在第 {cut} 個輸入後重啟：{id} 發了兩次 tool.called",
+                    dir.display()
+                );
+                if c.payload["placement"] == "staged" {
+                    assert_eq!(
+                        of("tool.placed", id),
+                        1,
+                        "{} 在第 {cut} 個輸入後重啟：暫存卡 {id} 沒有（或不只一次）放進串流",
+                        dir.display()
+                    );
+                }
+            }
+            tried += 1;
+        }
+    }
+    if tried == 0 {
+        eprintln!("略過：沒有 samples");
+    }
+}
+
+/// K-8：種回的暫存卡等不到 tool_use 行時，從重啟起算 FALLBACK_AFTER_MS 後照常降級，只放一次；
+/// 已經放進串流的不種回；重啟後再收到同一個 PreToolUse 也不重發 tool.called。
+#[test]
+fn resumed_staged_card_falls_back_after_the_usual_wait() {
+    let mut a = merger();
+    let mut before = a.handle(pre("t1", "Bash", json!({"command": "ls"}), 1000));
+    before.extend(a.handle(pre("t2", "Bash", json!({"command": "pwd"}), 1001)));
+    before.extend(a.tick(1001 + FALLBACK_AFTER_MS)); // t1、t2 都降級了
+    before.extend(a.handle(pre("t3", "Bash", json!({"command": "id"}), 20_000)));
+    let placed = |evs: &[Event], id: &str| {
+        evs.iter()
+            .filter(|e| e.type_name() == "tool.placed" && e.payload["toolUseId"] == id)
+            .count()
+    };
+    assert_eq!(placed(&before, "t1"), 1, "前提");
+    assert_eq!(placed(&before, "t3"), 0, "前提");
+
+    let mut b = merger();
+    let seq = before.iter().map(|e| e.seq).max().unwrap();
+    let pos = before.iter().filter_map(|e| e.pos).max().unwrap();
+    b.resume(S, seq, pos, "/p");
+    b.resume_staged(&before, 30_000);
+    let mut after = b.handle(pre("t3", "Bash", json!({"command": "id"}), 30_001));
+    assert!(
+        after.is_empty(),
+        "同一個 PreToolUse 不重發：{:?}",
+        types(&after)
+    );
+    after.extend(b.tick(30_000 + FALLBACK_AFTER_MS - 1));
+    assert_eq!(placed(&after, "t3"), 0, "從重啟起算還沒滿");
+    after.extend(b.tick(30_000 + FALLBACK_AFTER_MS));
+    after.extend(b.tick(30_000 + 3 * FALLBACK_AFTER_MS));
+    assert_eq!(placed(&after, "t3"), 1);
+    assert_eq!(
+        placed(&after, "t1") + placed(&after, "t2"),
+        0,
+        "已放進串流的不種回"
+    );
+    let p = after
+        .iter()
+        .find(|e| e.type_name() == "tool.placed")
+        .unwrap();
+    assert_eq!(p.payload["placement"], "fallback");
+    assert_eq!(p.pos, Some(pos + 1), "接著重啟前的位置");
+}
+
+/// C7（#744）：file.write 的預覽除了 200 行，也不超過 8 KB；一行 1.5 MB 的 bundle 不再整份進 JSONL、live 與 snapshot。
+#[test]
+fn write_preview_is_bounded_in_bytes_too() {
+    let mut m = merger();
+    let big = "x".repeat(1_500_000);
+    let w = m.handle(pre(
+        "w1",
+        "Write",
+        json!({"file_path": "/p/bundle.min.js", "content": big}),
+        1000,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    assert!(fw.payload["content"].as_str().unwrap().len() <= 8 * 1024);
+    assert_eq!(fw.payload["truncated"], true);
+    assert_eq!(fw.payload["lines"], 1, "全文行數照算");
+    // 多位元組字元不切壞
+    let wide = "中".repeat(10_000);
+    let w = m.handle(pre(
+        "w2",
+        "Write",
+        json!({"file_path": "/p/zh.txt", "content": wide}),
+        1100,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    let c = fw.payload["content"].as_str().unwrap();
+    assert!(c.len() <= 8 * 1024 && c.chars().all(|ch| ch == '中'));
+    // 小檔照舊
+    let w = m.handle(pre(
+        "w3",
+        "Write",
+        json!({"file_path": "/p/a.rs", "content": "fn a() {}\n"}),
+        1200,
+    ));
+    let fw = w.iter().find(|e| e.type_name() == "file.write").unwrap();
+    assert_eq!(fw.payload["content"], "fn a() {}\n");
+    assert_eq!(fw.payload["truncated"], false);
+}
+
+fn post_with(id: &str, tool: &str, response: Value, ts: u64) -> Input {
+    Input::Hook {
+        hook: hook(json!({
+            "session_id": S, "hook_event_name": "PostToolUse", "tool_name": tool,
+            "tool_use_id": id, "tool_response": response,
+        })),
+        ts_seen: ts,
+    }
+}
+
+/// E-M1：大的 tool_response（Edit 帶整個原檔、Read 帶全文）邊序列化邊截；結果和「整份序列化再截 8 KB」一樣。
+#[test]
+fn large_tool_response_is_cut_to_the_same_8_kb() {
+    let mut m = merger();
+    let resp =
+        json!({"filePath": "/p/a.rs", "originalFile": "中".repeat(400_000), "structuredPatch": []});
+    m.handle(pre(
+        "e1",
+        "Edit",
+        json!({"file_path": "/p/a.rs", "old_string": "a", "new_string": "b"}),
+        1000,
+    ));
+    let a = m.handle(post_with("e1", "Edit", resp.clone(), 1100));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    let full = resp.to_string();
+    let (want, _) = coding_lab::text::truncate_bytes(&full, 8 * 1024);
+    assert_eq!(r.payload["output"], want);
+    assert_eq!(r.payload["truncated"], true);
+
+    // Bash：stdout 很長時 stderr 放不進去；短時兩者用換行接起來
+    m.handle(pre("b1", "Bash", json!({"command": "x"}), 1200));
+    let out = "o".repeat(9000);
+    let a = m.handle(post_with(
+        "b1",
+        "Bash",
+        json!({"stdout": out, "stderr": "boom"}),
+        1300,
+    ));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["output"], "o".repeat(8 * 1024));
+    assert_eq!(r.payload["truncated"], true);
+    m.handle(pre("b2", "Bash", json!({"command": "x"}), 1400));
+    let a = m.handle(post_with(
+        "b2",
+        "Bash",
+        json!({"stdout": "out", "stderr": "err"}),
+        1500,
+    ));
+    let r = a.iter().find(|e| e.type_name() == "tool.result").unwrap();
+    assert_eq!(r.payload["output"], "out\nerr");
+    assert_eq!(r.payload["truncated"], false);
 }

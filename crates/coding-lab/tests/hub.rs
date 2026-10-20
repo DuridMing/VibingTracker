@@ -21,6 +21,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 static N: AtomicU32 = AtomicU32::new(0);
+/// hub 啟動時的 token（W-M8）：測試用固定值，正式由 `coding-lab hub` 產生
+const TOKEN: &str = "hubTestToken0123456789abcdefghijklmnopqrstu";
 
 fn tmp(name: &str) -> PathBuf {
     let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -482,7 +484,9 @@ async fn upstream(web: &Arc<WebState>) -> SocketAddr {
 }
 
 async fn connect(addr: SocketAddr) -> Ws {
-    let req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    let mut req = format!("ws://{addr}/ws").into_client_request().unwrap();
+    req.headers_mut()
+        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
     tokio_tungstenite::connect_async(req).await.unwrap().0
 }
 
@@ -514,7 +518,7 @@ async fn recv_until(ws: &mut Ws, pred: impl Fn(&Value) -> bool) -> Value {
 }
 
 async fn http_get(addr: SocketAddr, path: &str) -> (u16, Value) {
-    let r = hub::http_get(&format!("http://{addr}"), path, None)
+    let r = hub::http_get(&format!("http://{addr}"), path, Some(TOKEN))
         .await
         .unwrap();
     (
@@ -546,7 +550,7 @@ async fn hub_merges_two_collectors_and_follows_frames_from_both() {
             key: None,
         },
     ];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
 
@@ -719,6 +723,7 @@ async fn upstream_going_away_marks_its_sessions_offline_and_reconnect_restores_t
         "127.0.0.1:0".parse().unwrap(),
         ups,
         None,
+        TOKEN.into(),
         Duration::from_millis(100),
     )
     .await
@@ -814,7 +819,7 @@ async fn clients_with_different_offsets_do_not_make_the_hub_reconnect_its_upstre
         url: format!("http://{addr_a}"),
         key: None,
     }];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     let connects = |h: &Value| h["upstreams"][0]["connects"].as_u64().unwrap_or(0);
@@ -901,7 +906,7 @@ async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
             key: None,
         },
     ];
-    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None)
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
         .await
         .unwrap();
     let mut ws = connect(hub_addr).await;
@@ -965,4 +970,431 @@ async fn hub_forwards_sessions_that_are_only_in_an_upstreams_store() {
     // 哪台都沒有的 id 仍 404
     let (st, _) = http_get(hub_addr, "/api/sessions/nope/events").await;
     assert_eq!(st, 404);
+}
+
+/// hub 沒有金鑰驗證，反向代理轉來的連線（帶轉發標頭）一律 403：否則代理後面的任何人都是本機（S-1）。
+#[tokio::test]
+async fn hub_refuses_reverse_proxied_requests() {
+    let (hub_addr, _task) = hub::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Vec::new(),
+        None,
+        TOKEN.into(),
+    )
+    .await
+    .unwrap();
+    let get = |extra: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
+        let req = format!(
+            "GET /api/sessions HTTP/1.1\r\nHost: {hub_addr}\r\nAuthorization: Bearer {TOKEN}\r\n{extra}Connection: close\r\n\r\n"
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut s, req.as_bytes())
+            .await
+            .unwrap();
+        let mut out = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut s, &mut out)
+            .await
+            .unwrap();
+        out.split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u16>()
+            .unwrap()
+    };
+    assert_eq!(get("").await, 200, "本機直連照舊");
+    assert_eq!(get("X-Forwarded-For: 203.0.113.9\r\n").await, 403);
+    assert_eq!(get("Forwarded: for=203.0.113.9\r\n").await, 403);
+}
+
+/// C13（#742）：上游 store 裡有、但 live 已移出（結束超過 2 小時、或 hub 重連後快取清掉）的專案，
+/// hub 依 cwd 轉發時快取找不到就逐台問上游，不直接 404（回放、/api/sessions?cwd= 都一樣）。
+#[tokio::test]
+async fn hub_finds_the_owner_of_a_project_that_is_only_in_an_upstreams_store() {
+    let live = [started("live1", 1, 1000, "/a"), text("live1", 2, 1, 1001)];
+    let stored_only = [
+        started("old1", 1, 500, "/old"),
+        text("old1", 2, 1, 501),
+        text("old1", 3, 2, 502),
+    ];
+    let mut s = Store::open(&tmp("c13")).unwrap();
+    for e in live.iter().chain(&stored_only) {
+        s.append(e.clone());
+    }
+    s.flush().unwrap();
+    let web = WebState::new(Some(Arc::new(Mutex::new(s))), None, 64);
+    web.apply(&live);
+    web.flush(2000);
+    let up = upstream(&web).await;
+    let ups = vec![Upstream {
+        name: "alpha".into(),
+        url: format!("http://{up}"),
+        key: None,
+    }];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
+        .await
+        .unwrap();
+    // 等 hub 連上上游、快取有 live1
+    for _ in 0..100 {
+        // 連上上游、快取有 live1 才算（快取找不到時 /api/sessions?cwd= 也回 200，只是列是空的）
+        if http_get(hub_addr, "/api/sessions?cwd=%2Fa").await.1["sessions"][0]["id"] == "live1" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (st, body) = http_get(
+        hub_addr,
+        "/api/projects/replay?cwd=%2Fold&at=400&until=1000",
+    )
+    .await;
+    assert_eq!(st, 200, "hub 要把 /old 的回放轉給 alpha：{body}");
+    assert!(!body["frames"].as_array().unwrap().is_empty(), "{body}");
+    assert_eq!(
+        body["snapshot"]["sessions"].as_array().map(Vec::len),
+        Some(0),
+        "at=400 時還沒開始"
+    );
+    let (st, body) = http_get(hub_addr, "/api/sessions?cwd=%2Fold").await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["sessions"][0]["id"], "old1", "{body}");
+    assert_eq!(body["sessions"][0]["host"], "alpha");
+    // 哪一台都沒有的目錄照舊 404
+    assert_eq!(
+        http_get(hub_addr, "/api/projects/replay?cwd=%2Fnowhere&at=400")
+            .await
+            .0,
+        404
+    );
+}
+
+/// R-5：`coding-lab config` 用 Debug 印設定，上游金鑰只留 id，不印 secret。
+#[test]
+fn upstream_debug_does_not_print_the_key_secret() {
+    let key = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    let up = Upstream {
+        name: "srv".into(),
+        url: "http://10.0.0.2:4801".into(),
+        key: Some(key.into()),
+    };
+    let shown = format!("{up:?} {up:#?}");
+    assert!(!shown.contains("0123456789abcdefghij"), "{shown}");
+    assert!(shown.contains("clk_ABCDEFGH_…"), "{shown}");
+}
+
+/// W-L4：hub add 只收 clk_ 金鑰的格式；含 \ 之類的字會讓 config.toml 解析失敗、所有子命令起不來。
+#[test]
+fn hub_add_rejects_malformed_keys() {
+    let dir = tmp("hub-add");
+    let cfg = dir.join("config.toml");
+    for bad in [
+        "abc\\def",
+        "clk_short",
+        "not-a-key",
+        "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcd\\e",
+    ] {
+        assert!(
+            hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(bad)).is_err(),
+            "{bad}"
+        );
+        assert!(!cfg.exists(), "{bad}：被拒時 config.toml 不變");
+    }
+    let good = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    hub::append_upstream(&cfg, "srv", "http://10.0.0.2:4801", Some(good)).unwrap();
+    assert!(std::fs::read_to_string(&cfg).unwrap().contains(good));
+}
+
+/// W-L5（#768）：殘缺或惡意的 chunked 回應回 Err，不能 panic（release 是 panic=abort，整個 hub 會結束）。
+#[test]
+fn chunked_parser_rejects_truncated_and_huge_chunks_without_panicking() {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    for body in [
+        "5\r\nhello",                // 最後一個 chunk 後面沒有 \r\n、也沒有 0 chunk
+        "5\r\nhel",                  // chunk 不完整
+        "ffffffffffffffff\r\nx\r\n", // 長度大到加起來溢位
+        "fffffffffffffff0\r\nx\r\n",
+    ] {
+        let raw = format!("{head}{body}");
+        let r = std::panic::catch_unwind(|| hub::parse_http_response(raw.as_bytes()));
+        assert!(matches!(r, Ok(Err(_))), "{body:?}：要回 Err、不能 panic");
+    }
+}
+
+/// 每條新連線先等 `delay` 再接到 `to` 的 TCP 代理（模擬回應慢的上游）。
+async fn slow_proxy(to: SocketAddr, delay: Duration) -> SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = l.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut out) = TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// E-H7（#756）：hub 的 /api/sessions 並行問各台（不是一台一台等），合併排序後截到 limit。
+#[tokio::test]
+async fn hub_sessions_asks_upstreams_in_parallel_and_respects_limit() {
+    let mk = |name: &str, ids: &[&str]| {
+        let evs: Vec<Event> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| started(id, 1, 1000 + i as u64, &format!("/{name}")))
+            .collect();
+        let mut s = Store::open(&tmp(name)).unwrap();
+        for e in &evs {
+            s.append(e.clone());
+        }
+        s.flush().unwrap();
+        let web = WebState::new(Some(Arc::new(Mutex::new(s))), None, 64);
+        web.apply(&evs);
+        web.flush(2000);
+        web
+    };
+    let (a, b) = (mk("pa", &["a1", "a2", "a3"]), mk("pb", &["b1", "b2", "b3"]));
+    let delay = Duration::from_millis(800);
+    let addr_a = slow_proxy(upstream(&a).await, delay).await;
+    let addr_b = slow_proxy(upstream(&b).await, delay).await;
+    let ups = vec![
+        Upstream {
+            name: "alpha".into(),
+            url: format!("http://{addr_a}"),
+            key: None,
+        },
+        Upstream {
+            name: "beta".into(),
+            url: format!("http://{addr_b}"),
+            key: None,
+        },
+    ];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        let (_, h) = http_get(hub_addr, "/healthz").await;
+        if h["upstreams"]
+            .as_array()
+            .is_some_and(|u| u.iter().all(|x| x["online"] == true))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 每台的每個請求都慢 0.8 秒：依序問要 1.6 秒以上，並行約 0.8 秒
+    let t = std::time::Instant::now();
+    let (st, body) = http_get(hub_addr, "/api/sessions?limit=4").await;
+    let took = t.elapsed();
+    assert_eq!(st, 200, "{body}");
+    assert!(took < Duration::from_millis(1400), "逐台等待：{took:?}");
+    let ids: Vec<&str> = body["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4, "合併後截到 limit：{ids:?}");
+    assert_eq!(
+        &ids[..2],
+        ["a3", "b3"],
+        "依開始時間由新到舊，同時間依 host：{ids:?}"
+    );
+}
+
+/// E-H5（#756）：只有 sessions/<id>/events 與 projects/replay 要改寫加 host；其他 /api/* 原封轉送上游的 bytes
+/// （不解析、不重新序列化約 1 MB 的檔案樹與 diff）。前提：hub 沒有遠端客戶端——只綁 loopback、
+/// 帶轉發標頭的一律 403（hub_refuses_reverse_proxied_requests 鎖住），所以上游給本機版本可以原封送。
+#[tokio::test]
+async fn hub_relays_non_rewritten_api_bytes_unchanged() {
+    let repo = tmp("eh5-repo");
+    let git = |args: &[&str]| {
+        let mut c = std::process::Command::new("git");
+        for (k, _) in std::env::vars() {
+            if k.starts_with("GIT_") {
+                c.env_remove(k);
+            }
+        }
+        assert!(
+            c.current_dir(&repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false"
+                ])
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+    let cwd = repo
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let evs = [started("s1", 1, 1000, &cwd), text("s1", 2, 1, 1001)];
+    let web = collector("eh5", &evs);
+    let up = upstream(&web).await;
+    let ups = vec![Upstream {
+        name: "alpha".into(),
+        url: format!("http://{up}"),
+        key: None,
+    }];
+    let (hub_addr, _task) = hub::serve("127.0.0.1:0".parse().unwrap(), ups, None, TOKEN.into())
+        .await
+        .unwrap();
+    let enc: String = cwd
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect();
+    for _ in 0..100 {
+        if http_get(hub_addr, &format!("/api/sessions?cwd={enc}"))
+            .await
+            .1["sessions"][0]["id"]
+            == "s1"
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let path = format!("/api/files?cwd={enc}&base=main");
+    let direct = hub::http_get(&format!("http://{up}"), &path, None)
+        .await
+        .unwrap();
+    let via = hub::http_get(&format!("http://{hub_addr}"), &path, Some(TOKEN))
+        .await
+        .unwrap();
+    assert_eq!(direct.status, 200);
+    assert!(
+        String::from_utf8_lossy(&direct.body).contains("a.txt"),
+        "前提：有改動"
+    );
+    assert_eq!(via.body, direct.body, "原封轉送");
+    // 要改寫的照舊帶 host
+    let (_, ev) = http_get(hub_addr, "/api/sessions/s1/events?limit=5").await;
+    assert_eq!(ev["events"][0]["host"], "alpha", "{ev}");
+}
+
+/// 不經 helper 的原始請求：回 (狀態碼, 標頭, 內文)。
+async fn raw(addr: SocketAddr, path: &str, extra: &[(&str, &str)]) -> (u16, String, String) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    tokio::io::AsyncWriteExt::write_all(&mut s, req.as_bytes())
+        .await
+        .unwrap();
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut s, &mut out)
+        .await
+        .unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap_or((&out, ""));
+    let code = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (code, head.to_string(), body.to_string())
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case(name).then(|| v.trim())
+    })
+}
+
+/// W-M8（#782）：4802 是整台機器共用的 127.0.0.1，hub 又拿著上游的金鑰（常是 operate）。
+/// 沒有啟動時印出的 token、也沒有用它換到的 cookie，`/api` 與 `/ws` 一律 401。
+#[tokio::test]
+async fn hub_requires_its_startup_token_then_a_cookie() {
+    let (hub_addr, _task) = hub::serve(
+        "127.0.0.1:0".parse().unwrap(),
+        Vec::new(),
+        None,
+        TOKEN.into(),
+    )
+    .await
+    .unwrap();
+    // 什麼都沒帶、帶錯的 token／cookie：401
+    for extra in [
+        vec![],
+        vec![("Authorization", "Bearer nope")],
+        vec![("Cookie", "coding-lab-hub=nope")],
+    ] {
+        let (code, _, _) = raw(hub_addr, "/api/sessions", &extra).await;
+        assert_eq!(code, 401, "{extra:?}");
+    }
+    let (code, _, _) = raw(hub_addr, "/api/sessions?token=nope", &[]).await;
+    assert_eq!(code, 401);
+    let ws = tokio_tungstenite::connect_async(format!("ws://{hub_addr}/ws")).await;
+    match ws {
+        Err(tokio_tungstenite::tungstenite::Error::Http(r)) => assert_eq!(r.status(), 401),
+        other => panic!("沒帶 token 的 WS 要 401：{:?}", other.map(|_| ())),
+    }
+    // 前端遇到 401 會導去 /auth/login：說明要用 hub 印出的網址開
+    let (code, head, body) = raw(hub_addr, "/auth/login", &[]).await;
+    assert_eq!(code, 200);
+    assert!(
+        header(&head, "content-type")
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(
+        body.contains("coding-lab hub"),
+        "要說明怎麼拿到網址：{body}"
+    );
+    assert!(!body.contains(TOKEN));
+    // healthz 不用 token，但沒有 token 時不列上游
+    let (code, _, body) = raw(hub_addr, "/healthz", &[]).await;
+    assert_eq!(code, 200);
+    let h: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(h["hub"], true);
+    assert!(h.get("upstreams").is_none(), "{h}");
+
+    // 印出的網址：token 換 cookie，轉回不帶 token 的網址（token 不留在網址列與歷史紀錄）
+    let (code, head, _) = raw(hub_addr, &format!("/?token={TOKEN}"), &[]).await;
+    assert_eq!(code, 303);
+    assert_eq!(header(&head, "location"), Some("/"));
+    let set = header(&head, "set-cookie").expect("要發 cookie");
+    for attr in ["HttpOnly", "SameSite=Strict", "Path=/"] {
+        assert!(set.contains(attr), "{set}");
+    }
+    let cookie = set.split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("coding-lab-hub="), "{cookie}");
+
+    // cookie 與 Bearer 都可以用
+    let (code, _, _) = raw(hub_addr, "/api/sessions", &[("Cookie", &cookie)]).await;
+    assert_eq!(code, 200);
+    let (code, _, _) = raw(
+        hub_addr,
+        "/api/sessions",
+        &[("Cookie", &format!("other=1; {cookie}"))],
+    )
+    .await;
+    assert_eq!(code, 200, "和別的 cookie 一起送也認得");
+    let bearer = format!("Bearer {TOKEN}");
+    let (code, _, body) = raw(hub_addr, "/healthz", &[("Authorization", &bearer)]).await;
+    assert_eq!(code, 200);
+    let h: Value = serde_json::from_str(&body).unwrap();
+    assert!(h["upstreams"].is_array(), "有 token 才列上游：{h}");
+    let mut req = format!("ws://{hub_addr}/ws").into_client_request().unwrap();
+    req.headers_mut().insert("Cookie", cookie.parse().unwrap());
+    let mut ws = tokio_tungstenite::connect_async(req).await.unwrap().0;
+    send(&mut ws, json!({"op": "hello", "protocol": 1})).await;
+    assert_eq!(recv(&mut ws).await["t"], "welcome");
 }

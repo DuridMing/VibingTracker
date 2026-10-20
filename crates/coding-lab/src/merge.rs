@@ -4,7 +4,7 @@
 //! 串流位置 `pos` 只在 transcript 的行到達（或逾時降級）時配給，每個 session 只增不減，
 //! 所以已經顯示的東西永遠不會被往後擠。
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Map, Value};
 
@@ -12,13 +12,14 @@ use crate::derive;
 use crate::event::{
     AgentFinished, AgentSpawned, AssistantDisplay, AssistantText, AssistantThinking, AttentionKind,
     CONTRACT_VERSION, CompactFinished, CompactStarted, Danger, DangerLevel, Event, FileEdit,
-    FileRead, FileWrite, HunkSource, LineRef, ModelChanged, Payload, Placement, PromptSubmitted,
-    SessionEnded, SessionStarted, ToolCalled, ToolPlaced, ToolResult, ToolStatus, ToolUpdated,
-    TranscriptHealth, TurnStopped, Usage,
+    FileRead, FileWrite, Hunk, HunkSource, LineRef, ModelChanged, Payload, Placement,
+    PromptSubmitted, SessionEnded, SessionStarted, SessionState, ToolCalled, ToolPlaced,
+    ToolResult, ToolStatus, ToolUpdated, TranscriptHealth, TurnStopped, Usage, is_command_tool,
 };
 use crate::hook::HookInput;
 use crate::prices::Prices;
 use crate::status::{self, Change, OpenItem, Signal, Tracker};
+use crate::text;
 
 /// 暫存區等 transcript 的上限（實測最慢 4.5 秒的兩倍以上）。
 pub const FALLBACK_AFTER_MS: u64 = 10_000;
@@ -26,6 +27,8 @@ pub const FALLBACK_AFTER_MS: u64 = 10_000;
 pub const FALLBACK_WAIT_MS: u64 = 60_000;
 /// session 結束後在記憶體留多久（晚到的 transcript 行、tail 關掉前最後一次讀檔）。
 pub const SESSION_EVICT_AFTER_MS: u64 = 10 * 60 * 1000;
+/// 完成的卡片（已進串流、已結束、結果已送）在記憶體留多久：給重複送達的 hook（K-3）與晚到的行，之後釋放（K-12）。
+pub const CARD_KEEP_MS: u64 = 10 * 60 * 1000;
 /// 沒有 SessionEnd（終端機被直接關掉）的 session，多久沒有任何事件就移除。
 pub const SESSION_IDLE_EVICT_MS: u64 = 24 * 60 * 60 * 1000;
 /// SubagentStart 有好幾個候選呼叫時，等 meta.json／PostToolUse 的 agentId 的上限；過了依呼叫順序配對（#680）。
@@ -113,6 +116,10 @@ struct Card {
     called: bool,
     /// 命中敏感規則（#654）：tool.result 帶 sensitive，遠端送出時剝除
     sensitive: bool,
+    /// 已處理過的工具 hook（[`tool_hook_bit`]）：同一個 hook 收到兩次只處理第一次（K-3）
+    hooks_seen: u8,
+    /// 第一次被檢查到「完成」的時間；過了 [`CARD_KEEP_MS`] 就釋放（K-12）
+    done_at: Option<u64>,
 }
 
 impl Card {
@@ -125,8 +132,72 @@ impl Card {
             finished: false,
             called: false,
             sensitive: false,
+            hooks_seen: 0,
+            done_at: None,
         }
     }
+
+    /// 已進串流、已結束、結果也送了：之後只剩重複送達的 hook 會用到它
+    fn is_done(&self) -> bool {
+        self.called && self.staged_at.is_none() && self.finished && self.result_sent
+    }
+}
+
+/// 已處理過的行的 uuid。transcript 的 uuid 都是小寫的標準格式，存成 `u128`（一個 String 的約 1/4，E-M5）；
+/// 不是這個格式的退回存字串，比對結果和存字串一樣。
+#[derive(Default)]
+struct SeenUuids {
+    packed: HashSet<u128>,
+    other: HashSet<String>,
+}
+
+impl SeenUuids {
+    /// 第一次看到回 true
+    fn insert(&mut self, uuid: &str) -> bool {
+        match pack_uuid(uuid) {
+            Some(n) => self.packed.insert(n),
+            None => self.other.insert(uuid.to_string()),
+        }
+    }
+}
+
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`（小寫 16 進位）→ 128 位元；其他格式回 None。
+/// 只收小寫，`ABC…` 與 `abc…` 才不會被當成同一個（和存字串時一樣）。
+fn pack_uuid(s: &str) -> Option<u128> {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return None;
+    }
+    let mut n: u128 = 0;
+    for (i, c) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let d = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        n = (n << 4) | u128::from(d);
+    }
+    Some(n)
+}
+
+/// 檢查完成卡片的間隔：tick 不必每次走過所有卡片（E-M4）
+const CARD_SWEEP_EVERY_MS: u64 = 60_000;
+
+/// 帶 tool_use_id、每張卡片最多一次的 hook。URL 重複或裝了兩份 plugin 時同一個 hook 會收到兩次（K-3）。
+fn tool_hook_bit(event: &str) -> Option<u8> {
+    Some(match event {
+        "PreToolUse" => 1,
+        "PostToolUse" => 2,
+        "PostToolUseFailure" => 4,
+        "PermissionDenied" => 8,
+        _ => return None,
+    })
 }
 
 #[derive(Default)]
@@ -134,7 +205,11 @@ struct Session {
     seq: u64,
     pos: u64,
     cards: HashMap<String, Card>,
-    seen_uuids: HashSet<String>,
+    /// 還在暫存區的卡片 (暫存時間, tool_use_id)：tick 的逾時降級與 Degraded 只看這裡，不走過所有卡片（E-M4）。
+    /// 卡片的 `staged_at` 有值 ⇔ 在這裡
+    staged: BTreeSet<(u64, String)>,
+    /// 已處理過的行的 uuid：重讀被替換或截短的檔時不重複（session 存在期間都要留，見 [`SeenUuids`]）
+    seen_uuids: SeenUuids,
     degraded: HashSet<String>,
     /// TailReset 之後有效的 tail 編號下限（每個檔、整個 session）：比它舊的 tail 送來的降級訊號不理（#684 R20）
     tail_floor: HashMap<String, u64>,
@@ -145,7 +220,9 @@ struct Session {
     /// file.* 的路徑基準：第一次 SessionStart 的 cwd（#672）；之後的 hook 與 SessionStart 都不改
     cwd: Option<String>,
     last_model: HashMap<String, String>,
-    seen_messages: HashSet<String>,
+    /// 每個 transcript 檔最後一則 assistant 訊息的 message.id：同一則拆成多行時 usage 只算第一行。
+    /// 同一則的行在檔內一定連續（本機 17,586 則實測），不用留所有見過的 id（K-12、K-13）
+    last_message: HashMap<String, String>,
     pending_agents: Vec<PendingAgent>,
     /// 已知的 agent_id → 呼叫的 tool_use_id：PostToolUse 的 `tool_response.agentId`、meta.json 的 `toolUseId`（#680）
     known_agents: HashMap<String, String>,
@@ -185,6 +262,19 @@ struct HeldTool {
     hook: HookInput,
     agent_id: String,
     ts_seen: u64,
+}
+
+/// 完成的卡片第一次檢查到時記下時間，滿 [`CARD_KEEP_MS`] 後釋放（K-12）：長開的 session 不再一直累積卡片。
+/// 還在等 transcript tool_use 行的（已降級進串流）不算完成，行到了才不會再建一次。
+fn release_done_cards(s: &mut Session, now: u64) {
+    let waiting = &s.fallback_waiting;
+    s.cards.retain(|id, c| {
+        if !c.is_done() || waiting.contains_key(id) {
+            return true;
+        }
+        let since = *c.done_at.get_or_insert(now);
+        since + CARD_KEEP_MS > now
+    });
 }
 
 /// 已呼叫 Agent／Task 工具、還沒對到 SubagentStart 的 subagent。
@@ -244,6 +334,8 @@ pub struct Merger {
     cost_baseline: Option<f64>,
     /// 「等你」保底判斷的門檻（#706）；新建的 session 套用它
     wait_guess_ms: u64,
+    /// 上一次檢查完成卡片的時間（K-12）
+    card_sweep_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -257,6 +349,12 @@ struct Resumed {
     ended_at: Option<u64>,
     idle: bool,
     last_seen: Option<u64>,
+    /// 重啟前還在暫存區的卡片（K-8）
+    cards: Vec<(String, Card)>,
+    /// 重啟前每個檔最後算過 usage 的 message.id（K-13）
+    last_message: HashMap<String, String>,
+    /// store 的 session 狀態（見 [`Merger::resume_status`]）
+    status: Option<SessionState>,
 }
 
 impl Merger {
@@ -269,6 +367,7 @@ impl Merger {
             resumed: HashMap::new(),
             cost_baseline: None,
             wait_guess_ms: status::WAIT_GUESS_AFTER_MS,
+            card_sweep_at: None,
         }
     }
 
@@ -287,6 +386,66 @@ impl Merger {
         r.cwd = (!cwd.is_empty()).then(|| cwd.to_string());
     }
 
+    /// collector 重啟時（K-8）：重啟前收到 PreToolUse、transcript 的 tool_use 行還沒到的暫存卡片種回，
+    /// 行到了照常依行號放進串流（不再發第二筆 tool.called）。`recent` 是 store 最近的 Event（依 seq）；
+    /// 暫存時間從 `now` 重新算，重啟後的 tail 補讀有完整的 [`FALLBACK_AFTER_MS`] 可以趕上，等不到才降級。
+    /// 同時種回每個檔最後算過 usage 的訊息：重啟時正在寫的那則訊息，之後的行不再算一次（K-13）。
+    pub fn resume_staged(&mut self, recent: &[Event], now: u64) {
+        let mut staged: BTreeMap<(&str, &str), Card> = BTreeMap::new();
+        for e in recent {
+            if e.kind == "usage"
+                && let Some(m) = e.payload["messageId"].as_str()
+            {
+                self.resumed
+                    .entry(e.session.clone())
+                    .or_default()
+                    .last_message
+                    .insert(file_of(&e.agent), m.to_string());
+                continue;
+            }
+            let Some(id) = e.payload["toolUseId"].as_str() else {
+                continue;
+            };
+            let key = (e.session.as_str(), id);
+            match e.kind.as_str() {
+                "tool.called" if e.payload["placement"] == "staged" => {
+                    let card = Card {
+                        staged_at: Some(now),
+                        called: true,
+                        sensitive: e.payload["sensitive"].as_bool().unwrap_or(false),
+                        // 重啟前的 PreToolUse 已經處理過
+                        hooks_seen: tool_hook_bit("PreToolUse").unwrap_or(0),
+                        ..Card::new(&e.agent)
+                    };
+                    staged.insert(key, card);
+                }
+                "tool.placed" => {
+                    staged.remove(&key);
+                }
+                "tool.updated"
+                    if matches!(e.payload["status"].as_str(), Some("done" | "failed")) =>
+                {
+                    if let Some(c) = staged.get_mut(&key) {
+                        c.finished = true;
+                    }
+                }
+                "tool.result" => {
+                    if let Some(c) = staged.get_mut(&key) {
+                        c.result_sent = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ((sid, id), card) in staged {
+            self.resumed
+                .entry(sid.to_string())
+                .or_default()
+                .cards
+                .push((id.to_string(), card));
+        }
+    }
+
     /// collector 重啟時，把 store 裡 session 的結束時間、是否中斷（status idle）與最後一筆 Event 的時間
     /// 交給 merge（D3，#679）：session 回到記憶體時種回 Tracker，下一個 prompt 才會送 run；
     /// 已結束的不會被當成丟棄；沒結束、之後也沒再回來的，沒有輸入滿 [`SESSION_IDLE_EVICT_MS`] 時補 abandoned。
@@ -295,6 +454,12 @@ impl Merger {
         r.ended_at = ended_at;
         r.idle = idle;
         r.last_seen = Some(last_seen);
+    }
+
+    /// collector 重啟時，把 store 的 session 狀態交給 merge：已確認（不種回注意項目）的 done／fail 在沒重啟也會解除它的
+    /// 事件之前照樣是這個狀態，上一輪晚到的行不會把它算成 run（#749）。
+    pub fn resume_status(&mut self, sid: &str, status: SessionState) {
+        self.resumed.entry(sid.to_string()).or_default().status = Some(status);
     }
 
     /// collector 重啟時，把 store 裡還開著（未解除、未確認）的注意項目交給 merge，session 回到記憶體時
@@ -332,8 +497,18 @@ impl Merger {
                 (s.seq, s.pos, s.cwd) = (r.seq, r.pos, r.cwd);
                 s.ended_at = r.ended_at;
                 s.last_seen = r.last_seen.unwrap_or(0);
+                s.last_message = r.last_message;
                 for item in r.open {
                     s.status.seed_open(item);
+                }
+                for (id, card) in r.cards {
+                    if let Some(t) = card.staged_at {
+                        s.staged.insert((t, id.clone()));
+                    }
+                    s.cards.insert(id, card);
+                }
+                if let Some(st) = r.status {
+                    s.status.seed_status(st);
                 }
                 s.status.seed_state(r.ended_at.is_some(), r.idle);
             }
@@ -352,6 +527,11 @@ impl Merger {
     /// 記憶體裡的 session 數。
     pub fn session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    /// 記憶體裡這個 session 的卡片數（測試確認完成的卡片會釋放，K-12）
+    pub fn card_count(&self, sid: &str) -> usize {
+        self.sessions.get(sid).map_or(0, |s| s.cards.len())
     }
 
     pub fn handle(&mut self, input: Input) -> Vec<Event> {
@@ -393,7 +573,7 @@ impl Merger {
                 no,
                 value,
                 ts_seen,
-            } => self.on_line(&session, &file, no, &value, ts_seen),
+            } => self.on_line(&session, &file, no, value, ts_seen),
             Input::Degraded {
                 session,
                 file,
@@ -421,7 +601,11 @@ impl Merger {
                         ..Meta::default()
                     },
                 ));
-                out.extend(self.fall_back(&session, |c| file_of(&c.agent) == file_name, ts_seen));
+                out.extend(self.fall_back(
+                    &session,
+                    |_, c| file_of(&c.agent) == file_name,
+                    ts_seen,
+                ));
                 out
             }
             Input::Recovered {
@@ -526,6 +710,10 @@ impl Merger {
                     ended_at: s.ended_at,
                     idle: s.status.is_idle(),
                     last_seen: None,
+                    // 移出前暫存的卡片早就逾時降級了
+                    cards: Vec::new(),
+                    last_message: s.last_message,
+                    status: s.status.seeded_status(),
                 };
                 self.resumed.insert(id, r);
             }
@@ -615,6 +803,15 @@ impl Merger {
     /// 把暫存超過 [`FALLBACK_AFTER_MS`] 的卡片放進串流末端。
     pub fn tick(&mut self, now: u64) -> Vec<Event> {
         let mut out = self.evict(now);
+        if self
+            .card_sweep_at
+            .is_none_or(|t| now >= t + CARD_SWEEP_EVERY_MS)
+        {
+            self.card_sweep_at = Some(now);
+            for s in self.sessions.values_mut() {
+                release_done_cards(s, now);
+            }
+        }
         let sessions: Vec<String> = self.sessions.keys().cloned().collect();
         for sid in sessions {
             let changes = match self.sessions.get_mut(&sid) {
@@ -626,30 +823,31 @@ impl Merger {
                 }
                 None => Vec::new(),
             };
-            out.extend(self.fall_back(
-                &sid,
-                |c| c.staged_at.is_some_and(|t| t + FALLBACK_AFTER_MS <= now),
-                now,
-            ));
+            out.extend(self.fall_back(&sid, |t, _| t + FALLBACK_AFTER_MS <= now, now));
             out.extend(self.apply(&sid, changes, "main", now));
             out.extend(self.agents_tick(&sid, now));
         }
         out
     }
 
-    /// 把 `due` 選中的暫存卡片依暫存先後放進串流末端。
-    fn fall_back(&mut self, sid: &str, due: impl Fn(&Card) -> bool, ts_seen: u64) -> Vec<Event> {
+    /// 把 `due`（暫存時間, 卡片）選中的暫存卡片依暫存先後放進串流末端。
+    fn fall_back(
+        &mut self,
+        sid: &str,
+        due: impl Fn(u64, &Card) -> bool,
+        ts_seen: u64,
+    ) -> Vec<Event> {
         let Some(s) = self.sessions.get(sid) else {
             return Vec::new();
         };
-        let mut ids: Vec<(u64, String)> = s
-            .cards
+        let ids: Vec<String> = s
+            .staged
             .iter()
-            .filter_map(|(id, c)| c.staged_at.filter(|_| due(c)).map(|t| (t, id.clone())))
+            .filter(|(t, id)| s.cards.get(id).is_some_and(|c| due(*t, c)))
+            .map(|(_, id)| id.clone())
             .collect();
-        ids.sort();
         let mut out = Vec::new();
-        for (_, id) in ids {
+        for id in ids {
             out.push(self.place(sid, &id, Placement::Fallback, None, None, ts_seen));
         }
         out
@@ -668,7 +866,9 @@ impl Merger {
         let s = self.session(sid);
         let agent = match s.cards.get_mut(id) {
             Some(card) => {
-                card.staged_at = None;
+                if let Some(t) = card.staged_at.take() {
+                    s.staged.remove(&(t, id.to_string()));
+                }
                 card.agent.clone()
             }
             None => "main".into(),
@@ -772,6 +972,37 @@ impl Merger {
     fn on_hook(&mut self, h: &HookInput, ts_seen: u64) -> Vec<Event> {
         let sid = h.session_id().to_string();
         let agent = self.agent_of_hook(&sid, h);
+        let once = tool_hook_bit(h.event_name()).zip(h.tool_use_id().map(str::to_string));
+        if let Some((bit, id)) = &once
+            && self
+                .sessions
+                .get(&sid)
+                .and_then(|s| s.cards.get(id))
+                .is_some_and(|c| c.hooks_seen & bit != 0)
+        {
+            return Vec::new();
+        }
+        let out = self.on_hook_once(h, &sid, agent, ts_seen);
+        // 只記在已經有的卡片上：背景 agent 先扣著的 PreToolUse 還沒有卡片，不能替它建（建了就當成已知）
+        if let Some((bit, id)) = once
+            && let Some(c) = self
+                .sessions
+                .get_mut(&sid)
+                .and_then(|s| s.cards.get_mut(&id))
+        {
+            c.hooks_seen |= bit;
+        }
+        out
+    }
+
+    fn on_hook_once(
+        &mut self,
+        h: &HookInput,
+        sid: &str,
+        agent: String,
+        ts_seen: u64,
+    ) -> Vec<Event> {
+        let sid = sid.to_string();
         let mut out = Vec::new();
         if agent == "bg" {
             let (prefix, done) = self.on_background_tool(h, &sid, ts_seen);
@@ -806,7 +1037,8 @@ impl Merger {
             && !matches!(h.event_name(), "SessionStart" | "SessionEnd")
             && self.path_base(&sid).is_none()
         {
-            let cwd = s("cwd").unwrap_or_default().replace('\\', "/");
+            // 磁碟機代號大寫（L-11）；transcript_path 只換斜線，tail 用原樣的路徑比對重啟前的紀錄
+            let cwd = crate::paths::normalize(h.str_field("cwd").unwrap_or_default());
             if !cwd.is_empty() {
                 let p = SessionStarted {
                     cwd,
@@ -821,7 +1053,7 @@ impl Merger {
         match h.event_name() {
             "SessionStart" => {
                 let p = SessionStarted {
-                    cwd: s("cwd").unwrap_or_default().replace('\\', "/"),
+                    cwd: crate::paths::normalize(h.str_field("cwd").unwrap_or_default()),
                     source: s("source").unwrap_or_else(|| "startup".into()),
                     model: s("model"),
                     transcript_path: s("transcript_path").map(|p| p.replace('\\', "/")),
@@ -830,15 +1062,15 @@ impl Merger {
                 out.extend(self.start_session(&sid, p, &agent, meta(), ts_seen));
             }
             "UserPromptSubmit" => {
-                let prompt = s("prompt").unwrap_or_default();
+                let prompt = h.str_field("prompt").unwrap_or_default();
                 let p = PromptSubmitted {
-                    text: truncate(&prompt, PROMPT_LIMIT).0,
+                    text: truncate(prompt, PROMPT_LIMIT).0,
                     prompt_id: s("prompt_id"),
-                    source: status::is_task_notification(&prompt).then(|| "task".into()),
+                    source: status::is_task_notification(prompt).then(|| "task".into()),
                 };
                 out.push(self.emit(&sid, Payload::PromptSubmitted(p), meta()));
                 // 被 TaskStop 停掉的背景 agent 沒有 SubagentStop，只有這個通知（#677）
-                let notice = status::parse_task_notification(&prompt).filter(|n| {
+                let notice = status::parse_task_notification(prompt).filter(|n| {
                     self.sessions
                         .get(&sid)
                         .is_some_and(|ss| ss.started_agents.contains(&n.task_id))
@@ -850,22 +1082,14 @@ impl Merger {
                 {
                     self.tracker(&sid).signal(Signal::SubagentFail, ts_seen);
                 }
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                if let Some(n) = &notice {
-                    out.extend(self.agent_by_order(&sid, &n.task_id, ts_seen));
-                }
-                if let Some(n) = notice
-                    && let Some(ss) = self.sessions.get_mut(&sid)
-                    && ss.finished_agents.insert(n.task_id.clone())
-                {
-                    ss.held_bg.retain(|_, h| h.agent_id != n.task_id);
+                if let Some(n) = notice {
                     let p = AgentFinished {
                         agent_id: n.task_id,
                         last_message: None,
                         transcript_path: None,
                         status: n.status,
                     };
-                    out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                    out.extend(self.finish_agent(&sid, p, meta()));
                 }
                 let changes = self.tracker(&sid).prompt(s("prompt_id"), ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
@@ -882,12 +1106,13 @@ impl Merger {
                     error: None,
                     interrupted: None,
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
-                let output = response_text(h.field("tool_response"));
-                out.extend(self.result_once(&sid, &id, true, None, &output, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta()));
+                let output = || response_text(h.field("tool_response"), OUTPUT_LIMIT);
+                out.extend(self.result_once(&sid, &id, true, None, output, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, h.field("tool_response"), true, meta));
                 // Agent／Task 的結果帶 agentId（背景 agent 啟動時、前景 agent 結束時）：subagent 對應哪個呼叫（#680）
                 if matches!(h.str_field("tool_name"), Some("Agent" | "Task"))
                     && let Some(a) = h
@@ -903,20 +1128,26 @@ impl Merger {
                 let Some(id) = h.tool_use_id().map(str::to_string) else {
                     return out;
                 };
-                let error = s("error").unwrap_or_default();
+                // 先截再複製：不整串 clone（E-M12）
+                let error = h.str_field("error").unwrap_or_default();
                 let p = ToolUpdated {
                     tool_use_id: id.clone(),
                     status: ToolStatus::Failed,
                     duration_ms: h.field("duration_ms").and_then(Value::as_u64),
-                    error: Some(truncate(&error, MESSAGE_LIMIT).0),
+                    error: Some(truncate(error, MESSAGE_LIMIT).0),
                     interrupted: h.field("is_interrupt").and_then(Value::as_bool),
                     danger: None,
+                    denied: false,
                 };
                 self.mark_finished(&sid, &id, &agent);
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
-                let code = exit_code(&error);
-                out.extend(self.result_once(&sid, &id, false, code, &error, &agent, ts_seen));
-                out.extend(self.git_op(h, &sid, &id, None, false, meta()));
+                let code = exit_code(error);
+                let output = || {
+                    let (kept, cut) = text::truncate_bytes(error, OUTPUT_LIMIT);
+                    (kept.to_string(), cut)
+                };
+                out.extend(self.result_once(&sid, &id, false, code, output, &agent, ts_seen));
+                out.extend(self.git_op(h, &sid, &id, None, false, meta));
                 let interrupt = h.field("is_interrupt").and_then(Value::as_bool) == Some(true);
                 let ok = (!interrupt).then_some(false);
                 out.extend(self.tool_ended(h, &sid, &id, &agent, ok, ts_seen));
@@ -933,14 +1164,14 @@ impl Merger {
                     error: s("reason"),
                     interrupted: None,
                     danger: None,
+                    denied: true,
                 };
                 out.push(self.emit(&sid, Payload::ToolUpdated(p), meta()));
                 out.extend(self.tool_ended(h, &sid, &id, &agent, None, ts_seen));
             }
             "Stop" => {
                 let p = TurnStopped {
-                    last_message: s("last_assistant_message")
-                        .map(|m| truncate(&m, MESSAGE_LIMIT).0),
+                    last_message: h.str_field("last_assistant_message").map(last_message),
                 };
                 out.push(self.emit(&sid, Payload::TurnStopped(p), meta()));
                 if agent == "main" {
@@ -986,35 +1217,44 @@ impl Merger {
                 let Some(agent_id) = s("agent_id").filter(|a| !a.is_empty()) else {
                     return out;
                 };
-                // 還在等配對就先配好、發出 spawn：agent.finished 不能比 agent.spawned 早
-                out.extend(self.agent_by_order(&sid, &agent_id, ts_seen));
-                let ss = self.session(&sid);
-                ss.held_bg.retain(|_, h| h.agent_id != agent_id);
-                if !ss.finished_agents.insert(agent_id.clone()) {
-                    return out;
-                }
                 let p = AgentFinished {
                     agent_id,
-                    last_message: s("last_assistant_message")
-                        .map(|m| truncate(&m, MESSAGE_LIMIT).0),
+                    last_message: h.str_field("last_assistant_message").map(last_message),
                     transcript_path: s("agent_transcript_path").map(|p| p.replace('\\', "/")),
                     status: None,
                 };
-                out.push(self.emit(&sid, Payload::AgentFinished(p), meta()));
+                out.extend(self.finish_agent(&sid, p, meta()));
             }
             "PermissionRequest" => {
-                let tool = h.str_field("tool_name").unwrap_or_default().to_string();
-                let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
-                self.tracker(&sid)
-                    .permission_request(&tool, &input, ts_seen);
+                let tool = h.str_field("tool_name").unwrap_or_default();
+                let input = h.field("tool_input").unwrap_or(&Value::Null);
+                self.tracker(&sid).permission_request(tool, input, ts_seen);
             }
             "PostToolBatch" => {
-                let changes = self.tracker(&sid).batch_done(ts_seen);
+                let changes = self.tracker(&sid).batch_done(&agent, ts_seen);
                 out.extend(self.apply(&sid, changes, &agent, ts_seen));
             }
             // Notification（idle_prompt、permission_prompt）只當補強，P3 先不用（PLAN「注意佇列」）
             _ => {}
         }
+        out
+    }
+
+    /// 一個 subagent 結束（SubagentStop，或被 TaskStop 停掉的背景 agent 的 task-notification；E-M9）：
+    /// 先配好還在等配對的、發出 spawn（agent.finished 不能比 agent.spawned 早），每個 agent 只結束一次，
+    /// 它留下的連續失敗跟著解除（K-1）。
+    fn finish_agent(&mut self, sid: &str, p: AgentFinished, meta: Meta) -> Vec<Event> {
+        let ts_seen = meta.ts_seen;
+        let agent_id = p.agent_id.clone();
+        let mut out = self.agent_by_order(sid, &agent_id, ts_seen);
+        let ss = self.session(sid);
+        ss.held_bg.retain(|_, h| h.agent_id != agent_id);
+        if !ss.finished_agents.insert(agent_id.clone()) {
+            return out;
+        }
+        out.push(self.emit(sid, Payload::AgentFinished(p), meta));
+        let changes = self.tracker(sid).agent_finished(&agent_id, ts_seen);
+        out.extend(self.apply(sid, changes, &agent_id, ts_seen));
         out
     }
 
@@ -1173,7 +1413,9 @@ impl Merger {
         let t = self.tracker(sid);
         let mut changes = t.tool_finished(id, ts_seen);
         match (ok, h.str_field("tool_name")) {
-            (Some(ok), Some("Bash")) => changes.extend(t.bash_result(agent, id, ok, ts_seen)),
+            (Some(ok), Some(tool)) if is_command_tool(tool) => {
+                changes.extend(t.bash_result(agent, id, ok, ts_seen))
+            }
             // subagent 失敗（#674）：Agent／Task 工具失敗；Esc 中斷（ok 為 None）不算
             (Some(false), Some("Agent" | "Task")) => t.signal(Signal::SubagentFail, ts_seen),
             _ => {}
@@ -1280,13 +1522,13 @@ impl Merger {
             return Vec::new();
         };
         let tool = h.str_field("tool_name").unwrap_or_default().to_string();
-        let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
-        let danger = self.danger.check(&tool, &input);
-        let sensitive = crate::sensitive::is_sensitive(&tool, &input);
+        let input = h.field("tool_input").unwrap_or(&Value::Null);
+        let danger = self.danger.check(&tool, input);
+        let sensitive = crate::sensitive::is_sensitive(&tool, input);
         let raw = Some(h.raw().clone());
         let session = self.session(sid);
         let degraded = session.degraded.contains(&file_of(&agent));
-        session.status.tool_started(&id, &tool, &input);
+        session.status.tool_started(&id, &tool, input, &agent);
         let mut out = Vec::new();
 
         if session.cards.contains_key(&id) {
@@ -1298,6 +1540,7 @@ impl Merger {
                 error: None,
                 interrupted: None,
                 danger: danger.clone(),
+                denied: false,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1317,7 +1560,10 @@ impl Merger {
                     ..Card::new(&agent)
                 },
             );
-            let (input, input_truncated) = truncate_input(input);
+            session.staged.insert((ts_seen, id.clone()));
+            // tool.called 的 input：每個超過 OUTPUT_LIMIT 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）。
+            // Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
+            let (input, input_truncated) = text::truncated_clone(input, OUTPUT_LIMIT);
             let p = ToolCalled {
                 tool_use_id: id.clone(),
                 tool,
@@ -1326,6 +1572,7 @@ impl Merger {
                 placement: Placement::Staged,
                 danger: danger.clone(),
                 input_truncated,
+                sensitive,
             };
             let meta = Meta {
                 agent: agent.clone(),
@@ -1340,6 +1587,11 @@ impl Merger {
             }
         }
         out.extend(self.derive_from_pre(h, sid, &id, &agent, ts_seen));
+        // main 開始新的工具：這輪還沒完成（Stop hook 回 block 時不經 UserPromptSubmit，K-4）
+        if agent == "main" {
+            let changes = self.tracker(sid).main_tool_started(ts_seen);
+            out.extend(self.apply(sid, changes, &agent, ts_seen));
+        }
         // 危險不等 transcript：PreToolUse 一到就進注意佇列；warn 只在串流標示
         if let Some(d) = danger.filter(|d| d.level == DangerLevel::Danger) {
             let changes = self.tracker(sid).danger(&id, d.why, ts_seen);
@@ -1358,7 +1610,7 @@ impl Merger {
         ts_seen: u64,
     ) -> Vec<Event> {
         let tool = h.str_field("tool_name").unwrap_or_default();
-        let input = h.field("tool_input").cloned().unwrap_or(Value::Null);
+        let input = h.field("tool_input").unwrap_or(&Value::Null);
         let meta = || Meta {
             agent: agent.to_string(),
             ts_seen,
@@ -1371,10 +1623,43 @@ impl Merger {
                 .map(|p| derive::relative_path(&cwd, p))
         };
         let tool_use_id = id.to_string();
+        // 和 tool.called 同一個判斷（建卡時算過）
+        let sensitive = self
+            .sessions
+            .get(sid)
+            .and_then(|s| s.cards.get(id))
+            .is_some_and(|c| c.sensitive);
         let payload = match tool {
             "Read" => path().map(|path| Payload::FileRead(FileRead { tool_use_id, path })),
+            // 改了哪個檔，但沒有單一的 hunk（儲存格、多處改動）：hunk 為 null（W-L9、#746）
+            "NotebookEdit" | "MultiEdit" => input["notebook_path"]
+                .as_str()
+                .or_else(|| input["file_path"].as_str())
+                .map(|p| {
+                    Payload::FileEdit(FileEdit {
+                        tool_use_id,
+                        path: derive::relative_path(&cwd, p),
+                        hunk: None,
+                        hunk_source: HunkSource::None,
+                        truncated: false,
+                        sensitive,
+                        replace_all: false,
+                    })
+                }),
             "Edit" => path().map(|path| {
-                let hunk = h.probe().and_then(|p| p.hunk.clone());
+                // 多處取代只畫第一處會少算 +N／−M，乾脆不畫（D7）
+                let replace_all = input["replace_all"].as_bool() == Some(true);
+                let probed = h
+                    .probe()
+                    .and_then(|p| p.hunk.as_ref())
+                    .filter(|_| !replace_all);
+                let (hunk, truncated) = match probed {
+                    Some(hunk) => {
+                        let (hunk, cut) = bounded_hunk(hunk, OUTPUT_LIMIT);
+                        (Some(hunk), cut)
+                    }
+                    None => (None, false),
+                };
                 let hunk_source = if hunk.is_some() {
                     HunkSource::Pre
                 } else {
@@ -1385,6 +1670,9 @@ impl Merger {
                     path,
                     hunk,
                     hunk_source,
+                    sensitive,
+                    truncated,
+                    replace_all,
                 })
             }),
             "Write" => path().map(|path| {
@@ -1397,13 +1685,16 @@ impl Merger {
                 {
                     content.push('\n');
                 }
+                // 行數之外也限 bytes：一行就很大的檔（minified bundle）不能整份進 JSONL、live 與 snapshot（C7）
+                let cut = text::truncate_string(&mut content, OUTPUT_LIMIT);
                 Payload::FileWrite(FileWrite {
                     tool_use_id,
                     path,
                     is_new: !h.probe().is_some_and(|p| p.exists),
                     content,
-                    truncated: total > WRITE_PREVIEW_LINES,
+                    truncated: total > WRITE_PREVIEW_LINES || cut,
                     lines: Some(total as u64),
+                    sensitive,
                 })
             }),
             "Agent" | "Task" => {
@@ -1456,22 +1747,31 @@ impl Merger {
         id: &str,
         response: Option<&Value>,
         ok: bool,
-        meta: Meta,
+        meta: impl FnOnce() -> Meta,
     ) -> Option<Event> {
-        if h.str_field("tool_name") != Some("Bash") {
-            return None;
-        }
+        let tool = h.str_field("tool_name").filter(|t| is_command_tool(t))?;
         let command = h.field("tool_input").and_then(|i| i["command"].as_str())?;
-        let mut op = derive::git_op_from(command, response, ok)?;
+        let mut op = derive::git_op_from(&derive::normalize_command(tool, command), response, ok)?;
         op.tool_use_id = id.to_string();
-        Some(self.emit(sid, Payload::GitOp(op), Meta { raw: None, ..meta }))
+        // Meta（含 raw 的 clone）確定有 git 操作才建（E-M8）
+        Some(self.emit(
+            sid,
+            Payload::GitOp(op),
+            Meta {
+                raw: None,
+                ..meta()
+            },
+        ))
     }
 
     /// tool.result 以先到者為準（hook 或 transcript），每張卡片只送一次。
     /// 記下卡片已有結束狀態；回傳這次是不是第一次。
     fn mark_finished(&mut self, sid: &str, id: &str, agent: &str) -> bool {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         !std::mem::replace(&mut card.finished, true)
     }
 
@@ -1482,19 +1782,23 @@ impl Merger {
         id: &str,
         ok: bool,
         exit_code: Option<i32>,
-        output: &str,
+        output: impl FnOnce() -> (String, bool),
         agent: &str,
         ts_seen: u64,
     ) -> Option<Event> {
         let s = self.session(sid);
-        let card = s.cards.entry(id.to_string()).or_insert(Card::new(agent));
+        let card = s
+            .cards
+            .entry(id.to_string())
+            .or_insert_with(|| Card::new(agent));
         if card.result_sent {
             return None;
         }
         card.result_sent = true;
         let agent = card.agent.clone();
         let sensitive = card.sensitive;
-        let (output, truncated) = truncate(output, OUTPUT_LIMIT);
+        // 確定要送才組輸出，而且邊組邊截 8 KB：Edit／Read 的 tool_response 帶整個檔案（E-M1）
+        let (output, truncated) = output();
         let p = ToolResult {
             tool_use_id: id.to_string(),
             ok,
@@ -1516,10 +1820,18 @@ impl Merger {
 
     // ── transcript
 
-    fn on_line(&mut self, sid: &str, file: &str, no: u64, v: &Value, ts_seen: u64) -> Vec<Event> {
+    /// 收 owned 的行：thinking／text 的文字（常有幾十 KB）直接移進 Event，不再複製一份（E-M7）。
+    fn on_line(
+        &mut self,
+        sid: &str,
+        file: &str,
+        no: u64,
+        mut v: Value,
+        ts_seen: u64,
+    ) -> Vec<Event> {
         let s = self.session(sid);
         if let Some(uuid) = v["uuid"].as_str()
-            && !s.seen_uuids.insert(uuid.to_string())
+            && !s.seen_uuids.insert(uuid)
         {
             return Vec::new();
         }
@@ -1552,12 +1864,19 @@ impl Merger {
         if v["type"] == "assistant"
             && let Some(m) = &real_model
         {
-            match s.last_model.insert(agent.clone(), m.clone()) {
-                Some(prev) if prev != *m => changed = Some(prev),
-                _ => {}
+            // 模型沒變（幾乎每一行）時不配置字串（E-M12）
+            match s.last_model.get_mut(&agent) {
+                Some(prev) if prev == m => {}
+                Some(prev) => changed = Some(std::mem::replace(prev, m.clone())),
+                None => {
+                    s.last_model.insert(agent.clone(), m.clone());
+                }
             }
             first_line_of_message =
-                !message_id.is_empty() && s.seen_messages.insert(message_id.clone());
+                !message_id.is_empty() && s.last_message.get(file).is_none_or(|m| *m != message_id);
+            if first_line_of_message {
+                s.last_message.insert(file.to_string(), message_id.clone());
+            }
         }
         if let (Some(from), Some(to)) = (changed, &real_model) {
             let p = ModelChanged {
@@ -1592,7 +1911,7 @@ impl Merger {
         let changes = if agent == "main" && v["type"] == "assistant" && block["type"] == "text" {
             let r = Some(message_id.as_str())
                 .filter(|m| !m.is_empty())
-                .or(v["uuid"].as_str())
+                .or_else(|| v["uuid"].as_str())
                 .map_or_else(|| format!("line-{no}"), str::to_string);
             self.tracker(sid).assistant_text(&r, ts_seen)
         } else {
@@ -1601,11 +1920,24 @@ impl Merger {
         out.extend(self.apply(sid, changes, "main", ts_seen));
         let s = self.session(sid);
 
-        let main = match (v["type"].as_str(), block["type"].as_str()) {
-            (Some("assistant"), Some("thinking")) => {
+        // 先決定是哪種行，match 才不會一直借著 `v`（下面要把文字從 `v` 移出來）
+        let kind = match (v["type"].as_str(), block["type"].as_str()) {
+            (Some("assistant"), Some(k @ ("thinking" | "text" | "tool_use"))) => k,
+            (Some("user"), Some("tool_result")) => "tool_result",
+            (Some("user"), Some("text"))
+                if block["text"]
+                    .as_str()
+                    .is_some_and(status::is_interrupt_text) =>
+            {
+                "interrupt"
+            }
+            _ => "",
+        };
+        let main = match kind {
+            "thinking" => {
                 let signed = block["signature"].as_str().is_some_and(|x| !x.is_empty());
                 let p = AssistantThinking {
-                    text: block["thinking"].as_str().unwrap_or_default().to_string(),
+                    text: take_first_block_str(&mut v, "thinking"),
                     summarized: !signed,
                     message_id,
                     model,
@@ -1613,16 +1945,16 @@ impl Merger {
                 };
                 vec![self.emit(sid, Payload::AssistantThinking(p), meta(true))]
             }
-            (Some("assistant"), Some("text")) => {
+            "text" => {
                 let p = AssistantText {
-                    text: block["text"].as_str().unwrap_or_default().to_string(),
+                    text: take_first_block_str(&mut v, "text"),
                     message_id,
                     model,
                     delayed,
                 };
                 vec![self.emit(sid, Payload::AssistantText(p), meta(true))]
             }
-            (Some("assistant"), Some("tool_use")) => {
+            "tool_use" => {
                 let Some(id) = block["id"].as_str().map(str::to_string) else {
                     return out;
                 };
@@ -1635,11 +1967,16 @@ impl Merger {
                     }
                     Some(card) if card.called => Vec::new(),
                     _ => {
-                        let card = s.cards.entry(id.clone()).or_insert(Card::new(&agent));
+                        let card = s
+                            .cards
+                            .entry(id.clone())
+                            .or_insert_with(|| Card::new(&agent));
                         card.called = true;
                         let tool = block["name"].as_str().unwrap_or_default().to_string();
                         card.sensitive = crate::sensitive::is_sensitive(&tool, &block["input"]);
-                        let (input, input_truncated) = truncate_input(block["input"].clone());
+                        let sensitive = card.sensitive;
+                        let (input, input_truncated) =
+                            text::truncated_clone(&block["input"], OUTPUT_LIMIT);
                         let p = ToolCalled {
                             tool_use_id: id,
                             tool,
@@ -1648,24 +1985,24 @@ impl Merger {
                             placement: Placement::Stream,
                             danger: None,
                             input_truncated,
+                            sensitive,
                         };
                         vec![self.emit(sid, Payload::ToolCalled(p), meta(true))]
                     }
                 }
             }
-            (Some("user"), Some("tool_result")) => {
+            "tool_result" => {
                 let Some(id) = block["tool_use_id"].as_str() else {
                     return out;
                 };
                 let ok = !block["is_error"].as_bool().unwrap_or(false);
-                let output = content_text(&block["content"]);
                 let mut evs = Vec::new();
                 // 執行中按 Esc（或在權限詢問按 Esc）沒有任何 hook，tool_result 是唯一的結束訊號
                 if self.mark_finished(sid, id, &agent) {
                     let rejected = v["toolUseResult"].as_str() == Some(USER_REJECTED);
-                    let error = (!ok).then(|| {
-                        let why = v["toolUseResult"].as_str().unwrap_or(&output);
-                        truncate(why, MESSAGE_LIMIT).0
+                    let error = (!ok).then(|| match v["toolUseResult"].as_str() {
+                        Some(why) => truncate(why, MESSAGE_LIMIT).0,
+                        None => content_text(&block["content"], MESSAGE_LIMIT).0,
                     });
                     let p = ToolUpdated {
                         tool_use_id: id.to_string(),
@@ -1678,12 +2015,13 @@ impl Merger {
                         error,
                         interrupted: rejected.then_some(true),
                         danger: None,
+                        denied: false,
                     };
                     let agent = self
                         .sessions
                         .get(sid)
                         .and_then(|s| s.cards.get(id))
-                        .map_or(agent.clone(), |c| c.agent.clone());
+                        .map_or_else(|| agent.clone(), |c| c.agent.clone());
                     let m = Meta {
                         agent,
                         ts_seen,
@@ -1691,7 +2029,9 @@ impl Merger {
                     };
                     evs.push(self.emit(sid, Payload::ToolUpdated(p), m));
                 }
-                evs.extend(self.result_once(sid, id, ok, None, &output, &agent, ts_seen));
+                // hook 永遠先到：結果通常已經送過，用到才組輸出（E-M2）
+                let output = || content_text(&block["content"], OUTPUT_LIMIT);
+                evs.extend(self.result_once(sid, id, ok, None, output, &agent, ts_seen));
                 // Esc 拒絕或中斷時這是唯一的結束訊號；只解除 wait／danger，不算失敗
                 if !ok {
                     self.drop_pending_agent(sid, id);
@@ -1700,11 +2040,7 @@ impl Merger {
                 evs.extend(self.apply(sid, changes, &agent, ts_seen));
                 evs
             }
-            (Some("user"), Some("text"))
-                if block["text"]
-                    .as_str()
-                    .is_some_and(status::is_interrupt_text) =>
-            {
+            "interrupt" => {
                 let changes = self.tracker(sid).interrupted(ts_seen);
                 self.apply(sid, changes, "main", ts_seen)
             }
@@ -1712,6 +2048,20 @@ impl Merger {
         };
         out.extend(main);
         out
+    }
+}
+
+/// 把訊息第一個 content block 的字串欄位移出來（沒有或不是字串時給空字串）。
+fn take_first_block_str(v: &mut Value, key: &str) -> String {
+    match v
+        .get_mut("message")
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.get_mut(0))
+        .and_then(|b| b.get_mut(key))
+        .map(Value::take)
+    {
+        Some(Value::String(s)) => s,
+        _ => String::new(),
     }
 }
 
@@ -1729,80 +2079,91 @@ fn take_waiting(s: &mut Session, agent_id: &str) -> Option<WaitingStart> {
     Some(s.waiting_starts.remove(i))
 }
 
-/// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。
-/// tool.called 的 input：每個超過 [`OUTPUT_LIMIT`] 的字串截短（#654 R22，Write 大檔佔 JSONL 很多）；
-/// 回傳有沒有截到。Write 的預覽與 Edit 的 hunk 用的是 hook 的原始 input，不受影響。
-fn truncate_input(v: Value) -> (Value, bool) {
-    match v {
-        Value::String(s) if s.len() > OUTPUT_LIMIT => {
-            (Value::String(truncate(&s, OUTPUT_LIMIT).0), true)
-        }
-        Value::Array(items) => {
-            let mut cut = false;
-            let items = items
-                .into_iter()
-                .map(|x| {
-                    let (x, c) = truncate_input(x);
-                    cut |= c;
-                    x
-                })
-                .collect();
-            (Value::Array(items), cut)
-        }
-        Value::Object(map) => {
-            let mut cut = false;
-            let map = map
-                .into_iter()
-                .map(|(k, x)| {
-                    let (x, c) = truncate_input(x);
-                    cut |= c;
-                    (k, x)
-                })
-                .collect();
-            (Value::Object(map), cut)
-        }
-        other => (other, false),
-    }
+/// `lastMessage`：截 [`MESSAGE_LIMIT`] 個字元（契約寫的是「500 字」，不是 bytes，D8）。
+fn last_message(m: &str) -> String {
+    text::truncate_chars(m, MESSAGE_LIMIT).0.to_string()
 }
 
+/// 截到 `max` bytes 以內、不切壞 UTF-8；回傳是否有截斷。
 fn truncate(s: &str, max: usize) -> (String, bool) {
-    if s.len() <= max {
-        return (s.to_string(), false);
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (s[..end].to_string(), true)
+    let (kept, cut) = text::truncate_bytes(s, max);
+    (kept.to_string(), cut)
 }
 
 /// PostToolUse 的 `tool_response`：Bash 取 stdout（＋stderr），其他工具用精簡 JSON。
-fn response_text(v: Option<&Value>) -> String {
-    match v {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        Some(r) if r.get("stdout").is_some() => {
-            let out = r["stdout"].as_str().unwrap_or_default();
-            match r["stderr"].as_str().filter(|e| !e.is_empty()) {
-                Some(err) => format!("{out}\n{err}"),
-                None => out.to_string(),
+/// hunk 的行合計不超過 `max` bytes：放不下的行丟掉、最後一行截在字元邊界；行號與 +／− 的行數不動，
+/// 改動紀錄的 +N／−M 照算（C7）。回傳是否有截。
+fn bounded_hunk(hunk: &Hunk, max: usize) -> (Hunk, bool) {
+    let mut room = max;
+    let mut lines = Vec::new();
+    let mut cut = false;
+    for l in &hunk.lines {
+        let (kept, c) = text::truncate_bytes(l, room);
+        if c {
+            if !kept.is_empty() {
+                lines.push(kept.to_string());
             }
+            cut = true;
+            break;
         }
-        Some(r) => r.to_string(),
+        room -= l.len();
+        lines.push(l.clone());
+    }
+    let out = Hunk {
+        lines,
+        start: hunk.start,
+        old_lines: hunk.old_lines,
+        new_lines: hunk.new_lines,
+    };
+    (out, cut)
+}
+
+/// 截到 `max` bytes 以內，回傳是否有截。
+fn response_text(v: Option<&Value>, max: usize) -> (String, bool) {
+    match v {
+        None | Some(Value::Null) => (String::new(), false),
+        Some(Value::String(s)) => {
+            let (kept, cut) = text::truncate_bytes(s, max);
+            (kept.to_string(), cut)
+        }
+        Some(r) if r.get("stdout").is_some() => {
+            let mut out = String::new();
+            let mut cut =
+                text::push_bounded(&mut out, r["stdout"].as_str().unwrap_or_default(), max);
+            if let Some(err) = r["stderr"].as_str().filter(|e| !e.is_empty()) {
+                cut = text::push_bounded(&mut out, "\n", max) || cut;
+                cut = text::push_bounded(&mut out, err, max) || cut;
+            }
+            (out, cut)
+        }
+        Some(r) => text::json_bounded(r, max),
     }
 }
 
 /// transcript tool_result 的 content：字串，或 `[{type: text, text}]`。
-fn content_text(v: &Value) -> String {
+/// 截到 `max` bytes 以內，回傳是否有截。
+fn content_text(v: &Value, max: usize) -> (String, bool) {
     match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
+        Value::String(s) => {
+            let (kept, cut) = text::truncate_bytes(s, max);
+            (kept.to_string(), cut)
+        }
+        Value::Array(parts) => {
+            let mut out = String::new();
+            let mut cut = false;
+            for (i, t) in parts.iter().filter_map(|p| p["text"].as_str()).enumerate() {
+                if i > 0 {
+                    cut = text::push_bounded(&mut out, "\n", max) || cut;
+                }
+                cut = text::push_bounded(&mut out, t, max) || cut;
+                if cut {
+                    break;
+                }
+            }
+            (out, cut)
+        }
+        Value::Null => (String::new(), false),
+        other => text::json_bounded(other, max),
     }
 }
 

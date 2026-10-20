@@ -114,6 +114,8 @@ struct Running {
     id: String,
     tool: String,
     input: Value,
+    /// 呼叫這個工具的 agent（main、subagent 的 agent_id）
+    agent: String,
 }
 
 /// 一個 session 的狀態。
@@ -137,9 +139,18 @@ pub struct Tracker {
     fail_open: HashMap<String, String>,
     idle: bool,
     ended: bool,
+    /// 重啟或移出記憶體後種回：store／live 的 status 可能和這裡算的不同（例如已確認的 done 不會種回），
+    /// 下一次重算不論有沒有變都送一次（K-6）
+    report_next: bool,
+    /// 重啟或移出記憶體後回來：store 的狀態是 done／fail，但那個注意項目已經確認、沒有種回（ack 不是 Event，
+    /// 沒重啟時 merge 不知道 ack，那一項一直開著）。在沒重啟也會解除它的事件之前照樣是這個狀態，
+    /// 上一輪晚到的行或工具結束不能把它算成 run（#749 長情境）
+    seeded: Option<SessionState>,
     signals: Vec<(Signal, u64)>,
     /// 最近 24 小時的 (時間, 費用)，CostSpike 用（#675）
     recent_cost: std::collections::VecDeque<(u64, f64)>,
+    /// `recent_cost` 的合計，進出時加減（E-M10）
+    recent_total: f64,
     last_spike: Option<u64>,
 }
 
@@ -160,19 +171,23 @@ impl Default for Tracker {
             fail_open: HashMap::new(),
             idle: false,
             ended: false,
+            report_next: false,
+            seeded: None,
             signals: Vec::new(),
             recent_cost: Default::default(),
+            recent_total: 0.0,
             last_spike: None,
         }
     }
 }
 
 impl Tracker {
-    pub fn tool_started(&mut self, id: &str, tool: &str, input: &Value) {
+    pub fn tool_started(&mut self, id: &str, tool: &str, input: &Value, agent: &str) {
         self.running.push(Running {
             id: id.to_string(),
             tool: tool.to_string(),
             input: input.clone(),
+            agent: agent.to_string(),
         });
     }
 
@@ -216,6 +231,7 @@ impl Tracker {
         let mut out = Vec::new();
         if ok {
             *streak = 0;
+            self.unseed(SessionState::Fail);
             if let Some(r) = self.fail_open.remove(agent) {
                 out.extend(self.clear(AttentionKind::Fail, &r));
             }
@@ -230,9 +246,40 @@ impl Tracker {
         out
     }
 
-    /// 一批工具結束：被自動駁回的權限詢問只有這個訊號（實測 12 ms）。
-    pub fn batch_done(&mut self, now: u64) -> Vec<Change> {
-        let mut out = self.clear_waits();
+    /// subagent（含背景 agent）結束：之後不會再有它的 Bash 成功來解除它的連續失敗，跟著結束一起清掉（K-1）。
+    pub fn agent_finished(&mut self, agent: &str, now: u64) -> Vec<Change> {
+        self.fail_streak.remove(agent);
+        self.unseed(SessionState::Fail);
+        let mut out = Vec::new();
+        if let Some(r) = self.fail_open.remove(agent) {
+            out.extend(self.clear(AttentionKind::Fail, &r));
+        }
+        out.extend(self.recompute(now));
+        out
+    }
+
+    /// `agent` 的一批工具結束：被自動駁回的權限詢問只有這個訊號（實測 12 ms）。只清這個 agent 的工具
+    /// 在等的；不知道是誰的（推測的「等你」、重啟前種回的）算 main 的（K-11）。
+    pub fn batch_done(&mut self, agent: &str, now: u64) -> Vec<Change> {
+        let owner = |running: &[Running], id: &str| {
+            running
+                .iter()
+                .find(|r| r.id == id)
+                .map_or("main", |r| r.agent.as_str())
+                == agent
+        };
+        self.pending_wait
+            .retain(|(id, _)| !owner(&self.running, id));
+        let refs: Vec<String> = self
+            .open
+            .iter()
+            .filter(|o| o.kind == AttentionKind::Wait && owner(&self.running, &o.reference))
+            .map(|o| o.reference.clone())
+            .collect();
+        let mut out: Vec<Change> = refs
+            .iter()
+            .filter_map(|r| self.clear(AttentionKind::Wait, r))
+            .collect();
         out.extend(self.recompute(now));
         out
     }
@@ -280,10 +327,34 @@ impl Tracker {
         for r in done {
             out.extend(self.clear(AttentionKind::Done, &r));
         }
+        self.unseed(SessionState::Done);
         self.stop_at = None;
         self.stopped = false;
         self.idle = false;
         self.prompt_ref = prompt_id.or_else(|| Some(format!("prompt-{now}")));
+        out.extend(self.recompute(now));
+        out
+    }
+
+    /// main 開始新的工具（K-4）：Stop hook 回 block 時 Claude Code 會接著工作、不經 UserPromptSubmit，
+    /// 所以這輪還沒完成：靜默期取消、已發的 done 撤回。之後的 Stop（帶 `stop_hook_active`）照常計時。
+    pub fn main_tool_started(&mut self, now: u64) -> Vec<Change> {
+        let done: Vec<String> = self
+            .open
+            .iter()
+            .filter(|o| o.kind == AttentionKind::Done)
+            .map(|o| o.reference.clone())
+            .collect();
+        if !self.stopped && done.is_empty() && self.seeded != Some(SessionState::Done) {
+            return Vec::new();
+        }
+        self.unseed(SessionState::Done);
+        self.stop_at = None;
+        self.stopped = false;
+        let mut out: Vec<Change> = done
+            .iter()
+            .filter_map(|r| self.clear(AttentionKind::Done, r))
+            .collect();
         out.extend(self.recompute(now));
         out
     }
@@ -307,12 +378,22 @@ impl Tracker {
     }
 
     /// SessionStart：resume／compact／clear 接回同一個 session 時，結束、中斷與 Stop 的狀態都不再成立。
+    /// 之前還在跑的工具已經跟著舊的程序結束、不會再有 Post：它們的 danger／wait 一起解除，
+    /// 也不再算「有工具在跑」（K-2）。
     pub fn started(&mut self, now: u64) -> Vec<Change> {
         self.ended = false;
         self.idle = false;
         self.stop_at = None;
         self.stopped = false;
-        self.recompute(now).into_iter().collect()
+        self.pending_wait.clear();
+        let mut out = Vec::new();
+        for r in std::mem::take(&mut self.running) {
+            for kind in [AttentionKind::Wait, AttentionKind::Danger] {
+                out.extend(self.clear(kind, &r.id));
+            }
+        }
+        out.extend(self.recompute(now));
+        out
     }
 
     /// 種回還開著的注意項目（不發 Event：live 與 store 已經有這些列與狀態）。
@@ -332,12 +413,32 @@ impl Tracker {
         let _ = self.recompute(item.raised_at);
     }
 
-    /// 種回 session 是否已結束、是否中斷（D3：重啟或移出記憶體後回來）。不發 Event：live 與 store
-    /// 已經是這個狀態；之後狀態一變（例如新的 prompt 回到 run）才會照常送 `session.status`。
+    /// 種回 session 是否已結束、是否中斷（D3：重啟或移出記憶體後回來）。不發 Event；之後第一次重算
+    /// 一定送 `session.status`，因為 live 與 store 的狀態不一定和種回的相同（已確認的不種回，K-6）。
     pub fn seed_state(&mut self, ended: bool, idle: bool) {
         self.ended = ended;
         self.idle = idle;
         let _ = self.recompute(0);
+        self.report_next = true;
+    }
+
+    /// 種回 store 的狀態（只有 done、fail 有意義，見 `seeded`）。在 [`Tracker::seed_state`] 之前呼叫。
+    pub fn seed_status(&mut self, status: SessionState) {
+        if matches!(status, SessionState::Done | SessionState::Fail) {
+            self.seeded = Some(status);
+        }
+    }
+
+    /// 移出記憶體時交給下一次的 [`Tracker::seed_status`]。
+    pub fn seeded_status(&self) -> Option<SessionState> {
+        self.seeded
+    }
+
+    /// 沒重啟時會解除那一項的事件到了：done 是新的 prompt 或 main 開始新的工具（K-4），fail 是 Bash 成功或 agent 結束。
+    fn unseed(&mut self, which: SessionState) {
+        if self.seeded == Some(which) {
+            self.seeded = None;
+        }
     }
 
     /// 是否中斷中（使用者按 Esc 之後、下一個 prompt 之前）。
@@ -374,7 +475,7 @@ impl Tracker {
     pub fn cost(&mut self, at: u64, usd: f64, baseline: Option<f64>) {
         self.seed_cost(at, usd);
         let Some(base) = baseline else { return };
-        let total: f64 = self.recent_cost.iter().map(|(_, c)| c).sum();
+        let total = self.recent_total;
         if total > base * COST_SPIKE_FACTOR && self.last_spike.is_none_or(|t| t + DAY_MS <= at) {
             self.last_spike = Some(at);
             self.signal(Signal::CostSpike, at);
@@ -384,9 +485,15 @@ impl Tracker {
     /// 重啟時從 store 補回最近 24 小時的花費：只進滾動區間，不觸發。
     pub fn seed_cost(&mut self, at: u64, usd: f64) {
         self.recent_cost.push_back((at, usd));
+        self.recent_total += usd;
         let from = at.saturating_sub(DAY_MS);
         while self.recent_cost.front().is_some_and(|(t, _)| *t < from) {
-            self.recent_cost.pop_front();
+            if let Some((_, c)) = self.recent_cost.pop_front() {
+                self.recent_total -= c;
+            }
+        }
+        if self.recent_cost.is_empty() {
+            self.recent_total = 0.0; // 不讓浮點誤差一直累積
         }
     }
 
@@ -469,10 +576,6 @@ impl Tracker {
         score(&self.cfg, &open, &self.signals, now)
     }
 
-    pub fn state(&self) -> SessionState {
-        self.state
-    }
-
     fn is_open(&self, kind: AttentionKind, r: &str) -> bool {
         self.open.iter().any(|o| o.kind == kind && o.reference == r)
     }
@@ -539,13 +642,17 @@ impl Tracker {
                 Some(AttentionKind::Fail) => SessionState::Fail,
                 Some(AttentionKind::Wait) => SessionState::Wait,
                 Some(AttentionKind::Done) => SessionState::Done,
-                _ if self.idle => SessionState::Idle,
-                _ => SessionState::Run,
+                _ => match self.seeded {
+                    Some(s) => s,
+                    None if self.idle => SessionState::Idle,
+                    None => SessionState::Run,
+                },
             }
         };
-        if next == self.state {
+        if next == self.state && !self.report_next {
             return None;
         }
+        self.report_next = false;
         self.state = next;
         Some(Change::Status(SessionStatus {
             status: next,

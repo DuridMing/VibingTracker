@@ -332,7 +332,7 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
         "/api/sessions",
         "/api/sessions/s1/events",
         "/api/files?cwd=%2Fp",
-        "/api/projects/events?cwd=%2Fp",
+        "/api/projects/replay?cwd=%2Fp&at=1",
     ] {
         let (code, _) = get_with(addr, path, &me, Some("http://evil.example")).await;
         assert_eq!(code, 403, "{path}：別的網頁的 Origin");
@@ -343,144 +343,6 @@ async fn api_rejects_foreign_origin_and_non_loopback_host() {
     assert_eq!(code, 200, "同源的前端可以");
     let (code, _) = get_with(addr, "/api/sessions", &me, None).await;
     assert_eq!(code, 200, "沒帶 Origin 的程式（curl）可以");
-}
-
-// ── /api/projects/events（全專案回放，#702）
-
-/// 專案 /p：s1 在根目錄、s2 在 worktree；s3 是別的專案。時間交錯，s1 有一張完整的工具卡片。
-fn project_events_fixture() -> Vec<Event> {
-    let mut evs = vec![
-        started("s1", 1, 1_000, "/p"),
-        started("s2", 1, 1_000, "/p/worktrees/feature/x"),
-        started("s3", 1, 1_000, "/other"),
-        ev(
-            "s1",
-            2,
-            "tool.called",
-            None,
-            1_001,
-            json!({"toolUseId": "t1", "tool": "Bash",
-            "input": {"command": "ls"}, "status": "running", "placement": "staged", "danger": null}),
-        ),
-        ev(
-            "s1",
-            3,
-            "tool.placed",
-            Some(1),
-            1_002,
-            json!({"toolUseId": "t1", "placement": "stream"}),
-        ),
-        ev(
-            "s1",
-            4,
-            "tool.result",
-            None,
-            1_003,
-            json!({"toolUseId": "t1", "ok": true,
-            "exitCode": 0, "output": "a\n", "truncated": false}),
-        ),
-    ];
-    for i in 0..6u64 {
-        evs.push(text("s1", 5 + i, 2 + i, 1_010 + 2 * i));
-        evs.push(text("s2", 2 + i, 1 + i, 1_011 + 2 * i));
-        evs.push(text("s3", 2 + i, 1 + i, 1_011 + 2 * i));
-    }
-    evs
-}
-
-fn positions(body: &Value) -> Vec<(String, u64)> {
-    body["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| !e["pos"].is_null())
-        .map(|e| {
-            (
-                e["session"].as_str().unwrap().to_string(),
-                e["pos"].as_u64().unwrap(),
-            )
-        })
-        .collect()
-}
-
-#[tokio::test]
-async fn project_events_merge_the_projects_sessions_with_their_cards() {
-    let home = tmp("project-events");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&limit=100").await;
-    assert_eq!(code, 200, "{body}");
-    let mut got = positions(&body);
-    got.sort();
-    let mut want: Vec<_> = (1..=7).map(|p| ("s1".to_string(), p)).collect();
-    want.extend((1..=6).map(|p| ("s2".to_string(), p)));
-    want.sort();
-    assert_eq!(got, want, "worktree 的 s2 算進來，別的專案的 s3 不算");
-    let kinds: Vec<_> = body["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| e["payload"]["toolUseId"] == "t1")
-        .map(|e| e["type"].as_str().unwrap().to_string())
-        .collect();
-    assert!(
-        kinds.contains(&"tool.called".into()) && kinds.contains(&"tool.result".into()),
-        "卡片的呼叫與結果一起帶回來：{kinds:?}"
-    );
-    assert!(body["next"].is_null(), "一頁就拿完時沒有 next");
-}
-
-#[tokio::test]
-async fn project_events_page_back_to_the_start_without_gaps() {
-    let home = tmp("project-pages");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    let mut seen = Vec::new();
-    let mut path = "/api/projects/events?cwd=%2Fp&limit=4".to_string();
-    for _ in 0..20 {
-        let (code, body) = get(addr, &path).await;
-        assert_eq!(code, 200, "{body}");
-        seen.extend(positions(&body));
-        let next = &body["next"];
-        if next.is_null() {
-            break;
-        }
-        path = format!(
-            "/api/projects/events?cwd=%2Fp&limit=4&before={},{},{}",
-            next["ts"],
-            enc(next["session"].as_str().unwrap()),
-            next["pos"]
-        );
-    }
-    let total = seen.len();
-    seen.sort();
-    seen.dedup();
-    assert_eq!(seen.len(), total, "分頁之間不重複");
-    assert_eq!(seen.len(), 13, "s1 的 7 個與 s2 的 6 個都拿到");
-}
-
-#[tokio::test]
-async fn project_events_respect_the_time_range_and_need_a_cwd() {
-    let home = tmp("project-range");
-    let store = store_with(&home, &project_events_fixture());
-    let addr = start(WebState::new(Some(store), None, 8)).await;
-
-    // s1 的 text 在 1010、1012…；s2 在 1011、1013…
-    let (code, body) = get(addr, "/api/projects/events?cwd=%2Fp&from=1011&to=1013").await;
-    assert_eq!(code, 200, "{body}");
-    let mut got = positions(&body);
-    got.sort();
-    assert_eq!(
-        got,
-        vec![("s1".into(), 3), ("s2".into(), 1), ("s2".into(), 2)],
-        "兩端都包含"
-    );
-    let (code, _) = get(addr, "/api/projects/events").await;
-    assert_eq!(code, 400, "沒有 cwd");
-    let (code, _) = get(addr, "/api/projects/events?cwd=%2Fp&before=x").await;
-    assert_eq!(code, 400, "游標格式錯");
 }
 
 // ── /api/files
@@ -1452,4 +1314,532 @@ async fn project_replay_rebuilds_the_main_page_at_any_time() {
     ] {
         assert_eq!(get(addr, bad).await.0, 400, "{bad}");
     }
+}
+
+// ── diff API 的 untracked 備援與遠端剝除（C1、A-N1、C20，#734） ───────────────────────
+
+const ENV_SECRET: &str = "sk-live-VERY-SECRET-0123456789";
+
+/// main 上一個 commit；`.env` 被 .gitignore 忽略、`.env.local` 已追蹤（敏感路徑）；
+/// `secrets.json` 是沒被忽略的 untracked 敏感檔；`notes.txt` 是一般的 untracked 檔。
+fn diff_repo() -> PathBuf {
+    let root = canon(&tmp("diffrepo"));
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, ".gitignore", ".env\n");
+    write(&root, "a.txt", "a\n");
+    write(&root, ".env.local", "OLD=1\n");
+    git(&root, &["add", "."]);
+    git(&root, &["add", "-f", ".env.local"]);
+    git(&root, &["commit", "-qm", "init"]);
+    write(&root, ".env", &format!("API_KEY={ENV_SECRET}\n"));
+    write(&root, ".env.local", &format!("OLD=1\nNEW={ENV_SECRET}\n"));
+    write(
+        &root,
+        "secrets.json",
+        &format!("{{\"k\":\"{ENV_SECRET}\"}}\n"),
+    );
+    write(&root, "notes.txt", "hello untracked\n");
+    root
+}
+
+async fn diff_server(root: &Path, remote: bool) -> SocketAddr {
+    let home = tmp("diffhome");
+    let store = store_with(&home, &[started("s1", 1, 1_000, &s(root))]);
+    let state = WebState::new(Some(store), None, 8);
+    state.set_force_remote(remote);
+    start(state).await
+}
+
+async fn diff_of(addr: SocketAddr, root: &Path, api: &str, path: &str) -> (u16, Value) {
+    let cwd = enc(&s(root));
+    get(
+        addr,
+        &format!("/api/{api}?cwd={cwd}&worktree={cwd}&path={}", enc(path)),
+    )
+    .await
+}
+
+/// gitignored 的檔在 UI 清單裡本來就不會出現，直接打 API 也不讀：本機回空的 diff，遠端 403。
+#[tokio::test]
+async fn untracked_fallback_never_reads_ignored_files() {
+    let root = diff_repo();
+    for remote in [false, true] {
+        let addr = diff_server(&root, remote).await;
+        for api in ["commit-diff", "branch-diff"] {
+            let (code, body) = diff_of(addr, &root, api, ".env").await;
+            assert_eq!(code, if remote { 403 } else { 200 }, "{api}：{body}");
+            assert!(
+                !body.to_string().contains(ENV_SECRET),
+                "remote={remote} {api} 讀到 gitignored 的 .env：{body}"
+            );
+        }
+        // 對照：沒被忽略的一般 untracked 檔照樣整檔當新增
+        let (_, body) = diff_of(addr, &root, "commit-diff", "notes.txt").await;
+        assert!(
+            body["diff"].as_str().unwrap().contains("+hello untracked"),
+            "{body}"
+        );
+    }
+}
+
+/// 遠端看敏感路徑（不論追蹤與否）一律 403；本機照給。
+#[tokio::test]
+async fn remote_diff_of_a_sensitive_path_is_forbidden() {
+    let root = diff_repo();
+    let remote = diff_server(&root, true).await;
+    let local = diff_server(&root, false).await;
+    for path in [".env.local", "secrets.json"] {
+        for api in ["commit-diff", "branch-diff"] {
+            let (code, body) = diff_of(remote, &root, api, path).await;
+            assert_eq!(code, 403, "{api} {path}：{body}");
+            assert!(!body.to_string().contains(ENV_SECRET), "{path}：{body}");
+        }
+        let (_, body) = diff_of(local, &root, "commit-diff", path).await;
+        assert!(
+            body["diff"].as_str().unwrap().contains(ENV_SECRET),
+            "本機照給 {path}：{body}"
+        );
+    }
+    // 不敏感的檔遠端照給
+    let (_, body) = diff_of(remote, &root, "commit-diff", "notes.txt").await;
+    assert!(
+        body["diff"].as_str().unwrap().contains("+hello untracked"),
+        "{body}"
+    );
+}
+
+/// diff 內容裡的 clk_ 金鑰對遠端只留 id（#720 的規則套到 diff）。
+#[tokio::test]
+async fn remote_diff_strips_clk_keys() {
+    let root = diff_repo();
+    let key = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+    write(&root, "notes.txt", &format!("token {key}\n"));
+    let addr = diff_server(&root, true).await;
+    let (_, body) = diff_of(addr, &root, "commit-diff", "notes.txt").await;
+    let diff = body["diff"].as_str().unwrap();
+    assert!(
+        !diff.contains(key) && diff.contains("clk_ABCDEFGH_…"),
+        "{diff}"
+    );
+}
+
+/// symlink（檔或目錄）指到 worktree 外：不跟著讀（A-N1）。
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_fallback_does_not_follow_symlinks_out_of_the_worktree() {
+    let root = diff_repo();
+    let outside = canon(&tmp("outside"));
+    write(&outside, "id_ed", "OUTSIDE-PRIVATE-KEY\n");
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+    std::os::unix::fs::symlink(outside.join("id_ed"), root.join("linkfile")).unwrap();
+    let addr = diff_server(&root, false).await;
+    for path in ["linkdir/id_ed", "linkfile"] {
+        let (_, body) = diff_of(addr, &root, "commit-diff", path).await;
+        assert!(
+            !body.to_string().contains("OUTSIDE-PRIVATE-KEY"),
+            "{path}：{body}"
+        );
+    }
+}
+
+/// FIFO 不是一般檔：馬上回，不能卡住 blocking 執行緒（C20）。
+#[cfg(unix)]
+#[tokio::test]
+async fn untracked_fallback_skips_fifos() {
+    let root = diff_repo();
+    let fifo = root.join("pipe");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let addr = diff_server(&root, false).await;
+    let res = tokio::time::timeout(
+        Duration::from_secs(5),
+        diff_of(addr, &root, "commit-diff", "pipe"),
+    )
+    .await;
+    // 讀端若卡在 FIFO 上（修正前），開一次讀寫端再關掉讓它讀到 EOF，runtime 才關得掉。
+    // 用讀寫模式：沒有讀端時只開寫端會一直等（修正後就是這樣），讀寫模式在 Linux／macOS 都不會卡。
+    let _ = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo);
+    let (code, body) = res.expect("5 秒內沒回：讀 FIFO 卡住");
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["diff"], "", "{body}");
+}
+
+/// 大的 untracked 檔只讀前段、標 truncated，回應不超過上限（C20）。
+#[tokio::test]
+async fn untracked_fallback_reads_only_the_head_of_big_files() {
+    let root = diff_repo();
+    let line = "x".repeat(99) + "\n";
+    write(&root, "big.log", &line.repeat(100_000)); // 10 MB
+    let addr = diff_server(&root, false).await;
+    let (code, body) = diff_of(addr, &root, "commit-diff", "big.log").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["truncated"], true);
+    let diff = body["diff"].as_str().unwrap();
+    assert!(diff.len() <= 64 * 1024, "{}", diff.len());
+    assert!(
+        diff.starts_with("--- /dev/null\n+++ b/big.log\n+xxx"),
+        "{}",
+        &diff[..80]
+    );
+}
+
+/// X-1：cwd 白名單只放行已知 cwd、它底下的目錄、它所屬 repo 的主工作樹根；任意的上層目錄（例如 home）不放行。
+#[tokio::test]
+async fn cwd_whitelist_does_not_accept_arbitrary_ancestors() {
+    let r = repo();
+    std::fs::create_dir_all(r.x.join("sub")).unwrap();
+    let addr = files_server(&r).await;
+    let parent = r.root.parent().unwrap();
+    let cases = [
+        (s(&r.x), 200, "session 自己的 cwd"),
+        (s(&r.x.join("sub")), 200, "在 session 的 cwd 底下"),
+        (s(&r.root), 200, "session 所屬 repo 的主工作樹根"),
+        (s(&r.root.join("wt")), 404, "只是上層目錄、不是 repo 根"),
+        (s(parent), 404, "repo 外的上層目錄（像 home）"),
+    ];
+    for (cwd, want, why) in cases {
+        let (code, body) = get(addr, &format!("/api/files?cwd={}", enc(&cwd))).await;
+        assert_eq!(code, want, "{why}（{cwd}）：{body}");
+    }
+}
+
+// ── S-2：git 呼叫不執行 repo 設定或 .git/hooks 裡的外部程式（#743） ─────────────────────
+
+/// 植入三種「git 會替你執行的程式」：`.git/hooks/post-index-change`（git status 刷新 index 時跑）、
+/// submodule 自己 config 裡的 clean filter、`log.showSignature`＋假的 `gpg.program`。每支都只在 `marks/` 留下標記檔。
+#[cfg(unix)]
+fn booby_trapped_repo() -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = canon(&tmp("trap"));
+    let marks = base.join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let script = |name: &str| {
+        let p = base.join(name);
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\ntouch '{}'\ncat\n", marks.join(name).display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    // submodule 的來源
+    let sub = base.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&sub, &["init", "-q", "-b", "main"]);
+    write(&sub, "a.txt", "sub\n");
+    write(&sub, ".gitattributes", "*.txt filter=evil\n");
+    git(&sub, &["add", "."]);
+    git(&sub, &["commit", "-qm", "sub"]);
+    // 主 repo
+    let root = base.join("super");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    write(&root, "x.txt", "x\n");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-qm", "init"]);
+    git(
+        &root,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &s(&sub),
+            "sub",
+        ],
+    );
+    git(&root, &["commit", "-qm", "sub"]);
+    let filter = script("filter");
+    git(
+        &root.join("sub"),
+        &["config", "filter.evil.clean", &s(&filter)],
+    );
+    let gpg = script("gpg");
+    git(&root, &["config", "log.showSignature", "true"]);
+    git(&root, &["config", "gpg.program", &s(&gpg)]);
+    let hook = script("hook");
+    std::fs::copy(&hook, root.join(".git/hooks/post-index-change")).unwrap();
+    // 讓 index 的 stat 資訊過期（內容不變、mtime 改掉）：git status 會想刷新 index，就會觸發 post-index-change
+    let later = std::time::SystemTime::now() + Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(root.join("x.txt"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    write(&root.join("sub"), "a.txt", "sub changed\n");
+    (root, marks)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn git_calls_never_run_repo_hooks_filters_or_gpg() {
+    let (root, marks) = booby_trapped_repo();
+    let home = tmp("trap-home");
+    let store = store_with(&home, &[started("s1", 1, 1_000, &s(&root))]);
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    let cwd = enc(&s(&root));
+    let head = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    for path in [
+        format!("/api/files?cwd={cwd}"),
+        format!("/api/files?cwd={cwd}&base=session:s1"),
+        format!("/api/files?cwd={cwd}&base=commit:{head}"),
+        format!("/api/branches?cwd={cwd}"),
+        format!("/api/graph?cwd={cwd}"),
+        format!("/api/commit?cwd={cwd}&hash={head}"),
+        format!("/api/commit-diff?cwd={cwd}&worktree={cwd}&path=x.txt"),
+        format!("/api/commit-diff?cwd={cwd}&worktree={cwd}&path=sub"),
+        format!("/api/branch-diff?cwd={cwd}&worktree={cwd}&path=x.txt"),
+    ] {
+        let (code, body) = get(addr, &path).await;
+        assert!(code < 500, "{path}：{code} {body}");
+    }
+    let ran: Vec<String> = std::fs::read_dir(&marks)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(ran.is_empty(), "collector 執行了 repo 設定的程式：{ran:?}");
+}
+
+// ── 回放的上限與續頁（#742：B-N1、C6、C11、C22、D5） ─────────────────────────────
+
+const H_MS: u64 = 3_600_000;
+
+fn usage_ev(s: &str, seq: u64, ts: u64, cost: f64) -> Event {
+    ev(
+        s,
+        seq,
+        "usage",
+        None,
+        ts,
+        json!({"messageId": format!("u{seq}"), "model": "claude-opus-5-5", "input": 1, "output": 1,
+               "thinking": 0, "cacheRead": 0, "cacheWrite1h": 0, "cacheWrite5m": 0, "costUsd": cost}),
+    )
+}
+
+/// 00:00 起：old 01:00 開始、花 5 美元、01:00:02 結束；new 01:00:03 起到 06:00 每 10 秒一行文字＋0.01 美元。
+fn day_of_two_sessions() -> (u64, Vec<Event>) {
+    let day = (1_792_000_000_000 / (24 * H_MS)) * (24 * H_MS) + 24 * H_MS;
+    let mut evs = vec![
+        started("old", 1, day + H_MS, "/p"),
+        usage_ev("old", 2, day + H_MS + 1000, 5.0),
+        ev(
+            "old",
+            3,
+            "session.ended",
+            None,
+            day + H_MS + 2000,
+            json!({"reason": "other"}),
+        ),
+        started("new", 1, day + H_MS + 3000, "/p"),
+    ];
+    let (mut seq, mut pos, mut t) = (1, 0, day + H_MS + 10_000);
+    while t < day + 6 * H_MS {
+        seq += 1;
+        pos += 1;
+        evs.push(text("new", seq, pos, t));
+        seq += 1;
+        evs.push(usage_ev("new", seq, t, 0.01));
+        t += 10_000;
+    }
+    (day, evs)
+}
+
+/// 照前端的方式一段一段要（at=next、snapshot=0，until 固定），「今天」的花費只會增加（C6）。
+#[tokio::test]
+async fn replay_pages_keep_todays_kpi_of_sessions_that_ended_earlier() {
+    let (day, evs) = day_of_two_sessions();
+    let home = tmp("replay-kpi");
+    let addr = start(WebState::new(Some(store_with(&home, &evs)), None, 8)).await;
+    for echo_from in [false, true] {
+        let (until, mut at) = (day + 6 * H_MS, day + H_MS / 2);
+        let mut from: Option<u64> = None;
+        let (mut last, mut pages, mut late_pages) = (None::<f64>, 0, 0);
+        loop {
+            let mut url = format!("/api/projects/replay?cwd=%2Fp&at={at}&until={until}&limit=500");
+            if pages > 0 {
+                url += "&snapshot=0";
+            }
+            if let (true, Some(f)) = (echo_from, from) {
+                url += &format!("&from={f}");
+            }
+            let (code, b) = get(addr, &url).await;
+            assert_eq!(code, 200, "{b}");
+            from = from.or(b["from"].as_u64());
+            pages += 1;
+            if at > day + 3 * H_MS + 2000 {
+                late_pages += 1;
+            }
+            for f in b["frames"].as_array().unwrap() {
+                if let Some(c) = f["rows"]["kpi"]["costUsd"].as_f64() {
+                    assert!(
+                        last.is_none_or(|p| c + 1e-9 >= p),
+                        "花費掉下來：{last:?} → {c}（at={at}）"
+                    );
+                    last = Some(c);
+                }
+            }
+            match b["next"].as_u64() {
+                Some(n) => at = n,
+                None => break,
+            }
+        }
+        assert!(late_pages > 0, "前提：有一段的 at 在 old 結束 2 小時之後");
+        assert!(last.unwrap() > 5.0, "old 的 5 美元一直算在今天裡：{last:?}");
+    }
+}
+
+#[tokio::test]
+async fn replay_limits_its_range_and_concurrency() {
+    let (day, evs) = day_of_two_sessions();
+    let home = tmp("replay-limits");
+    let state = WebState::new(Some(store_with(&home, &evs)), None, 8);
+    let addr = start(state.clone()).await;
+    let at = day + H_MS;
+    let (code, b) = get(
+        addr,
+        &format!(
+            "/api/projects/replay?cwd=%2Fp&at={at}&until={}",
+            at + 24 * H_MS + 1
+        ),
+    )
+    .await;
+    assert_eq!(code, 400, "範圍最多 24 小時：{b}");
+    let (code, _) = get(
+        addr,
+        &format!(
+            "/api/projects/replay?cwd=%2Fp&at={at}&until={}",
+            at + 24 * H_MS
+        ),
+    )
+    .await;
+    assert_eq!(code, 200);
+    let (code, _) = get(
+        addr,
+        &format!("/api/projects/replay?cwd=%2Fp&at={at}&offset=-2147483648"),
+    )
+    .await;
+    assert_eq!(
+        code, 400,
+        "offset 超出 ±14 小時（i32::MIN 不能溢位成合法值，C22）"
+    );
+    // 同時進行的回放滿了就 429（這裡把上限設成 0 模擬兩個都在跑）
+    state.set_max_replays(0);
+    let (code, b) = get(addr, &format!("/api/projects/replay?cwd=%2Fp&at={at}")).await;
+    assert_eq!(code, 429, "{b}");
+    state.set_max_replays(2);
+    assert_eq!(
+        get(addr, &format!("/api/projects/replay?cwd=%2Fp&at={at}"))
+            .await
+            .0,
+        200,
+        "名額有還回來"
+    );
+}
+
+/// #672 之前的 Windows session 存的是 `C:\p`；/api/sessions 列得出來，回放用 `C:/p` 也要查得到（C11）。
+#[tokio::test]
+async fn replay_matches_backslash_cwds_like_sessions_does() {
+    let home = tmp("replay-bs");
+    let store = store_with(
+        &home,
+        &[started("w1", 1, 1000, "C:\\p"), text("w1", 2, 1, 1001)],
+    );
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    let (_, b) = get(addr, "/api/projects/replay?cwd=C%3A%2Fp&at=2000").await;
+    assert_eq!(
+        b["snapshot"]["sessions"].as_array().map(Vec::len),
+        Some(1),
+        "{b}"
+    );
+}
+
+/// 舊的全專案事件 API 已由回放取代（D5）。
+#[tokio::test]
+async fn project_events_api_is_gone() {
+    let home = tmp("pe-gone");
+    let addr = start(WebState::new(
+        Some(store_with(&home, &[started("s1", 1, 1000, "/p")])),
+        None,
+        8,
+    ))
+    .await;
+    assert_eq!(get(addr, "/api/projects/events?cwd=%2Fp").await.0, 404);
+}
+
+/// E-H2（#767）：/api/files 回 treeHash；請求帶 have＝目前的 treeHash 時省略 tree（其他欄位照給），不同時照給。
+#[tokio::test]
+async fn files_omits_the_tree_when_the_client_already_has_it() {
+    let r = repo();
+    let addr = files_server(&r).await;
+    let cwd = enc(&s(&r.x));
+    let (code, full) = get(addr, &format!("/api/files?cwd={cwd}")).await;
+    assert_eq!(code, 200);
+    let hash = full["treeHash"]
+        .as_str()
+        .expect("要有 treeHash")
+        .to_string();
+    assert_eq!(hash.len(), 16);
+    assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(full["tree"].as_array().is_some_and(|t| !t.is_empty()));
+    let (_, same) = get(addr, &format!("/api/files?cwd={cwd}&have={hash}")).await;
+    assert!(same.get("tree").is_none(), "have 相同時不送 tree：{same}");
+    assert_eq!(same["treeHash"], hash.as_str());
+    assert_eq!(same["changes"], full["changes"], "其他欄位照給");
+    let (_, other) = get(addr, &format!("/api/files?cwd={cwd}&have=0000000000000000")).await;
+    assert_eq!(other["tree"], full["tree"]);
+}
+
+// ── #748 L-11：Windows 的磁碟機代號（VS Code 的終端機給小寫 `e:\`、Windows Terminal 給大寫）
+
+/// 同一個專案、一個 session 的 cwd 是 `e:\proj`、一個是 `E:\proj\sub`：用哪一種寫法查都歸到同一個專案，
+/// 列出來的 cwd 一律 `E:/…`；白名單也認得（contracts §4「路徑正規化與比對」）。
+#[tokio::test]
+async fn drive_letter_case_does_not_split_a_project() {
+    let home = tmp("drive");
+    let store = store_with(
+        &home,
+        &[
+            started("lower", 1, 1_000, "e:\\proj"),
+            started("upper", 1, 2_000, "E:\\proj\\sub"),
+        ],
+    );
+    let addr = start(WebState::new(Some(store), None, 8)).await;
+    for q in ["E:/proj", "e:\\proj", "e:/proj/"] {
+        let (code, body) = get(addr, &format!("/api/sessions?cwd={}", enc(q))).await;
+        assert_eq!(code, 200, "{body}");
+        let mut got: Vec<(String, String)> = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["id"].as_str().unwrap().into(),
+                    r["cwd"].as_str().unwrap().into(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                ("lower".to_string(), "E:/proj".to_string()),
+                ("upper".to_string(), "E:/proj/sub".to_string())
+            ],
+            "查詢 {q}"
+        );
+    }
+    // 白名單：不在任何 session 的 cwd（或它底下）才回 404
+    let (code, body) = get(addr, &format!("/api/branches?cwd={}", enc("E:/proj"))).await;
+    assert_ne!(code, 404, "{body}");
 }

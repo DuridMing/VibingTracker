@@ -172,3 +172,39 @@ test("危險列解除時的更新（帶 clearedAt）不會再通知一次", () =
   c.advance(1000);
   assert.equal(out.length, 1);
 });
+
+test("合併中收到 snapshot（離開回放時重訂 `*`）：還在佇列裡的照發，snapshot 裡沒有的（已確認）不發（#765 C5）", () => {
+  const c = fakeClock();
+  const out = [];
+  const n = createNotifier({ ...c, emit: (x) => out.push(x) });
+  n.connected();
+  n.snapshot([]);
+  n.frame([att("s1/danger/t1", "danger", c.now()), att("s2/wait/t2", "wait", c.now())]);
+  c.advance(200);
+  // 重訂 `*` 送來的 snapshot：s1 的還在佇列，s2 的已經被確認、不在了
+  n.snapshot([att("s1/danger/t1", "danger", c.now() - 200)]);
+  c.advance(1000);
+  assert.equal(out.length, 1, "合併中的通知不能被 snapshot 吃掉");
+  assert.deepEqual(out[0].items.map((x) => x.id), ["s1/danger/t1"]);
+  // 之後同一個 id 不再響
+  n.frame([att("s1/danger/t1", "danger", c.now())]);
+  c.advance(1000);
+  assert.equal(out.length, 1);
+});
+
+test("leader：看得到的分頁優先；背景分頁被節流（心跳每分鐘一次）時不會兩個都出聲（#747 F-3）", () => {
+  const c = fakeClock();
+  const open = bus();
+  let aVisible = false;
+  // a 先開、在背景，瀏覽器把它的計時器節流到每分鐘一次；b 在前景
+  const a = createLeader({ id: "100-a", channel: open(), ...c, beatMs: 60_000, visible: () => aVisible });
+  const b = createLeader({ id: "200-b", channel: open(), ...c, visible: () => true });
+  c.advance(30_000);
+  assert.equal(b.isLeader(), true, "前景的 b 出聲");
+  assert.equal(a.isLeader(), false, "背景的 a 有看得到的同伴，不出聲");
+  // a 回到前景（visibilitychange 時馬上送心跳）：兩個都看得到，照 id 選
+  aVisible = true;
+  a.beat();
+  assert.equal(a.isLeader(), true);
+  assert.equal(b.isLeader(), false);
+});

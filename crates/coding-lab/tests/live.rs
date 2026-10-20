@@ -1,5 +1,7 @@
 //! live：彙總列、KPI、暫存區、串流、frame 與 snapshot（contracts.md §6、#636）。
 
+mod common;
+
 use coding_lab::event::Event;
 use coding_lab::live::{Channel, Live};
 use serde_json::{Value, json};
@@ -300,6 +302,33 @@ fn kpi_models_split_cost_and_thinking_by_model() {
         models["sonnet 5.5"],
         json!({"costUsd": 0.75, "thinkingTokens": 4, "ids": ["claude-sonnet-5-5"]})
     );
+}
+
+/// W-H3：PowerShell 是指令型工具，KPI 的指令數與 Agents 的「現在在做」和 Bash 一樣。
+#[test]
+fn powershell_counts_as_a_command() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.called(
+                "s1",
+                "p1",
+                "PowerShell",
+                json!({"command": "Get-ChildItem src"}),
+                DAY,
+                Value::Null,
+            ),
+        ],
+    );
+    l.register_offset(0);
+    let snap = l.snapshot(&Channel::All, 0, DAY + H);
+    assert_eq!(snap["kpi"]["commands"], 1);
+    let agents = rows(&snap, "agents");
+    let main = agents.iter().find(|a| a["id"] == "s1/main").unwrap();
+    assert_eq!(main["current"], "$ Get-ChildItem src");
 }
 
 // ── agents 列
@@ -1651,6 +1680,170 @@ fn ended_sessions_leave_live_after_two_hours() {
     assert!(text.contains("\"s2\""));
 }
 
+/// 移出時送 sessions 列 `deleted`（契約 §6）：已開著的頁面才知道它不在 live 了。
+#[test]
+fn evicted_session_sends_a_deleted_row() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.ev(
+                "s1",
+                "session.ended",
+                "main",
+                DAY + H,
+                false,
+                json!({"reason": "exit"}),
+            ),
+        ],
+    );
+    l.flush(DAY + H + 1);
+    let f = l.flush(DAY + 3 * H + 1).expect("移出要送 frame");
+    assert_eq!(
+        f.rows_for(&Channel::All)["sessions"],
+        json!([{"id": "s1", "deleted": true}])
+    );
+}
+
+/// 還有佇列列（未確認的 done、已解除但未確認的 danger）的 session 延後移出，佇列列不會變成孤兒列；
+/// 全部確認後下一次檢查才移（契約 §6、#737 K-7、D3）。
+#[test]
+fn session_with_open_attention_stays_until_the_queue_is_empty() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let raised = |b: &mut B, kind: &str, r: &str, ts: u64| {
+        b.ev(
+            "s1",
+            "attention.raised",
+            "main",
+            ts,
+            false,
+            json!({"kind": kind, "ref": r, "reason": "x"}),
+        )
+    };
+    let e1 = raised(&mut b, "done", "p1", DAY + 10);
+    let e2 = raised(&mut b, "danger", "t1", DAY + 20);
+    let e3 = b.ev(
+        "s1",
+        "attention.cleared",
+        "main",
+        DAY + 30,
+        false,
+        json!({"kind": "danger", "ref": "t1"}),
+    );
+    let end = b.ev(
+        "s1",
+        "session.ended",
+        "main",
+        DAY + H,
+        false,
+        json!({"reason": "exit"}),
+    );
+    apply_all(&mut l, &[b.started("s1", DAY), e1, e2, e3, end]);
+    l.flush(DAY + 3 * H + 1);
+    assert_eq!(l.session_count(), 1, "還有兩列沒確認：不移出");
+    let snap = l.snapshot(&Channel::All, 0, DAY + 3 * H + 2);
+    assert_eq!(rows(&snap, "sessions").len(), 1);
+    assert_eq!(rows(&snap, "attention").len(), 2);
+
+    assert!(l.ack("s1", "done", "p1"));
+    l.flush(DAY + 4 * H);
+    assert_eq!(l.session_count(), 1, "還有一列");
+    assert!(l.ack("s1", "danger", "t1"));
+    let f = l.flush(DAY + 5 * H).unwrap();
+    assert_eq!(l.session_count(), 0, "佇列清空後移出");
+    assert_eq!(
+        f.rows_for(&Channel::All)["sessions"],
+        json!([{"id": "s1", "deleted": true}])
+    );
+}
+
+/// 「已扣回 KPI」的記號和卡片的伴隨 Event 一起放掉（K-12）：session 移出後不留。
+#[test]
+fn reverted_marks_leave_with_the_session() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let edit = b.ev(
+        "s1",
+        "file.edit",
+        "main",
+        DAY + 10,
+        false,
+        json!({"toolUseId": "e1", "path": "a.rs", "hunk": null, "hunkSource": "none"}),
+    );
+    let failed = b.ev(
+        "s1",
+        "tool.updated",
+        "main",
+        DAY + 20,
+        false,
+        json!({"toolUseId": "e1", "status": "failed", "durationMs": null, "error": "denied",
+               "interrupted": null, "danger": null}),
+    );
+    let end = b.ev(
+        "s1",
+        "session.ended",
+        "main",
+        DAY + H,
+        false,
+        json!({"reason": "exit"}),
+    );
+    apply_all(
+        &mut l,
+        &[
+            b.started("s1", DAY),
+            b.called(
+                "s1",
+                "e1",
+                "Edit",
+                json!({"file_path": "a.rs"}),
+                DAY + 5,
+                Value::Null,
+            ),
+            edit,
+            failed,
+            end,
+        ],
+    );
+    assert_eq!(l.reverted_count(), 1, "前提：被拒的 Edit 扣回過");
+    l.flush(DAY + 3 * H + 1);
+    assert_eq!(l.session_count(), 0);
+    assert_eq!(l.reverted_count(), 0);
+}
+
+/// 「失敗」只算 tool.updated 的 failed、不是 Esc（interrupted）也不是 PermissionDenied（denied）；
+/// tool.result 的 ok=false 不另外算（D6、contracts §4）。KPI 與 sessions 列用同一個判斷。
+#[test]
+fn only_real_failures_are_counted() {
+    let mut b = B::new();
+    let mut l = Live::new();
+    let upd = |b: &mut B, id: &str, extra: Value| {
+        let mut p = json!({"toolUseId": id, "status": "failed", "durationMs": null, "error": "x", "interrupted": null});
+        for (k, v) in extra.as_object().unwrap() {
+            p[k] = v.clone();
+        }
+        b.ev("s1", "tool.updated", "main", DAY + 10, false, p)
+    };
+    let real = upd(&mut b, "t1", json!({}));
+    let esc = upd(&mut b, "t2", json!({"interrupted": true}));
+    let denied = upd(&mut b, "t3", json!({"denied": true}));
+    let result = b.ev(
+        "s1",
+        "tool.result",
+        "main",
+        DAY + 11,
+        false,
+        json!({"toolUseId": "t1", "ok": false, "exitCode": 1, "output": "", "truncated": false}),
+    );
+    apply_all(&mut l, &[b.started("s1", DAY), real, esc, denied, result]);
+    l.register_offset(0);
+    let snap = l.snapshot(&Channel::All, 0, DAY + H);
+    assert_eq!(snap["kpi"]["failures"], 1);
+    assert_eq!(rows(&snap, "sessions")[0]["failures"], 1);
+}
+
 /// #686（R23）：沒有新 Event 時 flush 不重算 KPI（只在有新 Event、跨時間格或跨午夜時算）。
 #[test]
 fn flush_without_new_events_does_not_recompute_kpi() {
@@ -1704,5 +1897,261 @@ fn seed_keeps_the_model_live_already_knows() {
         l.session_row("s2").unwrap()["modelId"],
         "claude-sonnet-5-5",
         "live 沒有就用 store 的"
+    );
+}
+
+/// E-L6（#771）：狀態行插進窗口的位置用二分搜尋（partition_point）的前提——同一個 session 依 pos 排序時 seq 也單調——
+/// 在 samples 回放上成立，而且組出來的串流裡每個狀態行都夾在 seq 比它小、比它大的帶 pos Event 之間。
+#[test]
+fn assemble_stream_places_status_lines_between_seqs_on_samples() {
+    let dirs = common::sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("沒有 samples，略過");
+        return;
+    }
+    let mut checked = 0;
+    for dir in dirs {
+        let Some(m) = common::merged_events(&dir) else {
+            continue;
+        };
+        let mut window: Vec<Event> = m
+            .events
+            .iter()
+            .filter(|e| e.pos.is_some())
+            .cloned()
+            .collect();
+        window.sort_by_key(|e| (e.pos, e.seq));
+        assert!(
+            window.windows(2).all(|w| w[0].seq < w[1].seq),
+            "{}：依 pos 排序時 seq 不單調",
+            dir.display()
+        );
+        let pool: Vec<Event> = m
+            .events
+            .iter()
+            .filter(|e| e.pos.is_none())
+            .cloned()
+            .collect();
+        // 整段、以及從中間開始的窗口（狀態行有時間下限）
+        let tail = window.len().saturating_sub(40);
+        for w in [window.clone(), window[tail..].to_vec()] {
+            let out = coding_lab::live::assemble_stream(w, pool.clone(), None);
+            for (i, e) in out.iter().enumerate() {
+                // 和 live.rs 的 STATUS_LINES 同一組（session.started 只有 resume／compact 算）
+                let status = e.pos.is_none()
+                    && match e.kind.as_str() {
+                        "prompt.submitted" | "session.status" | "agent.finished" => true,
+                        "session.started" => {
+                            matches!(e.payload["source"].as_str(), Some("resume" | "compact"))
+                        }
+                        _ => false,
+                    };
+                if !status {
+                    continue;
+                }
+                if let Some(prev) = out[..i].iter().rev().find(|x| x.pos.is_some()) {
+                    assert!(
+                        prev.seq < e.seq,
+                        "{}：狀態行 seq {} 排在 seq {} 之後",
+                        dir.display(),
+                        e.seq,
+                        prev.seq
+                    );
+                }
+                if let Some(next) = out[i + 1..].iter().find(|x| x.pos.is_some()) {
+                    assert!(
+                        next.seq > e.seq,
+                        "{}：狀態行 seq {} 排在 seq {} 之前",
+                        dir.display(),
+                        e.seq,
+                        next.seq
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("檢查了 {checked} 個狀態行");
+}
+
+/// E-L2（#771）：大量 apply 之後 discard_pending，不組那個超大的 frame（也不留在 history），snapshot 照樣是最新狀態。
+#[test]
+fn discard_pending_drops_the_backlog_but_keeps_the_state() {
+    let mut l = Live::new();
+    let mut b = B::new();
+    let mut evs = vec![b.started("s1", DAY)];
+    evs.extend((1..=50).map(|i| b.text("s1", DAY + i)));
+    apply_all(&mut l, &evs);
+    l.discard_pending();
+    assert!(l.flush(DAY + 1_000).is_none(), "丟掉之後沒有東西可送");
+    assert_eq!(
+        l.frames_since(0).map(|f| f.len()),
+        Some(0),
+        "history 裡沒有那個大 frame"
+    );
+    let snap = l.snapshot(&Channel::Session("s1".into()), 0, DAY + 1_000);
+    assert_eq!(snap["stream"].as_array().map(Vec::len), Some(50), "{snap}");
+}
+
+/// E-L4（#754）：同一個 frame 對每種（頻道、offset、剝除模式）只序列化一次；遠端模式與本機分開快取，
+/// 本機的全文絕不會送給遠端（X9，不變式 6）。session 頻道不帶 kpi，不同時區的連線共用同一份。
+#[test]
+fn frame_is_serialized_once_per_channel_offset_and_mode() {
+    use coding_lab::config::RemoteThinking;
+    use coding_lab::live::Wire;
+    let mut l = Live::new();
+    l.register_offset(0);
+    l.register_offset(480);
+    let mut b = B::new();
+    let mut evs = vec![b.started("s1", DAY)];
+    evs.push(b.called(
+        "s1",
+        "t1",
+        "Bash",
+        json!({"command": "cat .env"}),
+        DAY + 1,
+        Value::Null,
+    ));
+    evs.push(b.ev("s1", "tool.result", "main", DAY + 2, false,
+        json!({"toolUseId": "t1", "ok": true, "exitCode": 0, "output": "TOKEN=abc", "truncated": false, "sensitive": true})));
+    evs.push(b.ev(
+        "s1",
+        "assistant.thinking",
+        "main",
+        DAY + 3,
+        true,
+        json!({"text": "想一想", "summarized": false, "messageId": "m", "model": null}),
+    ));
+    apply_all(&mut l, &evs);
+    let f = l.flush(DAY + 1_000).expect("有變化");
+    let all = Channel::All;
+    let locals: Vec<String> = (0..3)
+        .map(|_| {
+            f.text_for(&all, 0, Wire::Local)
+                .unwrap()
+                .as_str()
+                .to_string()
+        })
+        .collect();
+    let remote = f
+        .text_for(&all, 0, Wire::Remote(RemoteThinking::OnDemand))
+        .unwrap()
+        .as_str()
+        .to_string();
+    assert_eq!(
+        f.serializations(),
+        2,
+        "3 條本機＋1 條遠端：本機一次、遠端一次"
+    );
+    assert!(locals.iter().all(|t| t == &locals[0]));
+    assert_eq!(
+        serde_json::from_str::<Value>(&locals[0]).unwrap(),
+        f.to_json(&all, 0).unwrap(),
+        "和 to_json 相同"
+    );
+    assert!(locals[0].contains("TOKEN=abc") && locals[0].contains("想一想"));
+    assert!(
+        !remote.contains("TOKEN=abc") && !remote.contains("想一想"),
+        "遠端收到剝除過的：{remote}"
+    );
+    // 不同 offset 的 `*`（kpi 不同）各算一次；session 頻道不分 offset
+    f.text_for(&all, 480, Wire::Local);
+    let s1 = Channel::Session("s1".into());
+    f.text_for(&s1, 0, Wire::Local);
+    f.text_for(&s1, 480, Wire::Local);
+    assert_eq!(f.serializations(), 4);
+}
+
+/// E-L9（#754）：「載入更多」只讀伴隨 Event 與狀態行，組出來的串流和讀範圍內每一行時完全相同（samples 回放）。
+#[test]
+fn more_reads_only_companions_and_status_lines_with_the_same_result() {
+    let dirs = common::sample_sessions();
+    if dirs.is_empty() {
+        eprintln!("沒有 samples，略過");
+        return;
+    }
+    let mut compared = 0;
+    for (n, dir) in dirs.iter().enumerate() {
+        let Some(m) = common::merged_events(dir) else {
+            continue;
+        };
+        let home = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("live-more-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut store = coding_lab::store::Store::open(&home).unwrap();
+        for e in &m.events {
+            store.append(e.clone());
+        }
+        store.flush().unwrap();
+        let last_pos = m.events.iter().filter_map(|e| e.pos).max().unwrap_or(0);
+        let mut before = Some(last_pos + 1);
+        while let Some(b) = before {
+            let window = store.stream_before(&m.session, Some(b), 20).unwrap();
+            let (Some(first), Some(last)) = (window.first().cloned(), window.last().cloned())
+            else {
+                break;
+            };
+            let (from, to) = (first.seq.saturating_sub(1000), last.seq + 1000);
+            let all = store.events_by_seq(&m.session, from, to).unwrap();
+            let only = store
+                .unplaced_by_seq(&m.session, from, to, coding_lab::live::pool_kinds())
+                .unwrap();
+            assert!(only.len() <= all.len());
+            let until = store
+                .next_pos_after(&m.session, last.pos.unwrap())
+                .unwrap()
+                .map(|(_, ts)| ts);
+            assert_eq!(
+                coding_lab::live::assemble_stream(window.clone(), only, until),
+                coding_lab::live::assemble_stream(window, all, until),
+                "{}：窗口 {b}",
+                dir.display()
+            );
+            compared += 1;
+            before = first.pos.filter(|p| *p > 1);
+        }
+    }
+    eprintln!("比較了 {compared} 個窗口");
+}
+
+/// W-M10（#781）：storeError 在 snapshot 的最外層一定有（正常時 null）；frame 只在改變時帶，恢復時帶 null，
+/// 沒有其他變化的 frame 也可以只帶它；每個頻道、本機與遠端都一樣（contracts §6）。
+#[test]
+fn store_error_is_in_every_snapshot_and_in_frames_when_it_changes() {
+    use coding_lab::live::Wire;
+    let mut l = Live::new();
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY)["storeError"], Value::Null);
+    assert!(
+        l.snapshot(&Channel::All, 0, DAY)
+            .as_object()
+            .unwrap()
+            .contains_key("storeError")
+    );
+    l.flush(DAY);
+
+    let err = json!({"message": "disk full", "since": 5, "pending": 3, "dropped": 0});
+    l.set_store_error(Some(err.clone()));
+    let f = l.flush(DAY + 1).expect("只有 storeError 也要送");
+    for ch in [Channel::All, Channel::Session("s1".into())] {
+        for wire in [
+            Wire::Local,
+            Wire::Remote(coding_lab::config::RemoteThinking::Hide),
+        ] {
+            let v: Value = serde_json::from_str(&f.text_for(&ch, 0, wire).unwrap()).unwrap();
+            assert_eq!(v["storeError"], err, "{ch:?} {wire:?}");
+        }
+    }
+    assert_eq!(l.snapshot(&Channel::All, 0, DAY + 1)["storeError"], err);
+
+    l.set_store_error(Some(err.clone()));
+    assert!(l.flush(DAY + 2).is_none(), "沒變就不送");
+
+    l.set_store_error(None);
+    let f = l.flush(DAY + 3).expect("恢復也要送");
+    let v: Value =
+        serde_json::from_str(&f.text_for(&Channel::All, 0, Wire::Local).unwrap()).unwrap();
+    assert!(
+        v.as_object().unwrap().contains_key("storeError") && v["storeError"].is_null(),
+        "{v}"
     );
 }

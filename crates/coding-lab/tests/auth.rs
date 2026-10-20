@@ -557,3 +557,252 @@ async fn successful_auth_records_last_used() {
     let op = keys::parse_token(&s.operate).unwrap().0;
     assert!(store.get(op).unwrap().last_used_ms.is_none());
 }
+
+// ── 反向代理（S-1）：loopback 來源帶 X-Forwarded-*／Forwarded 一律當遠端 ─────────
+
+/// 一個有 session 的 store：prompt 裡有 clk_ 金鑰、有一段 thinking（遠端要剝的兩樣東西）。
+fn proxied_server_store(
+    home: &Path,
+    secret: &str,
+) -> std::sync::Arc<std::sync::Mutex<coding_lab::store::Store>> {
+    let ev = |seq: u64, kind: &str, pos: Option<u64>, payload: Value| {
+        coding_lab::event::Event::from_json_line(
+            &json!({"v": 1, "session": "s1", "seq": seq, "type": kind, "agent": "main", "line": null,
+                    "pos": pos, "ts_model": null, "ts_exec": null, "ts_seen": NOW + seq, "host": "local",
+                    "payload": payload})
+            .to_string(),
+        )
+        .unwrap()
+    };
+    let mut s = coding_lab::store::Store::open(home).unwrap();
+    s.append(ev(1, "session.started", None,
+        json!({"cwd": "/p", "source": "startup", "model": "m", "transcriptPath": "/t", "branch": "main"})));
+    s.append(ev(
+        2,
+        "prompt.submitted",
+        None,
+        json!({"text": format!("use {secret} please"), "promptId": "p1"}),
+    ));
+    s.append(ev(
+        3,
+        "assistant.thinking",
+        Some(1),
+        json!({"text": "THINKING-FULL-TEXT", "summarized": false, "messageId": "m", "model": "m"}),
+    ));
+    s.flush().unwrap();
+    std::sync::Arc::new(std::sync::Mutex::new(s))
+}
+
+async fn start_proxied() -> Server {
+    let home = tmp("proxy");
+    let mut store = KeyStore::new_with_secret([9u8; 32]);
+    let mut rng = keys::test_rng(42);
+    let view = store.create("view", Scope::View, None, NOW, &mut rng);
+    let operate = store.create("op", Scope::Operate, None, NOW, &mut rng);
+    store.save(&home).unwrap();
+    let st = proxied_server_store(&home, &operate);
+    let state = WebState::new_with_auth(Some(st), None, 8, home.clone(), AuthMode::LocalOpen);
+    state.set_remote_thinking(coding_lab::config::RemoteThinking::Hide);
+    let (addr, _) = serve_web("127.0.0.1:0".parse().unwrap(), state)
+        .await
+        .unwrap();
+    Server {
+        addr,
+        home,
+        store,
+        view,
+        operate,
+    }
+}
+
+/// nginx 的 `proxy_pass` 預設把 Host 改成 upstream：來源與 Host 都是 loopback，只剩 X-Forwarded-* 看得出是代理轉來的。
+#[tokio::test]
+async fn proxied_request_on_loopback_needs_a_key() {
+    let s = start_proxied().await;
+    for fwd in [
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("X-Forwarded-Host", "lab.example.com"),
+        ("X-Forwarded-Proto", "https"),
+        ("Forwarded", "for=203.0.113.9;proto=https"),
+    ] {
+        let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[fwd], "").await;
+        assert_eq!(code, 401, "{fwd:?}：代理轉來的請求在 local-open 下也要金鑰");
+    }
+    // 沒有轉發標頭的本機請求照舊免金鑰
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions", &[], "").await;
+    assert_eq!(code, 200);
+}
+
+#[tokio::test]
+async fn proxied_request_with_a_key_is_redacted_like_a_remote_one() {
+    let s = start_proxied().await;
+    let bearer = format!("Bearer {}", s.view);
+    let fwd = [
+        ("X-Forwarded-For", "203.0.113.9"),
+        ("Authorization", bearer.as_str()),
+    ];
+    let (code, _, body) = http(s.addr, "GET", "/api/sessions/s1/events", &fwd, "").await;
+    assert_eq!(code, 200);
+    assert!(
+        !body.contains("THINKING-FULL-TEXT"),
+        "remote_thinking=hide 時 thinking 全文要 defer：{body}"
+    );
+    assert!(!body.contains(&s.operate), "clk_ 金鑰要剝：{body}");
+    let (code, _, _) = http(s.addr, "GET", "/api/sessions/s1/thinking/3", &fwd, "").await;
+    assert_eq!(code, 403, "hide 時遠端讀不到 thinking 全文");
+}
+
+#[tokio::test]
+async fn proxied_ws_needs_a_key_and_is_not_local() {
+    let s = start_proxied().await;
+    assert!(
+        ws_with(s.addr, &[("X-Forwarded-For", "203.0.113.9")])
+            .await
+            .is_err(),
+        "代理轉來的 WS 沒有金鑰要被拒"
+    );
+    let bearer = format!("Bearer {}", s.view);
+    let mut ws = ws_with(
+        s.addr,
+        &[
+            ("X-Forwarded-For", "203.0.113.9"),
+            ("Authorization", &bearer),
+        ],
+    )
+    .await
+    .unwrap();
+    let w = hello(&mut ws).await;
+    assert_eq!(w["scope"], "view");
+    assert_eq!(
+        w["thinking"], "hide",
+        "代理轉來的連線照遠端的 remote_thinking：{w}"
+    );
+}
+
+// ── 金鑰檔的並發（#743 S-3、S-7、E-H10，X12） ─────────────────────────────────────
+
+/// collector 驗金鑰不再寫 keys.json（last_used 另存一個檔）：keys.json 只有 CLI 的 create／revoke 會寫。
+#[test]
+fn verifying_a_key_never_rewrites_keys_json_but_last_used_is_kept() {
+    let home = tmp("used");
+    let mut rng = keys::test_rng(5);
+    let mut ks = KeyStore::new(&mut rng);
+    let token = ks.create("laptop", Scope::View, None, 1, &mut rng);
+    let id = keys::parse_token(&token).unwrap().0.to_string();
+    ks.save(&home).unwrap();
+    let before = std::fs::read(KeyStore::path(&home)).unwrap();
+    let a = auth::Auth::new(home.clone(), AuthMode::Always);
+    a.verify_token(&token, NOW).unwrap();
+    assert_eq!(
+        std::fs::read(KeyStore::path(&home)).unwrap(),
+        before,
+        "keys.json 原封不動"
+    );
+    let loaded = KeyStore::load(&home).unwrap().unwrap();
+    assert_eq!(
+        loaded.get(&id).unwrap().last_used_ms,
+        Some(NOW),
+        "key list 仍看得到 last_used"
+    );
+}
+
+/// CLI 撤銷時 collector 正在寫 last_used：撤銷不能被蓋掉，CLI 也不能寫失敗（S-3）。
+#[test]
+fn revoke_is_never_lost_to_a_concurrent_last_used_write() {
+    use std::sync::{Arc, Barrier};
+    let (mut lost, mut failed) = (0, 0);
+    for i in 0..50u64 {
+        let home = tmp("revoke-race");
+        let mut rng = keys::test_rng(i + 3);
+        let mut ks = KeyStore::new(&mut rng);
+        let token = ks.create("laptop", Scope::View, None, 1, &mut rng);
+        let id = keys::parse_token(&token).unwrap().0.to_string();
+        ks.save(&home).unwrap();
+        let a = Arc::new(auth::Auth::new(home.clone(), AuthMode::Always));
+        let b = Arc::new(Barrier::new(2));
+        let (a2, b2, tok) = (a.clone(), b.clone(), token.clone());
+        let h = std::thread::spawn(move || {
+            b2.wait();
+            for k in 0..20u64 {
+                let _ = a2.verify_token(&tok, NOW + k * 61_000);
+            }
+        });
+        b.wait();
+        let mut cli = KeyStore::load(&home).unwrap().unwrap();
+        cli.revoke(&id, 5);
+        let saved = cli.save(&home).is_ok();
+        h.join().unwrap();
+        if !saved {
+            failed += 1;
+        } else if KeyStore::load(&home)
+            .unwrap()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .revoked_ms
+            .is_none()
+        {
+            lost += 1;
+        }
+        assert!(
+            a.verify_token(&token, NOW + 2_000_000).is_err() || !saved,
+            "撤銷之後不能再用"
+        );
+    }
+    assert_eq!(
+        (lost, failed),
+        (0, 0),
+        "撤銷被蓋掉 {lost} 次、CLI 寫入失敗 {failed} 次"
+    );
+}
+
+/// 同一個一次性連結被同時兌換：最多一次成功（S-7）。
+#[test]
+fn once_link_is_redeemed_at_most_once_under_concurrency() {
+    use std::sync::{Arc, Barrier};
+    for i in 0..200u64 {
+        let home = tmp("once-race");
+        let code =
+            auth::create_once_link(&home, "abcdefgh", NOW, &mut keys::test_rng(i + 1)).unwrap();
+        let barrier = Arc::new(Barrier::new(8));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let (home, code, b) = (home.clone(), code.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    b.wait();
+                    auth::consume_once_link(&home, &code, NOW + 1)
+                })
+            })
+            .collect();
+        let ok = hs
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|r| matches!(r, Ok(Some(_))))
+            .count();
+        assert!(ok <= 1, "第 {i} 輪同一個 code 兌換成功 {ok} 次");
+        assert_eq!(ok, 1, "第 {i} 輪：要有一次成功");
+    }
+}
+
+/// E-H11（#756）：不會再來的 IP 也要清掉；換 IPv6 位址不能讓限流表一直長大。
+#[test]
+fn rate_limiter_table_stays_bounded() {
+    let mut r = RateLimiter::new(10, MIN);
+    for i in 0..1100u32 {
+        let ip = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            0,
+            0,
+            0,
+            0,
+            (i >> 16) as u16,
+            i as u16,
+        ));
+        r.record_failure(ip, NOW + u64::from(i));
+    }
+    assert!(r.tracked() <= 1024, "表裡有 {} 個 IP", r.tracked());
+    // 過了窗口之後，舊的整批清掉
+    r.record_failure("10.0.0.1".parse().unwrap(), NOW + 2 * MIN);
+    assert!(r.tracked() <= 2, "過期的要清掉：{}", r.tracked());
+}

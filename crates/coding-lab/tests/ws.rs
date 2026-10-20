@@ -677,7 +677,7 @@ async fn resume_only_covers_the_resubscribe_burst() {
 }
 
 /// #654 驗收（本機那一半）：本機連線收到的敏感輸出是全文；welcome 說明這是本機連線。
-/// 遠端那一半（剝除）由 tests/sensitive.rs 的 redact_remote 與下面的 is_remote 涵蓋：P6 之前 web 只綁 loopback。
+/// 遠端那一半（剝除）由下面的 redact_remote_copy_* 與 remote_sessions_rows_are_redacted_over_http_and_ws 涵蓋。
 #[tokio::test]
 async fn local_connection_sees_sensitive_output_in_full() {
     let state = WebState::new(None, None, 64);
@@ -716,4 +716,221 @@ fn only_non_loopback_peers_are_remote() {
     assert!(!is_remote("[::1]:5000".parse().unwrap()));
     assert!(is_remote("100.64.0.7:5000".parse().unwrap()));
     assert!(is_remote("192.168.1.20:5000".parse().unwrap()));
+}
+
+// ── 遠端剝除：單一的 redact_remote_copy（#734 C8、C2、S-5，E-L10） ───────────────────
+
+const CLK: &str = "clk_ABCDEFGH_0123456789abcdefghijABCDEFGHIJ0123456789abcde";
+
+/// 一個 frame：敏感與不敏感的 tool.called／file.write／file.edit／tool.result、一段 thinking、兩種 doing 來源的 sessions 列。
+fn redaction_frame() -> Value {
+    let event = |kind: &str, payload: Value| json!({"type": kind, "session": "s1", "seq": 1, "payload": payload});
+    json!({
+        "t": "frame",
+        "events": [
+            event("tool.called", json!({"toolUseId": "w1", "tool": "Write", "sensitive": true,
+                "input": {"file_path": "/p/.env", "content": "API_KEY=NEWSECRET"}})),
+            event("tool.called", json!({"toolUseId": "e1", "tool": "Edit", "sensitive": true,
+                "input": {"file_path": "/p/.env", "old_string": "OLDSECRET", "new_string": "NEWSECRET", "replace_all": false}})),
+            event("tool.called", json!({"toolUseId": "b1", "tool": "Bash", "sensitive": true,
+                "input": {"command": "cat .env", "description": "看 NEWSECRET"}})),
+            event("file.write", json!({"toolUseId": "w1", "path": "/p/.env", "content": "API_KEY=NEWSECRET", "sensitive": true})),
+            event("file.edit", json!({"toolUseId": "e1", "path": "/p/.env", "sensitive": true,
+                "hunk": {"oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 3, "lines": ["-DB=OLDSECRET", "+DB=NEWSECRET", " FOO=1"]}})),
+            event("tool.result", json!({"toolUseId": "b1", "ok": true, "output": "API_KEY=NEWSECRET", "sensitive": true})),
+            event("tool.called", json!({"toolUseId": "w2", "tool": "Write", "input": {"file_path": "/p/a.txt", "content": "plain"}})),
+            event("file.write", json!({"toolUseId": "w2", "path": "/p/a.txt", "content": "plain"})),
+            event("file.edit", json!({"toolUseId": "e2", "path": "/p/a.txt", "hunk": {"lines": ["+plain"]}})),
+            event("assistant.thinking", json!({"text": "想一想", "summarized": false})),
+            event("prompt.submitted", json!({"text": format!("用 {CLK}")})),
+        ],
+        "sessions": [
+            {"id": "s1", "doing": "想一想", "doingSource": "thinking"},
+            {"id": "s2", "doing": "改 a.txt", "doingSource": "text"},
+        ],
+    })
+}
+
+#[test]
+fn redact_remote_copy_strips_sensitive_writes_edits_and_results() {
+    use coding_lab::config::RemoteThinking;
+    let frame = redaction_frame();
+    let out = coding_lab::ws::redact_remote_copy(&frame, RemoteThinking::OnDemand);
+    let text = out.to_string();
+    assert!(
+        !text.contains("NEWSECRET") && !text.contains("OLDSECRET"),
+        "{text}"
+    );
+    let evs = &out["events"];
+    // tool.called 只留路徑類欄位
+    assert_eq!(evs[0]["payload"]["input"], json!({"file_path": "/p/.env"}));
+    assert_eq!(evs[1]["payload"]["input"], json!({"file_path": "/p/.env"}));
+    assert_eq!(evs[2]["payload"]["input"], json!({"command": "cat .env"}));
+    for i in 0..6 {
+        assert_eq!(evs[i]["payload"]["redacted"], true, "{}", evs[i]);
+    }
+    assert_eq!(evs[3]["payload"]["content"], "");
+    assert_eq!(evs[4]["payload"]["hunk"]["lines"], json!([]));
+    assert_eq!(evs[4]["payload"]["hunk"]["oldLines"], 3, "行號與計數保留");
+    assert_eq!(evs[5]["payload"]["output"], "");
+    // 不敏感的照送
+    for i in 6..9 {
+        assert_eq!(evs[i], frame["events"][i], "不敏感的不動");
+    }
+    // 原值不變（只改送出的副本）
+    assert_eq!(frame, redaction_frame());
+}
+
+#[test]
+fn redact_remote_copy_defers_thinking_and_thinking_doing_unless_show() {
+    use coding_lab::config::RemoteThinking;
+    let frame = redaction_frame();
+    for mode in [RemoteThinking::OnDemand, RemoteThinking::Hide] {
+        let out = coding_lab::ws::redact_remote_copy(&frame, mode);
+        let t = &out["events"][9]["payload"];
+        assert_eq!(t["text"], "");
+        assert_eq!(t["deferred"], true);
+        assert_eq!(t["chars"], 3);
+        assert_eq!(
+            out["sessions"][0]["doing"],
+            Value::Null,
+            "{mode:?}：thinking 來的 doing 不送"
+        );
+        assert_eq!(out["sessions"][1]["doing"], "改 a.txt");
+    }
+    let out = coding_lab::ws::redact_remote_copy(&frame, RemoteThinking::Show);
+    assert_eq!(out["events"][9]["payload"]["text"], "想一想");
+    assert_eq!(out["sessions"][0]["doing"], "想一想");
+    // 不論模式，clk_ 金鑰都剝
+    assert!(!out.to_string().contains(CLK));
+    assert!(
+        out["events"][10]["payload"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("clk_ABCDEFGH_…")
+    );
+}
+
+/// 遠端 /api/sessions 與 WS snapshot：prompt 裡的 clk_ 金鑰剝掉（S-5），hide 時 thinking 來的 doing 不送（C2）。
+#[tokio::test]
+async fn remote_sessions_rows_are_redacted_over_http_and_ws() {
+    use coding_lab::config::RemoteThinking;
+    let evs = vec![
+        ev(
+            "s1",
+            1,
+            "session.started",
+            None,
+            json!({"cwd": "/p", "source": "startup", "model": "m", "transcriptPath": "/t", "branch": "main"}),
+        ),
+        ev(
+            "s1",
+            2,
+            "prompt.submitted",
+            None,
+            json!({"text": format!("用 {CLK} 登入"), "promptId": "p1"}),
+        ),
+        ev(
+            "s1",
+            3,
+            "assistant.thinking",
+            Some(1),
+            json!({"text": "THOUGHT-密碼在第三行。", "summarized": false, "messageId": "m1", "model": "m"}),
+        ),
+    ];
+    let home = tmp("remote-rows");
+    let mut store = Store::open(&home).unwrap();
+    for e in &evs {
+        store.append(e.clone());
+    }
+    store.flush().unwrap();
+    let state = WebState::new(Some(Arc::new(std::sync::Mutex::new(store))), None, 8);
+    state.set_remote_thinking(RemoteThinking::Hide);
+    state.set_force_remote(true);
+    state.apply(&evs);
+    state.flush(5_000);
+    let addr = start(state).await;
+    let body = http_get(addr, "/api/sessions").await;
+    assert!(!body.contains(CLK), "遠端 /api/sessions 帶完整金鑰：{body}");
+    assert!(
+        !body.contains("THOUGHT"),
+        "遠端 /api/sessions 的 doing 是 thinking：{body}"
+    );
+    let mut ws = connect(addr, None).await.unwrap();
+    hello(&mut ws, json!({})).await;
+    send(&mut ws, json!({"op": "subscribe", "channel": "*"})).await;
+    let snap = recv(&mut ws).await.to_string();
+    assert!(!snap.contains(CLK) && !snap.contains("THOUGHT"), "{snap}");
+}
+
+/// 每個回應都禁止被嵌進 iframe（F-7）：local-open 時任何網站都能把 127.0.0.1:4801 放進 iframe 誘導點擊「全部確認」。
+#[tokio::test]
+async fn every_response_forbids_framing() {
+    let home = tmp("frame");
+    std::fs::write(home.join("index.html"), "<html></html>").unwrap();
+    let state = WebState::new(None, Some(home.clone()), 8);
+    let addr = start(state).await;
+    for path in ["/", "/healthz", "/api/sessions", "/auth/login", "/nope"] {
+        let raw = http_get_host(addr, path, &addr.to_string()).await;
+        let head = raw.split("\r\n\r\n").next().unwrap().to_ascii_lowercase();
+        assert!(head.contains("x-frame-options: deny"), "{path}：{head}");
+        assert!(
+            head.contains("content-security-policy: frame-ancestors 'none'"),
+            "{path}：{head}"
+        );
+    }
+}
+
+/// C8 端到端：merge 對敏感路徑的 Write／Edit 標 sensitive（#761），遠端副本剝掉新寫入的秘密，
+/// 也剝掉 Edit 的 hunk 前後文從實際檔案帶出的舊秘密（#734）。本機副本照舊。
+#[test]
+fn sensitive_writes_and_edits_from_merge_never_reach_remote_copies() {
+    use coding_lab::config::RemoteThinking;
+    use coding_lab::hook::HookInput;
+    use coding_lab::merge::{Input, Merger};
+    let dir = tmp("c8");
+    std::fs::write(
+        dir.join(".env"),
+        "DB_PASSWORD=OLDSECRET-zzz\nFOO=1\nBAR=2\n",
+    )
+    .unwrap();
+    let cwd = dir.to_string_lossy().replace('\\', "/");
+    let hook = |v: Value| {
+        let mut h = HookInput::from_json(v.to_string().as_bytes()).unwrap();
+        coding_lab::derive::attach_probe(&mut h);
+        h
+    };
+    let mut m = Merger::new(Box::new(coding_lab::rules::RuleSet::builtin()));
+    let mut evs = Vec::new();
+    for (i, v) in [
+        json!({"session_id": "s1", "hook_event_name": "SessionStart", "cwd": cwd, "source": "startup",
+               "transcript_path": format!("{cwd}/t.jsonl")}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Write", "cwd": cwd,
+               "tool_input": {"file_path": format!("{cwd}/new/.env"), "content": "API_KEY=NEWSECRET-abc\n"},
+               "tool_use_id": "w1"}),
+        json!({"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": "Edit", "cwd": cwd,
+               "tool_input": {"file_path": format!("{cwd}/.env"), "old_string": "FOO=1", "new_string": "FOO=2"},
+               "tool_use_id": "e1"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        evs.extend(m.handle(Input::Hook { hook: hook(v), ts_seen: i as u64 + 1 }));
+    }
+    let kinds: Vec<&str> = evs.iter().map(|e| e.type_name()).collect();
+    assert!(
+        kinds.contains(&"file.write") && kinds.contains(&"file.edit"),
+        "{kinds:?}"
+    );
+    let local = json!({ "events": evs }).to_string();
+    assert!(
+        local.contains("NEWSECRET") && local.contains("OLDSECRET"),
+        "前提：本機副本有全文"
+    );
+    let remote =
+        coding_lab::ws::redact_remote_copy(&json!({ "events": evs }), RemoteThinking::Show)
+            .to_string();
+    for secret in ["NEWSECRET", "OLDSECRET"] {
+        assert!(!remote.contains(secret), "遠端副本含 {secret}：{remote}");
+    }
 }
