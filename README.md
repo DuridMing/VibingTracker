@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：collector、plugin 與網頁都可以用，遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務也已完成並在 Linux 與 Windows 實機驗收過。正式版 0.1.0 發佈後，plugin 會自動下載對應平台的二進位；在那之前要從原始碼安裝。主頁的時間軸回放是實驗功能，大範圍回放會慢。
+> **狀態**：collector、plugin 與網頁都可以用，遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務也已完成並在 Linux 與 Windows 實機驗收過。0.1.0 起 GitHub Release 有預先編好的二進位，plugin 找不到二進位時會自動下載對應平台的版本；也可以從原始碼安裝。主頁的時間軸回放是實驗功能，大範圍回放會慢。
 
 ## 它做什麼
 
@@ -86,7 +86,7 @@ wrapper 依序找 `$CODING_LAB_BIN`、`~/.coding-lab/bin/coding-lab`、PATH 上�
 wrapper 找不到二進位時，會在背景從 GitHub Release 下載**和 plugin 同版**的壓縮檔（cargo-dist 產生的 `coding-lab-<平台>.tar.gz`／`.zip` 與 `.sha256`），不必編譯。要改下載來源（自己架的鏡像）或關掉自動下載，設在 Claude Code 讀得到的環境變數：
 
 ```bash
-export CODING_LAB_RELEASE_URL=https://example.com/coding-lab/releases/v0.1.0   # 放下載檔的目錄網址；只收 https://
+export CODING_LAB_RELEASE_URL=https://example.com/coding-lab/releases/v0.1.1   # 放下載檔的目錄網址；只收 https://
 export CODING_LAB_RELEASE_URL=                                                 # 空字串：不自動下載
 ```
 
