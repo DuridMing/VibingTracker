@@ -190,7 +190,16 @@ h2 small{color:var(--muted);font-weight:400;margin-left:8px;font-size:11.5px}
 /* 三欄 */
 .sgrid{flex:1;display:grid;grid-template-columns:minmax(0,1.3fr) 300px minmax(0,1fr);gap:12px;min-height:520px}
 @media (max-width:1300px){.sgrid{grid-template-columns:minmax(0,1fr) 280px}.sgrid .sside:last-child{grid-column:1/3}}
-@media (max-width:900px){.sgrid{grid-template-columns:1fr}.sgrid .sside:last-child{grid-column:auto}}
+/* 900px 以下單欄：三塊各自有固定高度、各自捲，外層（.col-work）改成上下捲。
+   原本三列平分視窗高度，串流只剩兩三行、Agents 疊到修改情形上（第 2 輪 Windows 驗收，800px） */
+@media (max-width:900px){
+  .sgrid{grid-template-columns:1fr;flex:none;min-height:0}
+  .sgrid .sside:last-child{grid-column:auto}
+  .col-work{overflow-y:auto}
+  .col-work>*{flex:none} /* 外層要捲的時候子元素不能被壓扁（分頁列原本縮到看不見） */
+  .scol{height:620px}
+  .sside{height:460px}
+}
 .scol{display:grid;grid-template-rows:2fr 1fr;gap:10px;min-height:0;min-width:0}
 /* 合流串流（虛擬化：每行固定 20px，展開的行另外量高度；js/stream-view.js 的 ROW_H 要跟這裡一致） */
 .streamwrap{display:flex;flex-direction:column;gap:6px;min-height:0}
