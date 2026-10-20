@@ -2,7 +2,7 @@
 
 同時開 8–16 個 Claude Code 時，用一個畫面追蹤整個專案、不漏掉任何一個 session。
 
-> **狀態**：collector、plugin 與網頁都可以用，遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務也已完成並在 Linux 與 Windows 實機驗收過。0.1.0 起 GitHub Release 有預先編好的二進位，plugin 找不到二進位時會自動下載對應平台的版本；也可以從原始碼安裝。主頁的時間軸回放是實驗功能，大範圍回放會慢。
+> **狀態**：collector、plugin 與網頁都可以用，遠端登入（金鑰）、遠端 thinking、多機總覽（hub）與常駐服務也已完成並在 Linux 與 Windows 實機驗收過。0.1.1 起 GitHub Release 有預先編好的二進位，plugin 找不到二進位時會自動下載對應平台的版本；也可以從原始碼安裝。主頁的時間軸回放是實驗功能，大範圍回放會慢。
 
 ## 它做什麼
 
