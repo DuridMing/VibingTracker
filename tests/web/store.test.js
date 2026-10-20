@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createStore, applySnapshot, applyFrame } from "../js/store.js";
+import { createStore, applySnapshot, applyFrame } from "../../web/js/store.js";
 
 const snap = {
   t: "snapshot",

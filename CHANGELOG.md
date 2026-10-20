@@ -7,6 +7,7 @@
 ### 修正
 
 - Windows 上用 `C:\…` 這種反斜線寫法設 `CODING_LAB_HOME` 時，plugin 的自動下載與背景更新一直說「sha256 不符」而裝不起來（每個 session 開始都重新下載一次）。
+- Release 的壓縮檔不再帶前端的單元測試（`web/test/`），裝進 `~/.coding-lab/bin/web/` 的只有網頁本身。
 
 ## 0.1.0（2026-10-20）
 

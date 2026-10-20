@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices } from "../js/branches.js";
+import { branchesUrl, branchDiffUrl, graphUrl, commitUrl, commitDiffUrl, changedBranches, diffLines, worktreeLabel, graphNotices } from "../../web/js/branches.js";
 
 // contracts §7 的 /api/branches 列（#696）
 const row = (branch, o = {}) => ({ branch, worktree: `/repo/wt/${branch}`, integration: false, ahead: 0, behind: 0, dirty: 0, changed: 0, sessions: [], shared: [], last: null, ...o });
@@ -33,7 +33,7 @@ test("worktree 顯示：主工作樹寫「主工作樹」，其他相對 repo �
   assert.equal(worktreeLabel("/repo", "/elsewhere/x"), "/elsewhere/x");
 });
 
-import { layoutGraph, withWip } from "../js/branches.js";
+import { layoutGraph, withWip } from "../../web/js/branches.js";
 
 const c = (hash, ...parents) => ({ hash, parents });
 // 線段寫成 "x1,y1>x2,y2"（x 是欄，y 是 0／0.5／1：列的上緣、圓點、下緣）

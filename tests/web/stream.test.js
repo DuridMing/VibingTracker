@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createStream, kindOf, ORPHAN_CAP } from "../js/stream.js";
+import { createStream, kindOf, ORPHAN_CAP } from "../../web/js/stream.js";
 
 // Event 照 contracts.md §4；這裡捏的是我們自己的 Event，不是 transcript。
 const A = "aaaaaaaa-0000-0000-0000-000000000001";

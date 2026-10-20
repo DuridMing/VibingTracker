@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fmtKpi, modelBreakdown } from "../js/kpi.js";
-import { createStore, applySnapshot, applyFrame } from "../js/store.js";
+import { fmtKpi, modelBreakdown } from "../../web/js/kpi.js";
+import { createStore, applySnapshot, applyFrame } from "../../web/js/store.js";
 
 test("費用兩位小數、思考 tokens 超過千以 k 表示、沒有值顯示 —", () => {
   assert.equal(fmtKpi("costUsd", 1.234), "$1.23");

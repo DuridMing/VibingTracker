@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sortAttention, sessionDangers, ackAllTargets } from "../js/attention.js";
-import { createStore, applySnapshot, applyFrame } from "../js/store.js";
+import { sortAttention, sessionDangers, ackAllTargets } from "../../web/js/attention.js";
+import { createStore, applySnapshot, applyFrame } from "../../web/js/store.js";
 
 const row = (id, session, kind, raisedAt) => ({ id, session, kind, ref: id, reason: "r", raisedAt });
 

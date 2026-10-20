@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createFileTree, projectPath, gitMarks, filesUrl, sinceChanges, LAZY_THRESHOLD } from "../js/tree.js";
+import { createFileTree, projectPath, gitMarks, filesUrl, sinceChanges, LAZY_THRESHOLD } from "../../web/js/tree.js";
 
 // Event 照 contracts.md §4；file.* 的 path 相對 session 的 cwd（#672）
 const A = "aaaaaaaa-0000-0000-0000-000000000001";

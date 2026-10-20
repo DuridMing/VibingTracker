@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mergeSessions, projectRoots, canReplay } from "../js/sessions.js";
+import { mergeSessions, projectRoots, canReplay } from "../../web/js/sessions.js";
 
 const row = (id, extra = {}) => ({ id, cwd: "/repo", status: "run", startedAt: 1000, model: null, ...extra });
 
@@ -39,7 +39,7 @@ test("▶ 回放按鍵只給已結束的 session（#690）", () => {
   assert.equal(canReplay(null), false);
 });
 
-import { fitTabs } from "../js/sessions.js";
+import { fitTabs } from "../../web/js/sessions.js";
 
 test("tab 列（#704）：全部放得下時不收、沒有「+N」", () => {
   assert.deepEqual(fitTabs([100, 100, 100], 300, 40, -1), { shown: [0, 1, 2], hidden: [] });

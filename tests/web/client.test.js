@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createClient, PROTOCOL } from "../js/client.js";
+import { createClient, PROTOCOL } from "../../web/js/client.js";
 
 // 假的 WebSocket 與計時器：測試不 sleep，由測試推動時間。
 function harness(opts = {}) {

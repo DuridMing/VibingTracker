@@ -65,6 +65,29 @@ fn manifest_name_and_version_match_the_crate() {
     );
 }
 
+/// Release 的壓縮檔整個帶上 `web/`（crates/coding-lab/Cargo.toml 的 dist include）：前端的單元測試不能放在裡面，
+/// 不然會一起裝進每個使用者的 `~/.coding-lab/bin/web/`（0.1.0 就是這樣，R-16）。測試放 tests/web/。
+#[test]
+fn web_dir_ships_no_tests() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.to_string_lossy().ends_with(".test.js") {
+                out.push(p.display().to_string());
+            }
+        }
+    }
+    let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
+    let mut found = Vec::new();
+    walk(&web, &mut found);
+    assert!(
+        found.is_empty(),
+        "web/ 會整個打包進 Release，不能有測試：{found:?}"
+    );
+}
+
 #[test]
 fn hooks_json_subscribes_exactly_the_contract_events() {
     let root = read_json("hooks/hooks.json");

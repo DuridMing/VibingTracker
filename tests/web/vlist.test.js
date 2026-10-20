@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { layout, indexAt } from "../js/vlist.js";
+import { layout, indexAt } from "../../web/js/vlist.js";
 
 const rows = [{ h: 20 }, { h: 0 }, { h: 60 }, { h: 20 }];
 const heightOf = (r) => r.h;

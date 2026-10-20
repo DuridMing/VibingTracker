@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { clampRect } from "../js/floatwin.js";
+import { clampRect } from "../../web/js/floatwin.js";
 
 const VIEW = { vw: 1600, vh: 1000 };
 
