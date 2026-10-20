@@ -23,14 +23,14 @@ echo "== cargo clippy"
 cargo clippy --workspace --all-targets --locked -- -D warnings
 echo "== cargo test"
 cargo test --workspace --locked
-# 前端純邏輯測試（web/test/）：開發機沒有 Node，走 podman；沒有 podman 但有 Node（例如 Windows）就直接跑；兩個都沒有才跳過。
+# 前端純邏輯測試（tests/web/；不放 web/ 底下，web/ 會整個打包進 Release）：開發機沒有 Node，走 podman；沒有 podman 但有 Node（例如 Windows）就直接跑；兩個都沒有才跳過。
 # 映像釘版本（#749 T-6）；離線又沒有這個映像時退到本機的 Node，再沒有才跳過並說清楚（不讓整個 check.sh 因為網路紅掉）
 echo "== web test"
 NODE_IMAGE=docker.io/library/node:22.23.3-alpine
 if command -v podman >/dev/null 2>&1 && { podman image exists "$NODE_IMAGE" || podman pull -q "$NODE_IMAGE" >/dev/null 2>&1; }; then
-  podman run --rm -v "$PWD/web:/web:Z,ro" -w /web "$NODE_IMAGE" node --test
+  podman run --rm -v "$PWD/web:/repo/web:Z,ro" -v "$PWD/tests/web:/repo/tests/web:Z,ro" -w /repo "$NODE_IMAGE" node --test "tests/web/*.test.js"
 elif command -v node >/dev/null 2>&1; then
-  (cd web && node --test)
+  node --test "tests/web/*.test.js"
 else
   echo "（沒有 podman 映像 $NODE_IMAGE（離線拉不到）也沒有 Node：跳過前端測試，連上網路後再跑一次）"
 fi

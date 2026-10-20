@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { degradedNotice } from "../js/degraded.js";
+import { degradedNotice } from "../../web/js/degraded.js";
 
 const s = (id, degraded = []) => ({ id, status: "run", degraded });
 

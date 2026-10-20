@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { norm, same, relUnder, under } from "../js/paths.js";
+import { norm, same, relUnder, under } from "../../web/js/paths.js";
 
 test("正規化：反斜線換成 /、去掉結尾的 /、磁碟機代號大寫（contracts §4 路徑正規化，#748 L-11）", () => {
   assert.equal(norm("e:\\proj\\x\\"), "E:/proj/x");

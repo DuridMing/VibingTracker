@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { SPEEDS, timelineUrl, createTimeline } from "../js/timeline.js";
+import { SPEEDS, timelineUrl, createTimeline } from "../../web/js/timeline.js";
 
 const frame = (ts) => ({ t: "frame", ch: "*", frame: ts, ts, events: [], rows: {} });
 

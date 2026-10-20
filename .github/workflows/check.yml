@@ -29,4 +29,22 @@ jobs:
       # bash 是 Git for Windows 的（和開發者在 Windows 上跑 check.sh 的環境一樣）
       - name: scripts/check.sh
         shell: bash
-        run: bash scripts/check.sh
+        run: bash scripts/check.sh 2>&1 | tee check.log; exit "${PIPESTATUS[0]}"
+      # 失敗時把每條紅的測試（cargo test 的 `---- 名稱 stdout ----` 段）標成 annotation：
+      # log 要登入才看得到，annotation 從公開的 API 就讀得到。沒有測試段（fmt、clippy 紅）時標 log 的最後 30 行
+      - name: 標出失敗的測試
+        if: failure()
+        shell: bash
+        run: |
+          out=$(awk '
+            function flush() { if (name != "") { gsub(/%/, "%25", buf); gsub(/\r/, "", buf); gsub(/\n/, "%0A", buf); t = name; gsub(/%/, "%25", t); gsub(/:/, "%3A", t); gsub(/,/, "%2C", t); printf "::error title=%s::%s\n", t, substr(buf, 1, 3000) } name = ""; buf = "" }
+            /^---- .* stdout ----$/ { flush(); name = $2; next }
+            /^failures:$/ { flush(); next }
+            name != "" { buf = buf $0 "\n" }
+            END { flush() }
+          ' check.log)
+          if [ -n "$out" ]; then
+            printf '%s\n' "$out" | head -10
+          else
+            printf '::error title=check.sh::%s\n' "$(tail -30 check.log | sed 's/%/%25/g' | tr -d '\r' | awk '{printf "%s%%0A", $0}')"
+          fi

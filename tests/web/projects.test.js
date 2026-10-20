@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { projectColors, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "../js/projects.js";
-import { PALETTE_SIZE } from "../js/color.js";
+import { projectColors, projectLabels, projectOf, sessionFilterFor, groupByProject, projectTreeRows } from "../../web/js/projects.js";
+import { PALETTE_SIZE } from "../../web/js/color.js";
 
 const ROOTS = ["/home/u/alpha", "/home/u/beta", "/srv/gamma"];
 
@@ -64,7 +64,7 @@ test("檔案樹的專案列（全部專案時）：每個專案一個標題列�
 });
 
 test("專案篩選：同一個 session 只算一次歸屬，cwd 還不知道的不快取（#757 E-F1）", async () => {
-  const { sessionFilterFor } = await import("../js/projects.js");
+  const { sessionFilterFor } = await import("../../web/js/projects.js");
   let lookups = 0;
   const cwds = new Map([["a", "/p/w"], ["b", "/q"]]);
   const f = sessionFilterFor("/p", ["/p", "/q"], (id) => { lookups++; return cwds.get(id); });

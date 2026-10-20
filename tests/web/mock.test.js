@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { installMock } from "../js/mock-feed.js";
+import { installMock } from "../../web/js/mock-feed.js";
 
 // mock 要和真的 collector 說同一套話（contracts §6），不然 ?mock 試不到單 session 的載入更多、回放、離開回放（#747 F-9）
 test("mock 的 more 帶回 beforePos；null（▶ 回放）從最新往前讀；取消訂閱 `*` 後不再收 frame", async () => {

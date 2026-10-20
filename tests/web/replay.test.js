@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { rangeFor } from "../js/replay.js";
+import { rangeFor } from "../../web/js/replay.js";
 
 const H = 3_600_000;
 

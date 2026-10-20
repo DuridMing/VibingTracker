@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PALETTE_SIZE, sessionColorIndex, sessionColor, shortId } from "../js/color.js";
+import { PALETTE_SIZE, sessionColorIndex, sessionColor, shortId } from "../../web/js/color.js";
 
 const ID = "dba6a637-9dd5-42a5-ad28-e4f502825ab7";
 

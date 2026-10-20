@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { agentView, agentWho } from "../js/agents.js";
-import { createStore, applySnapshot, applyFrame } from "../js/store.js";
+import { agentView, agentWho } from "../../web/js/agents.js";
+import { createStore, applySnapshot, applyFrame } from "../../web/js/store.js";
 
 const S = "s1";
 const ag = (agentId, extra = {}) => ({ id: `${S}/${agentId}`, session: S, agentId, agentType: null, name: agentId, task: null, status: "run", current: null, toolCount: 0, parentToolUseId: null, spawnedAt: 0, finishedAt: null, ...extra });

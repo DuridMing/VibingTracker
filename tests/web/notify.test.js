@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "../js/notify.js";
+import { loadSettings, saveSettings, sinksFor, summarize, createNotifier, createLeader } from "../../web/js/notify.js";
 
 function fakeClock(t = 1_000_000) {
   const timers = new Map();

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseMonitor, channelsFor, monitorUrl } from "../js/monitor.js";
+import { parseMonitor, channelsFor, monitorUrl } from "../../web/js/monitor.js";
 
 const ID = "617649c3-b3c4-4c43-9c4f-e7d5e77c16bd";
 

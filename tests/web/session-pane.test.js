@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { thinkingText, createSessionPane, nowOf, switchTab, sessionTitle, needsReplay, snapshotLoad } from "../js/session-pane.js";
+import { thinkingText, createSessionPane, nowOf, switchTab, sessionTitle, needsReplay, snapshotLoad } from "../../web/js/session-pane.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 let seq = 0;

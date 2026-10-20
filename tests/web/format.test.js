@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatRow } from "../js/format.js";
+import { formatRow } from "../../web/js/format.js";
 
 const S = "aaaaaaaa-0000-0000-0000-000000000001";
 const base = { key: "k", session: S, agent: "main", pos: 1, ts: 1, seq: 1, v: 0, expanded: false, delayed: false };
@@ -121,7 +121,7 @@ test("工具輸出（#654）：遠端被剝除的敏感輸出說明原因", () =
   assert.match(d, /敏感輸出/);
 });
 
-import { formatRow as fmtRow } from "../js/format.js";
+import { formatRow as fmtRow } from "../../web/js/format.js";
 test("串流前綴（#669）：全部專案時每行先標專案色標；沒給 projectTag 就和以前一樣", () => {
   const row = { key: "k", session: "aaaaaaaa-1", agent: "main", type: "text", text: "hi", v: 0, expanded: false, delayed: false };
   const plain = fmtRow(row, {});

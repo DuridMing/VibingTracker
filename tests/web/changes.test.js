@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createChanges, diffRows, writeRows, countHunk, editCounts } from "../js/changes.js";
+import { createChanges, diffRows, writeRows, countHunk, editCounts } from "../../web/js/changes.js";
 
 // file.edit／file.write Event 照 contracts.md §4
 const A = "aaaaaaaa-0000-0000-0000-000000000001";
