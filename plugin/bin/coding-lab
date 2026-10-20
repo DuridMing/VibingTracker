@@ -17,7 +17,7 @@
 #   platform  印出這台機器對應的 Release target
 
 # 和 Cargo.toml、.claude-plugin/plugin.json 同版（tests/plugin.rs 比對）
-VERSION=0.1.0
+VERSION=0.1.1
 
 # 資料目錄和二進位的 config 一致：Windows（Git Bash／Cygwin）先看 USERPROFILE，HOME 可能被改過（W-L10-4）。
 # 平台用 bash 的 OSTYPE 判斷，不多 fork 一次 uname
