@@ -16,7 +16,7 @@
 **還沒有下載原始碼：**
 
 ```text
-請讀 https://raw.githubusercontent.com/DuridMing/VibingTracker/develop/docs/install-with-ai.md ，
+請讀 https://raw.githubusercontent.com/DuridMing/VibingTracker/main/docs/install-with-ai.md ，
 照其中「給 AI 看的」步驟幫我安裝 coding-lab。安裝系統軟體或覆蓋檔案前先問我。
 ```
 
@@ -109,18 +109,18 @@ netsh int ipv4 show excludedportrange protocol=tcp
 
 ### 步驟 3：取得原始碼
 
-- 目前目錄已經是這個 repo（`git remote -v` 含 `VibingTracker`）：就用它，執行 `git switch develop && git pull --ff-only`。
+- 目前目錄已經是這個 repo（`git remote -v` 含 `VibingTracker`）：就用它，執行 `git switch main && git pull --ff-only`。
 - 否則問使用者要放哪裡（建議 `~/src/VibingTracker`），然後執行：
 
 ```bash
 mkdir -p ~/src && cd ~/src
-git clone -b develop https://github.com/DuridMing/VibingTracker.git
+git clone -b main https://github.com/DuridMing/VibingTracker.git
 cd VibingTracker
 ```
 
-**成功條件**：`git branch --show-current` 是 `develop`，而且 `plugin/hooks/hooks.json` 存在。記下這個資料夾的**絕對路徑**（`pwd`；Windows 的 Git Bash 用 `pwd -W`，得到 `C:/…` 的寫法），步驟 6、8 會用到；**這個資料夾裝好後不能刪**。
+**成功條件**：`git branch --show-current` 是 `main`，而且 `plugin/hooks/hooks.json` 存在。記下這個資料夾的**絕對路徑**（`pwd`；Windows 的 Git Bash 用 `pwd -W`，得到 `C:/…` 的寫法），步驟 6、8 會用到；**這個資料夾裝好後不能刪**。
 
-程式碼目前在 `develop` 分支，`main` 還沒有發佈的版本。
+`main` 是發佈的版本，`develop` 是開發中的版本。
 
 ### 步驟 4：編譯
 
@@ -196,7 +196,7 @@ curl -s http://127.0.0.1:4801/api/sessions
 ```text
 coding-lab 已安裝：
 - 執行檔：~/.coding-lab/bin/coding-lab（版本 x.y.z）
-- 原始碼：<repo>（develop，請不要刪除這個資料夾）
+- 原始碼：<repo>（main，請不要刪除這個資料夾）
 - plugin：coding-lab@coding-lab（已啟用）
 - collector：執行中（healthz 正常）
 - 驗證：已確認新 session 有被追蹤／尚未驗證
