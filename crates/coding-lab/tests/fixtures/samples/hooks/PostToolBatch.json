@@ -1,0 +1,19 @@
+{
+  "cwd": "/home/user/fixture-lab",
+  "hook_event_name": "PostToolBatch",
+  "permission_mode": "default",
+  "prompt_id": "a592e386-96e5-4944-8d2b-4fc1b808cdad",
+  "scratchpad_dir": "/tmp/claude-1000/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f/scratchpad",
+  "session_id": "9addaaff-fe09-4395-b5e6-86eca2de8c6f",
+  "tool_calls": [
+    {
+      "tool_input": {
+        "file_path": "/home/user/fixture-lab/calc.py"
+      },
+      "tool_name": "Read",
+      "tool_response": "1\tdef add(a, b):\n2\t    return a + b\n3\t\n4\t\n5\tdef sub(a, b):\n6\t    return a - b\n7\t",
+      "tool_use_id": "toolu_01KDjDUKj3EcGo6GqzecAtpX"
+    }
+  ],
+  "transcript_path": "/home/user/.claude/projects/-home-user-fixture-lab/9addaaff-fe09-4395-b5e6-86eca2de8c6f.jsonl"
+}

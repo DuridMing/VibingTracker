@@ -1,0 +1,306 @@
+#!/bin/sh
+# coding-lab plugin wrapper：找到本機的 coding-lab 二進位並執行它（SessionStart 呼叫 `ensure`）。
+#
+# 規則（不變式 4、5）：永遠 exit 0、stdout 永遠是空的（SessionStart 的 stdout 會進 Claude 的上下文）。
+# 找不到二進位時只在 stderr 說明，不擋 Claude Code。
+#
+# 尋找順序：$CODING_LAB_BIN → ${CODING_LAB_HOME:-~/.coding-lab}/bin/coding-lab → PATH 上的 coding-lab。
+# 都沒有時在背景下載對應平台的 Release（#656）：
+#   <url>/coding-lab-<target>.tar.gz（Windows 是 .zip）與 <壓縮檔>.sha256，校驗相符才解到 <home>/bin/
+#   （二進位與 web/ 放在一起）。這次 session 不追蹤，下一個 session 開始。
+#   <url> 預設是 GitHub 上和這個 plugin 同版的 Release（#733）；CODING_LAB_RELEASE_URL 可改（只收 https://
+#   與 file://），設成空字串就不自動下載。
+# wrapper 裝的二進位（<home>/bin/，旁邊有 coding-lab.version）比 plugin 舊時，照用舊的、同時在背景換新版。
+#
+# 給人用的子命令（不經 hook）：
+#   install   前景下載並安裝（同上，失敗也 exit 0）
+#   platform  印出這台機器對應的 Release target
+
+# 和 Cargo.toml、.claude-plugin/plugin.json 同版（tests/plugin.rs 比對）
+VERSION=0.1.0
+
+# 資料目錄和二進位的 config 一致：Windows（Git Bash／Cygwin）先看 USERPROFILE，HOME 可能被改過（W-L10-4）。
+# 平台用 bash 的 OSTYPE 判斷，不多 fork 一次 uname
+case ${OSTYPE-} in
+    msys* | cygwin*)
+        if [ -n "${USERPROFILE-}" ]; then
+            profile=$(cygpath -u "$USERPROFILE" 2>/dev/null || echo "$USERPROFILE")
+        else
+            profile=$HOME
+        fi
+        ;;
+    *) profile=$HOME ;;
+esac
+home_dir=${CODING_LAB_HOME:-$profile/.coding-lab}
+# 沒設才用預設；設成空字串＝不自動下載
+release_url=${CODING_LAB_RELEASE_URL-https://github.com/DuridMing/VibingTracker/releases/download/v$VERSION}
+
+say() {
+    echo "coding-lab：$*" >&2
+}
+
+manual() {
+    {
+        echo "  手動安裝：下載 Release 的壓縮檔，把二進位與 web/ 一起解到 $home_dir/bin/；"
+        echo "  或在原始碼目錄執行 cargo install --path crates/coding-lab，再把原始碼的 web/ 複製到 $home_dir/bin/web/"
+        echo "  （cargo install 只裝二進位，沒有 web/ 時網頁會 404）。也可以設定 CODING_LAB_BIN 指向二進位。"
+    } >&2
+}
+
+is_self() {
+    # 只有走到 PATH 查找才算（每個子殼在 Windows 的 Git Bash 上要數十 ms，#776 EW1）
+    [ -n "$self_dir" ] || self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+    [ "$(cd "$(dirname "$1")" 2>/dev/null && pwd)" = "$self_dir" ]
+}
+
+# 找到就設 bin、回 0。直接設變數，不用 $(find_bin)（少一個子殼，#776 EW1）
+find_bin() {
+    if [ -n "$CODING_LAB_BIN" ] && [ -x "$CODING_LAB_BIN" ]; then
+        bin=$CODING_LAB_BIN
+        return 0
+    fi
+    for bin in "$home_dir/bin/coding-lab" "$home_dir/bin/coding-lab.exe"; do
+        [ -x "$bin" ] && return 0
+    done
+    for name in coding-lab coding-lab.exe; do
+        bin=$(command -v "$name" 2>/dev/null) || continue
+        # plugin 的 bin/ 可能在 PATH 上：不要找到自己
+        if [ -n "$bin" ] && ! is_self "$bin"; then
+            return 0
+        fi
+    done
+    bin=
+    return 1
+}
+
+# uname → cargo-dist 的 target；沒有對應的 Release 時回 1
+platform() {
+    os=$(uname -s 2>/dev/null)
+    arch=$(uname -m 2>/dev/null)
+    case "$arch" in
+        x86_64 | amd64) arch=x86_64 ;;
+        aarch64 | arm64) arch=aarch64 ;;
+        *) return 1 ;;
+    esac
+    case "$os" in
+        Linux) echo "$arch-unknown-linux-gnu" ;;
+        Darwin) echo "$arch-apple-darwin" ;;
+        MINGW* | MSYS* | CYGWIN*)
+            [ "$arch" = x86_64 ] || return 1
+            echo "x86_64-pc-windows-msvc"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+fetch() { # url → 檔案
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 300 -o "$2" "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 30 -O "$2" "$1"
+    else
+        say "沒有 curl 或 wget，無法下載"
+        return 1
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        return 1
+    fi
+}
+
+# 解 zip 到目錄。標準的 Git for Windows 不附 unzip：退到 Windows 10+ 內建的 bsdtar（PATH 上的 tar 是
+# Git 自帶的 GNU tar，解不了 zip，所以用絕對路徑），再退到 PowerShell 的 Expand-Archive（要 Windows 路徑）。
+unzip_to() { # zip 目錄
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$1" -d "$2"
+    elif [ -x /c/Windows/System32/tar.exe ]; then
+        mkdir -p "$2" && /c/Windows/System32/tar.exe -xf "$1" -C "$2"
+    elif command -v powershell >/dev/null 2>&1; then
+        zip=$(cygpath -w "$1" 2>/dev/null || echo "$1")
+        dest=$(cygpath -w "$2" 2>/dev/null || echo "$2")
+        powershell -NoProfile -NonInteractive -Command \
+            "Expand-Archive -LiteralPath '$zip' -DestinationPath '$dest' -Force"
+    else
+        say "沒有 unzip、tar.exe 或 powershell，無法解壓。"
+        return 1
+    fi
+}
+
+# 下載、校驗、解壓到 <home>/bin；成功回 0。暫存檔與鎖一律清掉。
+install() {
+    if [ -z "$release_url" ]; then
+        say "CODING_LAB_RELEASE_URL 是空的（不自動下載）。"
+        manual
+        return 1
+    fi
+    # 只防損毀的 sha256 和壓縮檔從同一個地方來：http 會被中間人一起換掉（#733 R-12）
+    case "$release_url" in
+        https://* | file://*) ;;
+        *)
+            say "Release 網址只接受 https://（收到 $release_url），不下載。"
+            manual
+            return 1
+            ;;
+    esac
+    if ! target=$(platform); then
+        say "這個平台（$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)）沒有預先編好的二進位。"
+        manual
+        return 1
+    fi
+    case "$target" in
+        *windows*) archive="coding-lab-$target.zip" exe=coding-lab.exe ;;
+        *) archive="coding-lab-$target.tar.gz" exe=coding-lab ;;
+    esac
+    bin_dir=$home_dir/bin
+    mkdir -p "$bin_dir" || return 1
+    lock=$bin_dir/.installing
+    # 同時開的幾個 session 只下載一次；超過 10 分鐘的鎖當成上次中斷留下的
+    if [ -d "$lock" ] && [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+        rmdir "$lock" 2>/dev/null
+    fi
+    if ! mkdir "$lock" 2>/dev/null; then
+        say "另一個 session 正在下載"
+        return 1
+    fi
+    work=$bin_dir/.download.$$
+    trap 'rm -rf "$work"; rmdir "$lock" 2>/dev/null' EXIT INT TERM
+    mkdir -p "$work" || return 1
+    base=${release_url%/}
+    if ! fetch "$base/$archive" "$work/$archive" || ! fetch "$base/$archive.sha256" "$work/sum"; then
+        say "下載 $base/$archive 失敗（離線或沒有這個版本）。"
+        manual
+        return 1
+    fi
+    want=$(cut -d' ' -f1 <"$work/sum" | tr 'A-F' 'a-f')
+    got=$(sha256_of "$work/$archive") || {
+        say "沒有 sha256sum／shasum／openssl，無法校驗，不安裝。"
+        manual
+        return 1
+    }
+    if [ -z "$want" ] || [ "$want" != "$got" ]; then
+        say "sha256 不符（預期 $want，實際 $got），不安裝。"
+        manual
+        return 1
+    fi
+    case "$archive" in
+        *.zip) unzip_to "$work/$archive" "$work/x" ;;
+        *) mkdir -p "$work/x" && tar -xzf "$work/$archive" -C "$work/x" ;;
+    esac || {
+        say "解壓 $archive 失敗。"
+        manual
+        return 1
+    }
+    # cargo-dist 的壓縮檔最上層是 coding-lab-<target>/；也接受直接放在根目錄
+    src=$work/x/coding-lab-$target
+    [ -d "$src" ] || src=$work/x
+    if [ ! -f "$src/$exe" ]; then
+        say "$archive 裡沒有 $exe。"
+        manual
+        return 1
+    fi
+    chmod +x "$src/$exe"
+    # collector 還在跑（有 collector.json）而且這是更新：先放 staging，不換掉它正在用的 web/ 與二進位
+    # （新的 JS 配舊的二進位會壞；Windows 上執行中的 .exe 也換不掉）。下一次 ensure、沒有 collector 在跑時才換（#784 W-R1-5）
+    if [ -f "$home_dir/collector.json" ] && { [ -x "$bin_dir/$exe" ] || [ -d "$bin_dir/web" ]; }; then
+        rm -rf "$bin_dir/.staged.new"
+        mkdir -p "$bin_dir/.staged.new" || return 1
+        [ -d "$src/web" ] && mv "$src/web" "$bin_dir/.staged.new/web"
+        printf '%s\n' "$VERSION" >"$bin_dir/.staged.new/coding-lab.version"
+        mv "$src/$exe" "$bin_dir/.staged.new/$exe" || return 1
+        rm -rf "$bin_dir/.staged" && mv "$bin_dir/.staged.new" "$bin_dir/.staged" || return 1
+        say "collector 正在執行：新版（$target）先放在 $bin_dir/.staged，下一次沒有 collector 在跑時換上"
+        return 0
+    fi
+    if [ -d "$src/web" ]; then
+        rm -rf "$bin_dir/web.old"
+        [ -d "$bin_dir/web" ] && mv "$bin_dir/web" "$bin_dir/web.old"
+        mv "$src/web" "$bin_dir/web" && rm -rf "$bin_dir/web.old"
+    fi
+    # 版本記錄先寫、二進位最後才放：wrapper 看到它就表示整套裝好了
+    printf '%s\n' "$VERSION" >"$bin_dir/coding-lab.version"
+    mv "$src/$exe" "$bin_dir/$exe.new" && mv -f "$bin_dir/$exe.new" "$bin_dir/$exe" || return 1
+    say "已安裝 $bin_dir/$exe（$target）"
+    return 0
+}
+
+case "$1" in
+    platform)
+        platform || say "這個平台（$(uname -s 2>/dev/null) $(uname -m 2>/dev/null)）沒有預先編好的二進位"
+        exit 0
+        ;;
+    install)
+        install
+        exit 0
+        ;;
+esac
+
+# 背景更新放在 staging 的新版：沒有 collector 在跑時換上（#784 W-R1-5）。只有 wrapper 自己裝的位置才有 staging
+apply_staged() {
+    st=$home_dir/bin/.staged
+    [ -d "$st" ] && [ ! -f "$home_dir/collector.json" ] || return 0
+    for exe in coding-lab coding-lab.exe; do
+        [ -f "$st/$exe" ] || continue
+        if [ -d "$st/web" ]; then
+            rm -rf "$home_dir/bin/web.old"
+            [ -d "$home_dir/bin/web" ] && mv "$home_dir/bin/web" "$home_dir/bin/web.old"
+            mv "$st/web" "$home_dir/bin/web" && rm -rf "$home_dir/bin/web.old"
+        fi
+        [ -f "$st/coding-lab.version" ] && mv -f "$st/coding-lab.version" "$home_dir/bin/coding-lab.version"
+        mv -f "$st/$exe" "$home_dir/bin/$exe" || return 0
+    done
+    rm -rf "$st"
+}
+apply_staged
+
+if ! find_bin; then
+    if [ -n "$release_url" ] && target=$(platform); then
+        # hook 有 5 秒限制：背景下載，所有輸出都導開，Claude Code 不會等它
+        mkdir -p "$home_dir" 2>/dev/null
+        nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
+        say "還沒有 collector 二進位，已在背景下載（$target，紀錄在 $home_dir/install.log）；這次 session 不會被追蹤，下一個 session 開始。"
+    else
+        say "找不到 collector 二進位，這次 session 不會被追蹤（Claude Code 照常運作）。"
+        manual
+    fi
+    exit 0
+fi
+
+# wrapper 裝的二進位落後 plugin：這次照用，背景換新版（#733 R-4）。版本記在 coding-lab.version，
+# 不跑二進位問版本（每個 SessionStart 多開一個程序，Windows 上很貴）；沒有記錄的（手動放的）不動。
+case "$bin" in
+    "$home_dir/bin/coding-lab" | "$home_dir/bin/coding-lab.exe")
+        installed=
+        [ -f "$home_dir/bin/coding-lab.version" ] && read -r installed <"$home_dir/bin/coding-lab.version"
+        # 已經下載好、在 staging 等 collector 停下來的同版，不要每個 SessionStart 再下載一次
+        staged=
+        [ -f "$home_dir/bin/.staged/coding-lab.version" ] && read -r staged <"$home_dir/bin/.staged/coding-lab.version"
+        if [ -n "$installed" ] && [ "$installed" != "$VERSION" ] && [ "$staged" != "$VERSION" ] && [ -n "$release_url" ] && platform >/dev/null; then
+            nohup "$0" install </dev/null >/dev/null 2>>"$home_dir/install.log" &
+            say "collector 二進位是 $installed、plugin 是 $VERSION：已在背景更新（紀錄在 $home_dir/install.log），下一個 session 用新版。"
+        fi
+        ;;
+esac
+
+if [ "$1" = ensure ]; then
+    # stdin（SessionStart 的 payload）直接交給二進位，wrapper 不先讀：讀 payload 再用 pipe 餵要多開子殼與 cat，
+    # 終端機直接跑時還會卡在等 EOF（#776 EW1、R-9）。ensure 拉起的 collector 不會握著這些 handle
+    # （#712：Windows 由二進位關掉 handle 繼承，Unix 是 Stdio::null），所以呼叫端照樣馬上收到 EOF。
+    # stdout 丟掉（ensure 本來就不印）；stderr 寫進 ensure.log（錯誤本來就寫 collector.log，這裡只剩 panic 之類的意外）。
+    [ -d "$home_dir" ] || mkdir -p "$home_dir" 2>/dev/null
+    if [ -d "$home_dir" ]; then
+        "$bin" "$@" >/dev/null 2>>"$home_dir/ensure.log"
+    else
+        "$bin" "$@" >/dev/null 2>&1
+    fi
+else
+    "$bin" "$@" >&2
+fi
+exit 0

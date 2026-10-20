@@ -1,11 +1,26 @@
 # 規劃文件與協作規範只留在本機（同步到 OpenProject），不進 git。
 # README.md 與使用者手冊等專案文件（docs/ 底下 plan/ 以外）照常進 git。
-/docs/plan/
+/docs/plan
 /CLAUDE.md
 /.opdocs.toml
+
+# 遮蔽後的真實樣本：先只留在本機（使用者決定，2026-10-16）
+/samples/
+
+# hook-capture 的測試專案（自己是獨立 git repo，掛著收集用 hook）
+/capture-lab/
+
+# git worktree：依 git-flow 分支類型分資料夾（worktrees/feature/<名稱>、release/<版號>、hotfix/<版號>）
+/worktrees/
 
 # Rust
 /target/
 
 # 本機開發資料（CODING_LAB_HOME 指到這裡）
 /.coding-lab/
+
+# 在這個 repo 自我追蹤用的 Claude Code hook 設定（掛本機 coding-lab）
+/.claude/settings.local.json
+
+# Python 快取（scripts/、tests/ 的工具）
+__pycache__/

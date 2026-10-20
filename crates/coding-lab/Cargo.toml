@@ -1,0 +1,45 @@
+[package]
+name = "coding-lab"
+description = "Claude Code 多 session 專案追蹤 collector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[package.metadata.dist]
+# publish = false 的 crate 預設不發佈，要明講（#733 R-1：不然 `dist plan` 說沒有東西可以發佈）
+dist = true
+# 前端不內嵌：web/ 跟二進位放進同一個壓縮檔，collector 預設用二進位旁邊的 web/（config::bundled_web）
+include = ["../../web"]
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "ws"] }
+clap = { version = "4.6.7", features = ["derive"] }
+# 金鑰（#666）：secret 只存 SHA-256、金鑰與 server secret 要密碼學等級的亂數
+getrandom = "0.3.4"
+# hub（#663）對上游 collector 開 WebSocket client；兩個都已在 lock 裡（先前只是 dev-dependency），不帶 TLS
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+notify = "8.2.0"
+regex = "1.13.1"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# 終端機輸入金鑰時不回顯（#743 W-L2）：三個平台同一條路，Windows 不用新增 unsafe；
+# 只多 rtoolbox 一個 crate，windows-sys 0.61、libc 已在依賴樹裡
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+# 0.10 與 axum 的 sha1 共用 digest 0.10，不重複編兩版（#772）
+sha2 = "0.10"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs", "signal"] }
+# 跟 axum 0.8 的 ws 用同一版，不重複編兩版（#772）
+tokio-tungstenite = "0.29.0"
+toml = "1.1.8"
+
+# Windows 子程序（schtasks）的輸出是 OEM code page（cp950 等），要解成可讀文字（#724）；
+# 其他平台用不到，只在 Windows 編（#758 E-B9：Windows 二進位大小不變，Linux／macOS 少編一個 crate）
+[target.'cfg(windows)'.dependencies]
+encoding_rs = "0.8.42"
+
+[dev-dependencies]
+

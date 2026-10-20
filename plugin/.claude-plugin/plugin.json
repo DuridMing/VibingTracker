@@ -1,0 +1,14 @@
+{
+  "name": "coding-lab",
+  "version": "0.1.0",
+  "description": "同時追蹤多個 Claude Code session：合流串流、注意佇列、改動紀錄（本機 collector，零 token、不攔截）",
+  "author": {
+    "name": "Durid"
+  },
+  "license": "MIT",
+  "keywords": [
+    "monitoring",
+    "sessions",
+    "hooks"
+  ]
+}

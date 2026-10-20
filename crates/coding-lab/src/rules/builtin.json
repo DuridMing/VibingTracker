@@ -1,0 +1,175 @@
+{
+  "_comment": "內建危險規則（#634）。只標示、不攔截。使用者在 ~/.coding-lab/rules.json 用同樣格式覆寫：同 id 取代、新 id 優先、disable 停用。tools 寫 \"@command\" 代表所有指令型工具（Bash、PowerShell）與 cmd /c 裡的指令；\"cmd\" 只在 cmd /c、cmd.exe /c 裡比對。PowerShell 的反引號跳脫先去掉、反斜線換成 /，再比對。scope：segment（預設，依 && ; | 換行切段、pattern 錨定在該段的指令開頭；heredoc 本文接在 << 之後、不是指令）或 command（依原本分隔符號接回的整條指令，引號內的 | ; & 已換成空白）。unless（選填）：也命中時這條不算，例如 --dry-run。",
+  "rules": [
+    {
+      "id": "rm-rf-build",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^rm\\s+((-[a-zA-Z]+|--[a-z-]*)\\s+)*(-[a-zA-Z]*([rR][a-zA-Z]*f|f[a-zA-Z]*[rR])[a-zA-Z]*|(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\\s+((-[a-zA-Z]+|--[a-z-]*)\\s+)*(-[a-zA-Z]*f[a-zA-Z]*|--force)|(-[a-zA-Z]*f[a-zA-Z]*|--force)\\s+((-[a-zA-Z]+|--[a-z-]*)\\s+)*(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive))\\s+((-[a-zA-Z]+|--[a-z-]*)\\s+)*((\\./)?(target|node_modules|dist|build|out|\\.next|__pycache__|\\.pytest_cache|\\.cache|coverage)(/[^\\s/.][^\\s/]*|/\\.[^\\s/.][^\\s/]*)*/?(\\s+|$))+$",
+      "level": "warn",
+      "why": "遞迴強制刪除，但目標只有建置產物或快取"
+    },
+    {
+      "id": "rm-rf",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^rm\\s(.*\\s)?(-[a-zA-Z]*([rR][a-zA-Z]*f|f[a-zA-Z]*[rR])[a-zA-Z]*|(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)\\s(.*\\s)?(-[a-zA-Z]*f[a-zA-Z]*|--force)|(-[a-zA-Z]*f[a-zA-Z]*|--force)\\s(.*\\s)?(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive))(\\s|$)",
+      "level": "danger",
+      "why": "遞迴強制刪除，刪錯無法復原"
+    },
+    {
+      "id": "git-push-force",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*push\\b.*\\s(-[a-zA-Z]*f[a-zA-Z]*|--force|\\+\\S+)(\\s|$)",
+      "level": "danger",
+      "why": "強制推送會覆寫遠端歷史（--force-with-lease 較安全）"
+    },
+    {
+      "id": "git-reset-hard",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*reset\\b.*\\s--hard(\\s|$)",
+      "level": "danger",
+      "why": "丟棄工作目錄與暫存區的所有未提交改動"
+    },
+    {
+      "id": "git-clean-f",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "^git\\s+((-C|-c)\\s+\\S+\\s+|-\\S+\\s+)*clean\\b.*\\s(-[a-zA-Z]*f[a-zA-Z]*|--force)(\\s|$)",
+      "unless": "\\s(-[a-zA-Z]*n[a-zA-Z]*|--dry-run)(\\s|$)",
+      "level": "danger",
+      "why": "永久刪除未追蹤的檔案"
+    },
+    {
+      "id": "sql-drop",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "(?i)^(psql|mysql|mariadb|sqlite3|sqlcmd|duckdb|clickhouse-client)\\b.*\\bdrop\\s+(table|database|schema)\\b",
+      "level": "danger",
+      "why": "在資料庫客戶端（psql、mysql、sqlite3…）裡刪除資料表或資料庫"
+    },
+    {
+      "id": "sql-truncate",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "(?i)^(psql|mysql|mariadb|sqlite3|sqlcmd|duckdb|clickhouse-client)\\b.*\\btruncate\\s+(table\\s+)?[a-z_\\\"`]",
+      "level": "danger",
+      "why": "在資料庫客戶端裡清空資料表"
+    },
+    {
+      "id": "chmod-777",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^chmod\\s+(-\\S+\\s+)*(0?777|[ugoa]*[oa][ugoa]*[+=][rwxXst]*w[rwxXst]*)(,\\S*)?(\\s|$)",
+      "level": "danger",
+      "why": "任何人都可寫（777、o+w、a+rwx）"
+    },
+    {
+      "id": "curl-pipe-sh",
+      "tools": [
+        "Bash"
+      ],
+      "scope": "command",
+      "pattern": "\\b(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+(-\\S+\\s+)*)?(ba|z|da|k)?sh\\b|\\b(curl|wget)\\b[^|;]*\\|\\s*(sudo\\s+(-\\S+\\s+)*)?(python[0-9.]*|perl|ruby|node)(\\s+-[abdf-loq-zA-DF-Z]+)*(\\s+-)?\\s*($|[;&|)])|\\b(ba|z|da|k)?sh\\s+(-\\S+\\s+)*-[a-zA-Z]*c[a-zA-Z]*\\s+\\$\\((curl|wget)\\b",
+      "level": "danger",
+      "why": "下載後直接執行未檢查的腳本（管給 shell 或直譯器、sh -c \"$(curl …)\"）"
+    },
+    {
+      "id": "package-publish",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "^(npm|pnpm|yarn|cargo)\\s+(-\\S+\\s+)*(npm\\s+)?publish\\b",
+      "unless": "\\s--dry-run(\\s|=|$)",
+      "level": "danger",
+      "why": "發佈套件到公開的 registry"
+    },
+    {
+      "id": "container-rm-f",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "^(docker|podman)\\s+(container\\s+)?rm\\b.*\\s(-[a-zA-Z]*f[a-zA-Z]*|--force)(\\s|$)",
+      "level": "danger",
+      "why": "強制移除執行中的容器"
+    },
+    {
+      "id": "ps-remove-recurse-force",
+      "tools": [
+        "PowerShell"
+      ],
+      "pattern": "(?i)^(?:remove-item|ri|rm|del|erase|rd|rmdir)\\s(?:.*\\s)?(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\\$true)?\\s(?:.*\\s)?-fo(?:r(?:c(?:e)?)?)?(?::\\$true)?(?:\\s|$)|-fo(?:r(?:c(?:e)?)?)?(?::\\$true)?\\s(?:.*\\s)?-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\\$true)?(?:\\s|$))",
+      "level": "danger",
+      "why": "遞迴強制刪除（-Recurse -Force），刪錯無法復原"
+    },
+    {
+      "id": "cmd-rd-s-q",
+      "tools": [
+        "cmd",
+        "PowerShell"
+      ],
+      "pattern": "(?i)^(?:rd|rmdir)\\s(?:.*\\s)?(?:/s\\s(?:.*\\s)?/q|/q\\s(?:.*\\s)?/s)(?:\\s|$)",
+      "level": "danger",
+      "why": "遞迴刪除整個目錄且不詢問（/s /q）"
+    },
+    {
+      "id": "cmd-del-s-q",
+      "tools": [
+        "cmd"
+      ],
+      "pattern": "(?i)^(?:del|erase)\\s(?:.*\\s)?(?:/s\\s(?:.*\\s)?/q|/q\\s(?:.*\\s)?/s)(?:\\s|$)",
+      "level": "danger",
+      "why": "遞迴刪除子目錄裡的檔案且不詢問（/s /q）"
+    },
+    {
+      "id": "ps-download-exec",
+      "tools": [
+        "PowerShell"
+      ],
+      "scope": "command",
+      "pattern": "(?i)(?:\\b(?:iwr|irm|curl|wget|invoke-webrequest|invoke-restmethod)\\b[^|]*\\|\\s*(?:iex|invoke-expression)\\b|\\b(?:iex|invoke-expression)\\b\\s*\\(+\\s*(?:iwr|irm|invoke-webrequest|invoke-restmethod|new-object\\s+(?:system\\.)?net\\.webclient)\\b)",
+      "level": "danger",
+      "why": "下載後直接執行（Invoke-Expression），內容沒有經過檢查"
+    },
+    {
+      "id": "sudo",
+      "tools": [
+        "Bash"
+      ],
+      "pattern": "^(sudo|doas)\\b",
+      "level": "warn",
+      "why": "以 root 權限執行（sudo、doas）"
+    },
+    {
+      "id": "env-file-bash",
+      "tools": [
+        "@command"
+      ],
+      "pattern": "(^|[\\s/])\\.env(\\.(local|dev|development|prod|production|staging|test))?(\\s|$)",
+      "level": "warn",
+      "why": "讀寫 .env（可能含密鑰）"
+    },
+    {
+      "id": "env-file",
+      "tools": [
+        "Read",
+        "Write",
+        "Edit"
+      ],
+      "field": "file_path",
+      "pattern": "(^|/)\\.env(\\.(local|dev|development|prod|production|staging|test))?$",
+      "level": "warn",
+      "why": "讀寫 .env（可能含密鑰）"
+    }
+  ]
+}

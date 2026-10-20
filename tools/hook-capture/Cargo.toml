@@ -1,0 +1,14 @@
+[package]
+name = "hook-capture"
+description = "階段 0 用：收集 Claude Code hook payload 與 transcript 行到達時間（開發工具，不隨 coding-lab 發佈）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,14 @@
+{
+  "name": "coding-lab",
+  "description": "coding-lab：多 session 的 Claude Code 追蹤（本機 collector）",
+  "owner": {
+    "name": "Durid"
+  },
+  "plugins": [
+    {
+      "name": "coding-lab",
+      "source": "./plugin",
+      "description": "多 session 的 Claude Code 追蹤"
+    }
+  ]
+}

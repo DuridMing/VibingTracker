@@ -1,0 +1,1507 @@
+//! live：WebSocket 要推的即時狀態（contracts.md §6、#636）。
+//!
+//! 純邏輯、不碰 I/O：吃 merge 產生的 Event（[`Live::apply`]），維護彙總列（sessions、agents、attention、KPI）、
+//! 暫存區、串流與改動紀錄；呼叫端每 50 ms [`Live::flush`] 一次，打包成一個 [`Frame`]。
+//! KPI 的「今天」依各連線的時區：事件依 UTC 每 15 分鐘一格累計（時區偏移都是 15 分鐘的倍數），
+//! 任何時區的今天＝從當地午夜起的格子加總，新連線也算得出今天已累積的數字，跨午夜自然歸零。
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use serde_json::{Map, Value, json};
+
+use crate::derive::relative_path;
+use crate::doing::{Doing, Source};
+use crate::event::{DangerLevel, Event, Payload};
+use crate::status::task_failed;
+use crate::store::SessionRow;
+
+pub const STREAM_PER_SESSION: usize = 3000;
+pub const ALL_STREAM_PER_SESSION: usize = 200;
+pub const CHANGES_KEPT: usize = 60;
+pub const FRAMES_KEPT: usize = 2000;
+const SLOT_MS: u64 = 15 * 60 * 1000;
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const SLOTS_KEPT_MS: u64 = 50 * 60 * 60 * 1000;
+const TEXT_LIMIT: usize = 200;
+/// 結束的 session 在 live 裡多留多久（之後由 /api/sessions 與回放查看，#686）
+pub const ENDED_KEPT_MS: u64 = 2 * 60 * 60 * 1000;
+const STATUS_PER_SESSION: usize = 500;
+
+/// 卡片的伴隨 Event：沒有 pos，附在串流裡帶 pos 的卡片 Event 旁邊（contracts.md §6）。
+const COMPANIONS: &[&str] = &[
+    "tool.called",
+    "tool.updated",
+    "tool.result",
+    "file.read",
+    "file.edit",
+    "file.write",
+    "git.op",
+    "agent.spawned",
+];
+/// 帶 `model` 的行：agents 列的 `model` 跟著它們走（決定紀錄 #14）
+const MODEL_LINES: &[&str] = &["assistant.text", "assistant.thinking", "usage"];
+/// 串流裡的狀態行（▶ prompt、⏸ 等你、✔ 完成…、← subagent 完成／✗ 失敗、↻ resume／compact，#651、#688）
+const STATUS_LINES: &[&str] = &[
+    "prompt.submitted",
+    "session.status",
+    "agent.finished",
+    "session.started",
+];
+
+/// 「載入更多」組串流時會用到的不帶 pos 的 Event 種類：卡片的伴隨 Event 與狀態行（E-L9：store 只讀這些）。
+pub fn pool_kinds() -> impl Iterator<Item = &'static str> {
+    COMPANIONS.iter().chain(STATUS_LINES).copied()
+}
+
+/// 是串流裡的狀態行；session.started 只有接回同一個 session（resume／compact）才算。startup 與 clear
+/// 都是新 session 的第一行，不標（`/clear` 換 session id、舊 session 收到 SessionEnd reason clear，#688 實測）。
+fn is_status_line(e: &Event) -> bool {
+    STATUS_LINES.contains(&e.kind.as_str())
+        && (e.kind != "session.started"
+            || matches!(e.payload["source"].as_str(), Some("resume" | "compact")))
+}
+
+/// 這個 Event 屬於哪張卡片（toolUseId）；agent.spawned 屬於開它的那個工具呼叫。
+fn card_key(e: &Event) -> Option<String> {
+    let key = if e.kind == "agent.spawned" {
+        "parentToolUseId"
+    } else {
+        "toolUseId"
+    };
+    e.payload[key].as_str().map(str::to_string)
+}
+
+/// 組一個 session 的串流（contracts.md §6「同一 session 內永遠只看 pos」）：`window` 是帶 pos 的 Event，
+/// `pool` 是候選的伴隨 Event 與狀態行。
+/// - 帶 pos 的 Event 依 pos 排；窗口內卡片的伴隨 Event 跟在卡片旁（卡片與伴隨合起來依 seq），
+///   同卡只留最新的 tool.updated，較早一筆帶的 danger 併進它。
+/// - 狀態行只取窗口範圍內的（窗口從 pos 1 開始時沒有下限，否則從窗口第一個 Event 的時間起，
+///   `until`（不含）為上限），插在 seq 比它小的最後一個帶 pos Event 之後，同位置依 seq——
+///   和即時 append（依 merge 發出的順序）完全一樣，不受 ts_seen 同毫秒或倒退影響。
+pub fn assemble_stream(mut window: Vec<Event>, pool: Vec<Event>, until: Option<u64>) -> Vec<Event> {
+    window.sort_by_key(|e| (e.pos, e.seq));
+    let lower = match window.first() {
+        Some(first) if first.pos == Some(1) => 0,
+        Some(first) => first.ts_seen,
+        None => 0,
+    };
+    let cards: HashSet<String> = window
+        .iter()
+        .filter(|e| e.kind == "tool.placed" || e.kind == "tool.called")
+        .filter_map(card_key)
+        .collect();
+    let mut seen = HashSet::new();
+    let mut companions: HashMap<String, Vec<Event>> = HashMap::new();
+    let mut lines: Vec<Event> = Vec::new();
+    for e in pool {
+        if e.pos.is_some() || !seen.insert((e.session.clone(), e.seq)) {
+            continue;
+        }
+        if is_status_line(&e) {
+            if e.ts_seen >= lower && until.is_none_or(|u| e.ts_seen < u) {
+                lines.push(e);
+            }
+        } else if COMPANIONS.contains(&e.kind.as_str())
+            && let Some(id) = card_key(&e).filter(|id| cards.contains(id))
+        {
+            companions.entry(id).or_default().push(e);
+        }
+    }
+    for list in companions.values_mut() {
+        list.sort_by_key(|e| e.seq);
+        keep_latest_update(list);
+    }
+    // 每個狀態行接在第幾個帶 pos Event 之後（0＝最前面）。同 session 內 pos 與 seq 都由 merge 依序發、一起單調，
+    // 所以依 pos 排好的窗口 seq 也遞增，可以二分搜尋（E-L6）
+    lines.sort_by_key(|e| e.seq);
+    let mut after: Vec<Vec<Event>> = vec![Vec::new(); window.len() + 1];
+    for l in lines {
+        let at = window.partition_point(|e| e.seq < l.seq);
+        after[at].push(l);
+    }
+    let mut after = after.into_iter();
+    let mut out: Vec<Event> = after.next().unwrap_or_default();
+    for (e, tail) in window.into_iter().zip(after) {
+        let mut unit = card_key(&e)
+            .and_then(|id| companions.remove(&id))
+            .unwrap_or_default();
+        unit.push(e);
+        unit.sort_by_key(|e| e.seq);
+        out.extend(unit);
+        out.extend(tail);
+    }
+    out
+}
+
+/// 同卡只留最新的 tool.updated（`list` 依 seq 排好）；較早一筆帶的 danger 併進它，
+/// 否則 transcript 先到時危險標示會被之後的狀態更新蓋掉。
+fn keep_latest_update(list: &mut Vec<Event>) {
+    let danger = list
+        .iter()
+        .rev()
+        .filter(|e| e.kind == "tool.updated")
+        .find_map(|e| e.payload.get("danger").filter(|d| !d.is_null()).cloned());
+    let Some(last) = list.iter().rposition(|e| e.kind == "tool.updated") else {
+        return;
+    };
+    if let Some(d) = danger
+        && list[last].payload.get("danger").is_none_or(Value::is_null)
+    {
+        list[last].payload["danger"] = d;
+    }
+    let mut i = 0;
+    list.retain(|e| {
+        i += 1;
+        e.kind != "tool.updated" || i - 1 == last
+    });
+}
+
+/// 各 session 的串流（[`assemble_stream`] 的結果）依開頭那筆的順序鍵 `(ts_seen, session, pos)` 逐筆合併，
+/// 不打亂任何一個 session 內的順序（contracts.md §6）。伴隨 Event 沿用它前一筆的鍵，跟著卡片走。
+pub fn merge_streams(lists: Vec<Vec<Event>>) -> Vec<Event> {
+    type Key = (u64, String, Option<u64>, u64);
+    let mut queues: Vec<VecDeque<(Key, Event)>> = lists
+        .into_iter()
+        .map(|list| {
+            let mut prev: Option<Key> = None;
+            list.into_iter()
+                .map(|e| {
+                    let own = (e.ts_seen, e.session.clone(), e.pos, e.seq);
+                    let key = match &prev {
+                        Some(p) if e.pos.is_none() && !is_status_line(&e) => p.clone(),
+                        _ => own,
+                    };
+                    prev = Some(key.clone());
+                    (key, e)
+                })
+                .collect()
+        })
+        .collect();
+    let mut out = Vec::with_capacity(queues.iter().map(VecDeque::len).sum());
+    while let Some(q) = queues
+        .iter_mut()
+        .filter(|q| !q.is_empty())
+        .min_by(|a, b| a[0].0.cmp(&b[0].0))
+    {
+        if let Some((_, e)) = q.pop_front() {
+            out.push(e);
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Channel {
+    All,
+    Session(String),
+}
+
+impl Channel {
+    pub fn parse(s: &str) -> Option<Channel> {
+        match s {
+            "*" => Some(Channel::All),
+            _ => s
+                .strip_prefix("session:")
+                .filter(|id| !id.is_empty())
+                .map(|id| Channel::Session(id.into())),
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Channel::All => "*".into(),
+            Channel::Session(id) => format!("session:{id}"),
+        }
+    }
+
+    fn wants(&self, session: &str) -> bool {
+        match self {
+            Channel::All => true,
+            Channel::Session(id) => id == session,
+        }
+    }
+}
+
+/// 一個 50 ms 批次。各連線依自己的頻道與時區取用（[`Frame::to_json`]）。
+#[derive(Debug)]
+pub struct Frame {
+    pub no: u64,
+    events: Vec<Event>,
+    sessions: Vec<(String, Value)>,
+    agents: Vec<(String, Value)>,
+    attention: Vec<(String, Value)>,
+    kpi: BTreeMap<i32, Value>,
+    /// storeError 改變了（W-M10）：Some(null) 是恢復；None 是這個 frame 不帶
+    store_error: Option<Value>,
+    /// 序列化好的結果（E-L4）：(頻道, offset, 模式) → 送出的文字；None＝這種連線沒有內容
+    texts: std::sync::Mutex<HashMap<(String, i32, u8), Option<axum::extract::ws::Utf8Bytes>>>,
+    serialized: std::sync::atomic::AtomicUsize,
+}
+
+/// 本機版本直接序列化借用的 Event，不經過中間的 Value（E-L4）。
+#[derive(serde::Serialize)]
+struct FrameOut<'a> {
+    t: &'static str,
+    frame: u64,
+    ch: String,
+    events: Vec<&'a Event>,
+    rows: Value,
+    #[serde(rename = "storeError", skip_serializing_if = "Option::is_none")]
+    store_error: Option<&'a Value>,
+}
+
+/// frame 送給哪一種連線：本機原樣，遠端依 `remote_thinking` 剝除（[`crate::ws::redact_remote_copy`]）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    Local,
+    Remote(crate::config::RemoteThinking),
+}
+
+impl Frame {
+    /// 這個連線要送的文字（[`Frame::to_json`] 序列化後；遠端先剝除）。同一個 frame 每種（頻道、offset、模式）只序列化
+    /// 一次，之後的連線拿快取（E-L4）。遠端模式各自一份，本機的全文不會送給遠端（X9）；session 頻道不帶 kpi，不分 offset。
+    pub fn text_for(
+        &self,
+        ch: &Channel,
+        offset_min: i32,
+        wire: Wire,
+    ) -> Option<axum::extract::ws::Utf8Bytes> {
+        use crate::config::RemoteThinking;
+        let offset = if *ch == Channel::All { offset_min } else { 0 };
+        let mode = match wire {
+            Wire::Local => 0,
+            Wire::Remote(RemoteThinking::OnDemand) => 1,
+            Wire::Remote(RemoteThinking::Hide) => 2,
+            Wire::Remote(RemoteThinking::Show) => 3,
+        };
+        let key = (ch.name(), offset, mode);
+        let mut texts = self.texts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = texts.get(&key) {
+            return t.clone();
+        }
+        self.serialized
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = match wire {
+            Wire::Local => self.local_text(ch, offset),
+            Wire::Remote(thinking) => self
+                .to_json(ch, offset)
+                .map(|v| crate::ws::redact_remote_copy(&v, thinking).to_string()),
+        }
+        .map(axum::extract::ws::Utf8Bytes::from);
+        texts.insert(key, text.clone());
+        text
+    }
+
+    /// [`Frame::text_for`] 實際序列化了幾次（測試用）。
+    pub fn serializations(&self) -> usize {
+        self.serialized.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn local_text(&self, ch: &Channel, offset_min: i32) -> Option<String> {
+        let events: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|e| ch.wants(&e.session))
+            .collect();
+        let mut rows = self.rows_for(ch);
+        if *ch == Channel::All
+            && let Some(k) = self.kpi_for(offset_min)
+            && let Some(obj) = rows.as_object_mut()
+        {
+            obj.insert("kpi".into(), k);
+        }
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
+            return None;
+        }
+        serde_json::to_string(&FrameOut {
+            t: "frame",
+            frame: self.no,
+            ch: ch.name(),
+            events,
+            rows,
+            store_error: self.store_error.as_ref(),
+        })
+        .ok()
+    }
+
+    pub fn events_for(&self, ch: &Channel) -> Vec<Event> {
+        self.events
+            .iter()
+            .filter(|e| ch.wants(&e.session))
+            .cloned()
+            .collect()
+    }
+
+    pub fn rows_for(&self, ch: &Channel) -> Value {
+        let mut rows = Map::new();
+        for (kind, list) in [
+            ("sessions", &self.sessions),
+            ("agents", &self.agents),
+            ("attention", &self.attention),
+        ] {
+            let picked: Vec<Value> = list
+                .iter()
+                .filter(|(s, _)| ch.wants(s))
+                .map(|(_, v)| v.clone())
+                .collect();
+            if !picked.is_empty() {
+                rows.insert(kind.into(), Value::Array(picked));
+            }
+        }
+        Value::Object(rows)
+    }
+
+    pub fn kpi_for(&self, offset_min: i32) -> Option<Value> {
+        self.kpi.get(&offset_min).cloned()
+    }
+
+    /// 這個連線該收到的 frame（`*` 才帶 kpi）；沒有內容就回 None。
+    pub fn to_json(&self, ch: &Channel, offset_min: i32) -> Option<Value> {
+        let events = self.events_for(ch);
+        let mut rows = self.rows_for(ch);
+        if *ch == Channel::All
+            && let Some(k) = self.kpi_for(offset_min)
+            && let Some(obj) = rows.as_object_mut()
+        {
+            obj.insert("kpi".into(), k);
+        }
+        if events.is_empty()
+            && rows.as_object().is_none_or(|o| o.is_empty())
+            && self.store_error.is_none()
+        {
+            return None;
+        }
+        let mut v = json!({ "t": "frame", "frame": self.no, "ch": ch.name(), "events": events, "rows": rows });
+        if let Some(e) = &self.store_error {
+            v["storeError"] = e.clone();
+        }
+        Some(v)
+    }
+}
+
+#[derive(Clone, Default)]
+struct Counts {
+    sessions: HashSet<String>,
+    agents: HashSet<String>,
+    edits: u64,
+    writes: u64,
+    commands: u64,
+    failures: u64,
+    dangers: u64,
+    commits: u64,
+    thinking: u64,
+    cost: f64,
+    /// 短名 → (costUsd, thinking, 完整 id)
+    models: BTreeMap<String, (f64, u64, BTreeSet<String>)>,
+}
+
+#[derive(Clone, Default)]
+struct SessionLive {
+    host: String,
+    cwd: String,
+    branch: Option<String>,
+    /// 完整模型 id；列裡的 `model` 是它的短名（#643）
+    model: Option<String>,
+    first_prompt: Option<String>,
+    last_prompt: Option<String>,
+    started_at: u64,
+    ended_at: Option<u64>,
+    status: String,
+    status_since: u64,
+    commits: u64,
+    dangers: u64,
+    failures: u64,
+    cost: f64,
+    thinking: u64,
+    last_pos: Option<u64>,
+    /// merge 定期重算的 session 分數（契約 §6）
+    score: i64,
+    /// 「現在在做什麼」一句話的這一輪來源（#648）
+    doing: Doing,
+    /// transcript 解析失敗、還沒恢復的檔（main、agent-<id>）；前端依它標「文字與思考不可用」（#652）
+    degraded: std::collections::BTreeSet<String>,
+}
+
+#[derive(Clone)]
+struct AgentLive {
+    session: String,
+    agent_id: String,
+    agent_type: Option<String>,
+    /// 這個 agent 最近一行 assistant／usage 的完整模型 id
+    model: Option<String>,
+    name: String,
+    task: Option<String>,
+    status: &'static str,
+    current: Option<String>,
+    tool_count: u64,
+    parent: Option<String>,
+    spawned_at: Option<u64>,
+    finished_at: Option<u64>,
+}
+
+#[derive(Clone)]
+struct AttentionLive {
+    session: String,
+    kind: String,
+    reference: String,
+    reason: String,
+    raised_at: u64,
+    /// danger 解除（工具結束）的時間：列留到 ack（契約 §6）
+    cleared_at: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct Live {
+    /// store 寫不進去的狀態（W-M10，contracts §6）：snapshot 一定帶，frame 只在改變時帶
+    store_error: Option<Value>,
+    store_error_dirty: bool,
+    sessions: BTreeMap<String, SessionLive>,
+    agents: BTreeMap<String, AgentLive>,
+    attention: BTreeMap<String, AttentionLive>,
+    staged: BTreeMap<(String, String), Vec<Event>>,
+    streams: HashMap<String, VecDeque<Event>>,
+    changes: VecDeque<Event>,
+    slots: BTreeMap<u64, Counts>,
+    /// 有連線用的時區，以及上次送出的 kpi 與它的「今天」起點（跨午夜就送完整的 kpi）
+    offsets: BTreeMap<i32, Option<(u64, Value)>>,
+    /// 卡片的伴隨 Event（同卡只留最新的 tool.updated）與每個 session 的狀態行
+    card_events: HashMap<(String, String), Vec<Event>>,
+    status_lines: HashMap<String, VecDeque<Event>>,
+    /// KPI 已扣回的卡片（被拒或失敗的改動只扣一次，#682）
+    reverted: HashSet<(String, String)>,
+    /// 執行中的背景 subagent（每個 session 只顯示一列「背景」）
+    bg_running: HashMap<String, HashSet<String>>,
+    pending: Vec<Event>,
+    dirty_sessions: BTreeSet<String>,
+    dirty_agents: BTreeMap<String, bool>,
+    dirty_attention: BTreeMap<String, bool>,
+    frame_no: u64,
+    history: VecDeque<Arc<Frame>>,
+    /// KPI 只在需要時重算（#686 R23）：有新 Event、跨時間格、跨午夜或有新的時區
+    kpi_dirty: bool,
+    kpi_slot: u64,
+    kpi_computes: u64,
+    /// （每個 session 的串流筆數, 留幾個 frame 給斷線接續）；None＝即時用的預設
+    limits: Option<(usize, usize)>,
+}
+
+impl Live {
+    pub fn new() -> Live {
+        Live::default()
+    }
+
+    /// 回放這類不用「載入更多」也沒有人斷線接續的用途（E-L8）：串流每個 session 只留 `stream_cap` 筆
+    /// （`*` 的 snapshot 只送 [`ALL_STREAM_PER_SESSION`]）、history 留 `history_cap` 個 frame。
+    pub fn with_limits(stream_cap: usize, history_cap: usize) -> Live {
+        Live {
+            limits: Some((stream_cap, history_cap)),
+            ..Live::default()
+        }
+    }
+
+    pub fn frame_no(&self) -> u64 {
+        self.frame_no
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// 還沒結束的 session 數（/healthz 的 `open`，#716）；`session_count` 含 2 小時內結束的。
+    pub fn open_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|s| s.status != "ended")
+            .count()
+    }
+
+    /// 「已扣回 KPI」記號的數量（測試確認它跟著卡片放掉，K-12）
+    pub fn reverted_count(&self) -> usize {
+        self.reverted.len()
+    }
+
+    /// 重算 KPI 的次數（測試確認沒有新 Event 時 flush 不重算）
+    pub fn kpi_computations(&self) -> u64 {
+        self.kpi_computes
+    }
+
+    /// 結束超過 [`ENDED_KEPT_MS`] 的 session 移出 live（#686 R24）並送 sessions 列 `deleted`：之後由
+    /// /api/sessions 與回放查看。還有佇列列的延後到佇列清空，佇列列不會變成孤兒列（契約 §6、K-7、D3）。
+    fn evict_ended(&mut self, now: u64) {
+        let queued: HashSet<&str> = self
+            .attention
+            .values()
+            .map(|a| a.session.as_str())
+            .collect();
+        let gone: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(id, s)| {
+                s.ended_at.is_some_and(|t| t + ENDED_KEPT_MS <= now)
+                    && !queued.contains(id.as_str())
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for sid in gone {
+            self.sessions.remove(&sid);
+            self.streams.remove(&sid);
+            self.status_lines.remove(&sid);
+            self.bg_running.remove(&sid);
+            self.dirty_sessions.insert(sid.clone());
+            self.card_events.retain(|(s, _), _| *s != sid);
+            self.reverted.retain(|(s, _)| *s != sid);
+            self.staged.retain(|(s, _), _| *s != sid);
+            self.agents.retain(|_, a| a.session != sid);
+        }
+    }
+
+    /// 有連線使用這個時區（`hello.utcOffsetMin`），之後的 frame 會帶它的 kpi。
+    pub fn register_offset(&mut self, offset_min: i32) {
+        self.offsets.entry(offset_min).or_insert(None);
+    }
+
+    pub fn apply(&mut self, e: &Event) {
+        self.kpi_dirty = true;
+        let carried = self.carry_danger(e);
+        // 接手來的 danger 只為了顯示，KPI 的 dangers 不再計一次
+        let danger_carried = carried.is_some();
+        let e = carried.as_ref().unwrap_or(e);
+        self.pending.push(e.clone());
+        let sid = e.session.clone();
+        let ts = e.ts_seen;
+        let payload = e.payload_typed().ok().flatten();
+        let counts = self.slots.entry(ts / SLOT_MS).or_default();
+        counts.sessions.insert(sid.clone());
+
+        if !self.sessions.contains_key(&sid) {
+            self.sessions.insert(
+                sid.clone(),
+                SessionLive {
+                    host: e.host.clone(),
+                    started_at: ts,
+                    status: "run".into(),
+                    status_since: ts,
+                    ..SessionLive::default()
+                },
+            );
+        }
+        let ended = self
+            .sessions
+            .get(&sid)
+            .is_some_and(|s| s.ended_at.is_some())
+            && !matches!(payload, Some(Payload::SessionStarted(_)));
+        if !ended {
+            self.ensure_agent(&sid, "main", ts);
+        }
+        // `<synthetic>` 這類 Claude Code 自己產生的訊息不算模型
+        if MODEL_LINES.contains(&e.kind.as_str())
+            && let Some(m) = e.payload["model"].as_str().filter(|m| !m.starts_with('<'))
+        {
+            let m = m.to_string();
+            // VSCode 與 resume 的 SessionStart 不送 model：主模型取 main 第一行（#673）
+            if e.agent == "main"
+                && let Some(s) = self.sessions.get_mut(&sid)
+            {
+                s.model.get_or_insert_with(|| m.clone());
+            }
+            if let Some(a) = self.agents.get_mut(&format!("{sid}/{}", e.agent))
+                && a.model.as_ref() != Some(&m)
+            {
+                a.model = Some(m);
+                self.dirty_agents
+                    .entry(format!("{sid}/{}", e.agent))
+                    .or_insert(false);
+            }
+        }
+        if e.pos.is_none()
+            && COMPANIONS.contains(&e.kind.as_str())
+            && let Some(id) = card_key(e)
+        {
+            let list = self.card_events.entry((sid.clone(), id)).or_default();
+            if e.kind == "tool.updated" {
+                list.retain(|x| x.kind != "tool.updated");
+            }
+            list.push(e.clone());
+        }
+        if is_status_line(e) {
+            let lines = self.status_lines.entry(sid.clone()).or_default();
+            lines.push_back(e.clone());
+            while lines.len() > STATUS_PER_SESSION {
+                lines.pop_front();
+            }
+        }
+        if let Some(p) = e.pos {
+            let cap = self.limits.map_or(STREAM_PER_SESSION, |(s, _)| s);
+            let stream = self.streams.entry(sid.clone()).or_default();
+            stream.push_back(e.clone());
+            while stream.len() > cap {
+                // 卡片被擠出串流，它的伴隨 Event 也不用留了
+                if let Some(old) = stream.pop_front()
+                    && let Some(id) = card_key(&old)
+                {
+                    // 「已扣回」只在伴隨 Event 還在時有用（revert_kpi 找不到就不扣），一起放掉（K-12）
+                    let key = (sid.clone(), id);
+                    self.card_events.remove(&key);
+                    self.reverted.remove(&key);
+                }
+            }
+            if let Some(s) = self.sessions.get_mut(&sid) {
+                s.last_pos = Some(p);
+            }
+        }
+        self.dirty_sessions.insert(sid.clone());
+
+        let Some(payload) = payload else { return };
+        let counts = self.slots.entry(ts / SLOT_MS).or_default();
+        match &payload {
+            Payload::FileEdit(_) => counts.edits += 1,
+            Payload::FileWrite(w) if w.is_new => counts.writes += 1,
+            Payload::ToolCalled(c) => {
+                if crate::event::is_command_tool(&c.tool) {
+                    counts.commands += 1;
+                }
+                if c.danger
+                    .as_ref()
+                    .is_some_and(|d| d.level == DangerLevel::Danger)
+                {
+                    counts.dangers += 1;
+                }
+            }
+            Payload::ToolUpdated(u) => {
+                if u.status == crate::event::ToolStatus::Failed {
+                    // Esc 與 PermissionDenied 不算失敗（D6），但被拒的改動一樣扣回
+                    if u.is_failure() {
+                        counts.failures += 1;
+                    }
+                    self.revert_kpi(&sid, &u.tool_use_id);
+                }
+                let counts = self.slots.entry(ts / SLOT_MS).or_default();
+                if !danger_carried
+                    && u.danger
+                        .as_ref()
+                        .is_some_and(|d| d.level == DangerLevel::Danger)
+                {
+                    counts.dangers += 1;
+                }
+            }
+            Payload::GitOp(g) if g.op == "commit" && g.ok => counts.commits += 1,
+            Payload::AgentSpawned(a) if a.agent_type.is_some() => {
+                counts.agents.insert(format!("{sid}/{}", a.agent_id));
+            }
+            Payload::Usage(u) => {
+                counts.thinking += u.thinking;
+                counts.cost += u.cost_usd;
+                let m = counts.models.entry(short_model(&u.model)).or_default();
+                m.0 += u.cost_usd;
+                m.1 += u.thinking;
+                m.2.insert(u.model.clone());
+            }
+            _ => {}
+        }
+
+        let Some(s) = self.sessions.get_mut(&sid) else {
+            return;
+        };
+        match payload {
+            Payload::SessionStarted(p) => {
+                // 第一次的 cwd 是路徑基準（#672），之後的 session.started 不換
+                if s.cwd.is_empty() {
+                    s.cwd = crate::paths::normalize(&p.cwd);
+                }
+                s.model = p.model.or(s.model.take());
+                s.branch = p.branch.or(s.branch.take());
+                s.ended_at = None;
+                // 狀態不在這裡改，只認 session.status（不變式 8）：/compact 時 merge 的狀態可能還是 done（K-5）
+            }
+            Payload::SessionEnded(_) => {
+                // merge 在 session.ended 之後一定發 ended；這裡照設，是給沒有 session.status 的舊 JSONL（不變式 9）
+                s.ended_at = Some(ts);
+                s.status = "ended".into();
+                s.status_since = ts;
+                let ids: Vec<String> = self
+                    .agents
+                    .iter()
+                    .filter(|(_, a)| a.session == sid)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in ids {
+                    self.agents.remove(&id);
+                    self.dirty_agents.insert(id, true);
+                }
+                self.bg_running.remove(&sid);
+            }
+            Payload::TranscriptDegraded(h) => {
+                s.degraded.insert(h.file);
+            }
+            Payload::TranscriptRecovered(h) => {
+                s.degraded.remove(&h.file);
+            }
+            Payload::SessionStatus(p) => {
+                s.status = serde_json::to_value(p.status)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                s.status_since = p.since;
+                // 結束之後又回到其他狀態（被補 abandoned 的 session 繼續使用，#679）
+                if s.status != "ended" {
+                    s.ended_at = None;
+                }
+            }
+            Payload::PromptSubmitted(p) => {
+                let text = clip(&p.text);
+                s.first_prompt.get_or_insert_with(|| text.clone());
+                s.last_prompt = Some(text);
+                s.doing.prompt(&p.text, p.source.as_deref() == Some("task"));
+            }
+            Payload::AssistantText(t) if e.agent == "main" => s.doing.text(&t.text),
+            Payload::AssistantThinking(t) if e.agent == "main" => {
+                s.doing.thinking(&t.text);
+            }
+            Payload::Usage(u) => {
+                s.cost += u.cost_usd;
+                s.thinking += u.thinking;
+            }
+            Payload::ModelChanged(m) if e.agent == "main" => s.model = Some(m.to),
+            Payload::GitOp(g) => {
+                if g.op == "commit" && g.ok {
+                    s.commits += 1;
+                }
+                // `worktree add -b X` 是在另一個 worktree 建分支，這個 session 的分支沒變（#682）
+                if g.ok && matches!(g.op.as_str(), "switch" | "checkout") && g.branch.is_some() {
+                    s.branch = g.branch;
+                }
+            }
+            Payload::AttentionRaised(a) => {
+                let kind = enum_str(&a.kind);
+                if kind == "danger" {
+                    s.dangers += 1;
+                }
+                let id = format!("{sid}/{kind}/{}", a.reference);
+                self.attention.insert(
+                    id.clone(),
+                    AttentionLive {
+                        session: sid.clone(),
+                        kind,
+                        reference: a.reference,
+                        reason: a.reason.unwrap_or_default(),
+                        raised_at: ts,
+                        cleared_at: None,
+                    },
+                );
+                self.dirty_attention.insert(id, false);
+            }
+            Payload::AttentionCleared(a) => {
+                let id = format!("{sid}/{}/{}", enum_str(&a.kind), a.reference);
+                match self.attention.get_mut(&id) {
+                    // danger 解除只標時間，留到 ack
+                    Some(row) if row.kind == "danger" => {
+                        row.cleared_at = Some(ts);
+                        self.dirty_attention.insert(id, false);
+                    }
+                    Some(_) => {
+                        self.attention.remove(&id);
+                        self.dirty_attention.insert(id, true);
+                    }
+                    None => {}
+                }
+            }
+            Payload::ToolCalled(c) => {
+                let cwd = s.cwd.clone();
+                if e.pos.is_none() {
+                    self.staged
+                        .insert((sid.clone(), c.tool_use_id.clone()), vec![e.clone()]);
+                }
+                let id = self.ensure_agent(&sid, &e.agent, ts);
+                let current = describe(&c.tool, &c.input, &cwd);
+                if e.agent == "main"
+                    && let Some(s) = self.sessions.get_mut(&sid)
+                {
+                    s.doing.tool(&current);
+                }
+                if let Some(a) = self.agents.get_mut(&id) {
+                    a.current = Some(current);
+                    a.tool_count += 1;
+                    let danger = c
+                        .danger
+                        .as_ref()
+                        .is_some_and(|d| d.level == DangerLevel::Danger);
+                    a.status = if danger { "danger" } else { "run" };
+                    self.dirty_agents.insert(id, false);
+                }
+            }
+            Payload::ToolUpdated(u) => {
+                // 和 KPI 同一個判斷（D6）；tool_result 的 ok=false 含 Esc 與拒絕，不另外算
+                if u.is_failure() {
+                    s.failures += 1;
+                }
+                // 被拒或失敗的 Edit／Write 視為沒有發生，不留在改動紀錄（contracts §4，#682）
+                if u.status == crate::event::ToolStatus::Failed {
+                    self.changes.retain(|c| {
+                        !(c.session == sid
+                            && card_key(c).as_deref() == Some(u.tool_use_id.as_str()))
+                    });
+                }
+                self.stage_update(&sid, &u.tool_use_id, e)
+            }
+            Payload::ToolResult(r) => self.stage_update(&sid, &r.tool_use_id, e),
+            Payload::ToolPlaced(p) => {
+                self.staged.remove(&(sid.clone(), p.tool_use_id));
+            }
+            Payload::AgentSpawned(a) => match a.agent_type {
+                None => {
+                    self.bg_running
+                        .entry(sid.clone())
+                        .or_default()
+                        .insert(a.agent_id);
+                    self.ensure_agent(&sid, "bg", ts);
+                }
+                Some(t) => {
+                    let id = format!("{sid}/{}", a.agent_id);
+                    // agent.spawned 可能延後發（等配對，#680）：這段期間它的工具事件已經開了列、甚至已經結束，
+                    // 合併進去，保留工具次數、目前動作、模型與結束狀態
+                    let prev = self.agents.remove(&id);
+                    let row = AgentLive {
+                        session: sid.clone(),
+                        agent_id: a.agent_id.clone(),
+                        name: a.name.clone().unwrap_or_else(|| t.clone()),
+                        agent_type: Some(t),
+                        model: prev.as_ref().and_then(|p| p.model.clone()),
+                        task: a.task.as_deref().map(clip),
+                        status: prev.as_ref().map_or("run", |p| p.status),
+                        current: prev.as_ref().and_then(|p| p.current.clone()),
+                        tool_count: prev.as_ref().map_or(0, |p| p.tool_count),
+                        parent: a.parent_tool_use_id,
+                        spawned_at: prev.as_ref().and_then(|p| p.spawned_at).or(Some(ts)),
+                        finished_at: prev.as_ref().and_then(|p| p.finished_at),
+                    };
+                    self.agents.insert(id.clone(), row);
+                    self.dirty_agents.insert(id, false);
+                }
+            },
+            Payload::AgentFinished(a) => {
+                let bg = self
+                    .bg_running
+                    .get_mut(&sid)
+                    .is_some_and(|set| set.remove(&a.agent_id));
+                if bg {
+                    if self.bg_running.get(&sid).is_none_or(|set| set.is_empty()) {
+                        let id = format!("{sid}/bg");
+                        if self.agents.remove(&id).is_some() {
+                            self.dirty_agents.insert(id, true);
+                        }
+                    }
+                } else {
+                    let id = format!("{sid}/{}", a.agent_id);
+                    if let Some(row) = self.agents.get_mut(&id) {
+                        row.status = if task_failed(a.status.as_deref()) {
+                            "fail"
+                        } else {
+                            "done"
+                        };
+                        row.current = None;
+                        row.finished_at = Some(ts);
+                        self.dirty_agents.insert(id, false);
+                    }
+                }
+            }
+            Payload::TurnStopped(_) => {
+                let id = format!("{sid}/main");
+                if let Some(a) = self.agents.get_mut(&id) {
+                    a.status = "idle";
+                    a.current = None;
+                    self.dirty_agents.insert(id, false);
+                }
+            }
+            Payload::FileEdit(_) | Payload::FileWrite(_) => {
+                self.changes.push_back(e.clone());
+                while self.changes.len() > CHANGES_KEPT {
+                    self.changes.pop_front();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// live 裡所有 session 的 id。
+    pub fn session_ids(&self) -> HashSet<String> {
+        self.sessions.keys().cloned().collect()
+    }
+
+    pub fn has_session(&self, id: &str) -> bool {
+        self.sessions.contains_key(id)
+    }
+
+    /// collector 重啟後用 store 的 `sessions` 列補回 live 看不到的部分（#676）：cwd、第一個 prompt、
+    /// 開始時間與累計值以 store 為準；模型與分支 live 已經有的保留（重放看得到 checkout，store 不追）。
+    /// live 還沒有這個 session 時新建一列，`ts` 是狀態的起點。
+    pub fn seed(&mut self, r: &SessionRow, ts: u64) {
+        // 新建的列照 store 的狀態與結束時間：merge 重啟時也種回同樣的狀態（D3，#679），
+        // 不然重建窗口外的 session 回來時 live 顯示 run、merge 與 store 是 ended
+        let s = self
+            .sessions
+            .entry(r.id.clone())
+            .or_insert_with(|| SessionLive {
+                host: r.host.clone(),
+                status: if r.status.is_empty() {
+                    "run".into()
+                } else {
+                    r.status.clone()
+                },
+                status_since: if r.status.is_empty() {
+                    ts
+                } else {
+                    r.status_since
+                },
+                ended_at: r.ended_at,
+                ..SessionLive::default()
+            });
+        if !r.cwd.is_empty() {
+            s.cwd = crate::paths::normalize(&r.cwd);
+        }
+        if let Some(p) = &r.first_prompt {
+            s.first_prompt = Some(clip(p));
+        }
+        if s.model.is_none() {
+            s.model = r.model.clone();
+        }
+        if s.branch.is_none() {
+            s.branch = r.branch.clone();
+        }
+        s.started_at = r.started_at;
+        s.commits = r.commits;
+        s.dangers = r.dangers;
+        s.failures = r.failures;
+        s.cost = r.cost_usd;
+        s.thinking = r.thinking_tokens;
+        self.dirty_sessions.insert(r.id.clone());
+    }
+
+    /// merge 定期重算的分數（契約 §6 `sessions.score`）；變了才標記該列要送。
+    pub fn set_scores(&mut self, scores: &[(String, i64)]) {
+        for (sid, v) in scores {
+            if let Some(s) = self.sessions.get_mut(sid)
+                && s.score != *v
+            {
+                s.score = *v;
+                self.dirty_sessions.insert(sid.clone());
+            }
+        }
+    }
+
+    /// 重啟重建後對齊 store 的佇列：ack 不是 Event，重放會讓已確認的列跑回來。
+    pub fn keep_attention(&mut self, open: &std::collections::HashSet<String>) {
+        let gone: Vec<String> = self
+            .attention
+            .keys()
+            .filter(|id| !open.contains(*id))
+            .cloned()
+            .collect();
+        for id in gone {
+            self.attention.remove(&id);
+            self.dirty_attention.insert(id, true);
+        }
+    }
+
+    /// 注意佇列「已確認」：移除該列（store 另外記 `acked_at`）。
+    pub fn ack(&mut self, session: &str, kind: &str, reference: &str) -> bool {
+        let id = format!("{session}/{kind}/{reference}");
+        let removed = self.attention.remove(&id).is_some();
+        if removed {
+            self.dirty_attention.insert(id, true);
+        }
+        removed
+    }
+
+    /// 打包這段時間的變化；沒有任何變化回 None。
+    /// 丟掉還沒送出的變更、不組 frame（E-L2）：啟動時重建、回放追到起點這類大量 apply，
+    /// 沒有人在等那些 frame（重連的 instance 不同、回放只要 snapshot），組出來只會留在 history 佔記憶體。
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.dirty_sessions.clear();
+        self.dirty_agents.clear();
+        self.dirty_attention.clear();
+    }
+
+    pub fn flush(&mut self, now: u64) -> Option<Arc<Frame>> {
+        self.evict_ended(now);
+        let mut kpi = BTreeMap::new();
+        let slot = now / SLOT_MS;
+        let recompute = self.kpi_dirty
+            || slot != self.kpi_slot
+            || self.offsets.iter().any(|(off, last)| {
+                last.as_ref()
+                    .is_none_or(|(day, _)| *day != day_start(*off, now))
+            });
+        let offsets: Vec<i32> = if recompute {
+            self.kpi_dirty = false;
+            self.kpi_slot = slot;
+            self.kpi_computes += 1;
+            self.offsets.keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        for off in offsets {
+            let current = self.kpi(off, now);
+            let day = day_start(off, now);
+            // 和上次送出的比，借用不拷貝上一份（E-L3）
+            let changed = match self.offsets.get(&off).and_then(Option::as_ref) {
+                Some((prev_day, prev)) if *prev_day == day => {
+                    let mut diff = Map::new();
+                    if let (Some(c), Some(p)) = (current.as_object(), prev.as_object()) {
+                        for (k, v) in c {
+                            if p.get(k) != Some(v) {
+                                diff.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    Value::Object(diff)
+                }
+                // 第一次，或跨過當地午夜：整份重算、送完整的 kpi
+                _ => current.clone(),
+            };
+            if changed.as_object().is_some_and(|o| !o.is_empty()) {
+                kpi.insert(off, changed);
+            }
+            self.offsets.insert(off, Some((day, current)));
+        }
+        let oldest = now.saturating_sub(SLOTS_KEPT_MS) / SLOT_MS;
+        self.slots.retain(|slot, _| *slot >= oldest);
+
+        // 同一個 toolUseId 的 tool.updated 只留最後一個
+        let pending = std::mem::take(&mut self.pending);
+        let mut seen = HashSet::new();
+        let mut events: Vec<Event> = pending
+            .into_iter()
+            .rev()
+            .filter(|e| {
+                if e.kind != "tool.updated" {
+                    return true;
+                }
+                let id = e.payload["toolUseId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                seen.insert((e.session.clone(), id))
+            })
+            .collect();
+        events.reverse();
+
+        let sessions: Vec<(String, Value)> = std::mem::take(&mut self.dirty_sessions)
+            .into_iter()
+            .map(|id| {
+                // 不在 live 裡的是剛移出的（evict_ended）
+                let row = self
+                    .session_row(&id)
+                    .unwrap_or_else(|| json!({ "id": id, "deleted": true }));
+                (id, row)
+            })
+            .collect();
+        let agents: Vec<(String, Value)> = std::mem::take(&mut self.dirty_agents)
+            .into_iter()
+            .map(|(id, deleted)| {
+                let session = id.split('/').next().unwrap_or_default().to_string();
+                let row = match (deleted, self.agents.get(&id)) {
+                    (false, Some(a)) => agent_row(&id, a),
+                    _ => json!({ "id": id, "deleted": true }),
+                };
+                (session, row)
+            })
+            .collect();
+        let attention: Vec<(String, Value)> = std::mem::take(&mut self.dirty_attention)
+            .into_iter()
+            .map(|(id, deleted)| {
+                let session = id.split('/').next().unwrap_or_default().to_string();
+                let row = match (deleted, self.attention.get(&id)) {
+                    (false, Some(a)) => attention_row(&id, a),
+                    _ => json!({ "id": id, "deleted": true }),
+                };
+                (session, row)
+            })
+            .collect();
+
+        let store_error = std::mem::take(&mut self.store_error_dirty)
+            .then(|| self.store_error.clone().unwrap_or(Value::Null));
+        if events.is_empty()
+            && sessions.is_empty()
+            && agents.is_empty()
+            && attention.is_empty()
+            && kpi.is_empty()
+            && store_error.is_none()
+        {
+            return None;
+        }
+        self.frame_no += 1;
+        let frame = Arc::new(Frame {
+            no: self.frame_no,
+            events,
+            sessions,
+            agents,
+            attention,
+            kpi,
+            store_error,
+            texts: Default::default(),
+            serialized: Default::default(),
+        });
+        self.history.push_back(frame.clone());
+        let kept = self.limits.map_or(FRAMES_KEPT, |(_, h)| h);
+        while self.history.len() > kept {
+            self.history.pop_front();
+        }
+        Some(frame)
+    }
+
+    /// 編號 `no` 之後的 frame（斷線接續）；太舊已經丟掉、或編號不合理時回 None，改送 snapshot。
+    pub fn frames_since(&self, no: u64) -> Option<Vec<Arc<Frame>>> {
+        if no > self.frame_no {
+            return None;
+        }
+        if no == self.frame_no {
+            return Some(Vec::new());
+        }
+        let first = self.history.front()?.no;
+        if first > no + 1 {
+            return None;
+        }
+        Some(self.history.iter().filter(|f| f.no > no).cloned().collect())
+    }
+
+    /// 目前的 storeError（welcome 用）；正常時 null。
+    pub fn store_error(&self) -> Value {
+        self.store_error.clone().unwrap_or(Value::Null)
+    }
+
+    /// serve 每次試著寫 store 之後呼叫（W-M10）；和上次不同才送。
+    pub fn set_store_error(&mut self, e: Option<Value>) {
+        if e != self.store_error {
+            self.store_error = e;
+            self.store_error_dirty = true;
+        }
+    }
+
+    pub fn snapshot(&self, ch: &Channel, offset_min: i32, now: u64) -> Value {
+        let sessions: Vec<Value> = self
+            .sessions
+            .keys()
+            .filter(|id| ch.wants(id))
+            .filter_map(|id| self.session_row(id))
+            .collect();
+        let agents: Vec<Value> = self
+            .agents
+            .iter()
+            .filter(|(_, a)| ch.wants(&a.session))
+            .map(|(id, a)| agent_row(id, a))
+            .collect();
+        let mut attention: Vec<(&String, &AttentionLive)> = self
+            .attention
+            .iter()
+            .filter(|(_, a)| ch.wants(&a.session))
+            .collect();
+        attention.sort_by_key(|(id, a)| (a.raised_at, (*id).clone()));
+        let attention: Vec<Value> = attention
+            .into_iter()
+            .map(|(id, a)| attention_row(id, a))
+            .collect();
+        let mut staged: Vec<&Vec<Event>> = self
+            .staged
+            .iter()
+            .filter(|((s, _), _)| ch.wants(s))
+            .map(|(_, v)| v)
+            .collect();
+        staged.sort_by_key(|v| v.first().map(|e| (e.ts_seen, e.session.clone(), e.seq)));
+        let staged: Vec<&Event> = staged.into_iter().flatten().collect();
+
+        let per_session = if *ch == Channel::All {
+            ALL_STREAM_PER_SESSION
+        } else {
+            STREAM_PER_SESSION
+        };
+        let mut lists: Vec<Vec<Event>> = Vec::new();
+        for (sid, q) in self.streams.iter().filter(|(s, _)| ch.wants(s)) {
+            let window: Vec<Event> = q
+                .iter()
+                .skip(q.len().saturating_sub(per_session))
+                .cloned()
+                .collect();
+            let mut pool: Vec<Event> = self
+                .status_lines
+                .get(sid)
+                .map(|l| l.iter().cloned().collect())
+                .unwrap_or_default();
+            for e in &window {
+                if let Some(list) =
+                    card_key(e).and_then(|id| self.card_events.get(&(sid.clone(), id)))
+                {
+                    pool.extend(list.iter().cloned());
+                }
+            }
+            lists.push(assemble_stream(window, pool, None));
+        }
+        // 還沒有任何 pos 的 session：只有狀態行
+        for (_, lines) in self
+            .status_lines
+            .iter()
+            .filter(|(s, _)| ch.wants(s) && !self.streams.contains_key(*s))
+        {
+            lists.push(lines.iter().cloned().collect());
+        }
+        let stream = merge_streams(lists);
+
+        let mut snap = json!({
+            "t": "snapshot", "ch": ch.name(), "frame": self.frame_no,
+            "sessions": sessions, "agents": agents, "attention": attention,
+            "staged": staged, "stream": stream,
+            "storeError": self.store_error.clone().unwrap_or(Value::Null),
+        });
+        if *ch == Channel::All {
+            snap["kpi"] = self.kpi(offset_min, now);
+            snap["changes"] = json!(self.changes.iter().collect::<Vec<_>>());
+        }
+        snap
+    }
+
+    fn ensure_agent(&mut self, sid: &str, agent: &str, ts: u64) -> String {
+        // 事件的 agent 欄位：main、subagent 的 id，或 bg
+        let id = format!("{sid}/{agent}");
+        if !self.agents.contains_key(&id) {
+            let (name, agent_type) = match agent {
+                "main" => ("main".to_string(), None),
+                "bg" => ("背景".to_string(), None),
+                other => (other.to_string(), None),
+            };
+            self.agents.insert(
+                id.clone(),
+                AgentLive {
+                    session: sid.to_string(),
+                    agent_id: agent.to_string(),
+                    agent_type,
+                    model: None,
+                    name,
+                    task: None,
+                    status: "run",
+                    current: None,
+                    tool_count: 0,
+                    parent: None,
+                    spawned_at: Some(ts),
+                    finished_at: None,
+                },
+            );
+            self.dirty_agents.insert(id.clone(), false);
+        }
+        id
+    }
+
+    /// 沒帶 danger 的 tool.updated 接手同卡較早一筆帶的 danger：live、frame 與 snapshot 都只留同卡
+    /// 最新的 tool.updated，transcript 先到時的危險標示（PreToolUse 後到才判斷）不能因此不見（R15）。
+    fn carry_danger(&self, e: &Event) -> Option<Event> {
+        if e.kind != "tool.updated" || e.payload.get("danger").is_some_and(|d| !d.is_null()) {
+            return None;
+        }
+        let key = (e.session.clone(), card_key(e)?);
+        let danger = [self.card_events.get(&key), self.staged.get(&key)]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|x| x.kind == "tool.updated")
+            .find_map(|x| x.payload.get("danger").filter(|d| !d.is_null()))?
+            .clone();
+        let mut e = e.clone();
+        e.payload["danger"] = danger;
+        Some(e)
+    }
+
+    /// 被拒或失敗的 Edit／Write 視為沒有發生（contracts §4，#682）：從它當初計入的時段扣回 KPI 的
+    /// 改動與新檔案。同一張卡片只扣一次。
+    fn revert_kpi(&mut self, sid: &str, tool_use_id: &str) {
+        let key = (sid.to_string(), tool_use_id.to_string());
+        let Some(list) = self.card_events.get(&key) else {
+            return;
+        };
+        let mut minus: Vec<(u64, bool)> = Vec::new();
+        for e in list {
+            match e.payload_typed().ok().flatten() {
+                Some(Payload::FileEdit(_)) => minus.push((e.ts_seen / SLOT_MS, true)),
+                Some(Payload::FileWrite(w)) if w.is_new => minus.push((e.ts_seen / SLOT_MS, false)),
+                _ => {}
+            }
+        }
+        if minus.is_empty() || !self.reverted.insert(key) {
+            return;
+        }
+        for (slot, is_edit) in minus {
+            if let Some(c) = self.slots.get_mut(&slot) {
+                if is_edit {
+                    c.edits = c.edits.saturating_sub(1);
+                } else {
+                    c.writes = c.writes.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    fn stage_update(&mut self, sid: &str, tool_use_id: &str, e: &Event) {
+        if let Some(list) = self
+            .staged
+            .get_mut(&(sid.to_string(), tool_use_id.to_string()))
+        {
+            list.retain(|x| x.kind != e.kind);
+            list.push(e.clone());
+        }
+    }
+
+    fn kpi(&self, offset_min: i32, now: u64) -> Value {
+        // 加總時借用時間格裡的字串，不逐格 clone（E-L3：即時每次 flush、回放每個 frame 都算一次）
+        let start = day_start(offset_min, now);
+        let mut sessions: HashSet<&str> = HashSet::new();
+        let mut agents: HashSet<&str> = HashSet::new();
+        let mut models: BTreeMap<&str, (f64, u64, BTreeSet<&str>)> = BTreeMap::new();
+        let mut sum = Counts::default();
+        for c in self.slots.range(start / SLOT_MS..).map(|(_, c)| c) {
+            sessions.extend(c.sessions.iter().map(String::as_str));
+            agents.extend(c.agents.iter().map(String::as_str));
+            sum.edits += c.edits;
+            sum.writes += c.writes;
+            sum.commands += c.commands;
+            sum.failures += c.failures;
+            sum.dangers += c.dangers;
+            sum.commits += c.commits;
+            sum.thinking += c.thinking;
+            sum.cost += c.cost;
+            for (name, (cost, thinking, ids)) in &c.models {
+                let m = models.entry(name).or_default();
+                m.0 += cost;
+                m.1 += thinking;
+                m.2.extend(ids.iter().map(String::as_str));
+            }
+        }
+        let models: Map<String, Value> = models
+            .into_iter()
+            .map(|(name, (cost, thinking, ids))| {
+                (
+                    name.to_string(),
+                    json!({ "costUsd": cost, "thinkingTokens": thinking, "ids": ids }),
+                )
+            })
+            .collect();
+        json!({
+            "live": self.sessions.values().filter(|s| s.status == "run").count(),
+            "attention": self.attention.len(),
+            "sessions": sessions.len(),
+            "agents": agents.len(),
+            "edits": sum.edits,
+            "writes": sum.writes,
+            "commands": sum.commands,
+            "failures": sum.failures,
+            "dangers": sum.dangers,
+            "commits": sum.commits,
+            "thinkingTokens": sum.thinking,
+            "costUsd": sum.cost,
+            "models": models,
+        })
+    }
+
+    /// 某 session 的 `sessions` 列（contracts.md §6）；不在 live 狀態裡回 None。
+    pub fn session_row(&self, id: &str) -> Option<Value> {
+        let s = self.sessions.get(id)?;
+        let agents_live = self
+            .agents
+            .values()
+            .filter(|a| a.session == id && a.agent_id != "main" && a.agent_id != "bg")
+            .filter(|a| a.status != "done" && a.status != "fail")
+            .count();
+        Some(json!({
+            "id": id, "host": s.host, "cwd": s.cwd, "branch": s.branch, "model": s.model.as_deref().map(short_model), "modelId": s.model,
+            "firstPrompt": s.first_prompt, "lastPrompt": s.last_prompt,
+            "startedAt": s.started_at, "endedAt": s.ended_at,
+            "status": s.status, "statusSince": s.status_since, "doing": s.doing.local().map(|(_, t)| t),
+            "doingSource": s.doing.local().map(|(src, _)| doing_source(src)), "score": s.score,
+            "commits": s.commits, "dangers": s.dangers, "failures": s.failures,
+            "agentsLive": agents_live, "costUsd": s.cost, "thinkingTokens": s.thinking, "lastPos": s.last_pos,
+            "degraded": s.degraded,
+        }))
+    }
+}
+
+fn agent_row(id: &str, a: &AgentLive) -> Value {
+    json!({
+        "id": id, "session": a.session, "agentId": a.agent_id, "agentType": a.agent_type, "model": a.model.as_deref().map(short_model), "modelId": a.model, "name": a.name,
+        "task": a.task, "status": a.status, "current": a.current, "toolCount": a.tool_count,
+        "parentToolUseId": a.parent, "spawnedAt": a.spawned_at, "finishedAt": a.finished_at,
+    })
+}
+
+fn attention_row(id: &str, a: &AttentionLive) -> Value {
+    json!({
+        "id": id, "session": a.session, "kind": a.kind, "ref": a.reference,
+        "reason": a.reason, "raisedAt": a.raised_at, "clearedAt": a.cleared_at,
+    })
+}
+
+fn enum_str<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// `offset_min` 時區的當地今天 00:00（epoch ms）。
+fn day_start(offset_min: i32, now: u64) -> u64 {
+    let offset_ms = i64::from(offset_min) * 60_000;
+    let local = now as i64 + offset_ms;
+    (local - local.rem_euclid(DAY_MS) - offset_ms).max(0) as u64
+}
+
+/// 截成 sessions 列的文字長度（firstPrompt、lastPrompt）。
+pub fn clip(s: &str) -> String {
+    s.chars().take(TEXT_LIMIT).collect()
+}
+
+/// `claude-opus-5-5` → `opus 5.5`
+pub fn short_model(id: &str) -> String {
+    let base = id.split('[').next().unwrap_or(id);
+    let rest = base.strip_prefix("claude-").unwrap_or(base);
+    let mut parts = rest.split('-');
+    let family = parts.next().unwrap_or(rest);
+    let version: Vec<&str> = parts
+        .take_while(|p| p.chars().all(|c| c.is_ascii_digit()) && p.len() <= 2)
+        .collect();
+    if version.is_empty() {
+        family.to_string()
+    } else {
+        format!("{family} {}", version.join("."))
+    }
+}
+
+/// Agents 面板的「目前動作」。
+fn describe(tool: &str, input: &Value, cwd: &str) -> String {
+    let path = || {
+        input["file_path"]
+            .as_str()
+            .map(|p| relative_path(cwd, p))
+            .unwrap_or_default()
+    };
+    match tool {
+        t if crate::event::is_command_tool(t) => {
+            let cmd = input["command"].as_str().unwrap_or_default();
+            let first = cmd.lines().next().unwrap_or_default();
+            format!("$ {}", first.chars().take(80).collect::<String>())
+        }
+        "Read" => format!("read {}", path()),
+        "Edit" => format!("edit {}", path()),
+        "Write" => format!("write {}", path()),
+        other => other.to_string(),
+    }
+}
+
+/// sessions 列的 `doingSource`：遠端剝除靠它判斷 `doing` 是不是取自 thinking（C2，contracts §4）。
+fn doing_source(src: Source) -> &'static str {
+    match src {
+        Source::Text => "text",
+        Source::Thinking => "thinking",
+        Source::Tool => "tool",
+        Source::Prompt => "prompt",
+    }
+}
