@@ -125,6 +125,15 @@ pub fn files_for(platform: Platform, ctx: &Ctx) -> Vec<PathBuf> {
     }
 }
 
+/// `service status` 括號裡顯示的檔：Windows 的工作 XML 在服務的 home（`existing` 是查到的服務 home），
+/// 從別的 home 跑 status 時不能顯示目前 home 底下的。其他平台的檔位置和 home 無關。
+pub fn status_file(platform: Platform, ctx: &Ctx, existing: Option<&Path>) -> PathBuf {
+    match (platform, existing) {
+        (Platform::Windows, Some(h)) => h.join(WINDOWS_XML),
+        _ => files_for(platform, ctx).remove(0),
+    }
+}
+
 pub fn installed(platform: Platform, ctx: &Ctx) -> bool {
     files_for(platform, ctx).iter().all(|p| p.is_file())
 }

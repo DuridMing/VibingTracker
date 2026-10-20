@@ -666,3 +666,27 @@ fn windows_uninstall_stops_the_collector_before_ending_the_task() {
     let end = cmds.iter().position(|c| c.starts_with("schtasks /End "));
     assert!(stop.is_some() && end.is_some() && stop < end, "{cmds:?}");
 }
+
+/// 第 1 輪 Windows 驗收 §8.4：從別的 home 跑 `service status` 時，括號裡的檔要是服務真正用的那個
+/// （Windows 的工作 XML 放在服務的 home），不是目前 home 底下不存在的檔。Linux、macOS 的檔位置和 home 無關。
+#[test]
+fn status_shows_the_file_the_installed_service_uses() {
+    let c = ctx(Path::new("C:/cl-test/l11"));
+    let service_home = Path::new("C:/Users/u/.coding-lab");
+    assert_eq!(
+        service::status_file(Platform::Windows, &c, Some(service_home)),
+        service_home.join(service::WINDOWS_XML)
+    );
+    // 查不到服務的 home（沒裝）：照舊是目前 home 底下的
+    assert_eq!(
+        service::status_file(Platform::Windows, &c, None),
+        service::files_for(Platform::Windows, &c)[0]
+    );
+    for p in [Platform::Linux, Platform::Macos] {
+        assert_eq!(
+            service::status_file(p, &c, Some(service_home)),
+            service::files_for(p, &c)[0],
+            "{p:?}"
+        );
+    }
+}

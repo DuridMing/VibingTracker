@@ -484,11 +484,14 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
             Ok(())
         }
         ServiceCommand::Status => {
-            let files = service::files_for(platform, &ctx);
             // 以系統的登記為準（#719）：install 失敗後 unit／XML 檔可能還在
             let registered =
                 service::query_installed(platform, &ctx, &mut service::run_command_capture_quiet);
             let file = service::installed(platform, &ctx);
+            // 服務用的 home 和目前的不一定一樣（W-L11）；括號裡的檔跟著服務的 home（§8.4）
+            let existing =
+                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet);
+            let shown = service::status_file(platform, &ctx, existing.as_deref());
             println!(
                 "常駐服務：{}（{}：{}）",
                 if registered {
@@ -499,12 +502,9 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
                     "未安裝"
                 },
                 service::status_command(platform, &ctx).join(" "),
-                files[0].display()
+                shown.display()
             );
-            // 服務用的 home 和目前的不一定一樣（W-L11）
-            if let Some(h) =
-                service::existing_home(platform, &ctx, &mut service::run_command_capture_quiet)
-            {
+            if let Some(h) = existing {
                 let same = service::check_existing(Some(&h), &cfg.home, false).is_ok();
                 println!(
                     "服務的資料目錄：{}（{}）",
