@@ -398,7 +398,9 @@ fn serve_uses_at_most_four_runtime_workers() {
 fn ensure_never_fails_even_if_the_port_is_taken_by_something_else() {
     // 先占住再把埠寫進設定：先挑埠再綁的話，中間可能被別人拿走
     let squatter = TcpListener::bind("127.0.0.1:0").unwrap(); // 接受連線但從不回應
-    let e = env_on(0, squatter.local_addr().unwrap().port());
+    // 閒置 1 秒就結束（不是 0＝永遠不結束）：ensure 在背景拉起的 collector 不歸測試管，squatter 一放開
+    // 它就可能綁上同一個埠；idle 0 的話會一直跑下去（Windows 第 2 輪驗收與 Linux 都看到留下來的 collector）
+    let e = env_on(1, squatter.local_addr().unwrap().port());
     let t = Instant::now();
     let out = ensure(&e, r#"{"session_id":"s","hook_event_name":"SessionStart"}"#);
     assert!(out.status.success() && out.stdout.is_empty());
@@ -990,7 +992,7 @@ fn ensure_gives_up_fast_when_the_store_is_from_a_newer_version() {
 #[test]
 fn ensure_gives_up_fast_when_the_hook_port_belongs_to_another_program() {
     let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
-    let e = env_on(0, squatter.local_addr().unwrap().port());
+    let e = env_on(1, squatter.local_addr().unwrap().port()); // 閒置 1 秒：理由同上一條
     let t = Instant::now();
     let out = ensure(&e, SESSION_START);
     assert!(out.status.success() && out.stdout.is_empty());

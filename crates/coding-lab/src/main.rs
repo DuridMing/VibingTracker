@@ -344,9 +344,18 @@ fn service_inner(cfg: Config, cmd: ServiceCommand) -> Result<(), String> {
         )
     })?;
     let ctx = service::Ctx::detect(&cfg.home)?;
-    // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）
-    let _ = coding_lab::store::create_private_dir(&cfg.home);
-    let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
+    // 子命令裡 logging::log 要進 collector.log（#724：失敗訊息說「已寫進 log」就要真的在）。
+    // 唯讀的 status、--dry-run 不建資料目錄（第 2 輪 Windows 驗收：status 把不存在的 home 建出來了）
+    let writes = match &cmd {
+        ServiceCommand::Install { dry_run, .. } | ServiceCommand::Uninstall { dry_run, .. } => {
+            !dry_run
+        }
+        ServiceCommand::Status => false,
+    };
+    if writes {
+        let _ = coding_lab::store::create_private_dir(&cfg.home);
+        let _ = coding_lab::logging::to_file(&cfg.home.join("collector.log"));
+    }
     let describe = |plan: &service::Plan| {
         for (p, _) in &plan.files {
             println!("寫入 {}", p.display());

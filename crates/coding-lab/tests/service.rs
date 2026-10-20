@@ -690,3 +690,32 @@ fn status_shows_the_file_the_installed_service_uses() {
         );
     }
 }
+
+/// 第 2 輪 Windows 驗收 §2.4：唯讀的 `service status`、`--dry-run` 不能把還不存在的資料目錄建出來
+/// （B-S3 之後 service 子命令一律先建 home 收緊權限、開 collector.log；只有真的會改東西的才要）。
+/// HOME、XDG_CONFIG_HOME 也指到暫存目錄，不碰使用者真的 unit 檔。
+#[test]
+fn read_only_service_commands_do_not_create_the_home() {
+    let dir = tmp("readonly-home");
+    for args in [
+        &["service", "status"][..],
+        &["service", "install", "--dry-run"],
+        &["service", "uninstall", "--dry-run"],
+    ] {
+        let home = dir.join(format!("home-{}", args.join("-")));
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_coding-lab"))
+            .args(args)
+            .env("CODING_LAB_HOME", &home)
+            .env("HOME", dir.join("user"))
+            .env("USERPROFILE", dir.join("user"))
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .output()
+            .unwrap();
+        assert!(
+            !home.exists(),
+            "{args:?} 不能建出資料目錄：{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
